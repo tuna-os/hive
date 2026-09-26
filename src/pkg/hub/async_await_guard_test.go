@@ -123,7 +123,7 @@ func TestNoAwaitOutsideAsync(t *testing.T) {
 
 // inCommentOrString reports whether pos falls inside a `//` line comment, a
 // `/* */` block comment, or a single/double-quoted string literal, scanning
-// from the start of src. dashboardHTML is a single big Go raw string of
+// from the start of src. dashboardHTML is a single embedded HTML asset of
 // mostly-JS, so this is a best-effort lexer: it does not need to be exact,
 // only good enough that a literal `await hiveConfirm(` inside documentation
 // prose or an example string doesn't get flagged as a real call site.
