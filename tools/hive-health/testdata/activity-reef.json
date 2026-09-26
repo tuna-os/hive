@@ -1,0 +1,39 @@
+{
+  "activity": [
+    {
+      "timestamp": "2026-09-17T15:07:10Z",
+      "username": "castrojo",
+      "action": "released: gave the task back",
+      "cli": "omp",
+      "task": "issue tuna-os/.github#37: [architect] Flatpak tooling consolidation is incomplete and its drift guard checks the wrong repos — 0 of 8 consumers migrated, Tavern unwatched"
+    },
+    {
+      "timestamp": "2026-09-17T15:07:10Z",
+      "username": "castrojo",
+      "action": "picked up",
+      "cli": "omp",
+      "task": "issue tuna-os/.github#38: [guide] profile/README.md misidentifies historical predecessor of tunaos-packages"
+    },
+    {
+      "timestamp": "2026-09-17T15:07:13Z",
+      "username": "castrojo",
+      "action": "failed",
+      "cli": "omp",
+      "task": "issue tuna-os/.github#38: [guide] profile/README.md misidentifies historical predecessor of tunaos-packages"
+    },
+    {
+      "timestamp": "2026-09-17T15:17:43Z",
+      "username": "castrojo",
+      "action": "joined",
+      "cli": "omp"
+    },
+    {
+      "timestamp": "2026-09-17T15:24:13Z",
+      "username": "castrojo",
+      "action": "left",
+      "cli": "omp"
+    }
+  ],
+  "capacity": 50,
+  "retained": 50
+}

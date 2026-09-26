@@ -26,6 +26,7 @@ Current delta against `hivecommons:v4` (after the 2026-09-05 sync in #30):
 | `3b4fc73`, `01f9ef8` | ACMM evaluation: report "GitHub did not answer" as unknown, not as a missing file (#32) | Generic — upstream candidate |
 | `aff6235` | Agent onboarding files at the repository root (`AGENTS.md`, `CLAUDE.md`, editor and tool entrypoints) (#34) | Generic — upstream candidate |
 | `f29a791` | `governor.acmm.repo_roots`: probe a configured sub-root so `src/`-layout repos are seen (#35) | Generic — upstream candidate |
+| (this PR) | `tools/hive-health/` + `hive-health.yml`: hourly read-only probe of the live Tuna OS Hives, one self-closing `[operations]` issue per failing Hive | Fork-specific: it watches this org's deployments. Kept outside `src/` so it never conflicts with a sync |
 
 Regenerate this table with `git log --oneline --no-merges hivecommons/v4..v4`.
 

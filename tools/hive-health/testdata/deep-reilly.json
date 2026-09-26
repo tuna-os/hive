@@ -1,0 +1,134 @@
+{
+  "checks": {
+    "agents": {
+      "architect": {
+        "last_kick": "2026-09-25T19:15:46-04:00",
+        "last_kick_age": "4h1m49s",
+        "last_prompt_len": 25146,
+        "state": "running",
+        "status": "pass"
+      },
+      "brainstorm": {
+        "paused": true,
+        "state": "paused",
+        "status": "skip"
+      },
+      "ci-maintainer": {
+        "last_kick": "2026-09-25T19:20:34-04:00",
+        "last_kick_age": "3h57m2s",
+        "last_prompt_len": 25321,
+        "state": "running",
+        "status": "pass"
+      },
+      "guide": {
+        "last_kick": "2026-09-25T20:15:18-04:00",
+        "last_kick_age": "3h2m17s",
+        "last_prompt_len": 22176,
+        "state": "running",
+        "status": "pass"
+      },
+      "operations": {
+        "detail": "no kick message recorded",
+        "last_kick": "2026-09-24T09:50:59-04:00",
+        "last_kick_age": "37h26m36s",
+        "state": "running",
+        "status": "warn"
+      },
+      "quality": {
+        "last_kick": "2026-09-25T21:51:09-04:00",
+        "last_kick_age": "1h26m26s",
+        "last_prompt_len": 32795,
+        "state": "running",
+        "status": "pass"
+      },
+      "reviewer": {
+        "paused": true,
+        "state": "paused",
+        "status": "skip"
+      },
+      "scanner": {
+        "last_kick": "2026-09-25T20:55:50-04:00",
+        "last_kick_age": "2h21m45s",
+        "last_prompt_len": 33674,
+        "state": "running",
+        "status": "pass"
+      },
+      "sec-check": {
+        "last_kick": "2026-09-25T19:21:42-04:00",
+        "last_kick_age": "3h55m53s",
+        "last_prompt_len": 23899,
+        "state": "running",
+        "status": "pass"
+      },
+      "strategist": {
+        "last_kick": "2026-09-25T19:22:31-04:00",
+        "last_kick_age": "3h55m4s",
+        "last_prompt_len": 16441,
+        "state": "running",
+        "status": "pass"
+      },
+      "supervisor": {
+        "last_kick": "2026-09-25T23:14:48-04:00",
+        "last_kick_age": "2m48s",
+        "last_prompt_len": 3330,
+        "state": "running",
+        "status": "pass"
+      },
+      "telemetry": {
+        "detail": "no kick message recorded",
+        "last_kick": "2026-09-18T07:21:01-04:00",
+        "last_kick_age": "183h56m34s",
+        "state": "running",
+        "status": "warn"
+      }
+    },
+    "config": {
+      "acmm_level": 5,
+      "hive_id": "hive-slim-hare",
+      "org": "hanthor",
+      "repos": 7,
+      "status": "pass"
+    },
+    "contribute": {
+      "active_contributors": 0,
+      "status": "pass"
+    },
+    "github_auth": {
+      "status": "pass"
+    },
+    "governor": {
+      "hold": 129,
+      "issues": 46,
+      "mode": "SURGE",
+      "prs": 51,
+      "status": "pass"
+    },
+    "hub_heartbeat": {
+      "last_attempt": "2026-09-26T03:15:54Z",
+      "last_attempt_age": "1m42s",
+      "last_success": "2026-09-26T03:15:54Z",
+      "last_success_age": "1m42s",
+      "status": "pass"
+    },
+    "queue": {
+      "actionable": 46,
+      "status": "pass"
+    },
+    "ready": {
+      "status": "pass"
+    },
+    "stall_detection": {
+      "status": "pass"
+    },
+    "tokens": {
+      "by_agent": {
+        "unknown": 2149889562
+      },
+      "sessions": 14982,
+      "status": "pass",
+      "total_tokens": 2149889562
+    }
+  },
+  "fails": 0,
+  "status": "ok"
+}
