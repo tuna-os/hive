@@ -1,0 +1,23 @@
+{
+  "hub_snapshot_url": "https://hub.tunaos.org/activity.json",
+  "hives": [
+    {
+      "name": "school",
+      "url": "https://school.tunaos.org",
+      "namespace": "hive",
+      "session_env": "HIVE_HEALTH_SESSION_SCHOOL"
+    },
+    {
+      "name": "reef",
+      "url": "https://reef.tunaos.org",
+      "namespace": "hive-reef",
+      "session_env": "HIVE_HEALTH_SESSION_REEF"
+    },
+    {
+      "name": "reilly",
+      "url": "https://hive.reilly.asia",
+      "namespace": "hive-hanthor",
+      "session_env": "HIVE_HEALTH_SESSION_REILLY"
+    }
+  ]
+}

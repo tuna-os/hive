@@ -27,6 +27,9 @@ squash, which re-creates duplicated history.
 - `src/docs/` — operator and design docs; `docs/` — repo-level guides
   (`development.md`, `troubleshooting.md`).
 - `bin/` — operational shell scripts and their contract tests (`bin/test_*.sh`).
+- `tools/hive-health/` — fork-only, read-only health probe for the live Tuna OS
+  Hives (its own Go module). `hive-health.yml` runs it hourly and files
+  `hive-health` issues; see its README before acting on one.
 - `.github/workflows/` — 30+ workflows; `v2-tests.yml` is the test gate.
 
 ## Build, test, lint

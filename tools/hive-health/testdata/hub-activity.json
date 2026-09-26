@@ -1,0 +1,1553 @@
+{
+  "generated_at": "2026-09-26T03:15:01Z",
+  "spokes": [
+    {
+      "spoke": "school",
+      "hiveId": "hive-school-tunaos",
+      "acmmLevel": 6,
+      "governorMode": "surge",
+      "agents": [
+        {
+          "name": "supervisor",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "scanner",
+          "cli": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "reviewer",
+          "cli": "copilot",
+          "model": "claude-fable-5",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "ci-maintainer",
+          "cli": "claude",
+          "model": "claude-sonnet-5",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "quality",
+          "cli": "claude",
+          "model": "claude-sonnet-5",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "architect",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "guide",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "outreach",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "sec-check",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "telemetry",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "operations",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "strategist",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "brainstorm",
+          "cli": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "paused": true,
+          "busy": "idle",
+          "state": "paused"
+        }
+      ]
+    },
+    {
+      "spoke": "reef",
+      "hiveId": "hive-good-frog",
+      "acmmLevel": 6,
+      "governorMode": "surge",
+      "agents": [
+        {
+          "name": "supervisor",
+          "cli": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "scanner",
+          "cli": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "reviewer",
+          "cli": "copilot",
+          "model": "claude-fable-5",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "brainstorm",
+          "cli": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "paused": true,
+          "busy": "idle",
+          "state": "paused"
+        },
+        {
+          "name": "ci-maintainer",
+          "cli": "claude",
+          "model": "claude-sonnet-5",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "quality",
+          "cli": "claude",
+          "model": "claude-sonnet-5",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "architect",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "guide",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "outreach",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "sec-check",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "telemetry",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "operations",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "strategist",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        }
+      ]
+    },
+    {
+      "spoke": "hanthor",
+      "hiveId": "hive-slim-hare",
+      "acmmLevel": 5,
+      "governorMode": "surge",
+      "agents": [
+        {
+          "name": "supervisor",
+          "cli": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "scanner",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "reviewer",
+          "cli": "copilot",
+          "model": "claude-fable-5",
+          "paused": true,
+          "busy": "idle",
+          "state": "paused"
+        },
+        {
+          "name": "brainstorm",
+          "cli": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "paused": true,
+          "busy": "idle",
+          "state": "paused"
+        },
+        {
+          "name": "ci-maintainer",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "quality",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "architect",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-opus-5:high",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "guide",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-haiku-4-5:low",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "sec-check",
+          "cli": "pi",
+          "model": "kiro-api-key/gpt-5-6-luna:high",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "telemetry",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "operations",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-sonnet-5:medium",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        },
+        {
+          "name": "strategist",
+          "cli": "pi",
+          "model": "kiro-api-key/claude-opus-5:high",
+          "paused": false,
+          "busy": "idle",
+          "state": "running"
+        }
+      ]
+    }
+  ],
+  "beads": [
+    {
+      "spoke": "hanthor",
+      "agent": "scanner",
+      "id": "923a67d6-6a0",
+      "title": "Failing CI PR triage: 23 PRs analyzed, root causes identified",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T00:57:21.084044865Z"
+    },
+    {
+      "spoke": "hanthor",
+      "agent": "scanner",
+      "id": "8d3b5d92-be1",
+      "title": "PR #610 indiafoss-companion: test failures dependent on live schedule data",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T00:56:45.43849825Z"
+    },
+    {
+      "spoke": "hanthor",
+      "agent": "guide",
+      "id": "0adda090-b89",
+      "title": "dotfiles: Documentation audit - well-covered, CONTRIBUTING guide could be added",
+      "type": "advisory",
+      "status": "open",
+      "priority": 0,
+      "updated": "2026-09-26T00:17:24.628854225Z"
+    },
+    {
+      "spoke": "hanthor",
+      "agent": "guide",
+      "id": "d3097a7d-f53",
+      "title": "indiafoss-chat-android: Documentation audit",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T00:17:12.839002579Z"
+    },
+    {
+      "spoke": "hanthor",
+      "agent": "quality",
+      "id": "e4f7c21a-4ef",
+      "title": "Role-provisioned Python scripts in bluefin/systemd/browser lack unit test coverage",
+      "type": "advisory",
+      "status": "open",
+      "priority": 2,
+      "updated": "2026-09-25T23:46:40.808306389Z"
+    },
+    {
+      "spoke": "hanthor",
+      "agent": "quality",
+      "id": "acbdc6c9-ad9",
+      "title": "dotfiles scripts lack comprehensive unit test coverage",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-25T23:46:19.403158223Z"
+    },
+    {
+      "spoke": "reef",
+      "agent": "quality",
+      "id": "12ba4cff-955",
+      "title": "Intent alignment drift in tuna-os/corral#370",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T02:37:18.026674889Z"
+    },
+    {
+      "spoke": "reef",
+      "agent": "quality",
+      "id": "f83c49c9-936",
+      "title": "Intent alignment drift in tuna-os/corral#369",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T02:37:16.082986103Z"
+    },
+    {
+      "spoke": "reef",
+      "agent": "ci-maintainer",
+      "id": "2c585d89-cd5",
+      "title": "GTK office suite CI status check - main branch active",
+      "type": "advisory",
+      "status": "closed",
+      "priority": 3,
+      "updated": "2026-09-26T01:48:02.193467201Z"
+    },
+    {
+      "spoke": "reef",
+      "agent": "ci-maintainer",
+      "id": "bc2e6bc6-52c",
+      "title": "GTK office suite CI status check - main branch, workflows, and credential tests all verified healthy (2026-09-26)",
+      "type": "advisory",
+      "status": "open",
+      "priority": 3,
+      "updated": "2026-09-26T01:20:17.102886139Z"
+    },
+    {
+      "spoke": "reef",
+      "agent": "supervisor",
+      "id": "231c8688-f32",
+      "title": "Pipeline Status & Health Summary: Supervisor Advisory Run (-nogithub)",
+      "type": "advisory",
+      "status": "closed",
+      "priority": 2,
+      "updated": "2026-09-26T01:14:01.444722676Z"
+    },
+    {
+      "spoke": "reef",
+      "agent": "quality",
+      "id": "a4fc4561-57d",
+      "title": "Intent alignment drift in tuna-os/gtk-office-suite#1078",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T00:37:10.691438209Z"
+    },
+    {
+      "spoke": "school",
+      "agent": "supervisor",
+      "id": "b1c43af0-687",
+      "title": "Pass 991 (2026-09-26T02:51Z): Fleet recovered from pass-990 quiet spell - quality (11min) and ci-maintainer (14min) both wrote new beads, confirms it was a normal lull not a stall. architect/strategist mid-tier (66/120min), scanner/outreach/sec-check unchanged slow-tail. guide now 17hr stale, 3rd consecutive pass (988->991) with zero change and rank always worst. Confirmed again this pass: supervisor lane (uid 2012 hive-supervisor) has no write access to /var/run/hive-metrics/hive.singleton.lock (owned by dev, -rw-r--r--) so cannot self-kick guide. Left bead f7da753a-4fa OPEN (priority 1 bug, not closed) so a differently-privileged process/governor picks up the guide-kick action item instead of it being buried in a closed pass log. No gh calls made.",
+      "type": "advisory",
+      "status": "open",
+      "priority": 4,
+      "updated": "2026-09-26T02:51:13.286389217Z"
+    },
+    {
+      "spoke": "school",
+      "agent": "supervisor",
+      "id": "f7da753a-4fa",
+      "title": "[supervisor] Pass 991 — guide stale 17hr across 3 consecutive passes (988/989/990/991), no kick capability available",
+      "type": "bug",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T02:51:05.207118919Z"
+    },
+    {
+      "spoke": "school",
+      "agent": "quality",
+      "id": "b76577bd-83f",
+      "title": "Intent alignment drift in tuna-os/corral#370",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T02:39:34.401409332Z"
+    },
+    {
+      "spoke": "school",
+      "agent": "quality",
+      "id": "2c54340f-dbc",
+      "title": "Intent alignment drift in tuna-os/corral#369",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T02:39:32.659951098Z"
+    },
+    {
+      "spoke": "school",
+      "agent": "ci-maintainer",
+      "id": "852c1a54-f42",
+      "title": "tacklebox cancel-in-progress bug still live: main commit 253d595 lost verify-smoke+iso-smoke verdicts",
+      "type": "advisory",
+      "status": "open",
+      "priority": 1,
+      "updated": "2026-09-26T02:36:45.718742998Z"
+    },
+    {
+      "spoke": "school",
+      "agent": "supervisor",
+      "id": "141e9cee-a70",
+      "title": "Pass 990 (2026-09-26T02:19Z): All 8 bead-producing lanes quiet since pass 989 (~28min no new writes across the board) - not alarming yet, well under 8hr stale_timeout. guide remains stalest at 16.4hr, unchanged rank from passes 988/989 - candidate for a kick if/when kick capability is available (singleton lock still owned by another process last checked). operations/telemetry still 0 lifetime beads (known pre-existing gap, not re-verified this pass). No gh calls made.",
+      "type": "advisory",
+      "status": "open",
+      "priority": 4,
+      "updated": "2026-09-26T02:19:17.338676336Z"
+    }
+  ],
+  "registry": {
+    "hives": [
+      {
+        "id": "hive-school-tunaos",
+        "org": "tuna-os",
+        "acmmLevel": 6,
+        "governorMode": "SURGE",
+        "agentCount": 12,
+        "online": true,
+        "lastHeartbeat": "2026-09-26T03:13:41Z",
+        "totalTokens24h": 2149889562,
+        "actionableIssues": 596,
+        "actionablePRs": 115,
+        "tasksCompleted7d": 32,
+        "awaitingReview": 1,
+        "prsMerged90d": 2872,
+        "repoActivity": [
+          {
+            "repo": "tuna-os/.github",
+            "issues": {
+              "count": 7,
+              "newestAt": "2026-09-24T20:48:44Z"
+            },
+            "prs": {
+              "count": 4,
+              "newestAt": "2026-09-25T12:53:27Z"
+            },
+            "comments": {
+              "count": 3,
+              "newestAt": "2026-09-25T12:53:37Z"
+            },
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 3,
+                  "newestAt": "2026-09-24T19:45:14Z"
+                },
+                "prs": {
+                  "count": 2,
+                  "newestAt": "2026-09-24T19:46:43Z"
+                },
+                "comments": {
+                  "count": 1,
+                  "newestAt": "2026-09-14T07:13:03Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "scanner",
+                "issues": {
+                  "count": 0
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T12:53:27Z"
+                },
+                "comments": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T12:53:37Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 2,
+                  "newestAt": "2026-09-20T04:51:35Z"
+                },
+                "prs": {
+                  "count": 0
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "strategist",
+                "issues": {
+                  "count": 2,
+                  "newestAt": "2026-09-24T20:48:44Z"
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-17T09:30:38Z"
+                },
+                "comments": {
+                  "count": 1,
+                  "newestAt": "2026-09-24T20:48:22Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          },
+          {
+            "repo": "tuna-os/Tavern",
+            "issues": {
+              "count": 11,
+              "newestAt": "2026-09-25T12:52:04Z"
+            },
+            "prs": {
+              "count": 6,
+              "newestAt": "2026-09-19T23:01:47Z"
+            },
+            "comments": {
+              "count": 2,
+              "newestAt": "2026-09-25T12:52:17Z"
+            },
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 4,
+                  "newestAt": "2026-09-19T22:41:36Z"
+                },
+                "prs": {
+                  "count": 3,
+                  "newestAt": "2026-09-19T23:01:47Z"
+                },
+                "comments": {
+                  "count": 1,
+                  "newestAt": "2026-09-20T03:18:24Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "ci-maintainer",
+                "issues": {
+                  "count": 1,
+                  "newestAt": "2026-09-20T01:35:58Z"
+                },
+                "prs": {
+                  "count": 0
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "scanner",
+                "issues": {
+                  "count": 3,
+                  "newestAt": "2026-09-25T12:52:04Z"
+                },
+                "prs": {
+                  "count": 0
+                },
+                "comments": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T12:52:17Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 1,
+                  "newestAt": "2026-09-16T20:23:27Z"
+                },
+                "prs": {
+                  "count": 0
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          },
+          {
+            "repo": "tuna-os/bluefin-cli",
+            "issues": {
+              "count": 8,
+              "newestAt": "2026-09-24T13:50:13Z"
+            },
+            "prs": {
+              "count": 6,
+              "newestAt": "2026-09-25T00:49:42Z"
+            },
+            "comments": null,
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 3,
+                  "newestAt": "2026-09-15T17:48:54Z"
+                },
+                "prs": {
+                  "count": 3,
+                  "newestAt": "2026-09-25T00:49:42Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 2,
+                  "newestAt": "2026-09-17T00:12:27Z"
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-17T00:13:16Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "strategist",
+                "issues": {
+                  "count": 3,
+                  "newestAt": "2026-09-24T13:50:13Z"
+                },
+                "prs": {
+                  "count": 2,
+                  "newestAt": "2026-09-18T08:15:37Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          },
+          {
+            "repo": "tuna-os/bootc-installer",
+            "issues": {
+              "count": 10,
+              "newestAt": "2026-09-25T16:50:48Z"
+            },
+            "prs": {
+              "count": 6,
+              "newestAt": "2026-09-25T03:53:15Z"
+            },
+            "comments": null,
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 5,
+                  "newestAt": "2026-09-24T19:22:05Z"
+                },
+                "prs": {
+                  "count": 3,
+                  "newestAt": "2026-09-24T19:27:34Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "scanner",
+                "issues": {
+                  "count": 0
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T03:53:15Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 3,
+                  "newestAt": "2026-09-25T16:50:48Z"
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-17T02:29:10Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "strategist",
+                "issues": {
+                  "count": 2,
+                  "newestAt": "2026-09-24T15:31:28Z"
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-17T22:18:48Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          },
+          {
+            "repo": "tuna-os/bootc-installer-asahi",
+            "issues": {
+              "count": 12,
+              "newestAt": "2026-09-25T20:52:28Z"
+            },
+            "prs": {
+              "count": 6,
+              "newestAt": "2026-09-25T12:53:15Z"
+            },
+            "comments": {
+              "count": 1,
+              "newestAt": "2026-09-13T16:15:03Z"
+            },
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 5,
+                  "newestAt": "2026-09-19T20:25:05Z"
+                },
+                "prs": {
+                  "count": 0
+                },
+                "comments": {
+                  "count": 1,
+                  "newestAt": "2026-09-13T16:15:03Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "guide",
+                "issues": {
+                  "count": 1,
+                  "newestAt": "2026-09-23T17:49:23Z"
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-23T17:53:12Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "scanner",
+                "issues": {
+                  "count": 0
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T12:53:15Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T16:50:50Z"
+                },
+                "prs": {
+                  "count": 0
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          },
+          {
+            "repo": "tuna-os/bootc-migrate",
+            "issues": {
+              "count": 15,
+              "newestAt": "2026-09-25T15:49:38Z"
+            },
+            "prs": {
+              "count": 12,
+              "newestAt": "2026-09-25T18:51:31Z"
+            },
+            "comments": {
+              "count": 22,
+              "newestAt": "2026-09-25T19:48:37Z"
+            },
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 5,
+                  "newestAt": "2026-09-24T20:20:05Z"
+                },
+                "prs": {
+                  "count": 2,
+                  "newestAt": "2026-09-24T23:06:49Z"
+                },
+                "comments": {
+                  "count": 2,
+                  "newestAt": "2026-09-25T00:15:22Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "scanner",
+                "issues": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T12:48:38Z"
+                },
+                "prs": {
+                  "count": 5,
+                  "newestAt": "2026-09-25T18:51:31Z"
+                },
+                "comments": {
+                  "count": 8,
+                  "newestAt": "2026-09-25T19:48:37Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 5,
+                  "newestAt": "2026-09-25T15:49:38Z"
+                },
+                "prs": {
+                  "count": 4,
+                  "newestAt": "2026-09-24T11:48:48Z"
+                },
+                "comments": {
+                  "count": 9,
+                  "newestAt": "2026-09-25T15:49:41Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "strategist",
+                "issues": {
+                  "count": 4,
+                  "newestAt": "2026-09-25T05:21:20Z"
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-18T00:53:57Z"
+                },
+                "comments": {
+                  "count": 3,
+                  "newestAt": "2026-09-25T02:49:42Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          },
+          {
+            "repo": "tuna-os/branding",
+            "issues": {
+              "count": 6,
+              "newestAt": "2026-09-17T22:20:15Z"
+            },
+            "prs": {
+              "count": 7,
+              "newestAt": "2026-09-19T20:02:39Z"
+            },
+            "comments": {
+              "count": 1,
+              "newestAt": "2026-09-24T19:49:12Z"
+            },
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 1,
+                  "newestAt": "2026-09-14T09:16:04Z"
+                },
+                "prs": {
+                  "count": 4,
+                  "newestAt": "2026-09-19T20:02:39Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 4,
+                  "newestAt": "2026-09-17T22:20:15Z"
+                },
+                "prs": {
+                  "count": 2,
+                  "newestAt": "2026-09-17T22:22:41Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "strategist",
+                "issues": {
+                  "count": 1,
+                  "newestAt": "2026-09-17T08:52:35Z"
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-17T08:52:55Z"
+                },
+                "comments": {
+                  "count": 1,
+                  "newestAt": "2026-09-24T19:49:12Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          },
+          {
+            "repo": "tuna-os/bst-ci",
+            "issues": {
+              "count": 5,
+              "newestAt": "2026-09-20T05:48:25Z"
+            },
+            "prs": {
+              "count": 7,
+              "newestAt": "2026-09-25T12:52:23Z"
+            },
+            "comments": {
+              "count": 9,
+              "newestAt": "2026-09-25T10:22:52Z"
+            },
+            "merges": null,
+            "reviews": null,
+            "agents": [
+              {
+                "agent": "architect",
+                "issues": {
+                  "count": 2,
+                  "newestAt": "2026-09-20T05:48:25Z"
+                },
+                "prs": {
+                  "count": 3,
+                  "newestAt": "2026-09-25T10:26:46Z"
+                },
+                "comments": {
+                  "count": 3,
+                  "newestAt": "2026-09-25T10:22:52Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "scanner",
+                "issues": {
+                  "count": 0
+                },
+                "prs": {
+                  "count": 1,
+                  "newestAt": "2026-09-25T12:52:23Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "sec-check",
+                "issues": {
+                  "count": 0
+                },
+                "prs": {
+                  "count": 0
+                },
+                "comments": {
+                  "count": 6,
+                  "newestAt": "2026-09-24T19:24:39Z"
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              },
+              {
+                "agent": "strategist",
+                "issues": {
+                  "count": 3,
+                  "newestAt": "2026-09-18T01:50:36Z"
+                },
+                "prs": {
+                  "count": 3,
+                  "newestAt": "2026-09-18T01:51:16Z"
+                },
+                "comments": {
+                  "count": 0
+                },
+                "merges": {
+                  "count": 0
+                },
+                "claims": {
+                  "count": 0
+                },
+                "reviews": {
+                  "count": 0
+                },
+                "advisory": {
+                  "count": 0
+                },
+                "reconciled": {
+                  "count": 0
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

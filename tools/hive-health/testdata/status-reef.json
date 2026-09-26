@@ -1,0 +1,616 @@
+{
+  "hiveId": "hive-good-frog",
+  "governor": {
+    "active": true,
+    "mode": "surge",
+    "issues": 275,
+    "prs": 94,
+    "thresholds": {
+      "quiet": 54,
+      "busy": 135,
+      "surge": 270
+    }
+  },
+  "hold": {
+    "issues": 210,
+    "prs": 70,
+    "total": 280
+  },
+  "systemAlerts": [
+    {
+      "id": "provider-budget-exceeded",
+      "severity": "error",
+      "message": "provider quota exhausted — 1 agent(s) out of provider quota"
+    },
+    {
+      "id": "watchdog-producing-telemetry",
+      "severity": "warning",
+      "message": "Agent \"telemetry\" is alive but not producing: no production evidence for 6h5m0s (threshold 6h0m0s) while 378 item(s) are queued"
+    },
+    {
+      "id": "watchdog-producing-operations",
+      "severity": "warning",
+      "message": "Agent \"operations\" is alive but not producing: no production evidence for 6h5m0s (threshold 6h0m0s) while 378 item(s) are queued"
+    }
+  ],
+  "cadenceMatrix": [
+    {
+      "agent": "architect",
+      "idle": "2h",
+      "quiet": "1h",
+      "busy": "30m",
+      "surge": "15m"
+    },
+    {
+      "agent": "brainstorm",
+      "idle": "on demand",
+      "quiet": "on demand",
+      "busy": "on demand",
+      "surge": "on demand"
+    },
+    {
+      "agent": "ci-maintainer",
+      "idle": "30m",
+      "quiet": "20m",
+      "busy": "10m",
+      "surge": "5m"
+    },
+    {
+      "agent": "guide",
+      "idle": "1h",
+      "quiet": "1h",
+      "busy": "1h",
+      "surge": "1h"
+    },
+    {
+      "agent": "operations",
+      "idle": "paused",
+      "quiet": "paused",
+      "busy": "paused",
+      "surge": "paused"
+    },
+    {
+      "agent": "outreach",
+      "idle": "4h",
+      "quiet": "2h",
+      "busy": "1h",
+      "surge": "30m"
+    },
+    {
+      "agent": "quality",
+      "idle": "1h",
+      "quiet": "30m",
+      "busy": "15m",
+      "surge": "10m"
+    },
+    {
+      "agent": "reviewer",
+      "idle": "30m",
+      "quiet": "30m",
+      "busy": "30m",
+      "surge": "30m"
+    },
+    {
+      "agent": "scanner",
+      "idle": "30m",
+      "quiet": "20m",
+      "busy": "10m",
+      "surge": "5m"
+    },
+    {
+      "agent": "sec-check",
+      "idle": "2h",
+      "quiet": "1h",
+      "busy": "30m",
+      "surge": "15m"
+    },
+    {
+      "agent": "strategist",
+      "idle": "4h",
+      "quiet": "2h",
+      "busy": "1h",
+      "surge": "30m"
+    },
+    {
+      "agent": "supervisor",
+      "idle": "5m",
+      "quiet": "3m",
+      "busy": "2m",
+      "surge": "1m"
+    },
+    {
+      "agent": "telemetry",
+      "idle": "paused",
+      "quiet": "paused",
+      "busy": "paused",
+      "surge": "paused"
+    }
+  ],
+  "agents": [
+    {
+      "name": "supervisor",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "muse",
+      "cadence": "1m",
+      "restarts": 6737,
+      "lastKick": "9/25 11:03 PM EDT",
+      "structuredStatus": "BLOCKED",
+      "statusEvidence": "blocked: crash-looping (28 restarts in 24h): operator",
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-25T21:10:57.603861576-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend muse",
+          "lastTransitionTime": "2026-09-25T17:12:52.258937907-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 7m0s ago",
+          "lastTransitionTime": "2026-09-02T11:25:07.942951306-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "scanner",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "muse",
+      "cadence": "5m",
+      "restarts": 5989,
+      "lastKick": "9/25 11:03 PM EDT",
+      "structuredStatus": "BLOCKED",
+      "statusEvidence": "blocked: crash-looping (61 restarts in 24h): operator",
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-25T22:03:27.918630344-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend muse",
+          "lastTransitionTime": "2026-09-25T21:05:53.242218551-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 7m0s ago",
+          "lastTransitionTime": "2026-09-02T11:22:39.259514904-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "reviewer",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "copilot",
+      "cadence": "30m",
+      "restarts": 2,
+      "lastKick": "9/25 10:43 PM EDT",
+      "structuredStatus": null,
+      "statusEvidence": null,
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-24T03:18:16.729374597-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend copilot",
+          "lastTransitionTime": "2026-09-24T03:18:16.729374597-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 27m0s ago",
+          "lastTransitionTime": "2026-09-24T03:18:16.729374597-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "brainstorm",
+      "state": "paused",
+      "paused": true,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "muse",
+      "cadence": "1h",
+      "restarts": 3,
+      "lastKick": null,
+      "structuredStatus": null,
+      "statusEvidence": null,
+      "lastError": null,
+      "conditions": null,
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "ci-maintainer",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": true,
+      "cli": "claude",
+      "cadence": "5m",
+      "restarts": 6253,
+      "lastKick": "9/25 10:39 PM EDT",
+      "structuredStatus": "BLOCKED",
+      "statusEvidence": "blocked: crash-looping (44 restarts in 24h): operator",
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "False",
+          "reason": "auth-required",
+          "message": "pane shows a login/credential screen",
+          "lastTransitionTime": "2026-09-25T21:49:33.808588271-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "LoginPromptWithUsableCredential",
+          "message": "pane shows a login/credential screen; the backend credential is still usable, so a CLI restart recovers this without an operator login",
+          "lastTransitionTime": "2026-09-25T13:05:20.667148143-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 4m0s ago",
+          "lastTransitionTime": "2026-09-02T11:25:07.942951306-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "quality",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": true,
+      "cli": "claude",
+      "cadence": "10m",
+      "restarts": 5272,
+      "lastKick": "9/25 11:00 PM EDT",
+      "structuredStatus": "BLOCKED",
+      "statusEvidence": "blocked: crash-looping (75 restarts in 24h): operator",
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "False",
+          "reason": "auth-required",
+          "message": "pane shows a login/credential screen",
+          "lastTransitionTime": "2026-09-25T22:49:52.049911973-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "LoginPromptWithUsableCredential",
+          "message": "pane shows a login/credential screen; the backend credential is still usable, so a CLI restart recovers this without an operator login",
+          "lastTransitionTime": "2026-09-25T22:49:52.049911973-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 9m0s ago",
+          "lastTransitionTime": "2026-09-02T11:35:05.220275169-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "architect",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "pi",
+      "cadence": "15m",
+      "restarts": 1332,
+      "lastKick": "9/25 10:57 PM EDT",
+      "structuredStatus": null,
+      "statusEvidence": null,
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-25T23:10:52.258067193-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend pi",
+          "lastTransitionTime": "2026-09-19T21:40:26.667465204-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 7m0s ago",
+          "lastTransitionTime": "2026-09-02T11:25:07.942951306-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "guide",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "pi",
+      "cadence": "1h",
+      "restarts": 4989,
+      "lastKick": "9/25 9:58 PM EDT",
+      "structuredStatus": "BLOCKED",
+      "statusEvidence": "blocked: crash-looping (9 restarts in 24h): operator",
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-25T04:54:52.258177547-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend pi",
+          "lastTransitionTime": "2026-09-25T08:08:52.260517112-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 1h12m0s ago",
+          "lastTransitionTime": "2026-09-02T11:35:05.220275169-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "outreach",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "pi",
+      "cadence": "30m",
+      "restarts": 4590,
+      "lastKick": "9/25 10:40 PM EDT",
+      "structuredStatus": "BLOCKED",
+      "statusEvidence": "blocked: crash-looping (8 restarts in 24h): operator",
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-25T04:54:52.258177547-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend pi",
+          "lastTransitionTime": "2026-09-25T08:08:52.260517112-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 30m0s ago",
+          "lastTransitionTime": "2026-09-04T01:13:15.157058542-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "sec-check",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "pi",
+      "cadence": "15m",
+      "restarts": 1476,
+      "lastKick": "9/25 10:46 PM EDT",
+      "structuredStatus": null,
+      "statusEvidence": null,
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-24T13:53:13.863117601-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend pi",
+          "lastTransitionTime": "2026-09-24T11:14:45.947208179-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 24m0s ago",
+          "lastTransitionTime": "2026-09-02T11:25:07.942951306-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "telemetry",
+      "state": "running",
+      "paused": false,
+      "offByCadence": true,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "pi",
+      "cadence": "paused",
+      "restarts": 1779,
+      "lastKick": "9/16 6:48 AM EDT",
+      "structuredStatus": null,
+      "statusEvidence": null,
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-24T11:08:38.542760335-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend pi",
+          "lastTransitionTime": "2026-09-25T08:08:52.260517112-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "False",
+          "reason": "NoRecentProduction",
+          "message": "no production evidence for 15h3m0s (threshold 6h0m0s) while 369 item(s) are queued",
+          "lastTransitionTime": "2026-09-25T14:12:52.28690296-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "operations",
+      "state": "running",
+      "paused": false,
+      "offByCadence": true,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "pi",
+      "cadence": "paused",
+      "restarts": 3775,
+      "lastKick": "9/19 9:27 PM EDT",
+      "structuredStatus": null,
+      "statusEvidence": null,
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-24T14:47:14.971369055-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend pi",
+          "lastTransitionTime": "2026-09-25T08:08:52.260517112-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "False",
+          "reason": "NoRecentProduction",
+          "message": "no production evidence for 15h3m0s (threshold 6h0m0s) while 369 item(s) are queued",
+          "lastTransitionTime": "2026-09-25T14:12:52.28690296-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    },
+    {
+      "name": "strategist",
+      "state": "running",
+      "paused": false,
+      "offByCadence": false,
+      "noCadence": false,
+      "needsLogin": false,
+      "cli": "pi",
+      "cadence": "30m",
+      "restarts": 1057,
+      "lastKick": "9/25 10:47 PM EDT",
+      "structuredStatus": "BLOCKED",
+      "statusEvidence": "blocked: crash-looping (12 restarts in 24h): operator",
+      "lastError": null,
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "ready",
+          "message": "CLI ready signature present",
+          "lastTransitionTime": "2026-09-24T13:19:58.961646016-04:00"
+        },
+        {
+          "type": "Authenticated",
+          "status": "Unknown",
+          "reason": "NoProbe",
+          "message": "no credential probe available for backend pi",
+          "lastTransitionTime": "2026-09-25T08:08:52.260517112-04:00"
+        },
+        {
+          "type": "Producing",
+          "status": "True",
+          "reason": "RecentProduction",
+          "message": "last production evidence 23m0s ago",
+          "lastTransitionTime": "2026-09-02T11:25:07.942951306-04:00"
+        }
+      ],
+      "watchdogMode": "observe"
+    }
+  ]
+}
