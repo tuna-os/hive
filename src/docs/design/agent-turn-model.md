@@ -11,6 +11,8 @@ effects and crash/reload tests. Nothing constructs it in the live tmux agent
 loop or contributor relay. Steps 3 (handoff path) and 4 (feasibility + migration
 cost) remain untouched.
 
+See [`docs/rfc-4002-phased-roadmap.md`](../../../docs/rfc-4002-phased-roadmap.md) for how these steps phase into a delivery plan.
+
 Every claim below carries a `file:line` citation against `origin/v4` at the time
 of writing. Line numbers drift; the function names are the durable handle. Where
 the RFC's framing does not survive contact with the code, this page says so

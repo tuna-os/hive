@@ -50,6 +50,7 @@ Agent behavior is controlled by layered config and policy templates: see [`src/d
 | 2 | `hive-renew.timer` | Every 6 days + 5 min after boot | Claude Code `/loop` cron auto-expires at 7 days — kills the session so the supervisor re-registers a fresh one. **Disable this in EXECUTOR MODE** — there is no cron to renew. |
 | 3 | `hive-healthcheck.timer` | Every 20 min + 5 min after boot | Agent is "alive" but not making progress (auth loop, stuck prompt, model stuck thinking) — watches heartbeat-file mtime |
 | 4 | ntfy push inside the healthcheck | On stall, on recovery, on escalation | Operator not watching the box — phone push |
+| 5 | `ttyd-hive.service` | Always running | Optional web terminal (`:7681`) onto the agent's tmux session — loopback-bound and unauthenticated by default (`-W -a`); front it with an authenticated proxy or add a `-c user:pass` drop-in before exposing it beyond localhost |
 
 ## Reactions to each failure mode
 

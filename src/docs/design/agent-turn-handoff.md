@@ -8,7 +8,8 @@ does not propose wiring anything into the live agent loop.
 
 Read [The agent turn model and where in-process state lives](agent-turn-model.md)
 first: it is steps 1 and 2, and this page assumes its findings rather than
-repeating them.
+repeating them. See [`docs/rfc-4002-phased-roadmap.md`](../../../docs/rfc-4002-phased-roadmap.md)
+for how step 3 phases into the overall delivery plan.
 
 Every claim carries a `file:line` citation against `v4` at the time of writing.
 Line numbers drift; function names are the durable handle. Three findings are
