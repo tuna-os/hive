@@ -37,6 +37,16 @@ not on the first pass that misses it.
 Dependency bots (`renovate[bot]`, `dependabot[bot]`, `mergeraptor[bot]`) are
 not agent authors: their red PRs are not fix loops to break.
 
+A required check failing on every conclusive open PR in a repository is treated
+as a shared CI failure when the evidence includes both a Hive-authored PR and
+an independently authored control. Hive removes that check from each PR's
+escalation observation. If no PR-specific failures remain, the observation is
+inconclusive: it neither consumes the PR's fix budget nor clears its history.
+The operator log names the repository and shared check so alerting can target
+the underlying condition instead of labeling every affected PR `needs-human`.
+A green control or a failure observed only on Hive-authored changes keeps the
+normal per-PR behavior.
+
 ## Consequences
 
 The fleet stops spending cycles on fix loops that are not converging and gives a

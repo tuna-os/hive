@@ -7856,29 +7856,102 @@ func hivePRObservations(cfg *config.Config, actionable *github.ActionableResult)
 	if actionable == nil {
 		return nil
 	}
+	shared := repoWideFailingChecks(cfg, actionable)
 	var obs []escalation.Observation
 	for _, pr := range actionable.PRs.Items {
 		if !isHiveAgentAuthor(cfg, pr.Author) {
 			continue
 		}
-		obs = append(obs, escalationObservation(cfg, pr))
+		obs = append(obs, escalationObservation(cfg, pr, prSpecificFailingChecks(cfg, pr, shared)))
 	}
 	return obs
 }
 
-// escalationObservation projects one enumerated PR into the fix-loop ledger's
-// view of it. Red means a required check concluded failure. Pending means this
-// pass could not conclude CI at all — checks still running, no check runs, or
-// (per EnrichCIStatus) the check-run fetch errored — which the ledger must
-// treat as "no information", never as "went green". Labeled mirrors the forge's
-// needs-human label so the ledger and the label can never disagree about
-// whether a PR has already been handed to a human.
-func escalationObservation(cfg *config.Config, pr github.PullRequest) escalation.Observation {
-	repo := pr.Repo
+func escalationRepo(cfg *config.Config, repo string) string {
 	if !strings.Contains(repo, "/") && cfg.Project.Org != "" {
-		repo = cfg.Project.Org + "/" + repo
+		return cfg.Project.Org + "/" + repo
 	}
-	red := pr.HasFailingRequiredCheck()
+	return repo
+}
+
+// repoWideFailingChecks identifies required checks whose failure is shared by
+// every PR in a repo for which CI has reached a conclusion. Requiring at least
+// two PRs and both an agent and a non-agent control keeps this conservative: a
+// check red only on hive changes remains attributable to those changes. A
+// shared failure, however, is base-branch or CI infrastructure evidence, not a
+// reason to spend an individual PR's fix budget or hand that PR to a human.
+func repoWideFailingChecks(cfg *config.Config, actionable *github.ActionableResult) map[string]map[string]bool {
+	type repoEvidence struct {
+		conclusive      int
+		hasAgentControl bool
+		hasHumanControl bool
+		common          map[string]bool
+	}
+	evidence := map[string]*repoEvidence{}
+	if actionable == nil {
+		return map[string]map[string]bool{}
+	}
+	for _, pr := range actionable.PRs.Items {
+		if pr.CIStatus != "success" && !pr.HasFailingRequiredCheck() {
+			continue // pending or incomplete observations are not counter-evidence
+		}
+		repo := escalationRepo(cfg, pr.Repo)
+		e := evidence[repo]
+		if e == nil {
+			e = &repoEvidence{}
+			evidence[repo] = e
+		}
+		current := map[string]bool{}
+		for _, check := range pr.FailingChecks {
+			current[check] = true
+		}
+		if e.conclusive == 0 {
+			e.common = current
+		} else {
+			for check := range e.common {
+				if !current[check] {
+					delete(e.common, check)
+				}
+			}
+		}
+		e.conclusive++
+		if isHiveAgentAuthor(cfg, pr.Author) {
+			e.hasAgentControl = true
+		} else {
+			e.hasHumanControl = true
+		}
+	}
+
+	shared := map[string]map[string]bool{}
+	for repo, e := range evidence {
+		if e.conclusive >= 2 && e.hasAgentControl && e.hasHumanControl && len(e.common) > 0 {
+			shared[repo] = e.common
+		}
+	}
+	return shared
+}
+
+func prSpecificFailingChecks(cfg *config.Config, pr github.PullRequest, shared map[string]map[string]bool) []string {
+	repoShared := shared[escalationRepo(cfg, pr.Repo)]
+	checks := make([]string, 0, len(pr.FailingChecks))
+	for _, check := range pr.FailingChecks {
+		if !repoShared[check] {
+			checks = append(checks, check)
+		}
+	}
+	return checks
+}
+
+// escalationObservation projects one enumerated PR into the fix-loop ledger's
+// view of it. Red means a PR-specific required check concluded failure; checks
+// proven red repo-wide are removed before this call. Pending means this pass
+// could not attribute a conclusive failure to this PR — checks still running,
+// a check-run fetch error, or only a repo-wide infrastructure failure — which
+// the ledger must treat as "no information", never as "went green". Labeled
+// mirrors the forge's needs-human label so ledger and label cannot disagree.
+func escalationObservation(cfg *config.Config, pr github.PullRequest, failingChecks []string) escalation.Observation {
+	repo := escalationRepo(cfg, pr.Repo)
+	red := pr.CIStatus == "failure" && len(failingChecks) > 0
 	return escalation.Observation{
 		Repo:    repo,
 		Number:  pr.Number,
@@ -8042,6 +8115,14 @@ func runEscalationSweep(
 	}
 	getEscalationStore()
 
+	shared := repoWideFailingChecks(cfg, actionable)
+	for repo, checks := range shared {
+		for check := range checks {
+			logger.Warn("repo-wide required check failure; holding per-PR escalation",
+				"repo", repo, "check", check)
+		}
+	}
+
 	var obs []escalation.Observation
 	type prMeta struct{ checks []string }
 	meta := map[string]prMeta{}
@@ -8049,9 +8130,10 @@ func runEscalationSweep(
 		if !isHiveAgentAuthor(cfg, pr.Author) {
 			continue
 		}
-		o := escalationObservation(cfg, pr)
+		checks := prSpecificFailingChecks(cfg, pr, shared)
+		o := escalationObservation(cfg, pr, checks)
 		obs = append(obs, o)
-		meta[escalation.Key(o.Repo, o.Number)] = prMeta{checks: pr.FailingChecks}
+		meta[escalation.Key(o.Repo, o.Number)] = prMeta{checks: checks}
 	}
 	results := escalationStore.Sweep(obs, cfg.Escalation.EffectiveThreshold())
 

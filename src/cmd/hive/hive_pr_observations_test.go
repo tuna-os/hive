@@ -96,6 +96,65 @@ func TestHivePRObservationsRedRequiresFailingCheck(t *testing.T) {
 	}
 }
 
+// A required check failing on every conclusive PR, including an unrelated
+// human-authored control, is repo-wide evidence. It must hold the agent PR as
+// pending instead of consuming its fix budget or escalating needs-human.
+func TestHivePRObservationsHoldsRepoWideFailures(t *testing.T) {
+	cfg := observationsTestConfig()
+	actionable := &github.ActionableResult{PRs: github.PRResult{Items: []github.PullRequest{
+		{Repo: "hive", Number: 1, Author: "hive-bee", HeadSHA: "agent",
+			CIStatus: "failure", FailingChecks: []string{"Plain E2E stable"}},
+		{Repo: "hive", Number: 2, Author: "human-dev", HeadSHA: "control",
+			CIStatus: "failure", FailingChecks: []string{"Plain E2E stable"}},
+	}}}
+
+	obs := hivePRObservations(cfg, actionable)
+	if len(obs) != 1 {
+		t.Fatalf("got %d observations, want the one agent PR", len(obs))
+	}
+	if obs[0].Red || !obs[0].Pending {
+		t.Fatalf("repo-wide failure projected as PR-specific red: %+v", obs[0])
+	}
+}
+
+func TestHivePRObservationsKeepsFailuresThatAreNotRepoWide(t *testing.T) {
+	cfg := observationsTestConfig()
+	tests := []struct {
+		name string
+		prs  []github.PullRequest
+	}{
+		{
+			name: "a green control disproves a repo-wide outage",
+			prs: []github.PullRequest{
+				{Repo: "hive", Number: 1, Author: "hive-bee", CIStatus: "failure", FailingChecks: []string{"test"}},
+				{Repo: "hive", Number: 2, Author: "human-dev", CIStatus: "success"},
+			},
+		},
+		{
+			name: "agent PRs alone are not an independent control",
+			prs: []github.PullRequest{
+				{Repo: "hive", Number: 1, Author: "hive-bee", CIStatus: "failure", FailingChecks: []string{"test"}},
+				{Repo: "hive", Number: 2, Author: "copilot-swe-agent[bot]", CIStatus: "failure", FailingChecks: []string{"test"}},
+			},
+		},
+		{
+			name: "a PR-specific failure remains after shared checks are removed",
+			prs: []github.PullRequest{
+				{Repo: "hive", Number: 1, Author: "hive-bee", CIStatus: "failure", FailingChecks: []string{"infra", "unit"}},
+				{Repo: "hive", Number: 2, Author: "human-dev", CIStatus: "failure", FailingChecks: []string{"infra"}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obs := hivePRObservations(cfg, &github.ActionableResult{PRs: github.PRResult{Items: tt.prs}})
+			if len(obs) == 0 || !obs[0].Red {
+				t.Fatalf("PR-specific failure was suppressed: %+v", obs)
+			}
+		})
+	}
+}
+
 // A nil enumeration yields nil — the eval cycle calls this before the first
 // successful GitHub pass.
 func TestHivePRObservationsNilActionable(t *testing.T) {

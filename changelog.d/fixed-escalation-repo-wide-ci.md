@@ -1,0 +1,1 @@
+- Hold per-PR fix-loop escalation when the same required check fails on every conclusive PR in a repository, including an independently authored control, and log the shared CI condition instead of applying `needs-human` to each affected PR.
