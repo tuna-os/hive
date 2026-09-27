@@ -150,3 +150,11 @@ git commit -s
 ## Maintainer resources
 
 Project governance lives in [GOVERNANCE.md](GOVERNANCE.md). The current owner/approver signal is also reflected in [OWNERS](OWNERS). Security disclosure is handled through [SECURITY.md](SECURITY.md), not public issues.
+
+<!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
+## Contribute compute — no code needed
+
+No time to write code? You can still push this project's backlog forward. This repository is worked by TunaOS AI-agent hives: lend a hive your AI subscription or API tokens and your machine runs contributor tasks from this project's backlog.
+
+- 🪸 [Contribute compute to the reef hive](https://reef.tunaos.org/contribute)
+- 🏫 [Contribute compute to the school hive](https://school.tunaos.org/contribute)
