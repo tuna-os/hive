@@ -1,0 +1,1 @@
+- API proxy event logs are now restricted to owner-only access (mode 0600 instead of 0644), preventing information disclosure of sensitive API metadata to other local users ([#84](https://github.com/tuna-os/hive/pull/84)).
