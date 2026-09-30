@@ -58,6 +58,10 @@ pinned:
   # would gate a line no longer taking doc changes.
   docs-link-check.yml: [-v2]
   go-security-analysis.yml: []
+  # Fork-only probe of the live Tuna OS Hives (tools/hive-health). Its PR
+  # trigger gates tools/hive-health/ on v4 only: the tool does not exist on
+  # the sunset v2 line, and its scheduled run lives on the default branch.
+  hive-health.yml: [-v2]
   podman-arm64-lane.yml: []
   podman-contract.yml: []
   podman-rootful-lane.yml: []

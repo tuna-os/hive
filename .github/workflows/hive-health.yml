@@ -1,0 +1,200 @@
+# hive-health: probe the running Tuna OS Hives through their web API.
+#
+# Fork-specific (tuna-os/hive only): it watches this org's deployments
+# (school.tunaos.org, reef.tunaos.org, hive.reilly.asia). See
+# tools/hive-health/README.md and FORK.md.
+#
+# WHAT IT DOES
+#   - hourly (and on demand) runs tools/hive-health against every Hive in
+#     tools/hive-health/targets.json, using public endpoints plus, when the
+#     secret is set, a read-role dashboard session for /api/status;
+#   - uploads the JSON report and writes a job summary;
+#   - keeps ONE open issue per failing Hive (label `hive-health`, title prefix
+#     `[operations]`, label `agent/operations` so a Hive's operations lane
+#     picks it up), rewrites its body each run, comments only when the set of
+#     failing checks changes, and closes it when the Hive stops failing.
+#
+# WHAT IT NEVER DOES
+#   The probe only issues HTTP GETs; nothing here restarts, pauses, resumes or
+#   reconfigures a Hive. Repair goes issue -> agent diagnosis/PR -> human.
+#   Issues are written with GITHUB_TOKEN, so they cannot trigger ai-fix.yml or
+#   any other workflow.
+#
+# On pull requests it runs the unit tests and a public-tier probe (no
+# secrets, no issue writes) so a change's effect on the live verdict is
+# visible in the PR's job summary.
+name: hive-health
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Comma-separated hive names to probe (default all)
+        required: false
+        default: ''
+      dry_run:
+        description: Probe and plan issue changes, but do not write issues
+        type: boolean
+        default: false
+  pull_request:
+    branches: [v4]
+    paths:
+      - 'tools/hive-health/**'
+      - '.github/workflows/hive-health.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hive-health-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tools/hive-health
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/hive-health/go.mod
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed: $unformatted"
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go test -race -count=1 -cover ./...
+
+  probe:
+    name: probe hives
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Read the previous run's report (backlog spike detection).
+      actions: read
+      # Open / update / close the per-Hive health issues.
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      WRITE_ISSUES: ${{ github.event_name != 'pull_request' && !inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/hive-health/go.mod
+          cache: false
+      - name: Build probe
+        working-directory: tools/hive-health
+        run: go build -o "$RUNNER_TEMP/hive-health" .
+
+      - name: Fetch previous report
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/prev"
+          prev=$(gh run list --workflow hive-health.yml --branch "${{ github.event.repository.default_branch }}" \
+                   --status success --limit 10 --json databaseId,event \
+                 | jq -r '[.[] | select(.event != "pull_request")][0].databaseId // empty')
+          if [ -n "$prev" ]; then
+            gh run download "$prev" --name hive-health-report --dir "$RUNNER_TEMP/prev" || true
+          fi
+          ls -la "$RUNNER_TEMP/prev"
+
+      - name: Probe
+        env:
+          # Optional read-role dashboard sessions (hive_session cookie values).
+          # Never passed on pull_request events. Unset = public tier only.
+          HIVE_HEALTH_SESSION_SCHOOL: ${{ github.event_name != 'pull_request' && secrets.HIVE_HEALTH_SESSION_SCHOOL || '' }}
+          HIVE_HEALTH_SESSION_REEF: ${{ github.event_name != 'pull_request' && secrets.HIVE_HEALTH_SESSION_REEF || '' }}
+          HIVE_HEALTH_SESSION_REILLY: ${{ github.event_name != 'pull_request' && secrets.HIVE_HEALTH_SESSION_REILLY || '' }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/hive-health" \
+            -targets tools/hive-health/targets.json \
+            ${ONLY:+-only "$ONLY"} \
+            -previous "$RUNNER_TEMP/prev/report.json" \
+            -json "$RUNNER_TEMP/out/report.json" \
+            -markdown "$GITHUB_STEP_SUMMARY" \
+            -run-url "$RUN_URL"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hive-health-report
+          path: ${{ runner.temp }}/out/report.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Plan issue changes
+        run: |
+          gh issue list --label hive-health --state open --limit 100 --json number,title,body > "$RUNNER_TEMP/open.json"
+          "$RUNNER_TEMP/hive-health" plan-issues \
+            -report "$RUNNER_TEMP/out/report.json" \
+            -open-issues "$RUNNER_TEMP/open.json" \
+            -out "$RUNNER_TEMP/plan" \
+            -run-url "$RUN_URL"
+          {
+            echo
+            echo "### Issue sync plan"
+            echo
+            if [ "$(jq length "$RUNNER_TEMP/plan/plan.json")" -eq 0 ]; then
+              echo "No issue changes."
+            else
+              jq -r '.[] | "- \(.op) `\(.target)`\(if .number then " #\(.number)" else "" end)"' "$RUNNER_TEMP/plan/plan.json"
+            fi
+            if [ "$WRITE_ISSUES" != "true" ]; then
+              echo
+              echo "_Dry run (pull request or dry_run input): no issues written._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply issue changes
+        if: env.WRITE_ISSUES == 'true'
+        run: |
+          set -euo pipefail
+          plan="$RUNNER_TEMP/plan/plan.json"
+          [ "$(jq length "$plan")" -eq 0 ] && exit 0
+          gh label create hive-health --color B60205 \
+            --description "Opened by the hive-health probe; closes itself when the Hive recovers" 2>/dev/null || true
+          gh label create agent/operations --color 8250df \
+            --description "Routes to the Hive operations lane" 2>/dev/null || true
+          jq -c '.[]' "$plan" | while read -r a; do
+            op=$(jq -r .op <<<"$a")
+            num=$(jq -r '.number // 0' <<<"$a")
+            title=$(jq -r '.title // ""' <<<"$a")
+            labels=$(jq -r '.labels // ""' <<<"$a")
+            body=$(jq -r '.body_file // ""' <<<"$a")
+            comment=$(jq -r '.comment_file // ""' <<<"$a")
+            case "$op" in
+              create)
+                gh issue create --title "$title" --label "$labels" --body-file "$body"
+                ;;
+              update)
+                if [ -n "$comment" ]; then gh issue comment "$num" --body-file "$comment"; fi
+                gh issue edit "$num" --title "$title" --body-file "$body"
+                ;;
+              close)
+                if [ -n "$comment" ]; then gh issue comment "$num" --body-file "$comment"; fi
+                gh issue close "$num" --reason completed
+                ;;
+              *)
+                echo "::error::unknown op $op"; exit 1
+                ;;
+            esac
+          done

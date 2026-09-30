@@ -1,0 +1,45 @@
+{
+  "activity": [
+    {
+      "timestamp": "2026-09-26T02:07:50Z",
+      "username": "hanthor",
+      "action": "picked up",
+      "cli": "claude",
+      "model": "claude-opus-5-5",
+      "task": "issue tuna-os/corral#348: Web UI: draggable, resizable dashboard widgets and live charts (Datacenter, node and VM summaries)"
+    },
+    {
+      "timestamp": "2026-09-26T02:26:37Z",
+      "username": "hanthor",
+      "action": "completed",
+      "cli": "claude",
+      "model": "claude-opus-5-5",
+      "task": "issue tuna-os/corral#348: Web UI: draggable, resizable dashboard widgets and live charts (Datacenter, node and VM summaries)"
+    },
+    {
+      "timestamp": "2026-09-26T02:26:49Z",
+      "username": "hanthor",
+      "action": "picked up",
+      "cli": "claude",
+      "model": "claude-opus-5-5",
+      "task": "issue tuna-os/tunaos#272: [strategist] Bonito (Fedora 44) variant incomplete — largest Fedora ecosystem gap"
+    },
+    {
+      "timestamp": "2026-09-26T02:30:06Z",
+      "username": "hanthor",
+      "action": "completed",
+      "cli": "claude",
+      "model": "claude-opus-5-5",
+      "task": "issue tuna-os/tunaos#272: [strategist] Bonito (Fedora 44) variant incomplete — largest Fedora ecosystem gap"
+    },
+    {
+      "timestamp": "2026-09-26T02:58:31Z",
+      "username": "hanthor",
+      "action": "joined",
+      "cli": "claude",
+      "model": "claude-sonnet-5"
+    }
+  ],
+  "capacity": 50,
+  "retained": 50
+}
