@@ -1,15 +1,15 @@
 # Local development
 
-This guide describes the local workflow for contributing to the Hive Go codebase on the `v4` branch.
+This guide describes the local development workflow for the Hive Go codebase on `v4`.
 
 ## Prerequisites
 
 - Git and GitHub CLI (`gh`) for normal issue and PR workflows.
 - Go `1.25.6`, as declared by [`src/go.mod`](../src/go.mod).
-- Docker or Podman if you are exercising containerized contributor relay or deployment paths.
+- Docker or Podman if you use container relay or deployment paths.
 - `tmux` for local agent/contributor workflows that attach CLIs to terminal sessions.
 - `just` if you use the repository's helper recipes (`brew install just` on macOS, or install from the `just` project for your platform).
-- Optional agent CLIs depending on what you test locally: Claude Code, GitHub Copilot/`gh`, Gemini, Bob, Goose, Codex, Pi, or Antigravity.
+- Optional agent CLIs for local tests: Claude Code, GitHub Copilot, Gemini, Bob, Goose, Codex, Pi, or Antigravity.
 
 ## Clone and branch
 
@@ -19,7 +19,7 @@ cd hive
 git switch -c <topic-branch> origin/v4
 ```
 
-Use `v4` as the PR base for ordinary Hive development. Rebase or recreate your branch from a fresh `origin/v4` before opening or updating a PR.
+Use `v4` as the PR base for ordinary Hive development. Rebase or recreate your branch from a fresh `origin/v4` before you open or update a PR.
 
 ## Build
 
@@ -46,24 +46,16 @@ cd src
 go test ./...
 ```
 
-The `src/test/` package holds the inception e2e/regression suite. Those tests
-talk to a **live hive over the network** and sit behind the `integration` build
-tag, so the command above compiles the package but runs none of them — a plain
-`go test ./...` will never exercise this suite, and a green run says nothing
-about it. To actually run it:
+The `src/test/` package holds the inception e2e/regression suite. Those tests talk to a **live hive over the network**. They use the `integration` build tag. The command above compiles the package but runs none of them. A plain `go test ./...` will not run this suite. To run the suite:
 
 ```bash
 cd src
 HIVE_URL=http://<host>:<port> HIVE_TOKEN=<token> go test -tags integration ./test/...
 ```
 
-The suite skips itself (exit 0) when `HIVE_URL` is unset or the endpoint does
-not answer a fast TCP dial, so a passing run without those variables means
-"skipped", not "verified". Run it when you touch inception code; the normal
-`go test ./pkg/...` loop is enough otherwise. See `src/test/doc.go` for the
-package's own description.
+The suite skips (exit 0) when `HIVE_URL` is unset or the endpoint fails to answer. A run without those variables means "skipped", not "verified". Run it when you touch inception code; the normal `go test ./pkg/...` loop is enough otherwise. See `src/test/doc.go` for the package's own description.
 
-If a local environment dependency prevents a full run, include the failing package and error summary in the PR and still run the narrower package tests affected by your change.
+If an environment dependency stops a full run, document the package and error in your PR. Run the individual package tests that match your change.
 
 Useful narrower loops:
 
@@ -86,16 +78,9 @@ go test ./pkg/agent   -short -race -count=1 -run '<1/5 slice>'   # test (agent i
 go test $PKGS         -short -race -count=1                      # test (rest i/3)
 ```
 
-The workflow shards for wall-clock only: `pkg/hub` and `pkg/agent` are each
-sliced across several jobs by test *function* (they are single packages too
-slow to run whole), and everything else from `go list ./pkg/... ./cmd/...` is
-partitioned into balanced buckets. Every shard also runs with `-v` and posts
-its slowest test functions to the job's step summary — look there before
-reaching for a local profile when the gate feels slow. Scheduled runs add
-`-shuffle=on` (the seed is in the log); the PR gate does not, so an
-order-dependent test shows up as a filed issue rather than as a red PR. The union of the shards is the whole of `./pkg/...` and
-`./cmd/...`, so what changes between your loop and the gate is the *flags*, not
-the coverage. To reproduce the gate locally in one unsharded run:
+The workflow shards tests by time. Packages `pkg/hub` and `pkg/agent` run in separate jobs by test function. Other packages divide into balanced buckets. Every shard runs with `-v` and writes slowest tests to the step summary.
+
+Check that summary before local profiles when tests run slow. Scheduled runs add `-shuffle=on`. The PR gate will disable shuffle, so test order failures create issues instead of red PRs. Shards cover all of `./pkg/...` and `./cmd/...`. The difference from your local loop is the set of flags, not the test files. To run tests locally like the gate:
 
 ```bash
 cd src
@@ -104,41 +89,16 @@ go test ./pkg/... ./cmd/... -short -race -count=1
 
 What each flag changes:
 
-- **`-race`** is the one most likely to catch a bug you would otherwise ship. A
-  data race or a lock-ordering mistake usually passes a non-race run every time
-  and only surfaces under load in production. This repository has repeatedly
-  paid for that: see the `writeMu` / `WriteControl` reasoning in
-  [`src/pkg/dashboard/contribute_ws.go`](../src/pkg/dashboard/contribute_ws.go),
-  which exists because concurrent writers to a single WebSocket produced real
-  mutex re-entrancy deadlocks. If you run only one thing before pushing, run
-  the race build of the packages you touched.
-- **`-short`** sets `testing.Short()`, so any test guarded by
-  `if testing.Short() { t.Skip(...) }` does **not** run in CI. This cuts both
-  ways, and both directions bite. A slow test you write without a `Short` guard
-  runs on every shard and adds to the gate's wall clock. A test you write
-  *behind* a `Short` guard is never executed by the gate at all — a green
-  required check says nothing about it, exactly as a plain run says nothing
-  about the `integration` suite above. Guard slow *setup*, not the assertion
-  that proves your fix.
-- **`-count=1`** disables the test result cache. Without it, an unchanged
-  package reports its previous verdict instead of re-running, which is
-  precisely what you do not want when you are trying to reproduce a failure or
-  chase a flake.
+- **`-race`** catches bugs that slip past normal runs. A data race or lock order mistake will pass non-race tests and fail under load in production. For example, concurrent writes to a WebSocket created deadlocks in [`src/pkg/dashboard/contribute_ws.go`](../src/pkg/dashboard/contribute_ws.go). Before you push changes, run the race build on packages you touched.
+- **`-short`** sets `testing.Short()`. Tests with `if testing.Short() { t.Skip(...) }` do not run in CI. A slow test without this guard slows down every shard. But a test behind a `Short` guard never runs in the gate. A green check says nothing about that test. Guard slow setup only. Do not guard assertions that prove a fix.
+- **`-count=1`** disables the test cache. Without it, an unchanged package returns cached results instead of fresh runs. You want fresh runs when you debug failures or flakes.
 
 Two flags that appear in CI but are *not* part of the PR gate:
 
-- **`-timeout 600s`** is used only by the hourly coverage cron
-  ([`.github/workflows/coverage-hourly.yml`](../.github/workflows/coverage-hourly.yml)),
-  which runs the suite unsharded. The PR shards pass no `-timeout`, so they take
-  Go's default of 10 minutes per shard binary. The practical bound on a shard is
-  therefore the same 10 minutes, applied to a much smaller slice of the suite.
-- **`-coverprofile`** is added by each shard to feed a per-package coverage
-  report. Coverage is scored, but it is not the required merge gate; a failing
-  test is.
+- **`-timeout 600s`** runs only in the hourly coverage workflow ([`.github/workflows/coverage-hourly.yml`](../.github/workflows/coverage-hourly.yml)). The PR shards use the default 10-minute timeout for Go binaries.
+- **`-coverprofile`** generates coverage data on each shard. CI scores coverage, but only failed tests will block merge gates.
 
-Neither the PR gate nor the cron runs `./test/...`: both enumerate
-`./pkg/... ./cmd/...` explicitly, and the integration suite additionally needs
-the `integration` build tag and a live hive, as described above.
+Neither the PR gate nor the cron runs `./test/...`. Both run `./pkg/...` and `./cmd/...`. The integration suite also needs the `integration` tag and a live hive.
 
 ## Format and lint expectations
 
@@ -148,7 +108,7 @@ Run `gofmt` on Go files you edit:
 gofmt -w path/to/file.go
 ```
 
-The v4 CI workflow runs `go vet ./...` after building the Hive binary. Reproduce that check locally from the Go module:
+The v4 CI workflow runs `go vet ./...` after it builds the Hive binary. Run that check locally:
 
 ```bash
 cd src
@@ -158,11 +118,7 @@ go vet ./...
 
 ## If CI says "NOTICE is out of date"
 
-`NOTICE` lists every Go module compiled into the shipped binaries. It is
-**generated**, not hand-edited, so any change to `src/go.mod` or `src/go.sum`
-— including a Dependabot version bump — makes it stale and fails the
-`notice-drift` job ("NOTICE matches the module graph") in
-`.github/workflows/go-security-analysis.yml`.
+`NOTICE` lists Go modules in the binary. Scripts generate this file. Changes to `src/go.mod` or `src/go.sum` make it stale and fail the `notice-drift` check in `.github/workflows/go-security-analysis.yml`.
 
 Regenerate and commit it:
 
@@ -172,24 +128,13 @@ bash src/scripts/generate-notice.sh   # writes NOTICE at the repo root
 
 Three things that will otherwise cost you a CI round trip:
 
-- **Commit the output verbatim.** The check is byte-exact. Do not reformat it,
-  do not strip trailing whitespace — several dependency licences contain
-  trailing spaces on their own lines, and removing them produces a permanent
-  diff against what CI generates.
-- **The generator needs the module's Go toolchain.** `src/go.mod` pins a
-  specific version; running under an older `go` makes `go-licenses` fail to
-  resolve stdlib packages and abort before writing anything. Set
-  `GOTOOLCHAIN` to the pinned version if your default `go` is older.
-- **A red `notice-drift` is not always yours.** Because `NOTICE` lives on the
-  branch, a dependency bump merged without regenerating it leaves `v4` itself
-  stale — and then *every* open PR inherits the failure, including docs-only
-  ones. Check whether `v4` is clean before assuming your change caused it.
+- **Commit output verbatim.** The check is byte-exact. Do not reformat text or strip trailing whitespace. Some licenses contain trailing spaces. Edits create diffs against CI output.
+- **The generator needs Go from the module.** The file `src/go.mod` pins a version. If you run an older Go toolchain, `go-licenses` fails to resolve packages and aborts.
+- **Red checks may come from base branches.** If a dependency merge missed an update to `NOTICE`, `v4` becomes stale. Open PRs inherit this failure. Check whether `v4` is clean before you debug your change.
 
-A `FORBIDDEN` result is a different problem: the module graph contains a
-licence the project cannot ship (this is how an AGPL-3.0 dependency was caught
-in #5016). That needs the dependency removed or replaced, not a regeneration.
+A `FORBIDDEN` result means the module graph contains an unapproved license. Remove or replace the dependency.
 
-There is no public `just lint` recipe in the current root `Justfile`; use `go vet ./...` for the repository's documented local lint-equivalent check, plus `gofmt`, `go build`, and targeted `go test` for the files you change.
+The root Justfile does not define a `lint` recipe. Use `go vet ./...` to check code locally, with `gofmt`, `go build`, and `go test`.
 
 ## Running Hive locally
 
@@ -215,20 +160,20 @@ The root [`Justfile`](../Justfile) is the discoverable entry point for contribut
 just --list
 ```
 
-Current public recipes are centered on the **contribute** workflow:
+Current recipes focus on the **contribute** workflow:
 
 - `just contribute-check <backend>` — read-only preflight for an agent backend CLI.
 - `just contribute-setup <backend>` — one-time setup for GitHub auth, hub registration, and backend readiness.
-- `just contribute-hive [backend] [mode]` — start contributing work to a hive, using a container by default or local mode when requested.
+- `just contribute-hive [backend] [mode]` — start work on a hive with a container (or local mode on request).
 - `just contribute-status`, `just contribute-browse`, and `just contribute-stop` — inspect, discover, or stop contributor relay activity.
-- `just contribute-k8s [namespace] [outfile] [image_tag]` — print Kubernetes manifests for a headless contributor workload; it prints or writes the manifest you request and does not apply it.
-- `just hive-api <endpoint>` and `just hive-api-docs` — inspect hub API endpoints for the configured hive.
+- `just contribute-k8s [namespace] [outfile] [image_tag]` — generate Kubernetes manifests for headless workloads. It prints or writes manifests without apply actions.
+- `just hive-api <endpoint>` and `just hive-api-docs` — check API endpoints on the hub for the configured hive.
 
-Deployment and development tasks that are not listed by `just --list` are not public recipes today. Use the Go, Docker Compose, and Kubernetes commands documented in the README and `src/docs/` for those workflows.
+Tasks not shown in `just --list` are internal. Use Go, Docker Compose, and Kubernetes commands from the README and `src/docs/`.
 
 ## Before opening a PR
 
 1. Rebase on the latest `origin/v4`.
 2. Run the build and tests that match your change.
 3. Commit with DCO sign-off: `git commit -s`.
-4. Open a PR against `v4` with an emoji-prefixed title, testing notes, and `Fixes #...` lines for closing issues.
+4. Open a PR against `v4` with an emoji title, verification notes, and `Fixes #...` lines to close issues.

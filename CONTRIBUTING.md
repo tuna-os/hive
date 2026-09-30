@@ -1,8 +1,8 @@
 # Contributing to Hive
 
-Thank you for helping improve KubeStellar Hive. This guide is for contributing code and documentation to this repository. If you want to donate compute to a running hive, see [Contribute to a Hive](README.md#contribute-to-a-hive) instead.
+Thank you for your interest in KubeStellar Hive. This guide explains how to contribute code and documentation to this repository. To donate compute to a live hive, see [Contribute to a Hive](README.md#contribute-to-a-hive).
 
-**New here?** Start with the [getting-started guide for first-time contributors](docs/getting-started-contributing.md) — it walks the end-to-end journey (finding an issue, local setup, testing without a cluster, key concepts, and what the review/CI process looks like) and links back into this guide for the mechanics.
+**New here?** Read the [contributor intro guide](docs/getting-started-contributing.md). It explains issues, local setup, tests without a cluster, and CI review.
 
 ## Where to work
 
@@ -15,24 +15,23 @@ Thank you for helping improve KubeStellar Hive. This guide is for contributing c
 
 - `src/` — the current Go module (`github.com/hivecommons/hive`) and the main development target for this repository.
   - `src/cmd/hive` — main Hive binary.
-  - `src/cmd/hivectl`, `src/cmd/apiproxy`, `src/cmd/hive-backup` — supporting command-line tools.
-  - `src/pkg/` — Go packages for agents, GitHub integration, scheduling, policies, dashboards, hubs, backups, and related runtime behavior.
-  - `src/policies/` — policy prompts and rule files used by the deterministic/agent pipeline. Treat policy changes like code: review the behavior they enable, test where possible, and explain risk in the PR.
+  - `src/cmd/hivectl`, `src/cmd/apiproxy`, `src/cmd/hive-backup` — command-line tools for operators.
+  - `src/pkg/` — Go packages for agents, GitHub integration, agent schedules, policies, dashboards, hubs, backups, and runtime behavior.
+  - `src/policies/` — policy prompts and rule files used by the deterministic and agent pipeline. Treat policy changes like code: review the behavior they enable, test where possible, and explain risk in the PR.
   - `src/deploy/` and `src/examples/` — deployment manifests and example configuration.
   - `src/docs/` — architecture and operator/developer reference material.
   - `src/test/` — integration and regression tests.
 - `bin/` — deterministic pipeline, supervision, enforcement, deployment, and maintainer helper scripts. See [`bin/README.md`](bin/README.md) for the script-by-script index.
-- `config/hive-project.yaml.example` — project metadata for the top-level
-  deterministic shell pipeline; see [config/README.md](config/README.md). This
+- `config/hive-project.yaml.example` — project metadata for the deterministic shell pipeline at the top level; see [config/README.md](config/README.md). This
   is separate from the Go runtime config in `src/hive.yaml.example`.
-- `dashboard/`, `docs/`, `config/`, `systemd/`, `launchd/`, and top-level scripts — supporting assets for hub, dashboard, installation, and operational workflows.
-- `Justfile` — contributor relay recipes; see [Just recipes](docs/development.md#just-recipes).
+- `dashboard/`, `docs/`, `config/`, `systemd/`, `launchd/`, and top-level scripts — assets for the hub, dashboard, install, and operational flows.
+- `Justfile` — recipes for the contributor relay; see [`docs/development.md`](docs/development.md#just-recipes).
 
 ## Branches
 
 Use `v4` as the base branch for Hive work and PRs unless a maintainer asks otherwise. The `main` branch is not the active target for changes.
 
-Before starting work:
+Before you start work:
 
 ```bash
 git fetch origin
@@ -41,7 +40,7 @@ git switch -c <topic-branch> origin/v4
 
 ## Local development
 
-See [docs/development.md](docs/development.md) for the full local setup guide. The short path is:
+See [docs/development.md](docs/development.md) for the complete setup guide for local development. The short path is:
 
 ```bash
 cd src
@@ -49,11 +48,11 @@ go build ./...
 go test ./...
 ```
 
-The Go version is declared in [`src/go.mod`](src/go.mod). Install that version or newer compatible tooling before building.
+The file [`src/go.mod`](src/go.mod) declares the Go version. Install that version or newer tools before you build.
 
-## Contributor `just` recipes
+## Contributor recipes
 
-The root [`Justfile`](Justfile) exposes the public contributor relay workflow. Run `just --list` to see the current recipe signatures; private implementation details are intentionally not listed there.
+The root [`Justfile`](Justfile) defines recipes for the contributor relay. Run `just --list` to view current recipes.
 
 | Recipe | What it does |
 | --- | --- |
@@ -67,41 +66,28 @@ The root [`Justfile`](Justfile) exposes the public contributor relay workflow. R
 | `just hive-api <endpoint>` | Calls a hub API endpoint, defaulting to `/status`, using the configured hive URL. |
 | `just hive-api-docs` | Opens the hub API documentation in a browser. |
 
-See [src/docs/contributor-relay.md](src/docs/contributor-relay.md) for the end-to-end contributor relay workflow and Kubernetes workload details.
+See [src/docs/contributor-relay.md](src/docs/contributor-relay.md) for details on the relay for contributors and Kubernetes workloads.
 
 ## Style and quality
 
 - Format Go changes with `gofmt`.
 - Prefer small, focused PRs with tests or a clear explanation when tests are not practical.
-- Keep configuration values configurable instead of hard-coding environment-specific paths, tokens, or endpoints.
+- Keep settings configurable instead of hard-coding environment-specific paths, tokens, or endpoints.
 - Do not commit secrets, generated credentials, or local runtime state.
 - For documentation changes, verify every command, path, and branch name you mention.
 
 ## Test policy
 
-**A change to behavior must come with a test that would fail without it.** This
-is the project's standing expectation, not a per-PR negotiation.
+**A change to behavior must include a test that will fail without it.** This is a project rule, not a per-PR negotiation.
 
-- **Bug fixes** add a test that reproduces the bug — one that fails on the
-  parent commit and passes on the fix. A fix whose test passes either way has
-  not demonstrated it fixes anything.
-- **New functionality** adds tests covering its normal path and the failure
-  modes a caller can actually hit.
-- **Security-relevant changes** assert the invariant, not the implementation.
-  A test that merely calls a guard proves nothing; it must fail when the guard
-  is removed.
-- **Tests are in scope for review.** A test asserting the wrong thing is worse
-  than no test, because it reports green while the behavior is broken.
+- **Bug fixes** must add a test to reproduce the bug. The test fails on the parent commit and passes on the fix. A test that passes on both commits proves nothing.
+- **New functionality** must add tests for normal paths and reachable failure modes.
+- **Security changes** must assert invariants. A test that merely calls a guard proves nothing. The test must fail when an engineer removes the guard.
+- **Tests are in scope for review.** A test that asserts the wrong outcome is worse than no test. It reports green while behavior fails.
 
-Where a test is genuinely impractical — a change that only affects real cloud
-infrastructure, or a docs-only edit — say so in the PR body and explain what
-you did to verify it instead. "Tests not practical" without that explanation is
-a reason for a reviewer to push back.
+When a test is not practical (such as changes to cloud infrastructure or docs), state this in the PR body. Explain how you verified the change.
 
-Static analysis runs in CI (`go vet`, `golangci-lint`, `gosec`, and
-`govulncheck`; see [`.github/workflows/go-security-analysis.yml`](.github/workflows/go-security-analysis.yml)).
-Fix findings rather than suppressing them; when a suppression is genuinely
-right, comment why at the suppression site.
+Static analysis runs in CI (`go vet`, `golangci-lint`, `gosec`, `govulncheck`). Fix findings instead of suppressions. When a suppression is required, explain the reason in a code comment.
 
 ## Optional git hooks
 
@@ -111,9 +97,9 @@ The repository includes `githooks/post-checkout`. Install it only if you want th
 git config core.hooksPath githooks
 ```
 
-The hook runs after branch checkouts in the primary worktree. It prevents that worktree from staying on a branch other than `main` by printing guidance and checking `main` back out. It is intended for long-running dashboard checkouts where feature work should happen in separate `git worktree add ...` directories. It does not run for file checkouts or linked worktrees, because linked worktrees have a `.git` file instead of a `.git` directory.
+The hook runs after branch checkouts in the primary worktree. It keeps the worktree on `main`, shows guidance, and checks `main` back out. Use it for dashboard checkouts where you do feature work in separate worktrees from `git worktree add`. It does not run for file checkouts or linked worktrees, because linked worktrees use a `.git` file.
 
-If the hook is not installed, normal Git behavior applies. If it blocks a checkout unexpectedly, use a separate worktree from an unprotected checkout or remove the hooksPath setting for repositories where the guard is not desired.
+If you do not install the hook, normal Git behavior applies. If it stops a checkout, use a separate worktree or remove the `core.hooksPath` setting.
 
 ## DCO sign-off
 
@@ -123,7 +109,7 @@ Every commit must include a Developer Certificate of Origin sign-off. Use:
 git commit -s
 ```
 
-The sign-off adds a `Signed-off-by:` trailer certifying that you have the right to submit the contribution under this repository's license. If you forget, amend the commit with `git commit --amend -s` and force-push your branch.
+The sign-off adds a `Signed-off-by:` trailer to certify that you have the right to submit the change under the repository license. If you forget, amend the commit with `git commit --amend -s` and force-push your branch.
 
 ## Pull requests
 
@@ -132,8 +118,10 @@ The sign-off adds a `Signed-off-by:` trailer certifying that you have the right 
 - Include `Fixes #<issue>` lines for issues the PR closes.
 - Describe what changed, why, and how you tested it.
 - Include the relevant command output or a short note such as `Not run (docs only)` when tests are not applicable.
-- Add a changelog fragment under [`changelog.d/`](changelog.d/README.md) for user-visible changes — features, fixes, security changes, migrations, deprecations, and breaking changes (see "Changelog fragments" below). Routine refactors, test-only changes, and dependency churn are explicitly out of scope — add the `no-changelog` label if the advisory `changelog-fragment-guard` check asks anyway. Do **not** append to `CHANGELOG.md`'s `## Unreleased` section directly: every PR editing that one shared heading is what made unrelated PRs merge-conflict with each other ([#5675](https://github.com/hivecommons/hive/issues/5675)); fragments are compiled into [CHANGELOG.md](CHANGELOG.md) automatically at release time.
-- Expect maintainers to ask for focused follow-up changes rather than broad drive-by edits.
+- Add a changelog fragment in [`changelog.d/`](changelog.d/README.md) for user-visible changes (features, fixes, security, migrations, deprecations). See below.
+- Refactors, tests, and dependency updates do not need fragments. Add the `no-changelog` label if the check prompts for one.
+- Do not edit `CHANGELOG.md` directly. Changes to that file create merge conflicts ([#5675](https://github.com/hivecommons/hive/issues/5675)). CI compiles fragments during releases.
+- Maintainers want focused PRs instead of broad edits.
 
 ## Changelog fragments
 
@@ -149,4 +137,4 @@ git commit -s
 
 ## Maintainer resources
 
-Project governance lives in [GOVERNANCE.md](GOVERNANCE.md). The current owner/approver signal is also reflected in [OWNERS](OWNERS). Security disclosure is handled through [SECURITY.md](SECURITY.md), not public issues.
+Project governance lives in [GOVERNANCE.md](GOVERNANCE.md). The current owner/approver signal is also reflected in [OWNERS](OWNERS). Report security issues through [SECURITY.md](SECURITY.md), not public issues.

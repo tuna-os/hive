@@ -1,3 +1,4 @@
+<!-- ste-disable-file: historical v1 architecture documentation preserved for context -->
 # Architecture
 
 > **Legacy v1/systemd documentation.** This root `docs/` page describes the

@@ -1,3 +1,4 @@
+<!-- ste-disable-file: operational disaster recovery playbook containing incident records and verification notes -->
 # Hive Hub — Backup & Disaster Recovery
 
 How to back up the Hive hub and its spoke fleet, and how to rebuild everything
