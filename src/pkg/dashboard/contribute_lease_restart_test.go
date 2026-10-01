@@ -39,6 +39,30 @@ func restartedHub(t *testing.T) *ContributeWSHub {
 
 // --- 1. The headline contract, end to end --------------------------------------
 
+// waitContribDisconnect blocks until the hub read-loop disconnect defer for
+// username has fully run, using the defer last observable act (the "left"
+// activity row) as the signal.
+//
+// httptest.Server.Close does not wait for hijacked connections, so a handler
+// disconnect defer (which books a release cooldown and writes failed-tasks.json
+// under ws-state/) can still be running when the test returns, and the
+// t.TempDir RemoveAll then fails with "ws-state: directory not empty". Waiting
+// for the "left" row orders the defer disk writes before cleanup. Port of
+// hivecommons/hive#6158 / #6316.
+func waitContribDisconnect(t *testing.T, h *ContributeWSHub, username string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range h.RecentActivity() {
+			if e.Username == username && e.Action == "left" {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Errorf("timed out waiting for %s disconnect defer to finish", username)
+}
+
 // TestLeaseRestart_ResumeSurvivesHubRestart is the incident itself, driven through
 // the real protocol: assign a task, replace the hub with a freshly constructed one
 // over the same /data (a restart), and let the relay reconnect and re-assert the task
@@ -77,6 +101,10 @@ func TestLeaseRestart_ResumeSurvivesHubRestart(t *testing.T) {
 	// connection table, leases read back from disk.
 	conn.Close()
 	ts1.Close()
+	// ts1.Close does not wait for the hijacked websocket handler; its disconnect
+	// defer writes the release-cooldown ledger under ws-state/. Let it finish
+	// before the restarted hub boots over the same files.
+	waitContribDisconnect(t, s1.contributeHub, "restart-resume-user")
 
 	s2 := NewServer(0, slog.Default())
 	s2.registerContributeRoutes()
@@ -100,6 +128,9 @@ func TestLeaseRestart_ResumeSurvivesHubRestart(t *testing.T) {
 		t.Fatalf("reconnect dial: %v", err)
 	}
 	defer conn2.Close()
+	// Runs after the deferred conn2.Close and before t.TempDir RemoveAll: the s2
+	// handler defer must finish its ws-state/ writes before cleanup.
+	t.Cleanup(func() { waitContribDisconnect(t, s2.contributeHub, "restart-resume-user") })
 	readMsg(t, conn2) // auth_challenge
 	conn2.WriteJSON(WSMessage{Type: "auth_response", RegistrationToken: reg["registration_token"], CLIBackend: "claude"})
 	readMsg(t, conn2) // auth_ok
