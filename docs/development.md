@@ -140,6 +140,34 @@ Neither the PR gate nor the cron runs `./test/...`: both enumerate
 `./pkg/... ./cmd/...` explicitly, and the integration suite additionally needs
 the `integration` build tag and a live hive, as described above.
 
+## Test (Node.js proxy and dashboard)
+
+The dashboard proxy and UI have their own test suite separate from the Go tests above. Prerequisites:
+
+- **Node.js 18 or later** — the repository uses npm workspaces. Check `src/proxy/package.json` and `dashboard/package.json` for the exact version pins.
+
+Run proxy tests from the proxy directory:
+
+```bash
+cd src/proxy
+npm ci --ignore-scripts --no-audit --no-fund  # install dependencies
+npm test
+```
+
+This runs Jest unit tests for the reverse proxy (auth, path rewriting, token validation). Expected output includes a test summary; a passing run exits 0.
+
+The dashboard UI (`src/pkg/dashboard/static/index.html`) is a single-file application with inline JavaScript. Lint it locally the way CI does:
+
+```bash
+cd .github/scripts
+npm ci --ignore-scripts --no-audit --no-fund
+node check-inline-js.js ../../src/pkg/dashboard/static/index.html
+```
+
+This validates the dashboard JavaScript syntax and catches common issues. Expected output is silent if no errors are found; a non-zero exit means the linter found a problem.
+
+Both of these checks run in the PR gate (`.github/workflows/v2-tests.yml`). Running them locally before pushing saves a CI round trip.
+
 ## Format and lint expectations
 
 Run `gofmt` on Go files you edit:
