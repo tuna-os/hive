@@ -3796,48 +3796,8 @@ func main() {
 	dashSrv.MarkReady()
 
 	// Launch the persistent (non-on-demand) agents in the BACKGROUND so the
-	// staggered start no longer gates pod readiness. The loop honors ctx: on
-	// shutdown the ctx-aware stagger returns immediately instead of leaking a
-	// goroutine parked in a bare time.Sleep.
-	go func() {
-		const agentLaunchDelaySec = 15
-		agentIndex := 0
-		for name, ac := range cfg.EnabledAgents() {
-			isOnDemand := ac.OnDemand || onDemandFromPack[name]
-			if isOnDemand {
-				logger.Info("skipping on-demand agent at startup", "name", name)
-				continue
-			}
-			if agentIndex > 0 {
-				logger.Info("staggering agent launch", "name", name, "delay_sec", agentLaunchDelaySec)
-				select {
-				case <-time.After(time.Duration(agentLaunchDelaySec) * time.Second):
-				case <-ctx.Done():
-					logger.Info("aborting staggered agent launch: shutting down")
-					return
-				}
-			}
-			// Bail before starting another agent if we are already shutting down,
-			// so a SIGTERM during the launch window doesn't spawn fresh processes.
-			if ctx.Err() != nil {
-				logger.Info("aborting staggered agent launch: shutting down")
-				return
-			}
-			logger.Info("audit: starting agent", "name", name, "trigger", "startup")
-			if err := agentMgr.Start(ctx, name); err != nil {
-				logger.Warn("failed to start agent", "name", name, "error", err)
-			} else {
-				// Surface whether a persisted operator pause was honored on this
-				// restart, so the audit log shows pause state survived (or didn't).
-				detail := "trigger=startup"
-				if ac.Paused {
-					detail = "trigger=startup; restored paused (persisted)"
-				}
-				dashSrv.AuditLog("system", "agent_start", detail, name)
-			}
-			agentIndex++
-		}
-	}()
+	// staggered start no longer gates pod readiness.
+	go startPersistentAgents(ctx, cfg.EnabledAgents(), onDemandFromPack, agentMgr, dashSrv, logger, 15*time.Second)
 
 	// Start hub heartbeat push if configured (env var or config)
 	hubURL := cfg.Hub.URL

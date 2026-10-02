@@ -1,0 +1,1 @@
+- Separate agent startup orchestration from the main command entry point.
