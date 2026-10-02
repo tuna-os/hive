@@ -1,6 +1,6 @@
 # Agent backend setup
 
-Hive validates backend names in `src/pkg/config` and launches CLIs in `src/pkg/agent/manager.go`. `backend:` selects the runtime for an agent; inference backends are covered separately in [inference-backends.md](inference-backends.md).
+Hive will check backend names in `src/pkg/config` and start CLIs in `src/pkg/agent/manager.go`. `backend:` selects the runtime for an agent. See [inference-backends.md](inference-backends.md) for details on inference backends.
 
 ## CLI backends
 
@@ -22,24 +22,13 @@ Hive validates backend names in `src/pkg/config` and launches CLIs in `src/pkg/a
 
 ### Backends excluded from the headless K8s allowlist
 
-`just contribute-k8s` runs backends in a TTY-less pod and only permits the
-backends in its `HEADLESS_BACKENDS` allowlist, currently
-`claude litellm copilot codex goose` (`Justfile:1692`). `agy`, `opencode`, and
-`kilo` are deliberately excluded: their credentials are not verified for
-unattended use in a fresh pod, and `agy` in particular has no API-key mode at
-all.
+`just contribute-k8s` runs backends in a TTY-less pod. It allows only the backends in its `HEADLESS_BACKENDS` list, now `claude litellm copilot codex goose` (`Justfile:1692`). The system excludes `agy`, `opencode`, and `kilo`. Maintainers have not verified their credentials for unattended use in a fresh pod, and `agy` lacks an API-key mode.
 
-If you need one of the excluded backends, either choose a supported headless
-backend, or run it attended on the container or local path
-(`just contribute-hive <backend>`), where an operator can complete an
-interactive sign-in once. Tracking issue:
-[#5406](https://github.com/hivecommons/hive/issues/5406). Whether these backends
-can run headless at all remains an open question, so the allowlist is a
-deliberate gate rather than an oversight.
+If you need an excluded backend, choose a supported headless backend. You can also run it attended on the container or local path (`just contribute-hive <backend>`), where an operator can complete interactive sign-in once. See issue [#5406](https://github.com/hivecommons/hive/issues/5406). Whether these backends can run headless remains an open question, so the list is a deliberate gate.
 
 ## IBM Bob headless setup
 
-`backend: bob` launches IBM bobshell (`bob`), the IBM watsonx Code Assistant CLI. In a Hive pod or contributor container it must use API-key auth: the default IBMid/W3ID browser SSO flow opens a browser and waits on a localhost callback, which a headless pod cannot satisfy, then times out after about three minutes. Hive checks for a key before launch and parks the agent with an actionable error instead of burning that timeout.
+`backend: bob` starts `bob`, the CLI for watsonx Code Assistant from IBM. In a Hive pod or contributor container it must use API-key authentication. The default SSO flow in the browser opens a window and waits on a localhost callback. A headless pod can not complete this flow and times out after three minutes. Hive checks for a key before launch. It parks the agent with an error instead of a timeout.
 
 Configure the key in one of these ways:
 
@@ -50,11 +39,11 @@ governor:
     api_key_file: /secrets/bob_api_key  # mounted Secret path
 ```
 
-Defaults are already wired: Hive consults `/secrets/bob_api_key`, then `/data/secrets/bob_api_key` (where the dashboard's Governor → Bob tab stores a key), then the `HIVE_BOB_API_KEY` environment variable. Use the dashboard tab when you do not have cluster Secret access; it writes the key to the PVC-backed `/data/secrets/bob_api_key` and relaunches parked bob agents. The value is injected into bob as `BOBSHELL_API_KEY`, and Hive launches bob with the hidden-but-supported `--auth-method api-key` flag plus full approval/trust flags for unattended operation. Store only the location in YAML, never the key value.
+Defaults are already wired: Hive checks `/secrets/bob_api_key`, then `/data/secrets/bob_api_key` (where the dashboard stores a key), then the `HIVE_BOB_API_KEY` variable. Use the dashboard tab when you lack access to cluster Secrets; it writes the key to `/data/secrets/bob_api_key` on the PVC and restarts parked agents. Hive injects the value into bob as `BOBSHELL_API_KEY`. It starts bob with `--auth-method api-key` and full approval flags for unattended runs. Store only the location in YAML, never the key value.
 
 Contributor relay containers use the same bobshell package, but contributor-mode scripts expect `BOBSHELL_API_KEY` in the container environment when `AGENT_BACKEND=bob`.
 
-The dashboard **Test key** probe intentionally sends `User-Agent: bobshell`. IBM's edge has been observed to block generic Go/curl user agents with an HTML 403 before the request reaches bob auth, while the bobshell UA returns the real backend verdict. If you reproduce a key test manually, use that UA or treat a generic-UA 403 as an inconclusive edge block, not proof that the key is invalid.
+The dashboard **Test key** probe sends `User-Agent: bobshell`. The edge for IBM will stop generic user agents with an HTML 403 before requests reach authentication. The bobshell user agent returns the real backend response. When you test a key manually, use that user agent. Treat a generic 403 response as an edge block, not proof that the key is invalid.
 
 ## Contributor relay image
 
@@ -67,22 +56,16 @@ AGENT_BACKEND=pi AGENT_MODEL=openai/gpt-5 OPENAI_API_KEY=... CONTRIBUTOR_MODE=he
 AGENT_BACKEND=litellm HIVE_LITELLM_ENDPOINT=https://litellm.example.com just contribute-hive
 ```
 
-`AGENT_BACKEND` selects the CLI, `AGENT_MODEL` optionally pins the model, and `CONTRIBUTOR_MODE` defaults to `interactive` (tmux with a TTY). For Pi, `AGENT_MODEL` is required and must be the canonical `provider/model` token; this is a contributor preference, not task routing or assignment state. The same token is used for initial launch, restart, reconnect evidence, and headless execution. For Codex, `AGENT_REASONING_EFFORT` optionally pins the reasoning effort. `CONTRIBUTOR_MODE=headless` is reserved for one-shot/no-TTY task delivery.
+`AGENT_BACKEND` selects the CLI, `AGENT_MODEL` sets the model, and `CONTRIBUTOR_MODE` defaults to `interactive` (tmux with a TTY). For Pi, `AGENT_MODEL` is required and must be the canonical `provider/model` token. This is a contributor preference, not task assignment state. The same token is used for launch, restart, reconnect evidence, and headless execution. For Codex, `AGENT_REASONING_EFFORT` sets model effort levels. Use `CONTRIBUTOR_MODE=headless` for one-shot delivery without a TTY.
 
-Pi credentials remain in the selected provider's official environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and so on) or Pi's `~/.pi/agent/auth.json`. Hive never maps a generic `PI_API_KEY`, never puts a credential value in argv, passes only the selected provider's variables into its contributor container, and removes unrelated providers from the ephemeral auth/models profile mounted there. Readiness is deliberately staged: `pi_binary`, `pi_configuration`, `pi_authentication`, and `pi_invocation` appear in relay capability/status JSON. A present key or auth-file entry reports `configured_unverified`; only a successful real invocation advances authentication to `verified` and invocation to `succeeded`, because `pi --version` plus a non-empty key is not authentication proof.
+Pi credentials remain in the provider environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) or in `~/.pi/agent/auth.json`. Hive never maps a generic `PI_API_KEY` and never puts credentials in argv. It passes only selected provider variables into the container and removes unrelated providers from the auth profile. The system will stage readiness: `pi_binary`, `pi_configuration`, `pi_authentication`, and `pi_invocation` appear in status JSON. An auth file entry reports `configured_unverified`. Only a successful test run advances authentication to `verified` and invocation to `succeeded`.
 
-Headless Pi cancellation is bounded: revocation terminates the active child and fences its late exit from completing a newer task generation. Interactive Pi still uses tmux delivery and is not cancellation-conformance-proven.
+Headless Pi cancellation has strict bounds: revocation stops the active child and prevents late exits on newer task generations. Interactive Pi uses tmux delivery without formal cancellation guarantees.
 
-Both contributor modes are unattended from Codex's perspective: Hive may
-deliver work when nobody is watching the tmux pane. The default automatic
-reviewer evaluates only actions that already cross the `workspace-write`
-boundary. It does not widen that boundary, and the dangerous no-sandbox mode
-remains opt-in. A denied or timed-out automatic review returns to Codex; in
-headless mode a non-zero terminal result is reported to Hive with a bounded,
-token-redacted diagnostic rather than waiting for input.
+Both contributor modes are unattended for Codex: Hive can deliver work when nobody views the tmux pane. The automatic reviewer will evaluate actions that cross the `workspace-write` boundary. It does not widen that boundary, and no-sandbox mode remains opt-in. A denied or timed-out review returns to Codex. In headless mode, Codex sends a non-zero terminal result to Hive with a diagnostic message instead of a pause for input.
 
 `just contribute-check <backend>` runs a read-only preflight before registration. It checks that the chosen CLI exists and that obvious auth prerequisites are present.
 
 ## Secrets
 
-Store secret values outside `hive.yaml`. YAML should contain env var names or key-file paths, not keys. The dashboard and config save path rewrite YAML, so a literal secret in YAML would be persisted in plaintext.
+Store secret values outside `hive.yaml`. YAML files must contain env var names or key-file paths, not keys. The dashboard rewrites YAML on save, which would persist literal secrets in plaintext.

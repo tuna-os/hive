@@ -2,15 +2,15 @@
 
 ## Overview
 
-Hive Federation lets independent Hive instances publish themselves in a registry so contributors can discover projects and connect a local ClankeR contributor relay to one or more hubs. The registry is a directory, not a control plane: every hive keeps its own credentials, queue, agents, contributor registry, and trust policy.
+Hive Federation lets separate instances of Hive register in a directory. Contributors can discover projects and connect a local ClankeR relay to one or more hubs. The registry is a directory, not a control plane: every hive keeps its own credentials, queue, agents, contributor registry, and trust policy.
 
 ## Current implementation
 
-> This section was originally written while the source lived under the retired
-> `v2/` tree (v2 was retired in August 2026). The endpoints it describes are
+> We wrote this section when the source lived under the retired
+> `v2/` tree (we retired v2 in August 2026). The endpoints it describes are
 > live on the current `v4` branch, under `src/`.
 
-The Go dashboard API implements the federation endpoints in `src/pkg/dashboard/api_contribute.go`:
+The Go dashboard API provides the federation endpoints in `src/pkg/dashboard/api_contribute.go`:
 
 - `GET /api/hives` — list registered hives.
 - `POST /api/hives/register` — add or update a hive entry.
@@ -18,7 +18,7 @@ The Go dashboard API implements the federation endpoints in `src/pkg/dashboard/a
 - `DELETE /api/hives/:id` — remove a hive.
 - `POST /api/hives/onboard` — generate starter deployment/config text.
 
-Registry storage defaults to `/data/federation/registry.json` and can be overridden for tests with `HIVE_FEDERATION_REGISTRY_PATH`.
+Registry storage defaults to `/data/federation/registry.json`. You can override it for tests with `HIVE_FEDERATION_REGISTRY_PATH`.
 
 ## Project onboarding
 
@@ -36,7 +36,7 @@ curl -X POST https://hive.hivecommons.dev/api/hives/register \
   }'
 ```
 
-The starter endpoint can produce bootstrap text, but it is not a substitute for reviewing secrets, storage, ingress, and ACMM level before production.
+The starter endpoint can produce bootstrap text, but you must still review secrets, storage, ingress, and ACMM level before production.
 
 ## Contributor flow
 
@@ -80,14 +80,14 @@ Each hive owns:
 ## Operational notes
 
 - The registry does not proxy contributor traffic or mint credentials for remote hives.
-- Heartbeats are implemented; operators still need to run the heartbeat sender or otherwise call the endpoint.
-- Registration has validation and a maximum registry size, but production deployments should still place the public registry behind normal rate limiting and abuse controls.
+- The heartbeat endpoint is ready; operators still need to run the heartbeat sender or otherwise call the endpoint.
+- Registration validates input and limits registry size. Production deployments must place the public registry behind rate limits and abuse controls.
 
 ## Design-future items
 
-These are not complete today and should be treated as future design work:
+These items are not complete today. Treat them as future design work:
 
-- A polished web UI for joining hives from project cards.
-- Screenshot-level GitHub App installation guide.
-- Portable cross-hive contributor reputation attestations.
-- Stronger public registry abuse controls beyond the current API validation and size cap.
+- A web UI to join hives from project cards.
+- A guide with screenshots for GitHub App setup.
+- Portable attestations for contributor reputation across hives.
+- Stronger abuse controls for the public registry beyond current validation and size limits.

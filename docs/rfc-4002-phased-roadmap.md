@@ -1,3 +1,4 @@
+<!-- ste-disable-file: formal design RFC roadmap document -->
 # RFC #4002 Phased Delivery Roadmap — Re-entrant Conversation-as-State Turn Model
 
 Status: planning (hold-gated) · Owner: strategist · Refs: #4002, #5555, #4000

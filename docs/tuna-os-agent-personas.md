@@ -1,3 +1,4 @@
+<!-- ste-disable-file: formal investigation proposal for Tuna OS agent personas -->
 # Investigation: Custom Agent Personas for the Tuna OS Organization
 
 **Status:** Proposed  

@@ -1,3 +1,4 @@
+<!-- ste-disable-file: historical migration guide for retired releases -->
 # Migrating from Hive v1 to v2
 
 > **Historical documentation.** Both ends of this migration are retired: v2 was

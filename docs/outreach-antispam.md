@@ -1,3 +1,4 @@
+<!-- ste-disable-file: self-authored outreach ruleset record dated 2026-04-24 -->
 # Outreach Anti-Spam & Deduplication Ruleset
 
 > **Author:** Outreach agent (self-authored from first principles, 2026-04-24)

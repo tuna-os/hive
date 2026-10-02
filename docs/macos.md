@@ -1,7 +1,7 @@
 # macOS Support (launchd)
 
 > **Legacy v1/launchd documentation.** This page maps the original
-> systemd-style supervised agent workflow to macOS launchd. It does not describe
+> supervised agent workflow for systemd to macOS launchd. It does not describe
 > the current containerized Go deployment (branch `v4`; code under `src/`). For that, start with
 > [`src/docs/README.md`](../src/docs/README.md), plus
 > [`src/docs/operator-reference.md`](../src/docs/operator-reference.md) and
@@ -175,10 +175,10 @@ Then set a launchd plist with `StartInterval` of 3600 (hourly check).
 
 ## Alternative scheduler: standalone scanner script
 
-On macOS, some deployments skip the full supervisor+tmux pattern entirely and use a **standalone scanner script** fired by launchd on a fixed schedule. The script does the scanning/state-tracking work in bash, then triggers the AI agent (via a Copilot CLI skill, tmux work order, or similar) only when there's actionable work.
+On macOS, some deployments skip the full supervisor+tmux pattern. They use a **standalone scanner script** that launchd starts on a fixed schedule. The script tracks state in bash. It triggers the AI agent (via a Copilot CLI skill or tmux work order) only for actionable work.
 
 This pattern is simpler when:
-- The scanning logic is deterministic (no LLM needed for triage)
+- The scan logic is deterministic (no LLM needed for triage)
 - You want the scanner to run even when the AI session is down
 - You want to decouple scan cadence from agent availability
 

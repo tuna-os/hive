@@ -1,3 +1,4 @@
+<!-- ste-disable-file: adopted from the CNCF Code of Conduct and Contributor Covenant -->
 # KubeStellar Hive Code of Conduct
 
 Hive follows the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md), consistent with the KubeStellar project community.

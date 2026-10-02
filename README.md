@@ -6,21 +6,16 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 > This repository is a fork of [`hivecommons/hive`](https://github.com/hivecommons/hive)
-> that Tuna OS runs against its own repositories. Bugs, features, and security
-> reports for Hive itself go upstream — see [FORK.md](FORK.md) for what belongs
-> where and which documents here describe upstream rather than this fork.
+> that Tuna OS runs for its repositories. Send bugs, features, and security
+> reports upstream. See [FORK.md](FORK.md) for scope and details on upstream documents.
 
-AI agent orchestration for open source projects. A single Go binary enumerates GitHub issues and PRs, classifies them by complexity, and dispatches work to AI agents (Claude, Copilot, Gemini, Goose) on adaptive cadences governed by queue depth.
+AI agent orchestration for open source projects. A Go binary will scan GitHub issues and PRs, classify complexity, and send work to AI agents (Claude, Copilot, Gemini, Goose). The governor will adapt the cadence based on the queue depth.
 
-Hive separates decisions into two layers: a **deterministic pipeline** of shell scripts handles filtering, classification, merge-gating, and enforcement before any LLM sees the work. Agents only handle judgment calls — reading code, reasoning about fixes, writing PRs.
+Hive separates decisions into two layers. A **deterministic pipeline** of shell scripts filters, classifies, and gates merge operations before an LLM receives work. Agents will make judgment calls only: code review, fix design, and PR creation.
 
 ## Quick Start
 
-Two supported standalone runtimes. **Docker Compose is the default** and is what
-the rest of this README assumes; **Podman** is a parallel supported choice, not
-an experiment and not a recommendation over Docker. Pick one — they install the
-same two services (Hive plus its authenticating gateway) and land the dashboard
-on the same port.
+We support two standalone runtimes. **Docker Compose is the default** for this README. **Podman** is a parallel choice, not an experiment. Pick one — both install Hive and its auth gateway on the same port.
 
 | | [Docker Compose](#quick-start-docker-compose) | [Podman](#quick-start-podman) |
 | --- | --- | --- |
@@ -59,17 +54,15 @@ printf 'HIVE_DASHBOARD_TOKEN=%s\n' "$(openssl rand -hex 32)" >> src/.env
 docker compose -f src/docker-compose.yaml up -d
 ```
 
-Dashboard at `http://localhost:3001`. Confirm it end to end rather than assuming
-the port answers — the gateway publishes 3001 whether or not the proxy behind it
-came up:
+The dashboard is at http://localhost:3001. Confirm the port end to end. Do not assume the port answers. The gateway publishes port 3001 even if the proxy behind it is not up:
 
 ```bash
 curl -sf http://127.0.0.1:3001/api/health     # -> {"status":"ok"}
 ```
 
-The pre-built image tag is documented in [src/docs/operator-reference.md#image-provenance-and-tags](src/docs/operator-reference.md#image-provenance-and-tags). Standalone image references come from one source of truth, [`src/deploy/standalone-images.sh`](src/deploy/standalone-images.sh).
+The operator reference documents the pre-built image tag in [src/docs/operator-reference.md#image-provenance-and-tags](src/docs/operator-reference.md#image-provenance-and-tags). The file [`src/deploy/standalone-images.sh`](src/deploy/standalone-images.sh) provides the single source of truth for standalone image references.
 
-To build from source instead of pulling the pre-built image:
+To build from source without the pre-built image:
 
 ```bash
 docker compose -f src/docker-compose.yaml build
@@ -78,27 +71,19 @@ docker compose -f src/docker-compose.yaml up -d
 
 ## Quick Start (Podman)
 
-Same two services as the Compose stack, run as systemd units through Quadlet, so
-`systemctl start` returning means Hive answered `/api/health` rather than merely
-that a process was spawned. Docker is not required and is not used.
+This deployment uses the same two services as the Compose stack. The services run as systemd units through Quadlet. When `systemctl start` returns, Hive has answered `/api/health`. You do not need or use Docker.
 
 **Prerequisites**
 
-- **Podman 5.0.0+** (ADR-0017 recommends **5.6.0**; the verified floor is
-  unknown — see [the requirements note](src/docs/podman-standalone-quadlet.md#requirements))
+- **Podman 5.0.0+** (ADR-0017 recommends **5.6.0**; the verified floor is unknown — see [the requirements note](src/docs/podman-standalone-quadlet.md#requirements))
 - **systemd**, and **cgroup v2** — `podman info --format '{{.Host.CgroupsVersion}}'`
-- The **Quadlet generator** at `/usr/libexec/podman/quadlet`. It ships with the
-  distribution `podman` package; a hand-installed podman binary may not carry it.
-- **`aardvark-dns`** — `podman info --format '{{.Host.NetworkBackend}}'` should
-  say `netavark`. Without it the gateway starts and cannot resolve `hive`, so
-  `:3001` serves 502s.
+- The **Quadlet generator** at `/usr/libexec/podman/quadlet`. It ships with the distribution `podman` package; a hand-installed podman binary may not carry it.
+- **`aardvark-dns`** — `podman info --format '{{.Host.NetworkBackend}}'` should say `netavark`. Without it the gateway starts and cannot resolve `hive`, so `:3001` serves 502s.
 - `git`, `openssl`, and a GitHub token (PAT or App) for the org the hive works on
 
 ### One command
 
-`bin/hive-podman-setup.sh` does everything in the manual sequence below —
-preflights, configuration, the four Quadlet units, the boot wiring, and a final
-check that the **gateway** answers on the published port before it returns.
+The script `bin/hive-podman-setup.sh` completes all setup steps: preflights, configuration, four Quadlet units, boot wiring, and gateway checks.
 
 ```bash
 git clone https://github.com/hivecommons/hive.git
@@ -108,31 +93,19 @@ export HIVE_DEPLOY_RUNTIME=podman
 bin/hive-podman-setup.sh --rootless        # or --rootful
 ```
 
-It installs no packages and clones nothing, is idempotent, never overwrites an
-existing config without `--force` and never touches `secrets/`. A failing step
-stops the run and names itself; nothing is rolled back, so the partial state is
-there to inspect. It also enforces three couplings that are easy to get wrong by
-hand:
+The script installs no packages and clones nothing. It is idempotent, never overwrites an existing config without `--force`, and never touches `secrets/`. A failed step stops execution and reports its name. The script does not roll back state, so you can inspect partial state. It also enforces three rules:
 
-- `dashboard.port` is read out of the unit that will enforce it, and the run
-  stops if the config does not read back agreeing — the 300-second silent hang
-  the manual block warns about below.
-- the volume is created **through its unit**, so it carries the ownership labels
-  that make `bin/hive-podman-teardown.sh` able to see it.
-- the secrets directory gets the right ownership for the root mode, and rootless
-  installs are told when lingering is off and the deployment will not survive a
-  reboot.
+- The script reads `dashboard.port` from the unit. The run stops if the config does not match.
+- The unit creates the volume, so it carries the ownership labels for `bin/hive-podman-teardown.sh`.
+- The directory for secrets receives the correct ownership. The script warns rootless installs when linger is off.
 
-Add `--enable-linger` to fix that last one during the install rather than after.
+Add `--enable-linger` to enable linger during installation instead of after.
 
 ### Or, by hand
 
-Worth reading even if you use the script: the comments below are where the traps
-are documented, and the script enforces the same ones.
+Read this section even if you use the script. The comments below document the known traps, and the script enforces the same rules.
 
-The block below is **rootless**. For rootful, set `CONF=/etc/hive`, drop the
-`podman unshare` line in favour of the `chgrp` beside it, install the units into
-`/etc/containers/systemd/` with `sudo`, and drop `--user` from every `systemctl`.
+The block below is **rootless**. For rootful, set `CONF=/etc/hive`, replace `podman unshare` with the `chgrp` command beside it, install units into `/etc/containers/systemd/` with `sudo`, and drop `--user` from every `systemctl` command.
 
 ```bash
 # Selects the Podman path. WITHOUT THIS the preflights below exit 0 having
@@ -194,10 +167,7 @@ systemctl --user enable hive-boot-gate.service
 systemctl --user start hive-gateway.service
 ```
 
-Dashboard at `http://localhost:3001`, the same port and the same single
-published port as the Compose stack — Hive's own 3001/3002 and the raw ttyd
-terminal on 7681 stay inside the container network. Confirm the stack end to
-end, which also proves the gateway resolved `hive` over the shared network:
+The dashboard is at http://localhost:3001. This is the same port as the Compose stack. Hive uses ports 3001 and 3002 internally, and ttyd uses port 7681 inside the container network. Confirm the stack end to end to verify that the gateway resolves the `hive` host on the network:
 
 ```bash
 curl -sf http://127.0.0.1:3001/api/health     # -> {"status":"ok"}
@@ -207,50 +177,26 @@ curl -sf http://127.0.0.1:3001/api/health     # -> {"status":"ok"}
 bin/hive-podman-lifecycle-probe.sh check
 ```
 
-`daemon-reload` runs the generator, and `[Install] WantedBy=hive-boot.target`
-inside the units is half of what wires them to boot; the other half is
-`hive-boot-gate.service` — the one real (enableable) unit, so the `enable`
-above works and is required. **Rootless additionally needs
-`loginctl enable-linger "$USER"`** or the user manager never starts at boot.
-Check with `bin/hive-podman-lifecycle-probe.sh check`, not with
-`systemctl is-enabled hive.service`, which reports `generated` either way.
+`daemon-reload` runs the generator. The setting `[Install] WantedBy=hive-boot.target` inside the units wires them to boot. The service `hive-boot-gate.service` is the real unit, so you must enable it. **Rootless also needs `loginctl enable-linger "$USER"`**, or the user manager will not start at boot. Check with `bin/hive-podman-lifecycle-probe.sh check`, not with `systemctl is-enabled hive.service`.
 
-The gate is why booting never waits on Hive: it starts `hive-boot.target` only
-after systemd declares startup finished, so a Hive that cannot become healthy
-costs itself its `TimeoutStartSec` — not the host's boot, in either root mode.
-Before #4478 a rootful Hive sat inside the boot transaction and a broken one
-held the boot for up to five minutes, on every boot, until fixed. Measured,
-including the fix:
-[Boot persistence](src/docs/podman-standalone-quadlet.md#4-boot-persistence).
+The boot gate ensures that host boot does not wait on Hive. It starts `hive-boot.target` only after systemd finishes startup. If Hive does not become healthy, it stops at `TimeoutStartSec` and does not stop host boot. Before #4478, a rootful Hive ran inside the boot transaction and blocked boot for up to five minutes. See [Boot persistence](src/docs/podman-standalone-quadlet.md#4-boot-persistence) for details.
 
-**Security posture — pick deliberately.** The shipped unit requests
-`CAP_NET_ADMIN`, so the forced-proxy egress gate is *enforced* by default. Where
-that capability is unavailable, `HIVE_PROXY_ADVISORY_OK=true` in `$CONF/hive.env`
-starts Hive with the gate **not installed**; without either, Hive refuses to
-start with exit 77 rather than running an unenforced capability model.
+**Security posture — pick deliberately.** The shipped unit requests `CAP_NET_ADMIN`, so the egress gate is active by default. If that capability is unavailable, `HIVE_PROXY_ADVISORY_OK=true` in `$CONF/hive.env` starts Hive with the gate **not installed**. Without either setting, Hive exits with code 77 to avoid an unenforced capability model.
 
 | | Enforcing (default) | Advisory (`HIVE_PROXY_ADVISORY_OK=true`) |
 | --- | --- | --- |
 | **Rootful** | **Supported** | Supported as a deliberate choice, **unenforced** |
 | **Rootless** | **Supported** (needs `loginctl enable-linger` to survive reboot) | Supported as a deliberate choice, **unenforced** |
 
-Advisory mode is **not** a weaker grade of enforcing and **not** a fallback:
-agents can bypass the MITM proxy and the ACMM capability model is not enforced.
-Choose it knowingly. Full matrix and the evidence behind each cell:
-[src/docs/podman-support-matrix.md](src/docs/podman-support-matrix.md).
+Advisory mode is **not** a weaker grade of enforcement and is **not** a fallback. Agents can bypass the MITM proxy, and Hive does not enforce the ACMM model. See [src/docs/podman-support-matrix.md](src/docs/podman-support-matrix.md) for the full matrix.
 
-To build from source instead of pulling the pre-built image, build and tag it
-under the name the unit already names, then start as above:
+To build from source without the pre-built image, build and tag it under the unit name, then start as above:
 
 ```bash
 podman build -t ghcr.io/hivecommons/hive:stable -f src/Dockerfile .
 ```
 
-Full install detail — unit search paths, the traps behind each step above, boot
-persistence, and what was measured in both root modes — is in
-**[src/docs/podman-standalone-quadlet.md](src/docs/podman-standalone-quadlet.md)**.
-Update and rollback: [src/docs/podman-quadlet-update-rollback.md](src/docs/podman-quadlet-update-rollback.md).
-Teardown: `bin/hive-podman-teardown.sh`.
+See **[src/docs/podman-standalone-quadlet.md](src/docs/podman-standalone-quadlet.md)** for full installation details. It will cover the search paths for units, step traps, persistence at boot, and measurements in both root modes. See [src/docs/podman-quadlet-update-rollback.md](src/docs/podman-quadlet-update-rollback.md) for update and rollback instructions. For teardown, use `bin/hive-podman-teardown.sh`.
 
 ## Kubernetes Deployment
 
@@ -260,18 +206,13 @@ Teardown: `bin/hive-podman-teardown.sh`.
 - Kubernetes 1.24+
 - A StorageClass that supports `ReadWriteMany` (NFS recommended for zero-downtime rollouts)
 - cert-manager (for TLS certificates)
-- nginx-ingress (for ingress routing)
+- nginx-ingress (for ingress route management)
 
 ### Hosted Option
 
-The [Hive Hub](https://hive.hivecommons.dev) provides hosted hives with OAuth-protected dashboards, a public registry, and cross-hive leaderboards. No cluster required.
-The canonical hub address is now `https://hive.hivecommons.dev`; the legacy
-`https://hive.kubestellar.io` hostname redirects during the cutover.
-Start with the [hosted hub onboarding guide](src/docs/hosted-hub.md) to sign in,
-request a hosted hive, and finish first-run setup.
+The [Hive Hub](https://hive.hivecommons.dev) provides hosted hives with OAuth-protected dashboards, a public registry, and cross-hive leaderboards. You do not need a cluster. The canonical hub address is now https://hive.hivecommons.dev. The legacy https://hive.kubestellar.io address redirects to it. Use the [hosted hub guide](src/docs/hosted-hub.md) to sign in, request a hosted hive, and finish setup.
 
-If you need to run your own private hub instead, see the
-[self-hosted hub deployment guide](src/docs/hub-deployment.md).
+If you need to run a private hub, see the [hub deployment guide](src/docs/hub-deployment.md).
 
 ### Self-Hosted Deployment
 
@@ -295,14 +236,9 @@ kubectl -n hive create secret generic hive-secrets \
   --from-literal=HIVE_DASHBOARD_TOKEN="$(openssl rand -hex 32)"
 ```
 
-The PAT needs the classic `repo` scope (`public_repo` for public-only repos),
-plus `workflow` at L5/L6 if agent PRs may touch `.github/workflows/`. Scopes are
-never validated at startup, so a wrong-scoped token fails later as a generic
-GitHub 403 — see [Personal access token (PAT) scopes](src/docs/github-app-setup.md#personal-access-token-pat-scopes).
+The PAT needs the classic `repo` scope (`public_repo` for public-only repos), plus `workflow` at L5/L6 if agent PRs may touch `.github/workflows/`. Startup does not validate scopes. A token with an incorrect scope will fail later with a generic GitHub 403 error. See [Personal access token (PAT) scopes](src/docs/github-app-setup.md#personal-access-token-pat-scopes).
 
-The dashboard token is an opaque shared secret with no server-side strength
-check — always generate it with a CSPRNG as above, never a hand-typed value.
-See [Generating and rotating `HIVE_DASHBOARD_TOKEN`](src/docs/env-vars.md#generating-and-rotating-hive_dashboard_token).
+The dashboard token is an opaque shared secret with no server-side strength check — always generate it with a CSPRNG as above, never a hand-typed value. See [Generate and rotate `HIVE_DASHBOARD_TOKEN`](src/docs/env-vars.md#generating-and-rotating-hive_dashboard_token).
 
 For GitHub App auth (recommended for production), add the private key:
 
@@ -312,9 +248,7 @@ kubectl -n hive create secret generic hive-secrets \
   --from-file=gh-app-key.pem=/path/to/key.pem
 ```
 
-With `github.app_id`/`key_file` set, the App path supplies repository
-permissions and the PAT is only a fallback; see
-[GitHub App setup](src/docs/github-app-setup.md) for both paths.
+When you set `github.app_id` and `key_file`, the GitHub App will supply permissions for the repository. The PAT serves only as a fallback. See [GitHub App setup](src/docs/github-app-setup.md) for both paths.
 
 #### 3. Create ConfigMap from hive.yaml
 
@@ -333,7 +267,7 @@ Apply the provided PVC manifest:
 kubectl apply -f src/deploy/k8s/pvc.yaml
 ```
 
-The default PVC requests 10Gi with `ReadWriteOnce`. For zero-downtime rollouts with rolling updates, use an NFS-backed StorageClass with `ReadWriteMany`:
+The default PVC will request 10Gi of storage with `ReadWriteOnce`. For zero-downtime rollouts, use an NFS-backed StorageClass with `ReadWriteMany`:
 
 ```yaml
 apiVersion: v1
@@ -391,7 +325,7 @@ spec:
                   name: dashboard
 ```
 
-Long timeouts are needed for SSE streaming connections to the dashboard.
+Configure long timeouts for SSE stream connections to the dashboard.
 
 #### Quick apply (all manifests)
 
@@ -423,11 +357,21 @@ kubectl apply -f src/deploy/k8s/service.yaml
 
 ## Configuration
 
-All runtime config lives in a single `hive.yaml`. Environment variables are interpolated with `${VAR}` syntax. See [src/hive.yaml.example](src/hive.yaml.example) for the full reference, [src/docs/env-vars.md](src/docs/env-vars.md) for the centralized environment variable reference, [src/docs/agent-configuration.md](src/docs/agent-configuration.md) for agent configuration, [src/AGENT-DEFINITION.md](src/AGENT-DEFINITION.md) for the portable agent YAML format, [src/docs/supervisor.md](src/docs/supervisor.md) for the supervisor agent, [src/docs/telemetry.md](src/docs/telemetry.md) and [src/docs/operations.md](src/docs/operations.md) for the L5/L6-only opt-in observability and operational-readiness agents, [docs/backend-setup.md](docs/backend-setup.md) for CLI backends, [docs/inference-backends.md](docs/inference-backends.md) for model gateways, [docs/migration-v1-v2.md](docs/migration-v1-v2.md) for v1→v2 migration, and [src/docs/migration-v2-v4.md](src/docs/migration-v2-v4.md) for upgrading a v2 deployment to v4.
+All runtime configuration lives in a single `hive.yaml`. Hive will interpolate environment variables with `${VAR}` syntax.
 
-The top-level deterministic shell pipeline uses a separate project file,
-`config/hive-project.yaml.example`; see [config/README.md](config/README.md)
-before running the top-level `bin/` scripts directly.
+For details, see:
+- [src/hive.yaml.example](src/hive.yaml.example) for the configuration reference
+- [src/docs/env-vars.md](src/docs/env-vars.md) for environment variables
+- [src/docs/agent-configuration.md](src/docs/agent-configuration.md) for agent configuration
+- [src/AGENT-DEFINITION.md](src/AGENT-DEFINITION.md) for agent YAML definitions
+- [src/docs/supervisor.md](src/docs/supervisor.md) for the supervisor agent
+- [src/docs/telemetry.md](src/docs/telemetry.md) and [src/docs/operations.md](src/docs/operations.md) for observability and operations
+- [docs/backend-setup.md](docs/backend-setup.md) for CLI backends
+- [docs/inference-backends.md](docs/inference-backends.md) for model gateways
+- [docs/migration-v1-v2.md](docs/migration-v1-v2.md) for v1 to v2 migration
+- [src/docs/migration-v2-v4.md](src/docs/migration-v2-v4.md) to upgrade from v2 to v4
+
+The deterministic shell pipeline at the top level uses `config/hive-project.yaml.example`. See [config/README.md](config/README.md) before you run top-level `bin/` scripts directly.
 
 ```yaml
 project:
@@ -491,7 +435,7 @@ github:
 
 ## ACMM Levels
 
-Hive uses an **AI-native Capability Maturity Model** (ACMM) with six levels that control what agents are allowed to do:
+Hive uses the **Capability Maturity Model** (ACMM) for AI. Six ACMM levels will control what actions agents can do:
 
 | Level | Name | Agents | What agents can do |
 |-------|------|--------|-------------------|
@@ -504,17 +448,17 @@ Hive uses an **AI-native Capability Maturity Model** (ACMM) with six levels that
 
 Each level defines per-agent **policy modes**: advisory (observe only), measured (file issues), holdgated (PRs with hold label), or full (auto-merge). See `src/docs/acmm-policy-matrix.md` for the full matrix. Browse the [documentation index](src/docs/README.md) for operations, contributor relay, snapshots, health checks, and design guides.
 
-Operational references from the repository root include [hub disaster recovery](docs/HUB_DISASTER_RECOVERY.md), [federation design](docs/federation-design.md), [outreach antispam policy](docs/outreach-antispam.md), [macOS deployment notes](docs/macos.md), and [backend setup](docs/backend-setup.md). Worked examples live under [examples/](examples/README.md), including [KubeStellar skill and campaign configs](examples/kubestellar/README.md), [SQLite state backend notes](examples/sqlite-state.md), and [ACMM runtime fragments](examples/acmm/README.md).
+Operational references from the repository root include [hub disaster recovery](docs/HUB_DISASTER_RECOVERY.md), [federation design](docs/federation-design.md), [outreach antispam policy](docs/outreach-antispam.md), [macOS deployment notes](docs/macos.md), and [backend setup](docs/backend-setup.md). Worked examples live under [examples/](examples/README.md), including [KubeStellar skill and campaign configs](examples/kubestellar/README.md), [notes on SQLite state backends](examples/sqlite-state.md), and [ACMM runtime fragments](examples/acmm/README.md).
 
 ## Architecture
 
 Hive runs as a single container with three long-lived processes:
 
-- **Go binary** (`hive`, `:3002`) — the brain. Runs the governor eval loop, the agent manager (tmux sessions), the dashboard API, an in-process MITM GitHub proxy, the hub heartbeat, and token tracking — all as goroutines.
+- **Go binary** (`hive`, `:3002`) — the brain. Runs the governor loop, agent manager, dashboard API, GitHub MITM proxy, hub heartbeat, and token metrics.
 - **Node.js proxy** (`:3001`) — the public front door. Reverse-proxies to the Go API with auth and path-rewrite, and streams SSE/WebSocket to the dashboard and web terminal.
 - **ttyd** (`:7681`) — web terminal onto the agent tmux sessions.
 
-The governor evaluates queue depth on a configurable interval and switches between four modes (`SURGE`, `BUSY`, `QUIET`, `IDLE`), each with per-agent cadences. A deterministic pipeline (Go + shell) filters, classifies, and merge-gates all GitHub work before any agent is kicked, and three independent layers — CLI tool denial, least-privilege scoped tokens, and a network-level MITM proxy — enforce what each agent may do, keyed off its ACMM-assigned mode.
+The governor will evaluate the queue depth on a configurable interval. It switches between four modes (`SURGE`, `BUSY`, `QUIET`, `IDLE`), each with per-agent cadences. A deterministic pipeline (Go + shell) filters, classifies, and gates all GitHub work before Hive kicks an agent. Three independent layers will enforce what each agent can do based on its ACMM mode: CLI tool denial, least-privilege tokens, and a network-level MITM proxy.
 
 ```mermaid
 flowchart LR
@@ -528,26 +472,20 @@ flowchart LR
     dash["Dashboard :3001"] -.->|"SSE"| gov
 ```
 
-**See [src/docs/architecture.md](src/docs/architecture.md) for the full reference architecture** — process model, the governor loop, the deterministic pipeline, layered guardrails, ACMM, beads, hub & spoke, and an end-to-end walkthrough, with Mermaid diagrams throughout. Operator safety references include [trajectory review](src/docs/trajectory-review.md), [dashboard health checks](src/docs/health-checks.md), [sandbox guardrails](src/docs/sandbox-isolation.md), [manual provisioning](src/docs/manual-provisioning.md), [cross-cluster migration](src/docs/cross-cluster-migration.md), and [config layering](src/docs/config-layering.md). The dashboard API reference is published as [dashboard/openapi.json](dashboard/openapi.json).
+**See [src/docs/architecture.md](src/docs/architecture.md) for the full reference architecture.** It details the process model, governor loop, pipeline, guardrails, ACMM, beads, and hub-and-spoke design. Operator safety references include [trajectory review](src/docs/trajectory-review.md), [dashboard health checks](src/docs/health-checks.md), [sandbox guardrails](src/docs/sandbox-isolation.md), [manual provision](src/docs/manual-provisioning.md), [cross-cluster migration](src/docs/cross-cluster-migration.md), and [config layers](src/docs/config-layering.md). The dashboard API reference is available at [dashboard/openapi.json](dashboard/openapi.json).
 
-See also the [roadmap](ROADMAP.md) (release-line trajectory, with the [detailed near-term plan](src/docs/roadmap.md)), the [upgrade guide](UPGRADE.md), the [documentation index](src/docs/README.md), and the [landscape comparison](src/docs/landscape.md) for community-facing documentation and positioning.
+See also the [roadmap](ROADMAP.md) with the [detailed plan](src/docs/roadmap.md), the [upgrade guide](UPGRADE.md), the [documentation index](src/docs/README.md), and the [landscape comparison](src/docs/landscape.md).
 
 ## Terminal dashboard
 
-`hivectl tui` is a full-screen, keyboard-driven terminal view of the fleet —
-agents, governor, token spend, and activity in a live 2×2 grid, with
-pause/resume, model apply, kick, and ACMM level actions. It is **not a second
-Hive runtime**: it is another client of the same dashboard API the web
-dashboard at `:3001` uses, over the same auth token and the same SSE stream.
+`hivectl tui` provides a terminal view of the fleet in a live 2×2 grid. It displays agents, governor status, token spend, and activity. It supports pause/resume, model apply, kick, and ACMM level actions. It is **not a second Hive runtime**: it is another client of the same dashboard API at `:3001` over the same auth token and SSE stream.
 
 ```bash
 export HIVE_DASHBOARD_TOKEN="..."
 hivectl tui
 ```
 
-See [`hivectl tui` in the command reference](src/docs/hivectl.md#tui--live-terminal-dashboard)
-for keybindings, pane cadence, and v1 boundaries, and
-[the design record](src/docs/design/tui.md) for the reasoning behind it.
+See [`hivectl tui` in the command reference](src/docs/hivectl.md#tui--live-terminal-dashboard) for keybindings, pane cadence, and v1 boundaries. See [the design record](src/docs/design/tui.md) for design decisions.
 
 ## Tuna OS deployment
 
@@ -570,9 +508,7 @@ Start, so use `/api/health` to see whether a hive is up.
 
 ## Contribute to a Hive
 
-Community members can contribute compute to any hive through **ClankeR**, the
-contributor relay — it hands tasks from a hive's backlog to the CLI agent
-running on your own machine:
+Community members can contribute compute to any hive through **ClankeR**, the contributor relay. It hands tasks from a hive's backlog to the CLI agent on your local machine:
 
 ```bash
 brew install just gh
@@ -583,17 +519,17 @@ just contribute-hive
 
 Supported CLIs: Claude Code, GitHub Copilot, Pi, Goose, Bob. Contributors start as newcomer (rate-limited) and auto-promote based on completed tasks. Your credentials never leave your machine.
 
-A relay can subscribe to multiple hives with comma-separated `HIVE_HUB` and matching `HIVE_REGISTRATION_TOKEN` values, and operators can delegate selected spoke roles through **Acting as** / `HIVE_AGENT_ROLE`. See [src/docs/contributor-relay.md](src/docs/contributor-relay.md) and [src/docs/contributor-trust-and-roles.md](src/docs/contributor-trust-and-roles.md).
+A relay can subscribe to multiple hives with comma-separated `HIVE_HUB` and matching `HIVE_REGISTRATION_TOKEN` values. Operators can delegate roles for selected spokes through **Acting as** / `HIVE_AGENT_ROLE`. See [src/docs/contributor-relay.md](src/docs/contributor-relay.md) and [src/docs/contributor-trust-and-roles.md](src/docs/contributor-trust-and-roles.md).
 
-See the [Hive Hub contribute page](https://hive.hivecommons.dev) for details.
+See the [contribute page on Hive Hub](https://hive.hivecommons.dev) for details.
 
 ## Contributing
 
-See the [Hive Hub](https://hive.hivecommons.dev) to browse registered hives, view leaderboards, and find hives accepting contributions.
+See the [Hive Hub](https://hive.hivecommons.dev) to browse registered hives, view leaderboards, and find hives that accept contributions.
 
-To contribute to Hive itself, see [CONTRIBUTING.md](CONTRIBUTING.md) and open issues or PRs on this repository.
+To contribute to Hive itself, see [the contribution guide](CONTRIBUTING.md) and open issues or PRs on this repository.
 
-Recent user-visible changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+The file [CHANGELOG.md](CHANGELOG.md) records recent user-visible changes.
 
 ## Security
 

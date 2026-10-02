@@ -1,22 +1,18 @@
 # Security Policy
 
-The Hive maintainers take the security of this project seriously. Thank you for
-helping keep Hive and its users safe by disclosing vulnerabilities responsibly.
+The Hive maintainers take security seriously. Thank you for your work to keep Hive and its users safe through responsible disclosure.
 
 ## Reporting a Vulnerability
 
-**Please do not report security vulnerabilities through public GitHub issues,
-pull requests, or discussions.** Public reports expose users to the very
-weakness being reported before a fix is available.
+**Do not report security vulnerabilities through public GitHub issues, pull requests, or discussions**. Public reports expose users to the weakness before maintainers can provide a fix.
 
-Instead, use **private vulnerability reporting**:
+Instead, use the **private advisory flow**:
 
 1. Go to the repository's **Security** tab.
-2. Click **Report a vulnerability** (GitHub's private security advisory flow).
+2. Click **Report a vulnerability** (GitHub's private advisory flow).
 3. Provide a description of the issue and how to reproduce it.
 
-If private reporting is unavailable to you for any reason, contact a repository
-maintainer directly rather than opening a public issue.
+If you cannot report privately, contact a maintainer directly. Do not open a public issue.
 
 Please include, as much as you can:
 
@@ -38,15 +34,10 @@ Please include, as much as you can:
 
 ## Scope
 
-Reports about the code in this repository are in scope. When in doubt, report it
-privately and let us triage — we would rather hear about a non-issue than miss a
-real one.
+Reports about code in this repository are in scope. When in doubt, report privately and let us triage. We want to hear about a non-issue instead of missing a real problem.
 
 ## Who Responds
 
-Reports are handled by the Hive Maintainer Committee — see
-[`src/docs/security-response.md`](src/docs/security-response.md) for who
-that is today, how a report is triaged and resolved end to end, how
-membership is decided, and what to do if you don't get a response.
+The Maintainer Committee for Hive handles reports. See [`src/docs/security-response.md`](src/docs/security-response.md) for current members, triage procedures, resolution steps, committee membership rules, and escalation paths.
 
-Thank you for contributing to the security of Hive.
+Thank you for your help with Hive security.
