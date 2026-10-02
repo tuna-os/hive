@@ -7,7 +7,7 @@ import (
 )
 
 // The assignment-duration counter (#96) is rendered by inline JS inside the
-// server-sent dashboardHTML raw string, so it is invisible to ordinary Go
+// server-sent dashboardHTML asset, so it is invisible to ordinary Go
 // coverage. These structure tests assert the JS gate, the live ticker, and the
 // stuck-threshold wiring are present and correctly conditioned, so a refactor
 // that drops the counter or unconditions the gate fails loudly.
