@@ -1,0 +1,1 @@
+- Standalone API proxy event logs are now created owner-only, preventing other local users from reading recorded inference payloads ([#74](https://github.com/tuna-os/hive/issues/74)).
