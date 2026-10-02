@@ -349,6 +349,32 @@ func TestRunEscalationSweepPendingPassKeepsEscalation(t *testing.T) {
 	}
 }
 
+// Repo-wide CI failures belong to the shared infrastructure, not to each PR
+// showing the symptom. Distinct agent heads must not consume the breaker while
+// an unrelated human-authored control is red on the same required check.
+func TestRunEscalationSweepDoesNotEscalateRepoWideFailure(t *testing.T) {
+	store, _ := newTestEscalationStore(t)
+	client, fake := newEscalationSweepClient(t)
+	cfg := escalationTestConfig()
+	logger := discardLogger()
+
+	control := redPR("widgets", 99, "human-dev", "control")
+	for _, sha := range []string{"sha-1", "sha-2", "sha-3", "sha-4"} {
+		agent := redPR("widgets", 7, "hive-agent", sha)
+		got := runEscalationSweep(context.Background(), cfg, client,
+			actionableWith(agent, control), nil, nil, logger)
+		if len(got) != 0 {
+			t.Fatalf("head %s: escalated = %v, want shared failure held", sha, got)
+		}
+	}
+	if attempts := store.Attempts("acme/widgets", 7); attempts != 0 {
+		t.Fatalf("repo-wide failure consumed %d fix attempts, want 0", attempts)
+	}
+	if len(fake.paths) != 0 {
+		t.Fatalf("repo-wide failure triggered escalation side effects: %v", fake.paths)
+	}
+}
+
 // Dependency bots carry the "[bot]" suffix but are not hive agents: their red
 // PRs are not fix loops and must never be escalated.
 func TestRunEscalationSweepIgnoresDependencyBots(t *testing.T) {

@@ -84,9 +84,11 @@ func TestRecordRedStaleness(t *testing.T) {
 		store, clock := newTestEscalationStore(t)
 		cfg := escalationTestConfig()
 
+		human := redPR("widgets", 8, "some-human", "def")
+		human.FailingChecks = []string{"unrelated-human-failure"}
 		recordRedStaleness(cfg, actionableWith(
 			redPR("widgets", 7, "hive-agent", "abc"),
-			redPR("widgets", 8, "some-human", "def"),
+			human,
 		))
 		if store.StaleRed("acme/widgets", 7, "abc") {
 			t.Error("fresh red must not read as stale")
