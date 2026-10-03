@@ -142,14 +142,14 @@ the `integration` build tag and a live hive, as described above.
 
 ## Test (Node.js proxy)
 
-The dashboard's HTTP proxy and authentication layer are written in Node.js. Run its tests from `src/proxy/`:
+The dashboard proxy and authentication code are written in Node.js. Run tests from `src/proxy/`:
 
 ```bash
 cd src/proxy
 npm test
 ```
 
-This executes all `.test.js` files sequentially. Tests verify:
+This runs all `.test.js` files in order. The tests verify:
 - Session cookie generation and validation (v2 and v3 formats)
 - Public key rotation for session validation
 - CSP token injection and script-src scoping
@@ -160,11 +160,11 @@ This executes all `.test.js` files sequentially. Tests verify:
 ### Prerequisites
 
 - Node.js 22 (check `.github/workflows/v2-tests.yml` for the tested version)
-- Dependencies are already in `src/proxy/package.json`; no additional setup needed
+- Dependencies are in `src/proxy/package.json`. No additional setup is needed.
 
 ### Expected output
 
-A passing run prints `✓` per test file with no errors:
+A passing run prints `✓` for each test file. No errors are shown.
 
 ```
 server.test.js ✓
@@ -172,11 +172,11 @@ health_probe.test.js ✓
 ...
 ```
 
-If a test fails, the error is printed with the failing assertion. Exit code is non-zero; CI fails on any non-zero exit.
+If a test fails, the error is printed with the failing assertion. The exit code is not zero. CI fails if the exit code is not zero.
 
 ### Running in CI
 
-The proxy tests are part of the `test` gate in [`.github/workflows/v2-tests.yml`](./.github/workflows/v2-tests.yml) and must pass before a PR can merge. They are also run as part of the dashboard lint job.
+The proxy tests are part of the `test` gate in [`.github/workflows/v2-tests.yml`](./.github/workflows/v2-tests.yml). A PR cannot merge until these tests pass. They also run as part of the dashboard lint job.
 
 ## Format and lint expectations
 

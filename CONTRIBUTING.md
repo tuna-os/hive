@@ -13,41 +13,41 @@ Thank you for helping improve KubeStellar Hive. This guide is for contributing c
 
 ## Contributing to the tuna-os fork
 
-This repository is a fork of [`hivecommons/hive`](https://github.com/hivecommons/hive) maintained by Tuna OS. The fork keeps the delta near zero and sends generic changes upstream — only fork-specific configuration (CI `runs-on` values for GitHub Actions) lives here.
+This repository is a fork of [`hivecommons/hive`](https://github.com/hivecommons/hive) that Tuna OS maintains. The fork has very few changes. Only fork-specific configuration (CI `runs-on` values for GitHub Actions) is kept here. Other changes are sent upstream.
 
 ### When to contribute upstream vs. this fork
 
 **Contribute upstream** if your change is:
 - A bug fix that affects all Hive deployments
-- A feature that improves Hive generically (not Tuna OS-specific)
-- A documentation improvement that applies broadly
+- A feature that improves Hive (not Tuna OS-specific)
+- A documentation improvement that applies to all users
 - A dependency update or code quality improvement
 
-Generic work merged upstream automatically flows into this fork via periodic syncs, saving duplicate work.
+Generic work that is merged upstream automatically goes into this fork at the next sync. This means you do not duplicate the work.
 
 **Contribute to this fork** if your change is:
 - Tuna OS-specific configuration or policy
-- A workflow or CI change using Tuna OS infrastructure
+- A workflow or CI change for Tuna OS infrastructure
 - Documentation about running Hive on Tuna OS
-- A temporary fix awaiting upstream acceptance
+- A temporary fix that is waiting for upstream acceptance
 
 ### Fork sync policy
 
-This fork syncs with upstream `v4` periodically (see [FORK.md](FORK.md) for details). When syncing:
+This fork syncs with upstream `v4` at regular times (see [FORK.md](FORK.md) for details). When syncing:
 
-1. Syncs are always **merge commits** to preserve upstream history
-2. The only deliberate delta is CI configuration: `runs-on: [ubuntu-latest, ubuntu-24.04-arm]` instead of upstream's `[self-hosted, hive]`
-3. This delta is re-applied automatically on every sync
-4. Bugs and features go upstream first — this fork's PRs should rarely touch `src/` or `bin/`
+1. Syncs use **merge commits** to keep upstream history
+2. The only intentional difference is CI configuration: `runs-on: [ubuntu-latest, ubuntu-24.04-arm]` instead of upstream's `[self-hosted, hive]`
+3. This difference is re-applied automatically on every sync
+4. Bug fixes and features go upstream first. PRs to this fork should rarely change `src/` or `bin/`
 
 ### Before starting work
 
-If you're unsure whether your change belongs upstream or here:
-1. Check [FORK.md](FORK.md) — it clarifies what belongs where
-2. Open a GitHub discussion or comment on an existing issue to ask a maintainer
-3. Reference the upstream repository if your change might apply there too
+If you are not sure whether your change belongs upstream or here:
+1. Check [FORK.md](FORK.md). It explains what belongs where.
+2. Open a GitHub discussion or add a comment to an existing issue. Ask a maintainer.
+3. Reference the upstream repository if your change might apply there too.
 
-For generic bug fixes and features, PRs to upstream are encouraged — they help the whole Hive community and reduce fork drift.
+Generic bug fixes and features to upstream are encouraged. They help all Hive users and reduce differences between this fork and upstream.
 
 ## Repository layout
 
