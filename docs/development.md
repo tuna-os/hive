@@ -140,6 +140,44 @@ Neither the PR gate nor the cron runs `./test/...`: both enumerate
 `./pkg/... ./cmd/...` explicitly, and the integration suite additionally needs
 the `integration` build tag and a live hive, as described above.
 
+## Test (Node.js proxy)
+
+The dashboard proxy and authentication code are written in Node.js. Run tests from `src/proxy/`:
+
+```bash
+cd src/proxy
+npm test
+```
+
+This runs all `.test.js` files in order. The tests verify:
+- Session cookie generation and validation (v2 and v3 formats)
+- Public key rotation for session validation
+- CSP token injection and script-src scoping
+- Redirect pinning for ReDoc documentation
+- GitHub OAuth setup proxy behavior
+- Health probe responses
+
+### Prerequisites
+
+- Node.js 22 (check `.github/workflows/v2-tests.yml` for the tested version)
+- Dependencies are in `src/proxy/package.json`. No additional setup is needed.
+
+### Expected output
+
+A passing run prints `✓` for each test file. No errors are shown.
+
+```
+server.test.js ✓
+health_probe.test.js ✓
+...
+```
+
+If a test fails, the error is printed with the failing assertion. The exit code is not zero. CI fails if the exit code is not zero.
+
+### Running in CI
+
+The proxy tests are part of the `test` gate in [`.github/workflows/v2-tests.yml`](../.github/workflows/v2-tests.yml). A PR cannot merge until these tests pass. They also run as part of the dashboard lint job.
+
 ## Format and lint expectations
 
 Run `gofmt` on Go files you edit:

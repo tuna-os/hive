@@ -762,6 +762,38 @@ hive_podman_check_ports() {
   return "$rc"
 }
 
+hive_podman_check_networking() {
+  local backend rc
+  rc=0
+
+  if ! backend="$(podman info --format '{{.Host.NetworkBackend}}' 2>/dev/null)"; then
+    _pfh_fail "Networking: podman info failed — unable to verify network backend"
+    return 1
+  fi
+
+  if [[ "$backend" != "netavark" ]]; then
+    _pfh_fail "Networking: NetworkBackend is $backend — expected netavark"
+    _pfh_hint "The Hive gateway requires netavark and aardvark-dns for container DNS resolution."
+    _pfh_hint "If aardvark-dns is not installed, install it (dnf install aardvark-dns) and restart Podman: systemctl restart podman.socket"
+    rc=1
+  fi
+
+  # Additional check: verify aardvark-dns binary exists when using netavark
+  if [[ "$backend" == "netavark" ]] && ! command -v aardvark-dns &>/dev/null; then
+    _pfh_fail "Networking: netavark is configured but aardvark-dns binary is not installed"
+    _pfh_hint "Install aardvark-dns: dnf install aardvark-dns (or your package manager)"
+    _pfh_hint "Then restart the Podman socket: systemctl restart podman.socket"
+    rc=1
+  fi
+
+  # Only print success if all checks passed
+  if [[ $rc -eq 0 ]]; then
+    _pfh_pass "Networking: netavark with aardvark-dns configured"
+  fi
+
+  return "$rc"
+}
+
 # --- Runner ------------------------------------------------------------------
 
 hive_podman_preflight_host_selected_runtime() {
@@ -791,7 +823,7 @@ hive_podman_preflight_host_main() {
     return 0
   fi
 
-  echo "Podman preflight (SELinux, mounts, secrets, ports)"
+  echo "Podman preflight (SELinux, mounts, secrets, networking, ports)"
 
   # Resolve the layout BEFORE any check runs — every path below depends on it.
   # Announced rather than inferred silently: auto-detection that does not say
@@ -809,6 +841,7 @@ hive_podman_preflight_host_main() {
   hive_podman_check_selinux
   hive_podman_check_mount_labels
   hive_podman_check_config_secrets
+  hive_podman_check_networking
   hive_podman_check_ports
 
   printf 'SUMMARY: pass=%d warn=%d fail=%d\n' \
@@ -828,8 +861,8 @@ Usage: hive-podman-preflight-host.sh [check]
 
 Reports the SELinux mode and Podman's labeling state, the SELinux labels on
 every bind-mount source, whether the Hive configuration and secrets are
-readable by the right user and nobody else, and whether the published host
-ports are free.
+readable by the right user and nobody else, the network backend and aardvark-dns
+availability, and whether the published host ports are free.
 
 Read-only. It starts no container, relabels nothing, changes no permission or
 owner, and contacts no registry. It never proposes disabling SELinux and never

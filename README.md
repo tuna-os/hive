@@ -108,7 +108,51 @@ export HIVE_DEPLOY_RUNTIME=podman
 bin/hive-podman-setup.sh --rootless        # or --rootful
 ```
 
-It installs no packages and clones nothing, is idempotent, never overwrites an
+#### Setup script output and verification
+
+The script does the following steps and reports the result of each step:
+
+1. **Preflight checks** - Verify Podman version, systemd, cgroups v2, subordinate IDs, networking, and SELinux labels
+   - Output: `SUMMARY: pass=N warn=M fail=0` when all checks pass
+   - The script stops if any check fails
+
+2. **Configuration setup** - Create or keep existing `~/.config/hive/` (or `/etc/hive` if rootful) with `hive.yaml`, `hive.env`, and `nginx.conf`
+   - Output: `[KEPT] ~/.config/hive/hive.yaml` when already present, or `[NEW] ...` when created
+
+3. **Image pull** - Download the pre-built Hive container image (~3.8GB)
+   - Output: Docker pull progress, ending with `Status: Downloaded newer image for ghcr.io/hivecommons/hive:stable`
+
+4. **Quadlet unit installation** - Install systemd units to `~/.config/containers/systemd/` (rootless) or `/etc/containers/systemd/` (rootful)
+   - Output: Silent if successful. Fails if permissions are not correct.
+
+5. **systemd reloading** - Run `systemctl --user daemon-reload` to register the units
+   - Output: Silent if successful
+
+6. **Boot gate service** - Enable the boot gate service
+   - Output: `Created symlink ...hive-boot-gate.service => .../hive-boot.target.wants/hive-boot-gate.service`
+
+7. **Health check** - Start the gateway and verify it responds on the published port
+   - Output: `[OK] gateway at http://127.0.0.1:3001 answered /api/health`
+   - If rootless without lingering enabled: `[WARN] Linger is off. Hive will not survive reboot. Run: loginctl enable-linger`
+
+**Exit codes:**
+- `0` = install succeeded and gateway is healthy
+- `64` = bad flags or missing environment variable
+- `70` = repository files are missing or damaged
+- `78` = a setup step failed
+
+**Fixing common failures:**
+
+When the script stops at a preflight check, read the output to see the problem and what to do. Common problems:
+
+- `Podman 5.0.0+` = Update Podman: `dnf upgrade podman` or use your package manager
+- `aardvark-dns` missing = Install it: `dnf install aardvark-dns`. Then restart Podman: `systemctl restart podman.socket`
+- `SELinux labels` = If enforcing, run the suggested `chcon` or `semanage` commands
+- Port already in use = Use a different port with `HIVE_PODMAN_PREFLIGHT_PORTS` or free the port
+
+You can run the script again after you fix the problem. The script does not delete anything on the first run.
+
+```
 existing config without `--force` and never touches `secrets/`. A failing step
 stops the run and names itself; nothing is rolled back, so the partial state is
 there to inspect. It also enforces three couplings that are easy to get wrong by

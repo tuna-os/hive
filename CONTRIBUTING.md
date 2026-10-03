@@ -11,6 +11,44 @@ Thank you for helping improve KubeStellar Hive. This guide is for contributing c
 - Follow the [KubeStellar Code of Conduct](CODE_OF_CONDUCT.md) and [Hive governance](GOVERNANCE.md).
 - Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
+## Contributing to the tuna-os fork
+
+This repository is a fork of [`hivecommons/hive`](https://github.com/hivecommons/hive) that Tuna OS maintains. The fork has very few changes. Only fork-specific configuration (CI `runs-on` values for GitHub Actions) is kept here. Other changes are sent upstream.
+
+### When to contribute upstream vs. this fork
+
+**Contribute upstream** if your change is:
+- A bug fix that affects all Hive deployments
+- A feature that improves Hive (not Tuna OS-specific)
+- A documentation improvement that applies to all users
+- A dependency update or code quality improvement
+
+Generic work that is merged upstream automatically goes into this fork at the next sync. This means you do not duplicate the work.
+
+**Contribute to this fork** if your change is:
+- Tuna OS-specific configuration or policy
+- A workflow or CI change for Tuna OS infrastructure
+- Documentation about running Hive on Tuna OS
+- A temporary fix that is waiting for upstream acceptance
+
+### Fork sync policy
+
+This fork syncs with upstream `v4` at regular times (see [FORK.md](FORK.md) for details). When syncing:
+
+1. Syncs use **merge commits** to keep upstream history
+2. The only intentional difference is CI configuration: `runs-on: [ubuntu-latest, ubuntu-24.04-arm]` instead of upstream's `[self-hosted, hive]`
+3. This difference is re-applied automatically on every sync
+4. Bug fixes and features go upstream first. PRs to this fork should rarely change `src/` or `bin/`
+
+### Before starting work
+
+If you are not sure whether your change belongs upstream or here:
+1. Check [FORK.md](FORK.md). It explains what belongs where.
+2. Open a GitHub discussion or add a comment to an existing issue. Ask a maintainer.
+3. Reference the upstream repository if your change might apply there too.
+
+Generic bug fixes and features to upstream are encouraged. They help all Hive users and reduce differences between this fork and upstream.
+
 ## Repository layout
 
 - `src/` — the current Go module (`github.com/hivecommons/hive`) and the main development target for this repository.
