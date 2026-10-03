@@ -38,8 +38,22 @@ case "$*" in
     [ "${FAKE_ROOTLESS:-}" = "__ERR__" ] && exit 125
     printf '%s\n' "${FAKE_ROOTLESS:-true}"
     ;;
+  "info --format {{.Host.NetworkBackend}}")
+    [ "${FAKE_NETWORK_BACKEND:-}" = "__ERR__" ] && exit 125
+    printf '%s\n' "${FAKE_NETWORK_BACKEND:-netavark}"
+    ;;
+  *info*--format*NetworkBackend*)
+    [ "${FAKE_NETWORK_BACKEND:-}" = "__ERR__" ] && exit 125
+    printf '%s\n' "${FAKE_NETWORK_BACKEND:-netavark}"
+    ;;
   *) exit 1 ;;
 esac
+EOF
+
+cat >"${FAKE_BIN}/aardvark-dns" <<'EOF'
+#!/bin/sh
+# Mock aardvark-dns for testing
+exit 0
 EOF
 
 # uutils coreutils has no %C: it prints an error to STDOUT and exits 0, so a
@@ -237,6 +251,7 @@ run_preflight env HIVE_DEPLOY_RUNTIME=podman
 assert_eq "0" "$RUN_STATUS" "prepared host exit"
 assert_contains "$RUN_OUT" "SELinux: Enforcing, Podman labeling enabled" "prepared host SELinux"
 assert_contains "$RUN_OUT" "already container-readable" "prepared host labels"
+assert_contains "$RUN_OUT" "netavark" "prepared host networking backend"
 assert_contains "$RUN_OUT" "Port 3001: free" "prepared host port"
 assert_contains "$RUN_OUT" "fail=0" "prepared host has no failure"
 assert_not_contains "$RUN_OUT" "△" "prepared host has no warning"
@@ -279,6 +294,7 @@ for tool in dirname id awk head grep; do
 done
 ln -sf "${FAKE_BIN}/podman" "${SLIM_BIN}/podman"
 ln -sf "${FAKE_BIN}/stat" "${SLIM_BIN}/stat"
+ln -sf "${FAKE_BIN}/aardvark-dns" "${SLIM_BIN}/aardvark-dns"
 [[ -x "${SLIM_BIN}/getenforce" ]] && fail "slim PATH must not contain getenforce"
 
 set +e
@@ -537,6 +553,7 @@ done
 for tool in podman getenforce stat sysctl; do
   ln -sf "${FAKE_BIN}/${tool}" "${NOSS_BIN}/${tool}"
 done
+ln -sf "${FAKE_BIN}/aardvark-dns" "${NOSS_BIN}/aardvark-dns"
 [[ -x "${NOSS_BIN}/ss" || -x "${NOSS_BIN}/netstat" ]] && fail "no-ss PATH must have neither tool"
 
 set +e

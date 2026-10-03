@@ -786,6 +786,11 @@ hive_podman_check_networking() {
     rc=1
   fi
 
+  # Only print success if all checks passed
+  if [[ $rc -eq 0 ]]; then
+    _pfh_pass "Networking: netavark with aardvark-dns configured"
+  fi
+
   return "$rc"
 }
 
