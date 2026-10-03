@@ -176,7 +176,7 @@ If a test fails, the error is printed with the failing assertion. The exit code 
 
 ### Running in CI
 
-The proxy tests are part of the `test` gate in [`.github/workflows/v2-tests.yml`](./.github/workflows/v2-tests.yml). A PR cannot merge until these tests pass. They also run as part of the dashboard lint job.
+The proxy tests are part of the `test` gate in [`.github/workflows/v2-tests.yml`](../.github/workflows/v2-tests.yml). A PR cannot merge until these tests pass. They also run as part of the dashboard lint job.
 
 ## Format and lint expectations
 
