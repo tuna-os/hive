@@ -1,0 +1,1 @@
+- Updated `dashboard/package-lock.json` and `discord/package-lock.json` to pull in already-released patch versions (`proxy-addr` 2.0.8, `js-yaml` 4.3.2, `undici` 6.29.0) that close a critical IP-spoofing advisory and two high-severity denial-of-service advisories; no `package.json` ranges changed.
