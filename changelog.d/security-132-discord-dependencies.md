@@ -1,0 +1,1 @@
+- The Discord service now uses patched `js-yaml` and `undici` releases to prevent dependency-level denial of service ([#132](https://github.com/tuna-os/hive/issues/132)).
