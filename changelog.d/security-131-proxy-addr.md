@@ -1,0 +1,1 @@
+- The dashboard now uses a patched `proxy-addr` release that rejects spoofed IPv4-mapped IPv6 trust matches ([#131](https://github.com/tuna-os/hive/issues/131)).
