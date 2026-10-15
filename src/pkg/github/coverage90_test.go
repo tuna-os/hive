@@ -196,6 +196,63 @@ func TestEnrichCIStatus_StillRunning(t *testing.T) {
 	}
 }
 
+// Regression for hive#142: CI that reports ONLY through the legacy Statuses
+// API (CircleCI, Jenkins, etc.) has zero check runs, so a build that walked
+// check runs alone could never see it and stayed "pending" forever even once
+// the status went green. EnrichCIStatus must walk commit statuses too.
+func TestEnrichCIStatus_CommitStatusOnlyFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/check-runs"):
+			json.NewEncoder(w).Encode(map[string]interface{}{"total_count": 0, "check_runs": []interface{}{}})
+		case strings.Contains(r.URL.Path, "/status"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"statuses": []map[string]interface{}{
+					{"context": "ci/circleci: build", "state": "failure"},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server, "org", []string{"repo"})
+	prs := []PullRequest{{Repo: "org/repo", Number: 1, HeadSHA: "abc123"}}
+	c.EnrichCIStatus(context.Background(), prs)
+	if prs[0].CIStatus != "failure" {
+		t.Errorf("CIStatus = %q, want failure from a commit-status-only CI result", prs[0].CIStatus)
+	}
+	if len(prs[0].FailingChecks) != 1 || prs[0].FailingChecks[0] != "ci/circleci: build" {
+		t.Errorf("FailingChecks = %v, want [ci/circleci: build]", prs[0].FailingChecks)
+	}
+}
+
+func TestEnrichCIStatus_CommitStatusOnlySuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/check-runs"):
+			json.NewEncoder(w).Encode(map[string]interface{}{"total_count": 0, "check_runs": []interface{}{}})
+		case strings.Contains(r.URL.Path, "/status"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"statuses": []map[string]interface{}{
+					{"context": "ci/circleci: build", "state": "success"},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server, "org", []string{"repo"})
+	prs := []PullRequest{{Repo: "org/repo", Number: 1, HeadSHA: "abc123"}}
+	c.EnrichCIStatus(context.Background(), prs)
+	if prs[0].CIStatus != "success" {
+		t.Errorf("CIStatus = %q, want success from a commit-status-only CI result", prs[0].CIStatus)
+	}
+}
+
 // --------------------------------------------------------------------------
 // client.go — GetFileContentRef: explicit ref + content-decode error.
 // --------------------------------------------------------------------------
