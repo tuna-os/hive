@@ -12,6 +12,10 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analysis:
     uses: hivecommons/infra/.github/workflows/reusable-scorecard.yml@f1c0b61675386f54e63c04cf07b3aa933cc963eb # hivecommons/infra main as of 2026-09-02

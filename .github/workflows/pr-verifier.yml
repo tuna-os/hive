@@ -9,6 +9,10 @@ permissions:
   pull-requests: read
   packages: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+
 jobs:
   verify:
     name: verify PR contents

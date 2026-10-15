@@ -11,6 +11,10 @@ permissions:
   issues: write
   pull-requests: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   greet:
     uses: hivecommons/infra/.github/workflows/reusable-greetings.yml@f1c0b61675386f54e63c04cf07b3aa933cc963eb # hivecommons/infra main as of 2026-09-02
