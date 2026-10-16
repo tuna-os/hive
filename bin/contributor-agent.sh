@@ -194,12 +194,12 @@ fi
 
 # Extension seam for downstream images (kubestellar/hive#2393 item 4). A derived
 # image (e.g. projectbluefin/donate-clanker) can drop *.sh into
-# /etc/hive/entrypoint.d/ and/or set HIVE_PRE_AGENT_HOOK to run setup here —
-# after the full contributor env and default backend helpers are available,
-# before backend detection and the tmux launch — WITHOUT forking this entrypoint
-# and re-implementing the tmux wait/attach logic. Sourced (not exec'd) so hooks
-# can export env the agent sees and can override backend_binary(),
-# backend_perm_flag(), or other shell helpers without being clobbered later.
+# /etc/hive/entrypoint.d/ to run setup here — after the full contributor env
+# and default backend helpers are available, before backend detection and the
+# tmux launch — WITHOUT forking this entrypoint and re-implementing the tmux
+# wait/attach logic. Sourced (not exec'd) so hooks can export env the agent
+# sees and can override backend_binary(), backend_perm_flag(), or other shell
+# helpers without being clobbered later.
 ENTRYPOINT_HOOK_DIR="${HIVE_ENTRYPOINT_HOOK_DIR:-/etc/hive/entrypoint.d}"
 if [[ -d "$ENTRYPOINT_HOOK_DIR" ]]; then
   for _hook in "$ENTRYPOINT_HOOK_DIR"/*.sh; do
@@ -208,10 +208,6 @@ if [[ -d "$ENTRYPOINT_HOOK_DIR" ]]; then
     # shellcheck source=/dev/null
     source "$_hook"
   done
-fi
-if [[ -n "${HIVE_PRE_AGENT_HOOK:-}" ]]; then
-  echo "Running HIVE_PRE_AGENT_HOOK"
-  eval "$HIVE_PRE_AGENT_HOOK"
 fi
 
 # LiteLLM backend: Claude Code pointed at the contributor's own LiteLLM proxy.
