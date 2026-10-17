@@ -1,0 +1,1 @@
+- Rewrites the hub and spoke disaster-recovery guide in Simplified Technical English and lowers the prose budget from 670 to 541 findings ([#37](https://github.com/tuna-os/hive/issues/37)).

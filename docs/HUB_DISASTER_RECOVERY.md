@@ -9,9 +9,9 @@ from zero after a catastrophic loss.
 
 ### 1. `HIVE_BACKUP_KEY` must be escrowed OUTSIDE the cluster
 
-Backups are encrypted with AES-256-GCM using `HIVE_BACKUP_KEY`. **If that key
-exists only inside the cluster, the backup is worthless the moment the cluster
-is gone.** Store it in a password manager and/or an offline copy, today.
+Backups use AES-256-GCM with `HIVE_BACKUP_KEY`. **The backup is worthless if
+the key stays in the failed cluster.** Store it in a password manager or an
+offline copy.
 
 There is no key-recovery mechanism. A lost key means an unreadable archive.
 
@@ -19,9 +19,9 @@ There is no key-recovery mechanism. A lost key means an unreadable archive.
 openssl rand -hex 32     # generate; store the output OUT OF BAND
 ```
 
-The key is deliberately **independent of `/data/saas/hmac.key`**. `hmac.key` is
-itself backup *payload*; deriving the backup key from it would make the archive
-undecryptable in exactly the disaster it exists for.
+The key is deliberately **independent of `/data/saas/hmac.key`**. `hmac.key`
+is part of the backup payload. Do not derive the backup key from it. The archive
+would fail to decrypt after the disaster.
 
 ### 2. `hmac.key` is a single point of failure for all user tokens
 
@@ -29,18 +29,17 @@ undecryptable in exactly the disaster it exists for.
 `encrypted_token` (see `encryptToken`/`decryptToken` in `pkg/hub/saas.go`).
 There is no KMS, no escrow, no second copy anywhere.
 
-**If `hmac.key` is lost, all ~88 users' stored GitHub tokens become permanently
-undecryptable ciphertext and every user must re-authorize via OAuth.** No
-restore procedure recovers it. This backup is the only thing standing between
-you and that outcome.
+**If `hmac.key` is lost, all ~88 users' stored GitHub tokens become permanent
+ciphertext.** Every user must authorize again through OAuth. No restore
+procedure can recover the key. This backup prevents that outcome.
 
 ### 3. The authoritative spoke config is the PVC overlay — usually NOT `hive.yaml.runtime`
 
-> **Corrected.** This section previously stated that `copy-config` restores from
-> `/data/hive.yaml.runtime`, and that restoring that file is what brings a spoke
-> back. **That is true on only 3 of 51 live hives.** Following it on the other
-> 48 produces a differently-configured spoke with no error — the worst kind of
-> DR bug, because it fails only when you are already in an emergency.
+> **Corrected.** Before this section, it said that `copy-config` restores from
+> `/data/hive.yaml.runtime` and that this file brings a spoke back. **That is
+> true for only 3 of 51 live hives.** On the other 48, this method creates a
+> spoke with different configuration and no error. The failure appears only
+> during an emergency.
 
 The fleet runs **two different `copy-config` variants**, baked into each
 spoke's Deployment at provision time and never migrated.
@@ -60,18 +59,18 @@ elif [ -f /data/hive.yaml.bak ]; then echo legacy-runtime-config-exists-for-reco
 
 Note it only *reports* the runtime config. It never restores from it.
 
-> **Naming.** This file was `hive.yaml.bak` until the rename to
-> `hive.yaml.runtime`. The migration is copy-forward: writers emit the new name,
-> readers fall back to the legacy one, and nothing renames or deletes the legacy
-> file on a PVC. A hive that has not saved since upgrading still carries only
-> `hive.yaml.bak` and boots normally from it. Backups capture **both** names, so
-> restore whichever the archive contains — under the new name.
->
-> Outside Kubernetes — Docker, Podman, LXC, or a bare host binary; the branch is
-> chosen by the absence of a Kubernetes pod, not by the runtime — this file is not
-> a snapshot at all but the boot-time source of truth, since there is no ConfigMap
-> and no overlay there. Restoring such a hive means restoring the data volume that
-> holds it, not the seed. See `src/docs/config-layering.md`.
+> **Naming.** Before the rename, this file used `hive.yaml.bak`; it now uses
+> `hive.yaml.runtime`. Writers use the new name. Readers accept the legacy name.
+> No code renames or deletes the legacy file on a PVC. A hive that has not saved
+> since the upgrade still has `hive.yaml.bak` and boots from it.
+
+> Backups capture both names. During recovery, copy the name that the archive
+> contains to `hive.yaml.runtime`.
+
+> Outside Kubernetes — Docker, Podman, LXC, or a bare host binary — no
+> Kubernetes pod selects this branch. This file is the boot-time source because
+> no ConfigMap or overlay exists. To recover such a hive, restore its data
+> volume, not the seed. See `src/docs/config-layering.md`.
 
 **How to tell which variant a hive runs** — this is the only way to know:
 
@@ -82,34 +81,31 @@ kubectl -n hive-hosted-<id> get deploy -o jsonpath\
 
 #### What actually holds the running config
 
-On **every** hive, the config in effect is dominated by the PVC overlay
-`/data/hive.yaml.dashboard`, which the entrypoint merges over the seed at boot.
-The ConfigMap seed is 4–11% of the running config on sampled hives and omits
-whole top-level blocks (`policies`, `data`, `knowledge`, `notifications`,
-`hive_id`).
+Every hive uses the PVC overlay as its effective config. The entrypoint merges
+`/data/hive.yaml.dashboard` over the seed at boot. In sampled hives, the
+ConfigMap seed provides 4–11% of the effective config and lacks top-level blocks
+(`policies`, `data`, `knowledge`, `notifications`, `hive_id`).
 
 **So the file to restore is `/data/hive.yaml.dashboard`.** It is the only
-writable layer and the one that wins. See `src/docs/config-layering.md` for the
-full precedence order, and `GET /api/config/provenance` on a running spoke to
-ask which layer set any given field.
+writable layer and wins. See `src/docs/config-layering.md` for the precedence
+order. Query `GET /api/config/provenance` on an active spoke to identify the
+source for any field.
 
 #### `hive.yaml.runtime` is a snapshot, not a restore source
 
-The name misleads. `hive.yaml.runtime` is written by the entrypoint **after** the merge
-(`src/deploy/entrypoint.sh:150`) — it is a snapshot of the *result*, not an
-input. On variant-C hives nothing reads it during a normal boot.
+The name misleads. The entrypoint writes `hive.yaml.runtime` after the merge
+(`src/deploy/entrypoint.sh:150`). The file records the result, not an input.
+Variant C does not read it during normal boot.
 
-It has exactly one non-redundant role: the **disaster fallback** at
-`entrypoint.sh:152-161`, which restores from `hive.yaml.runtime` when the ConfigMap is
-missing or empty. That is a genuinely different scenario from the overlay path,
-which is why the file is still worth capturing.
+Its only role is the **disaster fallback** at `entrypoint.sh:152-161`. The
+fallback reads `hive.yaml.runtime` when the ConfigMap is missing or empty. This
+case differs from the overlay path, so capture this file too.
 
-`hive.yaml.runtime` and the overlay are **near-copies but not interchangeable**. The overlay
-is written secret-free on purpose (`dashboardOverlayBytes` collapses
-`HIVE_GITHUB_TOKEN` back to `${HIVE_GITHUB_TOKEN}` and blanks a
-pod-env-derived `dashboard.auth_token`), while `hive.yaml.runtime` is a verbatim copy of the
-merged config **including** those secrets. Observed live on
-`projectbluefin-knuckle`:
+`hive.yaml.runtime` and the overlay are similar but not interchangeable. The
+overlay contains no secrets by design: `dashboardOverlayBytes` replaces
+`HIVE_GITHUB_TOKEN` with `${HIVE_GITHUB_TOKEN}` and clears the pod-env-derived
+`dashboard.auth_token`. The runtime file copies the merged config and keeps
+those secrets. Live values on `projectbluefin-knuckle` show the difference:
 
 ```
 /data/hive.yaml.runtime        14609 B   auth_token: 55c076f9…
@@ -133,14 +129,14 @@ Four Kubernetes Secrets live **outside** the hub PVC and are required:
 `hive-backup` captures these automatically and **fails the backup** if any of
 the first three is missing.
 
-> **Adding a new hub credential?** Put it in the **existing `hive-hub-secrets`**
-> Secret rather than creating a new one. That Secret is already in
-> `hubbackup.DefaultHubSecrets`, so a key added to it is captured — and restored
-> — for free. A brand-new Secret is **silently lost in a restore** unless it is
-> also added to `DefaultHubSecrets`.
+> **New hub credential?** Put it in the **existing `hive-hub-secrets`**
+> Secret. Do not create another Secret. That Secret already appears in
+> `hubbackup.DefaultHubSecrets`, so backup and restore capture each new key
+> at no extra cost. A new Secret disappears during recovery unless you also
+> add it to `DefaultHubSecrets`.
 >
 > This is why the Slack bot token (`HIVE_HUB_SLACK_BOT_TOKEN`, see
-> [Slack messaging](#slack-messaging)) is a key on `hive-hub-secrets`.
+> [Slack DMs](#slack-messaging)) is a key in `hive-hub-secrets`.
 
 ---
 
@@ -158,13 +154,13 @@ the first three is missing.
 Excluding them keeps an archive at roughly **300–400KB**, small enough to retain
 30 daily copies and restore in minutes.
 
-Losing the excluded data costs agent history and learned context — not the
-ability to run.
+The excluded data contains agent history and learned context. It does not
+affect the ability to run.
 
 ### What is NOT recoverable by any backup
 
-- **GitHub App installation consent** — if the App registration is recreated,
-  each org owner must re-approve the installation.
+- **GitHub App consent** — if someone creates a new App registration, each org
+  owner must approve the installation again.
 - **In-flight agent work** at the moment of loss.
 - **`hmac.key` if it was never backed up** — see above.
 
@@ -172,10 +168,15 @@ ability to run.
 
 ## Backup
 
-Runs as a CronJob in `hive-hub` — **opt-in, not deployed by default**: `src/deploy/k8s/backup-cronjob.yaml` is deliberately excluded from the kustomization and must be applied explicitly, after creating Secret `hive-hub-backup-key` (key `backup-key`) with the escrowed `HIVE_BACKUP_KEY` and reviewing ConfigMap `hive-hub-backup-config`. The CronJob image tracks the `stable` release channel. Each run builds the archive, encrypts it,
-uploads it to OCI Object Storage, **downloads it again and verifies checksums**,
-then prunes beyond the retention count. A run that cannot self-verify fails
-rather than reporting a good backup.
+The `hive-hub` CronJob is opt-in and does not run by default. The kustomization
+omits `src/deploy/k8s/backup-cronjob.yaml`; apply that file after you create
+Secret `hive-hub-backup-key`. Put `HIVE_BACKUP_KEY` in the `backup-key` field
+and check ConfigMap `hive-hub-backup-config`. The image follows the `stable`
+release channel.
+
+Each run builds and encrypts the archive, uploads it to OCI Object Storage,
+downloads it, verifies checksums, and prunes old archives. A run fails when
+self-verification fails. It does not report a good backup.
 
 ```bash
 hive-backup run                    # to object storage
@@ -201,10 +202,10 @@ Environment:
 
 ### Spoke gaps are recorded, not hidden
 
-A spoke scaled to zero, or with no Running pod, cannot be read. Those hives are
-listed in the archive's `MANIFEST.json` under `spoke_errors`, and printed by
-`run` and `verify`. **Check this output** — a "successful" backup can still be
-missing spokes, and the manifest is where you find out before you need it.
+A spoke with zero replicas or no active pod has no readable data. The archive
+lists such hives in `MANIFEST.json` under `spoke_errors`; `run` and `verify`
+print the list. **Check this output.** A backup can succeed and still miss
+spokes. The manifest shows the gap before you need the archive.
 
 ---
 
@@ -224,7 +225,7 @@ hive-backup extract -file <archive> -dest ./restore
 ```
 
 `./restore` now contains `hub/`, `secrets/`, `spokes/`, `MANIFEST.json`.
-Read `MANIFEST.json` → `spoke_errors` to learn which spokes were not captured.
+Read `MANIFEST.json` → `spoke_errors` to see which spokes the archive missed.
 
 ### Step 1 — Provision a cluster
 
@@ -244,11 +245,11 @@ for f in restore/secrets/*.json; do
 done
 ```
 
-`hive-hub-tls` may be omitted; cert-manager reissues it.
+You may omit `hive-hub-tls`; cert-manager reissues it.
 
 ### Step 3 — Restore the hub PVC data
 
-Start a helper pod mounting the hub PVC, then stream the data in:
+Start a helper pod with the hub PVC mounted. Then stream the data into it:
 
 ```bash
 kubectl apply -n hive-hub -f - <<'YAML'
@@ -272,7 +273,7 @@ tar cf - -C restore/hub saas hub-registry.json \
   | kubectl exec -i -n hive-hub restore-helper -- sh -c 'cd /data && tar xf -'
 ```
 
-Verify before continuing — especially `hmac.key`:
+Verify before the next step, especially `hmac.key`:
 
 ```bash
 kubectl exec -n hive-hub restore-helper -- sh -c \
@@ -284,8 +285,8 @@ kubectl delete pod restore-helper -n hive-hub
 
 Deploy the hub. On boot it reads `/data/saas` and `/data/hub-registry.json`.
 
-Because `hmac.key`, `hub-secret.key` and `webhook-secret.key` were restored
-rather than regenerated:
+The restore keeps `hmac.key`, `hub-secret.key`, and `webhook-secret.key`. The
+system does not regenerate them:
 
 - existing user tokens still decrypt — **no mass re-OAuth**
 - spokes still authenticate with their existing `hub-secret`
@@ -349,19 +350,20 @@ kubectl -n $NS exec $POD -c hive -- \
 
 Manual, and unavoidable:
 
-- If the **OAuth App** still exists, restoring `hive-hub-secrets` is enough.
-- If the **GitHub App** was recreated, every org owner must re-approve the
+- If the **OAuth App** still exists, restore `hive-hub-secrets`.
+- If someone recreated the **GitHub App**, every org owner must re-approve the
   installation. Its private keys are in `restore/hub/saas/app-keys/` and
-  `restore/spokes/*/gh-app-key*.pem` — reuse them if the App survived.
+  `restore/spokes/*/gh-app-key*.pem`; reuse them if the App survived.
 - Re-point DNS / ingress for `hive.hivecommons.dev`.
 
 ### Step 7 — Verify
 
 - [ ] user count matches (`ls /data/saas/users | wc -l`)
-- [ ] users can log in without re-authorizing (proves `hmac.key` restored)
+- [ ] users can log in with the restored `hmac.key`
 - [ ] hive count and vanity URLs unchanged
 - [ ] spokes appear online and heartbeat to the hub
-- [ ] `copy-config` logged the expected line for the spoke's variant (`override-used` on A/B, `configmap-copied` on C), and the hive container logged "dashboard overlay merged over ConfigMap seed"
+- [ ] `copy-config` logged `override-used` on A/B or `configmap-copied` on C
+- [ ] The hive container logged "dashboard overlay merged over ConfigMap seed"
 - [ ] a fresh `hive-backup run` succeeds against the rebuilt hub
 
 ---
@@ -379,52 +381,51 @@ Manual, and unavoidable:
 
 ## Testing status
 
-Verified end-to-end against production data (read-only against live systems;
-writes confined to a throwaway namespace that was deleted afterwards).
-Counts below are as measured at the time of that drill — expect different
-numbers on a grown fleet, not a restore failure:
+The drill used production data in read-only mode. It wrote only to a throwaway
+namespace and deleted that namespace afterward. Counts below reflect the drill
+date. A larger fleet will produce different counts; that does not show a
+restore failure:
 
 - Backup of the real hub: **423 files, all 50 spokes, all 4 Secrets**
 - Archive is opaque ciphertext — no plaintext leakage
-- Wrong key and bit-flips are rejected (GCM auth tag)
-- Restored `hmac.key` byte-identical to production
-- **All 88 restored user tokens decrypt successfully**
-- Restored `hive.yaml.dashboard` and `hive.yaml.runtime` byte-identical to the live spoke
-- Secrets restored into a throwaway namespace matched live values
-- Hub PVC data restored into a live pod: 88 users, 50 hives
+- The GCM tag rejects a bad key and bit flips
+- Production and restored `hmac.key` bytes matched
+- **All 88 user tokens decrypt after restore**
+- Restored `hive.yaml.dashboard` and `hive.yaml.runtime` matched the live spoke
+- The restored Secrets matched live values in a throwaway namespace
+- A live pod received data from the Hub PVC: 88 users, 50 hives
 
-**UNTESTED** — no production meltdown was simulated:
+**UNTESTED** — The drill did not simulate a production meltdown:
 
-- Restoring onto a genuinely fresh/empty cluster
-- Starting the hub server against restored data (Step 4)
+- Restore on a fresh, empty cluster
+- Start the hub server with restored data (Step 4)
 - Spoke re-adoption and heartbeat after restore (Step 5)
 - GitHub App/OAuth re-linkage (Step 6)
-- The CronJob running in-cluster on its schedule
-- Upload to OCI Object Storage from *inside* the cluster (write permission was
-  verified out-of-band with the hub's own credentials; the in-cluster upload
-  path itself has not been exercised)
+- Scheduled in-cluster CronJob
+- Upload to OCI Object Storage from inside the cluster
+- An out-of-band check confirmed write permission with the hub credentials.
+- The team has not tested the in-cluster upload path.
 
 ---
 
 # Spoke self-service backup (owner-triggered)
 
-This is a **second, complementary** backup, separate from the fleet-wide hub
-backup described above. A spoke owner triggers it themselves from the avatar
-menu on their spoke dashboard (**Back up this hive**), and it downloads an
-encrypted archive to their browser.
+This is a **second, complementary** backup. It differs from the fleet-wide hub
+backup above. A spoke owner triggers it from the avatar menu on the spoke
+dashboard (**Back up this hive**). The browser downloads an encrypted archive.
 
 ## Why it exists — and why it includes beads
 
-The hub backup is deliberately config-only. It excludes `/data/beads`,
-`/data/nous`, `/data/home` and `/data/logs`, because including them across ~50
-spokes would be roughly 40GB — too slow and expensive to run nightly and too
-slow to restore in an emergency. That trade-off is recorded in issue #2318.
+The hub backup is config-only. It excludes `/data/beads`, `/data/nous`,
+`/data/home`, and `/data/logs`. Across ~50 spokes, these paths total about
+40GB. Nightly jobs would run too slowly, and recovery would take too long.
+Issue #2318 records this trade-off.
 
-The cost profile of a *single owner backing up their own hive on demand* is
-completely different. So this backup **includes `/data/beads`** — the agent
-work ledger that #2318 identifies as the most painful documented loss. After a
-hub-backup-only restore, agents come back configured but with no memory of what
-they had already found, claimed, deferred or closed. This backup preserves that.
+A single owner can back up one hive on demand. That cost differs greatly. This
+backup **includes `/data/beads`** — the agent work ledger that #2318 identifies
+as the most painful documented loss. After a hub-only restore, agents return
+with no record of work they found, claimed, deferred, or closed. This backup
+preserves that record.
 
 ## What is captured
 
@@ -454,54 +455,52 @@ Bead directories are **discovered, not hardcoded**. A production spoke had ten
 | `dashboard-sessions.json` | 1KB | **Live browser session tokens** — credentials with no restore value; restoring them would resurrect sessions that should have expired |
 | `hive.yaml` | 16KB | The *stale* ConfigMap seed — not authoritative |
 
-**Resulting archive: roughly 3–5MB before compression** on a measured
-production spoke (beads 2.6MB dominating), versus ~796MB for the whole PVC.
-Small enough to stream to a browser and stay responsive.
+**Archive size: about 3–5MB before compression** on a measured production
+spoke. Beads use 2.6MB; the whole PVC uses about 796MB.
+The small archive streams to a browser and stays responsive.
 
 ## Capture the overlay and `hive.yaml.runtime`, not `hive.yaml`
 
-The same trap as the hub backup, and worth repeating because it is silent.
+The hub backup has the same silent trap.
 
-`/etc/hive/hive.yaml` is **not** the file to back up. On a sampled production
-spoke it was a root-owned copy days older than the live config. It is
-regenerated from the seed plus the overlay on every boot.
+`/etc/hive/hive.yaml` is **not** the file to back up. A sampled production
+spoke had a root-owned copy that lagged the live config by days. The boot
+process creates it from the seed and overlay at each boot.
 
-The two files worth capturing are:
+Capture these two files:
 
 | File | Why |
 |---|---|
 | `/data/hive.yaml.dashboard` | The **overlay** — the only writable layer, and the one that wins the boot-time merge on all 51 hives. This is the real running config. |
 | `/data/hive.yaml.runtime` | The post-merge snapshot. Read by the disaster fallback when the ConfigMap is missing/empty, and by variant-A/B hives on every boot. Also the only copy that retains env-derived secrets. |
 
-They are near-copies but **not interchangeable** — the overlay is deliberately
-secret-free. Backing up the wrong one produces no error at backup time and no
-symptom until a restore quietly reverts the owner's settings. Tests lock this
-in.
+They are similar but **not interchangeable**. The overlay has no secrets. A
+later restore can silently lose the owner's settings when you back up the wrong
+file. Tests enforce this.
 
 ## Encryption is mandatory
 
-The archive contains GitHub App private keys, so it is **always** sealed with
-AES-256-GCM using the same code path as the hub backup.
+The archive contains private keys for the GitHub App. The archive always uses
+AES-256-GCM and the same code path as the hub backup.
 
-- The key comes from **governor config** (`governor.backup.key_file`, set by the
-  hive owner in the dashboard under **Governor Config → Security → Backup**), or
-  from **`HIVE_BACKUP_KEY`** on the spoke as a fallback. There is **no default**.
-  Governor config exists because hosted spoke owners have no deployment-env
-  access, so an env-only key made backup unavailable to them (#4129). The value
-  is written to `/data/secrets/backup_encryption_key` (mode `0600`); `hive.yaml`
-  records the path only, and the value is never returned by an API or logged.
-  If no source supplies a key the endpoint returns `412 Precondition Failed` and
-  refuses — it never streams plaintext credentials to a browser.
-- The key is **not in the archive** and is not derivable from it. An artifact
-  carrying its own decryption key is not encrypted. The owner must have the key
-  escrowed separately, or the backup is unreadable.
-- The response is `Cache-Control: no-store` and is served over `POST` only, so
-  it cannot be pulled by a cross-origin navigation or `<img>` tag.
+- The key comes from **governor config** (`governor.backup.key_file`). The hive
+  owner sets it in the dashboard under **Governor Config → Security → Backup**.
+  As a fallback, the spoke reads **`HIVE_BACKUP_KEY`**. No default exists.
+- Hosted-spoke owners do not have access to the deployment environment. An
+  environment-only key would block their backups (#4129).
+- The service writes the value to `/data/secrets/backup_encryption_key` (mode
+  `0600`). `hive.yaml` stores the path. APIs and logs never return the value.
+- If no source supplies a key, the endpoint returns `412 Precondition Failed`
+  and refuses the request. It never streams plaintext credentials to a browser.
+- The key is **not in the archive** and cannot come from it. An artifact that
+  includes its own key has no encryption. The owner must keep the key separate.
+- The service returns `Cache-Control: no-store` and uses `POST` only. A
+  cross-origin navigation or `<img>` tag cannot fetch the response.
 
-The UI states plainly that the file is encrypted and that the key is not
-included, and a `412` refusal deep-links the owner to the Governor Config panel
-where they can set the key themselves. Clearing the key from that panel restores
-the refusal — there is no path that produces an unencrypted archive.
+The UI says that the service encrypts the file and omits the key. A
+`412` response links the owner to the Governor Config panel to set the key. If
+the owner clears the key, the endpoint still refuses. No path produces an
+unencrypted archive.
 
 ## Authorization
 
@@ -512,9 +511,9 @@ entry for non-owners is UX; the server check is the boundary.
 
 ## Restore procedure
 
-There is **no restore button** — restoring is a deliberate, disruptive act on a
-running hive, so it is a documented operator procedure rather than a one-click
-control. The archive shares the hub format, so the same tooling reads it.
+No restore button exists. Restore can disrupt a live hive, so an operator must
+follow a documented procedure, not a one-click control. The archive uses the
+hub format, so the same tooling reads it.
 
 ```bash
 # 0. Decrypt and verify. Uses the SAME archive format as the hub backup,
@@ -575,54 +574,56 @@ kubectl -n $NS rollout restart deploy/hive
 kubectl -n $NS rollout status  deploy/hive --timeout=300s
 ```
 
-**Verify:** the dashboard loads, the hive ID matches, config changes the owner
-made are present (not the ConfigMap defaults), and agents show their prior bead
-counts rather than starting from an empty ledger.
+**Verify:** The dashboard loads and the hive ID matches. The owner's config
+changes appear, not ConfigMap defaults. Agents show prior bead counts; the
+ledger is not empty.
 
 ### Bead ownership
 
-Bead directories are owned per-agent UID on the spoke (`hive-scanner`,
-`hive-quality`, …). If agents cannot write their ledgers after a restore, fix
-ownership to match the surrounding directories rather than loosening the mode.
+Bead directories use each agent's UID on the spoke (`hive-scanner`,
+`hive-quality`, …). If agents cannot write ledgers after a restore, match
+ownership to nearby directories. Do not weaken the mode.
 
 ## Testing status
 
 **Verified:**
 
-- Unit tests cover: `hive.yaml.dashboard` and `hive.yaml.runtime` captured and `hive.yaml` excluded; beads
-  captured for every discovered agent; `nous`/`logs`/`home`/`audit.jsonl`/
-  `dashboard-sessions.json` excluded; App keys captured; sealed archive is
-  opaque ciphertext with no plaintext key/config leakage; wrong key and
-  bit-flips rejected; manifest digests non-empty so `Verify` is not vacuous;
-  build refuses with no key; missing files recorded rather than silently
-  dropped; hostile hive IDs cannot escape the filename.
-- Handler tests cover: `403` for `read`/`read-write`/`write`/`viewer` on both
-  endpoints and on all three backup-key config endpoints, `412` with no key from
-  any source and no download offered, `no-store` caching, an `.enc` attachment,
-  a backup that succeeds (and decrypts) with a key set only through governor
-  config, a `412` again after the key is cleared, and no key value in any
-  response, in `hive.yaml`, or in the stored config struct.
-- Archives are extracted through `hubbackup.Extract`, proving both backups
-  share one format and one restore path.
-- Spoke layout, `hive.yaml`/`hive.yaml.runtime` divergence, bead directory names
-  and all sizes above were read from a live production spoke (read-only).
+- Unit tests capture `hive.yaml.dashboard` and `hive.yaml.runtime` and exclude
+  `hive.yaml`.
+- For every discovered agent, unit tests capture its beads.
+- Unit tests exclude `nous`/`logs`/`home`/`audit.jsonl`/`dashboard-sessions.json`.
+- In the unit tests, App keys enter the archive, and the archive is opaque
+  ciphertext.
+- The tests reject a wrong key and bit flips.
+- The tests need manifest digests with values; `Verify` checks the data.
+- The build fails without a key.
+- Tests record missing files; they do not omit them.
+- For hostile hive IDs, tests keep them inside the filename.
+- On both endpoints, handler tests return `403` for `read`, `read-write`,
+  `write`, and `viewer`. They also test the three config endpoints.
+- Handler tests return `412` with no key from any source and offer no download.
+- Handler tests check the `no-store` header and an `.enc` attachment.
+- Tests confirm that the backup succeeds and decrypts with a governor config key.
+- Tests return `412` after the owner clears the key.
+- Tests keep the key out of every response, `hive.yaml`, and stored config
+  struct.
+- `hubbackup.Extract` extracts both archives through one format and restore path.
+- A production spoke supplied the layout, file divergence, bead names, and sizes.
 
 **UNTESTED:**
 
-- The restore procedure above has **not** been executed against a live spoke.
-- No real backup was run against a user's hive; the endpoint was exercised
-  only against temporary directories in tests.
-- Browser download of a multi-MB archive was not exercised end-to-end in a
-  real browser.
+- The team has not run the restore procedure against a live spoke.
+- No real backup ran against a user's hive. Tests used temporary directories only.
+- Tests did not cover a multi-MB browser download in a real browser.
 
 ---
 
 ## Slack messaging
 
-The hub can send Slack DMs to a single user, to the owner of a hive, or to every
-user. Recipients are resolved from the **existing** `slack_id` contact field on
-each user record (`/data/saas/users/<GitHubUsername>.json`), which admins edit
-from the Users panel.
+The hub can send Slack DMs to one user, a hive owner, or every user. The
+service gets recipients from the **existing** `slack_id` field in each user
+record (`/data/saas/users/<GitHubUsername>.json`). Admins edit that field in
+the Users panel.
 
 ### Credential
 
@@ -632,12 +633,12 @@ The bot token is read from the environment with **no default**:
 |---|---|
 | `HIVE_HUB_SLACK_BOT_TOKEN` | key on the existing `hive-hub-secrets` Secret |
 
-It is deliberately a key on `hive-hub-secrets` rather than a new Secret, so it is
-already inside the DR-captured set (`hubbackup.DefaultHubSecrets`) and survives a
-restore. **The token must never be committed to this repository** — a previous
-leak required scrubbing the git history.
+The token is a key in `hive-hub-secrets`, not a new Secret. It therefore belongs
+to the DR-captured set (`hubbackup.DefaultHubSecrets`) and survives a restore.
+**Never commit the token to this repository.** A previous leak forced a git
+history scrub.
 
-Add it without disturbing the other keys:
+Add the key and keep the other keys:
 
 ```bash
 kubectl -n <hub-namespace> patch secret hive-hub-secrets \
@@ -674,22 +675,22 @@ Body: `{"message": "...", "dry_run": false, "confirm": "..."}`.
 
 ### Broadcast safety
 
-Broadcast reaches every user with a `slack_id` and cannot be recalled, so:
+A broadcast reaches every user with a `slack_id`. No caller can recall a
+broadcast:
 
-1. **Dry-run first.** `{"dry_run": true}` sends nothing and returns the recipient
-   count, the **names** of users who will be skipped, a message preview, and an
-   estimated duration.
-2. **Confirm explicitly.** A real broadcast requires `"confirm": "SEND TO ALL
-   USERS"` — a typed string, not a boolean, so no client can set it by accident.
-   Without it the request returns **409** and reports the blast radius.
-3. **Sending is paced and backgrounded.** Slack throttles `chat.postMessage` at
-   roughly 1/sec, so sends are spaced one second apart and run in a goroutine;
-   ~88 users takes about a minute and a half. The HTTP response returns
-   immediately with the estimate.
+1. **Dry-run first.** `{"dry_run": true}` sends nothing. It returns the recipient
+   count, the **names** it skips, a message preview, and an estimated duration.
+2. **Confirm explicitly.** A real broadcast needs `"confirm": "SEND TO ALL
+   USERS"`. The client must send this typed string; a boolean cannot trigger the
+   broadcast by accident. Without it the request returns **409** and reports the
+   blast radius.
+3. **Slack sends one message per second in a background goroutine.** Slack
+   throttles `chat.postMessage` at roughly 1/sec. A run for ~88 users takes
+   about a minute and a half. The HTTP response returns the estimate at once.
 
 ### Users without a Slack ID are skipped VISIBLY
 
-A user with no `slack_id` cannot be reached. Every response reports how many were
-skipped **and names them**, and the full skipped list is written to the hub log on
-a broadcast. Silent drops are not acceptable: "sent to 61" while 27 people never
-heard anything is worse than a clear failure.
+A user without a `slack_id` cannot receive a message. Each response reports the
+count and names omitted users. A broadcast writes the full list to the hub log.
+Silent drops are not acceptable: "sent to 61" while 27 people hear nothing is
+worse than a clear failure.
