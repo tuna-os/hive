@@ -6,10 +6,29 @@ Hive-specific questions those docs don't. If you just want the mechanics
 (branches, DCO, PR format), see [`CONTRIBUTING.md`](../CONTRIBUTING.md); for
 build/test commands, see [`docs/development.md`](development.md).
 
+## Before you start: fork scope
+
+This checkout is [`tuna-os/hive`](https://github.com/tuna-os/hive), a fork of
+[`hivecommons/hive`](https://github.com/hivecommons/hive) that runs the Tuna OS
+agent fleet. Read [About this fork](../FORK.md) before opening an issue or pull
+request: the fork keeps its local delta near zero and carries only
+Tuna OS-specific deployment, registry, organization, synchronization, and
+health-monitoring changes.
+
+- Send a Hive bug, feature, or change useful to any fork to the upstream
+  repository.
+- Send Tuna OS fleet configuration, deployment, fork-synchronization, or
+  `tools/hive-health/` changes to this repository.
+- Target `v4` for work in either repository. When scope is unclear, ask in the
+  issue before editing; do not bundle upstream synchronization with an unrelated
+  change.
+
 ## 1. Find something to work on
 
-- Browse the [issue tracker](https://github.com/hivecommons/hive/issues). Issues
-  labeled `documentation` and `help wanted` are good entry points; many
+- Start with the [Tuna OS issue tracker](https://github.com/tuna-os/hive/issues)
+  for fork-specific work, or the [upstream issue
+  tracker](https://github.com/hivecommons/hive/issues) for generic Hive work.
+  Issues labeled `documentation` and `help wanted` are good entry points; many
   `[guide]` doc-gap issues are small and self-contained.
 - Docs-only fixes (a wrong path, a dead link, a missing README) are the fastest
   way to land a first PR and learn the review flow.
