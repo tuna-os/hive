@@ -140,6 +140,38 @@ Neither the PR gate nor the cron runs `./test/...`: both enumerate
 `./pkg/... ./cmd/...` explicitly, and the integration suite additionally needs
 the `integration` build tag and a live hive, as described above.
 
+## JavaScript proxy and dashboard checks
+
+CI uses Node.js 22 for the JavaScript checks. Install Node.js 22 and npm before
+running these commands.
+
+The reverse-proxy tests use the lockfile and run from `src/proxy`:
+
+```bash
+cd src/proxy
+npm ci
+npm test
+```
+
+`npm test` executes every test file listed by the `test` script in
+[`src/proxy/package.json`](../src/proxy/package.json). The suite starts local
+mock services; it does not require a live Hive or dashboard deployment. A
+non-zero exit is a test failure, not a successful partial run.
+
+The dashboard is inline JavaScript rather than a separate browser-test
+application. CI checks both `dashboard/index.html` and the shipped
+`src/pkg/dashboard/static/index.html` for syntax errors and ESLint `no-undef`
+violations. Reproduce that check from the repository root:
+
+```bash
+(cd .github/scripts && npm ci --ignore-scripts --no-audit --no-fund)
+find dashboard src/pkg/dashboard/static -name '*.html' -print0 \
+  | xargs -0 --no-run-if-empty node .github/scripts/check-inline-js.js
+```
+
+The `.github/scripts` install is CI-only tooling; it does not install dashboard
+runtime dependencies.
+
 ## Format and lint expectations
 
 Run `gofmt` on Go files you edit:
