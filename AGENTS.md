@@ -11,10 +11,12 @@ deployed at [hive.tunaos.org](https://hive.tunaos.org) to run agents across
 the `tuna-os` organization. Default branch is `v4`, tracking upstream `v4`.
 
 Fork policy: keep the delta near zero and send generic changes upstream. The
-one deliberate delta is CI `runs-on:` values (`ubuntu-latest` /
-`ubuntu-24.04-arm` instead of upstream's `[self-hosted, hive]`), re-applied on
-every sync. Syncs are merges of `upstream/v4` with a merge commit — never a
-squash, which re-creates duplicated history.
+CI `runs-on:` mapping (`ubuntu-latest` / `ubuntu-24.04-arm` instead of
+upstream's `[self-hosted, hive]`) is deliberately fork-specific; other local
+commits and their dispositions are recorded in `FORK.md`. Tuna OS fleet
+tooling may stay here only when it is genuinely fork-specific. Syncs are
+merges of `upstream/v4` with a merge commit — never a squash, which re-creates
+duplicated history.
 
 ## Layout
 

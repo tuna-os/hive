@@ -16,19 +16,48 @@ The fork tracks the upstream `v4` branch. The goal is to carry **no** local
 patches beyond what is unavoidably org-specific, and to upstream anything that
 is not.
 
-Current delta against `hivecommons:v4` (after the 2026-09-05 sync in #30):
+Recorded fork-side delta (last upstream comparison: 2026-09-24, 1,273 commits behind and 37 ahead; the 2026-09-05 sync landed in #30):
 
 | Commit | Change | Disposition |
 | --- | --- | --- |
-| `4955b9f` | Publish images to `ghcr.io/${{ github.repository_owner }}` instead of the hardcoded upstream org | Generic to any fork — should be upstreamed, tracked in [#2](https://github.com/tuna-os/hive/issues/2) and [#10](https://github.com/tuna-os/hive/issues/10) |
+| `4955b9f` | Publish images to `ghcr.io/${{ github.repository_owner }}` instead of the hardcoded upstream org | Generic to any fork — upstream candidate; tracked in [#2](https://github.com/tuna-os/hive/issues/2) and [#10](https://github.com/tuna-os/hive/issues/10) |
 | `1433a16` | Run CI on GitHub-hosted runners instead of upstream's self-hosted fleet | Fork-specific: upstream's runner labels do not exist here |
 | `2f6421c` | Point the PR Verifier at the `pr-verifier` image's current org (#29) | Generic — upstream candidate |
 | `3b4fc73`, `01f9ef8` | ACMM evaluation: report "GitHub did not answer" as unknown, not as a missing file (#32) | Generic — upstream candidate |
-| `aff6235` | Agent onboarding files at the repository root (`AGENTS.md`, `CLAUDE.md`, editor and tool entrypoints) (#34) | Generic — upstream candidate |
-| `f29a791` | `governor.acmm.repo_roots`: probe a configured sub-root so `src/`-layout repos are seen (#35) | Generic — upstream candidate |
-| (this PR) | `tools/hive-health/` + `hive-health.yml`: hourly read-only probe of the live Tuna OS Hives, one self-closing `[operations]` issue per failing Hive | Fork-specific: it watches this org's deployments. Kept outside `src/` so it never conflicts with a sync |
+| `77b0c5d` | Specify custom Tuna OS agent personas (#1) | Fork-specific: fleet policy |
+| `5a53947` | Document fork scope, delta, and upstream routing | Fork-specific: this fork's policy |
+| `14aa61a` | Add the Tuna OS observability assessment and stack guidelines | Fork-specific: fleet operations |
+| `710064d`, `03782ee` | Make `needs-human` idempotent and exclude dependency bots from escalation observations | Generic — upstream candidate |
+| `aff6235` | Add agent onboarding files at the repository root (#34) | Generic — upstream candidate |
+| `f29a791` | Probe a configured ACMM sub-root so `src/`-layout repos are seen (#35) | Generic — upstream candidate |
+| `cd58800` | Refresh fork facts after the upstream sync | Fork-specific: this fork's policy |
+| `9ee77c9` | Adopt the shared Simplified Technical English check (#36) | Generic — upstream candidate |
+| `4664f33`, `654dd71`, `0821731`, `ed726ae` | Add and harden the Muse Code rotation backend (#48, #50, #52, #53) | Generic feature — upstream candidate |
+| `e841e7f` | Reject an unsubstituted repository-name prompt placeholder (#54) | Generic — upstream candidate |
+| `1a1aef9` | Make `github-copilot` a first-class rotation backend (#14) | Generic feature — upstream candidate |
+| `b34178c` | Link the Tuna OS fleet hosts from README and FORK.md (#3, #13) | Fork-specific: deployment documentation |
+| `ec8ce36` | Add the hourly read-only `hive-health` probe and self-closing operations issues (#77) | Fork-specific: it watches Tuna OS deployments |
+| `4cd9346` | Build the fork-only v6 image for the Talos fleet | Fork-specific: deployment image |
+| `9fa426f` | Wait for contributor disconnect cleanup in the lease-restart test (#104) | Generic — upstream candidate |
+| `500465f` | Require positive CI evidence before v4 merge gating (#96) | Generic — upstream candidate |
+| `3ce31fd` | Protect API-proxy event logs (#75) | Generic security fix — upstream candidate |
+| `96da39d` | Resolve dashboard and Discord npm audit CVEs (#130) | Generic security fix — upstream candidate |
+| `90da6b0` | Link orphaned docs and document `ttyd-hive.service` (#45) | Generic documentation — upstream candidate |
+| `6cb4612` | Cancel superseded CI runs with concurrency groups (#140) | Generic — upstream candidate |
+| `bd70e62` | Restrict prose-workflow token permissions (#114) | Generic security hardening — upstream candidate |
+| `3a66546` | Document Tuna OS compute-contribution entry points (#79) | Fork-specific: deployment/community operations |
+| `1ca0af5` | Hold repo-wide CI failures for explicit escalation (#51) | Generic — upstream candidate |
 
-Regenerate this table with `git log --oneline --no-merges hivecommons/v4..v4`.
+The table lists commits added locally after the last recorded upstream sync and
+the fork-specific commits already identified in the policy record. Verify each
+generic candidate against upstream before the next sync; do not silently grow
+the fork delta.
+
+Regenerate the candidate list after every upstream sync with:
+
+```sh
+git log --oneline --no-merges hivecommons/v4..v4
+```
 
 Every entry in that table is a liability, not an asset: a local patch has to be
 rebased on every sync, and it grows a merge-conflict surface as upstream moves.
