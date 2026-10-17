@@ -10,11 +10,10 @@ The `tuna-os` fork of [hivecommons/hive](https://github.com/hivecommons/hive),
 deployed at [hive.tunaos.org](https://hive.tunaos.org) to run agents across
 the `tuna-os` organization. Default branch is `v4`, tracking upstream `v4`.
 
-Fork policy: keep the delta near zero and send generic changes upstream. The
-one deliberate delta is CI `runs-on:` values (`ubuntu-latest` /
-`ubuntu-24.04-arm` instead of upstream's `[self-hosted, hive]`), re-applied on
-every sync. Syncs are merges of `upstream/v4` with a merge commit — never a
-squash, which re-creates duplicated history.
+Fork policy: keep the delta near zero and send generic changes upstream. Fork-specific changes are limited to org deployment, CI, health probes, and documentation; the complete delta ledger and disposition for each local commit lives in [FORK.md](FORK.md). Re-apply those changes after every upstream merge.
+Syncs are merges of `upstream/v4` with a merge commit — never a squash, which
+re-creates duplicated history. Keep the sync decision, drift budget, and owner
+explicit in [issue #18](https://github.com/tuna-os/hive/issues/18).
 
 ## Layout
 
