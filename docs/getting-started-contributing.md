@@ -19,6 +19,9 @@ health-monitoring changes.
   repository.
 - Send Tuna OS fleet configuration, deployment, fork-synchronization, or
   `tools/hive-health/` changes to this repository.
+- Expect fork CI to use GitHub-hosted `ubuntu-latest` and `ubuntu-24.04-arm`
+  runners rather than upstream `[self-hosted, hive]`; maintainers reapply this
+  fork-only runner delta after each upstream sync.
 - Target `v4` for work in either repository. When scope is unclear, ask in the
   issue before editing; do not bundle upstream synchronization with an unrelated
   change.
