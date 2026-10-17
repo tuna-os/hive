@@ -161,6 +161,11 @@ cd hive
 bin/hive-podman-preflight.sh
 bin/hive-podman-preflight-ids.sh
 
+# The gateway needs netavark plus aardvark-dns for the `hive` container name.
+# Expect: netavark. The final gateway health check below is still required:
+# it proves DNS resolution works, not only that the backend is selected.
+podman info --format '{{.Host.NetworkBackend}}'
+
 CONF=~/.config/hive                       # rootful: CONF=/etc/hive
 mkdir -p "$CONF/secrets" && chmod 750 "$CONF/secrets"
 podman unshare chown -R 0:1002 "$CONF/secrets"    # rootful: chgrp -R 1002 "$CONF/secrets"
