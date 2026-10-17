@@ -54,6 +54,24 @@ gh api repos/tuna-os/hive/compare/hivecommons:v4...tuna-os:v4 \
   --jq '{ahead: .ahead_by, behind: .behind_by}'
 ```
 
+### Maintainer sync checklist
+
+Until automated sync is adopted, treat each sync as a maintainer change to
+`v4`, separate from feature work:
+
+1. Measure the upstream/fork `ahead` and `behind` counts before deciding what
+   needs to be carried.
+2. Merge `upstream/v4` into the fork with a merge commit. Never squash the sync;
+   squashing recreates duplicated history and makes later drift harder to read.
+3. Resolve conflicts by preserving only deliberate fork deltas: GitHub-hosted
+   runner labels and the fork-only `tools/hive-health/` probe. Do not carry an
+   unrelated local feature through the sync.
+4. Run the `v4` build, test, and verification gates, then refresh the delta table
+   above with each remaining commit's disposition.
+5. Send generic fixes to `hivecommons/hive`; keep only Tuna OS deployment,
+   registry, organization, and sync behavior here.
+
+
 ## Where to send things
 
 | You have | Send it |
