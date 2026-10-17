@@ -337,8 +337,9 @@ func TestDiagnoseStuckLoginNonClaudeBackendStaysGeneric(t *testing.T) {
 
 	got := m.diagnoseStuckLogin(agent)
 	// Copilot does not split auth across two files, so a claude-shaped
-	// diagnosis would be fabricated.
-	if strings.Contains(got, "4596") || strings.Contains(got, "oauthAccount") {
+	// diagnosis would be fabricated. Match the complete issue reference:
+	// HOME includes a random numeric suffix that can contain "4596".
+	if strings.Contains(got, "hivecommons/hive#4596") || strings.Contains(got, "oauthAccount") {
 		t.Errorf("non-claude backend must not get the claude diagnosis:\n%s", got)
 	}
 	if !strings.Contains(got, "copilot") {

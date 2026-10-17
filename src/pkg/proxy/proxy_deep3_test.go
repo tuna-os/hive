@@ -278,7 +278,7 @@ func TestProxyHTTPResponseWriteError(t *testing.T) {
 	clientConn, proxyClient := net.Pipe()
 	upstreamConn, proxyUpstream := net.Pipe()
 
-	go p.proxyHTTP(proxyClient, proxyUpstream, "scanner", agent.ModeAdvisory, agent.AgentCapabilities{})
+	returned := runProxyHTTP(p, proxyClient, proxyUpstream)
 
 	go func() {
 		fmt.Fprintf(clientConn, "GET /repos/org/repo HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
@@ -298,7 +298,11 @@ func TestProxyHTTPResponseWriteError(t *testing.T) {
 		upstreamConn.Close()
 	}()
 
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxyHTTP did not return after the client closed")
+	}
 }
 
 // ---------- forwardToInference: flusher path ----------
