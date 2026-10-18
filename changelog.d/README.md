@@ -36,12 +36,12 @@ Example — a complete fragment, `changelog.d/fixed-1234-relay-timeout.md`:
 - The contributor relay no longer times out during long tasks ([#1234](https://github.com/kubestellar/hive/issues/1234)). Previously ...
 ```
 
-## Transition (until 2026-09-09)
+## Permanent rule
 
-Entries already sitting under `## Unreleased` — and PRs in flight that edit it
-directly — keep working: the compiler merges fragments *into* whatever is
-there, and the fragment guard accepts direct `CHANGELOG.md` edits until
-2026-09-09. New PRs should write fragments; that is the whole point.
+All new user-visible entries go in a fragment under `changelog.d/`. Direct edits
+to `CHANGELOG.md`'s `## Unreleased` section are rejected by
+`changelog-fragment-guard`; release automation compiles accepted fragments into
+that section. Existing entries remain in `CHANGELOG.md` until release.
 
 This `README.md` is never treated as a fragment and keeps the directory alive
 between releases.
