@@ -78,9 +78,8 @@ is nothing new — it is the existing changelog convention, now load-bearing:
 - The filename's category prefix picks the subsection your entry is compiled
   into (`added-` → `### Added`, and so on for `changed`/`deprecated`/`fixed`/
   `security`), and the subsections drive the bump exactly as they always
-  have. Direct `## Unreleased` edits still compose with fragments during the
-  transition (#5675), but every PR editing that one shared heading is what
-  made unrelated PRs conflict, so prefer fragments.
+have. Direct edits to `CHANGELOG.md`'s `## Unreleased` section are rejected by
+the `changelog-fragment-guard`; use a fragment instead.
 - If your PR carries **no** fragment (and no `CHANGELOG.md` edit), it
   contributes to whatever release fires next but does not by itself trigger
   one — and if `Unreleased` and `changelog.d/` are otherwise empty, no
