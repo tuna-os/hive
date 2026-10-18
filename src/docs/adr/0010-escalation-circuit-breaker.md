@@ -39,13 +39,15 @@ not agent authors: their red PRs are not fix loops to break.
 
 A required check failing on every conclusive open PR in a repository is treated
 as a shared CI failure when the evidence includes both a Hive-authored PR and
-an independently authored control. Hive removes that check from each PR's
-escalation observation. If no PR-specific failures remain, the observation is
+an independently human-authored control. Anonymous observations and bot
+accounts — including dependency bots — cannot provide that independent
+evidence. Hive removes a confirmed shared check from each agent PR's escalation
+observation. If no PR-specific failures remain, the observation is
 inconclusive: it neither consumes the PR's fix budget nor clears its history.
 The operator log names the repository and shared check so alerting can target
 the underlying condition instead of labeling every affected PR `needs-human`.
-A green control or a failure observed only on Hive-authored changes keeps the
-normal per-PR behavior.
+A green control or a failure observed only on Hive-authored or bot changes
+keeps the normal per-PR behavior.
 
 ## Consequences
 
