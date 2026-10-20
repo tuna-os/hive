@@ -267,7 +267,7 @@ func TestSeedIsWritableByNobody(t *testing.T) {
 // Layer-metadata level (see TestProvenanceReportsSeedWritableOutsideKubernetes
 // in pkg/dashboard for the end-to-end HTTP version). Outside Kubernetes there
 // is no ConfigMap and no RBAC to omit: LayerSeed is RuntimeConfigFile, a plain
-// file the spoke rewrites on every save (saveLocked, config.go:5141). Reporting
+// file the spoke rewrites on every save (saveLocked in persist.go). Reporting
 // writable=false / writer=nobody / path=ConfigMap there sends an operator
 // looking for something that does not exist while hiding the file that
 // actually decides the value.

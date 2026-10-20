@@ -140,7 +140,7 @@ func TestProvenanceReportsSeedUnwritable(t *testing.T) {
 // TestProvenanceReportsSeedWritableOutsideKubernetes is the #4971 regression
 // test: on a non-Kubernetes hive (Docker/podman/LXC) there is no ConfigMap and
 // no RBAC to omit — LayerSeed is RuntimeConfigFile, a plain file the spoke
-// rewrites on every save (saveLocked, config.go:5141) and the entrypoint
+// rewrites on every save (saveLocked in config/persist.go) and the entrypoint
 // restores over the boot config on every restart (entrypoint.sh:267-311). The
 // report must say so: writable=true, writer names the spoke, and the path
 // names the real file — never the ConfigMap, which does not exist here.

@@ -127,10 +127,10 @@ func (l Layer) String() string {
 // GitHub Enterprise incident.
 //
 // LayerSeed is environment-aware, gated on the same IsKubernetesPod() the
-// layering itself already uses (see config.go). In Kubernetes the seed really
+// layering itself already uses (see persist.go). In Kubernetes the seed really
 // is the ConfigMap. Outside Kubernetes there is no ConfigMap at all — the seed
 // is RuntimeConfigFile, a plain file on the PVC that Save() rewrites on every
-// dashboard save (see saveLocked, config.go:5141) — so naming the ConfigMap
+// dashboard save (see persist.go:saveLocked) — so naming the ConfigMap
 // there points an operator at a layer that does not exist (#4971).
 func (l Layer) Path() string {
 	switch l {
@@ -161,8 +161,8 @@ func (l Layer) Path() string {
 // happened four times in a row during the GHE incident.
 //
 // Outside Kubernetes there is no ConfigMap and no RBAC to omit — LayerSeed is
-// RuntimeConfigFile, which the spoke rewrites on every save (saveLocked,
-// config.go:5141) and the entrypoint restores over the boot config on every
+// RuntimeConfigFile, which the spoke rewrites on every save (saveLocked in
+// persist.go) and the entrypoint restores over the boot config on every
 // restart (entrypoint.sh:267-311, Docker/LXC branch). Reporting "nobody" there
 // is the same misdirection in the opposite direction: it hides the one file
 // that actually decides the value (#4971).
