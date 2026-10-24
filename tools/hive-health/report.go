@@ -113,6 +113,10 @@ type HiveReport struct {
 	Agents       []AgentReport  `json:"agents"`
 	Queue        *QueueSnapshot `json:"queue,omitempty"`
 	RecentOutput []OutputItem   `json:"recent_output,omitempty"`
+	// Models is what the Hive's own discovery offered per backend at probe
+	// time. It is carried in the report so the NEXT run can tell a model
+	// that is new from one that was always there (see models.go).
+	Models []BackendModels `json:"models,omitempty"`
 	// Fingerprint identifies the SET of failing checks, so the issue sync can
 	// tell "still failing the same way" from "failing differently".
 	Fingerprint string `json:"fingerprint"`
