@@ -1,0 +1,470 @@
+<!doctype html>
+<!-- TunaOS hub-front index source. Publish with publish-hub.py; keep /api and /login on the hub backend. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TunaOS Hive Constellation</title>
+<style>
+  :root{
+    --deep:#04161f; --abyss:#020d13; --surface:#0a2430; --line:#12394a;
+    --foam:#e8f6f8; --mist:#8fb3bd;
+    --tuna:#2fb6c4;      /* tuna-fin cyan */
+    --coral:#f2795b;     /* reef coral */
+    --kelp:#3fbf8f;
+  }
+  *{box-sizing:border-box}
+  /* The gradient lives on body, but body only spans its content — anything
+     below (rubber-band scroll, a short page on a tall screen) shows the UA's
+     white. Painting html with the base colour backstops it. */
+  html{background:#020d13}
+  body{
+    margin:0;background:
+      radial-gradient(1100px 600px at 15% -10%, #0b3446 0%, transparent 60%),
+      radial-gradient(900px 500px at 90% 0%, #0d3a4a 0%, transparent 55%),
+      linear-gradient(180deg,var(--deep) 0%, var(--abyss) 100%);
+    background-attachment:fixed;
+    color:var(--foam);
+    font:15px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    min-height:100vh;
+  }
+  .wrap{max-width:860px;margin:0 auto;padding:64px 24px 80px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:8px}
+  .mark{font-size:34px;line-height:1}
+  h1{margin:0;font-size:26px;letter-spacing:-.01em;font-weight:750}
+  .tag{color:var(--mist);margin:6px 0 40px;font-size:15px;max-width:62ch}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.11em;color:var(--mist);
+     font-weight:700;margin:44px 0 14px}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  .card{
+    display:block;text-decoration:none;color:inherit;
+    background:linear-gradient(180deg,var(--surface),#07202b);
+    border:1px solid var(--line);border-radius:12px;padding:18px 20px;
+    transition:border-color .15s, transform .15s;
+  }
+  .card:hover{border-color:var(--tuna);transform:translateY(-2px)}
+  .card h3{margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px}
+  .card p{margin:0;color:var(--mist);font-size:13.5px}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+  .d-tuna{background:var(--tuna)} .d-coral{background:var(--coral)}
+  .meta{margin-top:12px;font-size:12px;color:var(--mist);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .note{
+    border:1px solid var(--line);border-left:3px solid var(--kelp);
+    background:#07202b99;border-radius:10px;padding:16px 20px;margin-top:14px;
+  }
+  .note p{margin:0 0 10px;color:var(--mist);font-size:14px}
+  .note p:last-child{margin:0}
+  a.link{color:var(--tuna);text-decoration:none;border-bottom:1px solid #2fb6c455}
+  a.link:hover{border-bottom-color:var(--tuna)}
+  footer{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);
+         color:var(--mist);font-size:12.5px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+       background:#07202b;border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+  .fresh{font-size:12px;letter-spacing:0;text-transform:none;color:var(--mist);font-weight:400}
+  .pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--kelp);margin-right:6px;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  .strip{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-bottom:16px}
+  .spoke{background:#07202b;border:1px solid var(--line);border-radius:10px;padding:12px 16px;font-size:13px}
+  .spoke h3{margin:0 0 2px;font-size:14px;display:flex;align-items:center;gap:8px}
+  .spoke .sub{color:var(--mist);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .spoke .agents{color:var(--mist);font-size:12px;margin-top:6px}
+  .spoke .agents b{color:var(--foam);font-weight:600}
+  .d-kelp{background:var(--kelp)}
+  .filters{display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 14px}
+  .filters button{background:transparent;border:1px solid var(--line);border-radius:999px;color:var(--mist);font-size:12.5px;padding:5px 14px;cursor:pointer;font-family:inherit}
+  .filters button:hover{border-color:var(--tuna);color:var(--foam)}
+  .filters button.on{background:var(--tuna);border-color:var(--tuna);color:#04222b;font-weight:700}
+  .feed{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
+  .feed li{display:flex;gap:12px;padding:10px 4px;border-bottom:1px solid #0e2f3d;font-size:13.5px;align-items:baseline}
+  .feed li:last-child{border-bottom:0}
+  .feed li.fresh-in{background:#0d3a2a66;border-radius:6px}
+  .t{flex:none;width:64px;color:var(--mist);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .kind{flex:none;width:74px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+  .k-bead{color:var(--kelp)} .k-issue{color:var(--tuna)} .k-pr{color:var(--coral)}
+  .k-comment{color:var(--mist)} .k-merge{color:var(--kelp)} .k-review{color:var(--mist)}
+  .body{min-width:0}
+  .body .title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .body .sub{color:var(--mist);font-size:12px;margin-top:1px}
+  .pill{display:inline-block;font-size:11px;border:1px solid var(--line);border-radius:999px;padding:0 8px;margin-left:8px;color:var(--mist)}
+  .pill.closed{color:var(--kelp);border-color:var(--kelp)}
+  .feed a{color:inherit;text-decoration:none}
+  .feed a:hover .title{color:var(--tuna)}
+  .feed-empty{color:var(--mist);font-size:13.5px;padding:12px 4px}
+  @media (prefers-reduced-motion:reduce){.card{transition:none}.pulse{animation:none}}
+  .wrap,.grid,.card,.contribute-band,.contribute-box{min-width:0}
+  .spoke .sub,.spoke .agents,.feed .sub{overflow-wrap:anywhere}
+  .body .title{white-space:normal;overflow-wrap:anywhere}
+  .feed .body{flex:1}
+  button:focus-visible,a:focus-visible,select:focus-visible{outline:2px solid var(--tuna);outline-offset:3px}
+  .btn-copy:disabled{opacity:.5;cursor:wait}
+  @media(max-width:540px){.wrap{padding:28px 16px}.contribute-band{padding:20px 16px}.feed li{gap:6px}.t{width:44px}.kind{width:56px}.contribute-box-head{gap:8px}}
+
+  /* Contributor CTA */
+  .contribute-band{
+    background:linear-gradient(180deg,#0a2a38 0%,#061a24 100%);
+    border:1px solid var(--tuna);
+    box-shadow:0 0 24px #2fb6c422;
+    border-radius:14px;
+    padding:24px 26px;
+    margin:24px 0 36px;
+  }
+  .contribute-badge{
+    display:inline-flex;align-items:center;
+    background:#2fb6c422;border:1px solid #2fb6c466;border-radius:999px;
+    color:var(--tuna);font-size:11.5px;font-weight:700;letter-spacing:.08em;
+    text-transform:uppercase;padding:3px 10px;margin-bottom:10px;
+  }
+  .contribute-band h2{
+    font-size:20px;text-transform:none;letter-spacing:-.01em;
+    color:var(--foam);margin:0 0 6px;font-weight:750;
+  }
+  .contribute-lead{
+    color:var(--mist);font-size:14px;line-height:1.55;margin:0 0 16px;max-width:64ch;
+  }
+  .contribute-controls{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .contribute-controls label{
+    font-size:12px;color:var(--mist);display:flex;flex-direction:column;gap:5px;
+  }
+  .contribute-controls select{
+    background:#04161f;border:1px solid var(--line);border-radius:6px;
+    color:var(--foam);font:inherit;font-size:13px;padding:6px 10px;min-width:160px;
+  }
+  .contribute-controls select:focus{outline:none;border-color:var(--tuna)}
+  .contribute-box{
+    background:#020d13;border:1px solid var(--line);border-radius:8px;
+    overflow:hidden;margin-top:10px;
+  }
+  .contribute-box-head{
+    display:flex;justify-content:space-between;align-items:center;
+    background:#07202b;padding:7px 12px;font-size:12px;color:var(--mist);
+    border-bottom:1px solid var(--line);
+  }
+  .btn-copy{
+    background:#2fb6c422;border:1px solid #2fb6c455;color:var(--foam);
+    font:inherit;font-size:11.5px;padding:3px 10px;border-radius:5px;cursor:pointer;
+  }
+  .btn-copy:hover{background:var(--tuna);color:#020d13}
+  .contribute-box pre{
+    margin:0;padding:12px;background:transparent;border:0;border-radius:0;
+    overflow-x:auto;font-size:12.5px;line-height:1.5;color:var(--foam);
+  }
+  .contribute-box code{
+    background:transparent;border:0;padding:0;font-size:inherit;color:inherit;white-space:pre;
+  }
+  .contribute-foot{
+    display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;
+    gap:10px;margin-top:12px;font-size:12px;color:var(--mist);
+  }
+  .contribute-links a{margin-left:6px}
+
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="mark" aria-hidden="true">🐟</span>
+    <h1>TunaOS Hive Constellation</h1>
+  </header>
+  <p class="tag">
+    <a class="link" href="https://github.com/hivecommons/hive">Hive</a> coordinates
+    AI coding agents working on the <a class="link" href="https://github.com/tuna-os">TunaOS</a>
+    backlog. Our hub and hives run on Kubernetes in AWS, on Talos Linux nodes.
+    The dashboards are private; contributing compute is open to the community.
+  </p>
+
+  
+  <section class="contribute-band" id="contribute">
+    <div class="contribute-header">
+      <div class="contribute-badge"><span class="pulse"></span>Contribute Compute</div>
+      <h2>Lend your AI CLI to TunaOS</h2>
+      <p class="contribute-lead">
+        Share your AI coding-agent capacity with <strong>School</strong> and <strong>Reef</strong>.
+        One <strong>ClankeR</strong> relay runs one task at a time and alternates eligible hives after each task.
+        If one hive is unavailable or has no work, the other can continue.
+      </p>
+    </div>
+
+    <div class="contribute-controls">
+      <label>Your Agent CLI
+        <select id="cta-backend">
+          <option value="claude">Claude Code</option>
+          <option value="copilot">GitHub Copilot</option>
+          <option value="codex">Codex</option>
+          <option value="goose">Block Goose</option>
+          <option value="gemini">Gemini CLI</option>
+          <option value="bob">IBM Bob</option>
+          <option value="pi">Pi</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="contribute-box">
+      <div class="contribute-box-head">
+        <span>Start or resume — Bash on Linux, macOS, or Windows Git Bash</span>
+        <button type="button" class="btn-copy" id="cta-copy-btn" disabled>Copy command</button>
+      </div>
+      <pre><code id="cta-code">Loading verified setup bundle…</code></pre>
+    </div>
+    <p class="contribute-lead">Before starting: install <a class="link" href="https://git-scm.com/downloads">Git</a>,
+      <a class="link" href="https://cli.github.com/">GitHub CLI (gh)</a>, <a class="link" href="https://jqlang.org/download/">jq</a>,
+      curl, and a running <a class="link" href="https://docs.docker.com/get-started/get-docker/">Docker</a> or
+      <a class="link" href="https://podman.io/docs/installation">Podman</a>. Install and sign in to your selected agent CLI.
+      The wrapper reuses working <code>just</code>, or installs it into <code>~/.local/bin</code>
+      without sudo after verifying the pinned installer. Errors stop setup before the relay starts.</p>
+    <details><summary>What runs, what it costs, and how to stop</summary>
+      <p>Your chosen provider bills your usage or consumes your subscription quota. Agents receive work from the hives,
+        run inside a container, and may change repositories according to their granted trust tier.
+        Container mode is a boundary, not a guarantee against all malicious work.
+        GitHub and agent credentials are staged locally for the relay; task-scoped credentials can also be supplied by the hive.</p>
+      <p>Keep the terminal open. <strong>Ctrl+C stops the relay and removes its container.</strong>
+        Existing registrations are reused; other saved hive tokens are preserved but are not selected for this TunaOS session.
+        No system service is installed.</p>
+      <pre><code id="cta-manage-code"></code></pre>
+      <p>To remove local credentials, stop every relay using them, then remove only the TunaOS entries from
+        <code>~/.config/hive/contributor.env</code>. Remove the entire directory only if no other Hive setup uses it.
+        Local removal does not revoke server-side registration. Ask the hive operator to revoke access if needed.</p>
+    </details>
+    <div class="contribute-foot">
+      <span>Already registered on another machine? <a class="link" href="#move" id="toggle-move">Show move command</a></span>
+      <span class="contribute-links">
+        Detailed guides:
+        <a class="link" href="https://school.tunaos.org/contribute">school</a> · 
+        <a class="link" href="https://reef.tunaos.org/contribute">reef</a>
+      </span>
+    </div>
+    <div id="cta-move-box" class="contribute-box" style="display:none;margin-top:10px">
+      <div class="contribute-box-head">
+        <span>Move identity — rotates tokens and disconnects your old machine after confirmation</span>
+        <button type="button" class="btn-copy" id="cta-copy-move-btn" disabled>Copy move command</button>
+      </div>
+      <pre><code id="cta-move-code"></code></pre>
+    </div>
+  </section>
+
+  <h2>Hives</h2>
+  <div class="grid">
+    <a class="card" href="https://school.tunaos.org">
+      <h3><span class="dot d-tuna"></span>school</h3>
+      <p>The operating system — bootable container images, the BuildStream desktop
+         build, installers, bootc tooling, branding, and OS package publishing.</p>
+      <div class="meta">school.tunaos.org</div>
+    </a>
+    <a class="card" href="https://reef.tunaos.org">
+      <h3><span class="dot d-coral"></span>reef</h3>
+      <p>Applications and their distribution — GTK/libadwaita and Rust desktop
+         apps, editors, VM and terminal tools, app indexes and Flatpak distribution.</p>
+      <div class="meta">reef.tunaos.org</div>
+    </a>
+  </div>
+  <p class="tag"><code>hive.tunaos.org</code> is another hostname for School, not a third hive.
+    Personal hives may appear in the fleet activity below; they are not part of this two-hive contribution setup.</p>
+
+  <h2>Live activity <span id="feed-freshness" class="fresh"></span></h2>
+  <div id="spoke-strip" class="strip" aria-live="off"></div>
+  <div id="feed-filters" class="filters" role="group" aria-label="Filter activity">
+    <button data-f="all" class="on">All</button><button data-f="bead">Beads</button><button data-f="issue">Issues</button><button data-f="pr">PRs</button><button data-f="comment">Comments</button><button data-f="merge">Merges</button>
+  </div>
+  <div id="feed-note" class="note" hidden></div>
+  <ol id="feed" class="feed"></ol>
+
+  <h2>Want a hive for your project?</h2>
+  <div class="note">
+    <p>
+      This hub is private to tuna-os and does not host hives for other projects.
+    </p>
+    <p>
+      Hive is an open-source project maintained by
+      <a class="link" href="https://github.com/hivecommons/hive">HiveCommons</a> (co-maintained by TunaOS).
+      To ask about running one — hosted or self-hosted — go to
+      <a class="link" href="https://github.com/hivecommons/hive">github.com/hivecommons/hive</a>.
+    </p>
+  </div>
+
+  <h2>Registry</h2>
+  <div class="note">
+    <p>
+      Spokes register themselves by heartbeat. The live registry is served at
+      <code>/api/registry</code> and is what this page describes.
+    </p>
+  </div>
+
+  <footer>
+    Running <a class="link" href="https://github.com/hivecommons/hive">hivecommons/hive</a>
+    in hub mode. Co-maintained by TunaOS and HiveCommons.
+  </footer>
+
+</div>
+<script>
+(function(){
+  "use strict";
+  var feed=document.getElementById('feed'), strip=document.getElementById('spoke-strip'),
+      fresh=document.getElementById('feed-freshness'), note=document.getElementById('feed-note'),
+      filterBox=document.getElementById('feed-filters'),
+      filter='all', seen={}, timer=null;
+  var DOTS={school:'d-tuna',reef:'d-coral',hanthor:'d-kelp'};
+  function ago(ts){
+    var s=Math.max(0,(Date.now()-new Date(ts).getTime())/1000);
+    if(s<60) return Math.floor(s)+'s';
+    if(s<3600) return Math.floor(s/60)+'m';
+    if(s<86400) return Math.floor(s/3600)+'h';
+    return Math.floor(s/86400)+'d';
+  }
+  function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+  function eventsOf(d){
+    var ev=[];
+    (d.beads||[]).forEach(function(b){
+      ev.push({t:b.updated,kind:'bead',spoke:b.spoke,agent:b.agent,title:b.title,
+        sub:(b.type||'bead')+' · '+b.status,id:'bead:'+b.spoke+':'+b.id,status:b.status});
+    });
+    var reg=(d.registry&&d.registry.hives)||[];
+    reg.forEach(function(h){
+      (h.repoActivity||[]).forEach(function(r){
+        [['issues','issue'],['prs','pr'],['comments','comment'],['merges','merge'],['reviews','review']].forEach(function(pair){
+          var src=pair[0],kind=pair[1],v=r[src];
+          if(!v||!(v.count>0)||!v.newestAt) return;
+          var agents=(r.agents||[]).map(function(a){return a.agent;}).slice(0,3).join(', ');
+          ev.push({t:v.newestAt,kind:kind,spoke:null,hiveId:h.id,repo:r.repo,count:v.count,
+            title:v.count+' '+src+' in '+r.repo,
+            sub:(agents?agents+' · ':'')+'newest '+ago(v.newestAt)+' ago',
+            url:'https://github.com/'+(r.repo.indexOf('/')===-1?(h.org||'tuna-os')+'/':'')+r.repo,id:kind+':'+h.id+':'+r.repo});
+        });
+      });
+    });
+    ev.sort(function(a,b){return new Date(b.t)-new Date(a.t);});
+    return ev.slice(0,120);
+  }
+  function renderStrip(d){
+    strip.textContent='';
+    (d.spokes||[]).forEach(function(s){
+      var working=(s.agents||[]).filter(function(a){return !a.paused;}).map(function(a){return a.name;});
+      var paused=(s.agents||[]).filter(function(a){return a.paused;}).map(function(a){return a.name;});
+      var box=el('div','spoke');
+      var h=el('h3'); h.appendChild(el('span','dot '+(DOTS[s.spoke]||'d-tuna')));
+      h.appendChild(document.createTextNode(s.spoke)); box.appendChild(h);
+      box.appendChild(el('div','sub','L'+(s.acmmLevel==null?'?':s.acmmLevel)+' · '+(s.governorMode||'—')+' · '+(s.hiveId||'')));
+      var a=el('div','agents');
+      a.appendChild(el('b',null,String(working.length)+' working'));
+      a.appendChild(document.createTextNode(' · '+paused.length+' paused'));
+      if(working.length) a.appendChild(el('div',null,working.slice(0,6).join(', ')+(working.length>6?'…':'')));
+      box.appendChild(a); strip.appendChild(box);
+    });
+    if(!(d.spokes||[]).length) strip.appendChild(el('div','feed-empty','No spoke data in this snapshot.'));
+  }
+  function renderFeed(d){
+    feed.textContent='';
+    var gaps=[];
+    if(!d.registry) gaps.push('repo activity (hub registry unreachable this run)');
+    if(gaps.length){note.hidden=false;note.textContent='';note.appendChild(el('p',null,'Missing this run: '+gaps.join(', ')+'. Beads and spoke state below are still live.'));}
+    else note.hidden=true;
+    var list=eventsOf(d).filter(function(e){return filter==='all'||e.kind===filter;});
+    if(!list.length){feed.appendChild(el('div','feed-empty','Nothing in this view yet.'));return;}
+    list.forEach(function(e){
+      var li=el('li'), key=e.id||(e.kind+e.t+e.title);
+      if(!seen[key]){seen[key]=1;li.className='fresh-in';}
+      li.appendChild(el('span','t',ago(e.t)+' ago'));
+      li.appendChild(el('span','kind k-'+e.kind,e.kind==='pr'?'PR':e.kind));
+      var body=el('span','body'), title=el('span','title',e.title);
+      if(e.url){var a=el('a');a.href=e.url;a.rel='noreferrer';a.appendChild(title);body.appendChild(a);}
+      else body.appendChild(title);
+      var sub=e.spoke?((e.agent?e.agent+' · ':'')+e.spoke+(e.sub?' · '+e.sub:e.sub||'')):(e.sub||'');
+      if(e.status&&e.kind==='bead'){var p=el('span','pill'+(e.status==='closed'?' closed':''),e.status);body.appendChild(p);}
+      body.appendChild(el('div','sub',sub));
+      li.appendChild(body); feed.appendChild(li);
+    });
+  }
+  function poll(){
+    fetch('activity.json',{cache:'no-store'}).then(function(r){
+      if(!r.ok) throw 0; return r.json();
+    }).then(function(d){
+      renderStrip(d); renderFeed(d);
+      fresh.textContent='';
+      fresh.appendChild(el('span','pulse'));
+      fresh.appendChild(document.createTextNode('updated '+ago(d.generated_at)+' ago · refreshes every 5 min'));
+    }).catch(function(){
+      fresh.textContent='feed unavailable — retrying';
+    }).finally(function(){
+      clearTimeout(timer);
+      timer=setTimeout(function(){if(!document.hidden) poll(); else timer=setTimeout(poll,60000);},60000);
+    });
+  }
+  filterBox.addEventListener('click',function(ev){
+    var b=ev.target.closest('button'); if(!b) return;
+    filter=b.getAttribute('data-f');
+    filterBox.querySelectorAll('button').forEach(function(x){x.classList.toggle('on',x===b);});
+    poll();
+  });
+  poll();
+})();
+
+  /* Bundle bytes and their digest are published together in hub-front. */
+  (function(){
+    var beSel=document.getElementById('cta-backend'), release=null;
+    var code=document.getElementById('cta-code'), moveCode=document.getElementById('cta-move-code');
+    var copy=document.getElementById('cta-copy-btn'), copyMove=document.getElementById('cta-copy-move-btn');
+    function command(action){
+      var sha=release.sha256;
+      return `(
+set -euo pipefail
+sha=${sha}
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \\
+  --connect-timeout 15 --max-time 120 \\
+  "https://hub.tunaos.org/contributor-$sha.tar.gz" -o "$work/bundle.tar.gz"
+if command -v sha256sum >/dev/null 2>&1; then
+  hash=(sha256sum)
+else
+  hash=(shasum -a 256)
+fi
+printf '%s  %s\\n' "$sha" "$work/bundle.tar.gz" | "\${hash[@]}" -c -
+dir="$HOME/.local/share/tunaos-contributor/$sha"
+mkdir -p "$dir"
+tar -xzf "$work/bundle.tar.gz" -C "$dir"
+bash "$dir/examples/tuna-os/contribute.sh" ${beSel.value}${action==='move'?' move':''}
+)`;
+    }
+    function update(){
+      if(!release)return;
+      code.textContent=command('start');moveCode.textContent=command('move');
+      document.getElementById('cta-manage-code').textContent=
+        'export PATH="$PATH:$HOME/.local/bin"\n'+
+        'just --justfile "$HOME/.local/share/tunaos-contributor/'+release.sha256+'/Justfile" contribute-status\n'+
+        'just --justfile "$HOME/.local/share/tunaos-contributor/'+release.sha256+'/Justfile" contribute-stop';
+      copy.disabled=false;copyMove.disabled=false;
+    }
+    fetch('/contributor-release.json',{cache:'no-store'}).then(function(r){
+      if(!r.ok)throw new Error('Bundle manifest unavailable');return r.json();
+    }).then(function(r){
+      if(!/^[a-f0-9]{64}$/.test(r.sha256))throw new Error('Invalid bundle digest');
+      release=r;update();
+    }).catch(function(){
+      code.textContent='Setup bundle unavailable. Reload to retry, or contact the TunaOS maintainers. No command has been copied.';
+    });
+    beSel.addEventListener('change',update);
+    document.getElementById('toggle-move').addEventListener('click',function(e){
+      e.preventDefault();var box=document.getElementById('cta-move-box');
+      var show=box.style.display==='none';box.style.display=show?'block':'none';
+      this.textContent=show?'Hide move command':'Show move command';
+    });
+    function wireCopy(button,target){
+      button.addEventListener('click',function(){
+        function selectCommand(){
+          var range=document.createRange(), selection=window.getSelection();
+          range.selectNodeContents(target);
+          selection.removeAllRanges();selection.addRange(range);
+          button.textContent='Selected — press Ctrl+C / ⌘C';
+        }
+        if(!navigator.clipboard){selectCommand();return;}
+        navigator.clipboard.writeText(target.textContent).then(function(){
+          button.textContent='Copied!';setTimeout(function(){if(button.textContent==='Copied!')button.textContent='Copy command';},1500);
+        }).catch(selectCommand);
+      });
+    }
+    wireCopy(copy,code);wireCopy(copyMove,moveCode);
+  })();
+
+</script>
+</body>
+</html>
+
