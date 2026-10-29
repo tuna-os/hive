@@ -11,7 +11,8 @@
     "Forge": "",
     "IssueFilter": {
       "hard_suppress_labels": {},
-      "reporter_trust": {}
+      "reporter_trust": {},
+      "agent_proposal": {}
     },
     "CheckoutsDir": "",
     "AgentsMdMaxBytes": 0,
