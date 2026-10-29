@@ -12,9 +12,10 @@ upstream project, not this fork.
 
 ## Intent: track upstream, keep the delta near zero
 
-The fork tracks the upstream `v4` branch. The goal is to carry **no** local
-patches beyond what is unavoidably org-specific, and to upstream anything that
-is not.
+This `v4` branch tracks the upstream `v4` branch, which upstream froze on
+2026-10-05. **The fleet does not run `v4`** — see "What the fleet runs" below.
+The goal is still to carry **no** local patches beyond what is unavoidably
+org-specific, and to upstream anything that is not.
 
 Current delta against `hivecommons:v4` (after the 2026-09-05 sync in #30):
 
@@ -89,7 +90,32 @@ to rebase. Read them as upstream's, and scope them with this page:
 ## Where the fleet runs
 
 The README's [Tuna OS deployment](README.md#tuna-os-deployment) section lists
-the live hosts and the health check that shows each one is up.
+the live hosts and the health check that shows each one is up. Since
+2026-10-25 hub, school and reef run as Docker Compose services under
+`/srv/hives` on the Spindle VPS, not on Kubernetes.
+
+## What the fleet runs
+
+The services use the upstream `ghcr.io/hivecommons/hive:v6-latest` image, but
+`/srv/hives/compose.override.yaml` bind-mounts a fork-built binary over
+`/usr/local/bin/hive`, so the image tag does not say what runs.
+
+| Since (UTC) | Services | Branch | Commit | Base |
+| --- | --- | --- | --- | --- |
+| 2026-10-29 12:47 | hub, reef, school | `tuna/fleet` (= `feat/agent-proposal-gate`) | `911e5c0` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
+
+Delta of `tuna/fleet` against that upstream base:
+
+| Commits | Change | Disposition |
+| --- | --- | --- |
+| 4, ending `a9e21b5` | Hub-coordinated shared CLI session pool | Merged upstream as hivecommons/hive#15049; drop on the next rebase |
+| `6ad4ed4` | `SendKick` re-locks before the shared-pool auto-start error return (the crash loop: 114 restarts in two days) | Fixed upstream in #15049; drop on the next rebase |
+| `911e5c0` | `project.issue_filter.agent_proposal`: hold unacknowledged hive-filed proposals at admission | Proposed upstream: hivecommons/hive#15329 |
+
+Update this table in the same change as any binary swap. Check a running
+service with `docker exec hives-<svc>-1 sha256sum /usr/local/bin/hive` and
+compare with `sha256sum` of the `bin/hive-<commit>` it should mount. Tracking
+issue for the rollout: tuna-os/tunaOS#4072.
 
 ## Ownership
 
