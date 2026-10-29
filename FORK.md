@@ -108,7 +108,8 @@ The services use the upstream `ghcr.io/hivecommons/hive:v6-latest` image, but
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
-| 2026-10-29 22:05 | reef (canary) | `tuna/v6` | `fcbc71f` | upstream `v6` @ 2026-10-29 (`463615a`) |
+| 2026-10-29 22:25 | hub, reef, school | `tuna/v6` | `a60b5cf` | upstream `v6` @ 2026-10-29 (`463615a`) |
+| 2026-10-29 22:05 | reef (canary) | `tuna/v6` | `fcbc71f` | same |
 | 2026-10-29 16:40 | hub, school (reef until 22:05) | `tuna/fleet` (= `fix/agent-broker-no-proxy`) | `14409c3` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
 | 2026-10-29 12:47 | hub, reef, school | `feat/agent-proposal-gate` | `911e5c0` | same |
 
@@ -119,8 +120,9 @@ Delta of `tuna/v6` against upstream `v6`:
 | `eea4d3d` | `**/` path globs match with `path.Match` (`**/*luks*` fires) | Merged upstream on `v5` as hivecommons/hive#15387; drop when it reaches `v6` |
 | `504b6bc`, `fcbc71f` | `project.issue_filter.agent_proposal`: hold unacknowledged hive-filed proposals at admission | Pilot; RFC hivecommons/hive#15329 |
 | `e51c5c7` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY` | Upstream PR hivecommons/hive#15433 (contributor) |
+| `a60b5cf` | `governor.freeze_windows`: pause listed agents on fixed days of a repeating cycle. School runs `iso-weekend` (7-day cycle from Mon 2026-11-02, days 6–7 UTC: architect, strategist, outreach) ahead of the Sunday 22:00 UTC ISO publish | Pilot |
 
-Delta of `tuna/fleet` (the `v5`-based line, retired once every service runs `tuna/v6`) against its upstream base:
+Delta of `tuna/fleet` (the `v5`-based line, retired 2026-10-29 22:25 when every service moved to `tuna/v6`) against its upstream base:
 
 | Commits | Change | Disposition |
 | --- | --- | --- |
