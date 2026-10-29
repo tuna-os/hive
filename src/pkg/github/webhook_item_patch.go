@@ -104,6 +104,14 @@ func (c *Client) classifyWebhookIssue(repo string, issue *gh.Issue, labels []str
 	if !issueFilter.Admits(labels) {
 		return sidelined("filtered", "Project issue filter")
 	}
+	// Admission-side #5117. Parent acknowledgement needs the list-wide pass,
+	// so an unacknowledged proposal is left to the reconcile pass rather than
+	// admitted (or sidelined) on what this single item shows.
+	if c.isKnownNonHumanAuthor(issue.GetUser()) && !c.issueHasCheapHumanAcknowledgement(issue) {
+		if gate, ok := issueFilter.(AgentProposalGate); ok && gate.HoldsAgentProposal(issue.GetTitle(), labels) {
+			return WebhookItemPatch{Bucket: WebhookBucketUnknown}
+		}
+	}
 	return WebhookItemPatch{Bucket: WebhookBucketActionable, Issue: &Issue{
 		Repo:              repo,
 		Number:            issue.GetNumber(),

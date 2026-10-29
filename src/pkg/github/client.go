@@ -1815,6 +1815,18 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 				ackSource = ackSourceForParent(parentNum)
 			}
 		}
+		// Admission-side #5117: a hive-filed direction proposal nobody has
+		// acknowledged is not work yet. Held here, at the same choice point
+		// as the require gate, so no kick prompt or agent re-listing the repo
+		// can select it; the approved-direction label (or a human assignee)
+		// admits it on the next sweep.
+		if !acknowledged && c.isKnownNonHumanAuthor(issue.GetUser()) {
+			if gate, ok := issueFilter.(AgentProposalGate); ok && gate.HoldsAgentProposal(issue.GetTitle(), labels) {
+				breakdown.Filtered++
+				details = append(details, repoWorkIssue(repo, issue, labels, "filtered", agentProposalFilterReason))
+				continue
+			}
+		}
 
 		// #9839: GitHub "blocked by" links become DependsOn edges. An
 		// unreadable blocker list fails OPEN with a warning: hiding work

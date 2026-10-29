@@ -64,6 +64,18 @@ type HardSuppressClassifier interface {
 	HardSuppressIssueBucket(labels []string) string
 }
 
+// AgentProposalGate is the optional admission-side half of #5117: a filter
+// that implements it is asked whether an UNACKNOWLEDGED, hive-filed issue
+// with this title and these labels is a direction proposal that must wait for
+// a human. config.IssueFilterConfig implements it; the zero value holds
+// nothing.
+type AgentProposalGate interface {
+	HoldsAgentProposal(title string, labels []string) bool
+}
+
+// agentProposalFilterReason is the work-detail reason for a held proposal.
+const agentProposalFilterReason = "Agent proposal awaiting " + HumanAckLabel
+
 // NeedsDecisionLabeler is the optional configurable name of the label that
 // parks an issue on a maintainer decision. The issue relay applies it when an
 // agent files an issue with needs_decision set (hivecommons/hive#11215). A

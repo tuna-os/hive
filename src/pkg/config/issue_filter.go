@@ -122,11 +122,14 @@ type IssueFilterConfig struct {
 	// runs BEFORE RequireLabels, which still applies to everything afterwards,
 	// so "everyone needs triage" stays expressible exactly as before.
 	ReporterTrust ReporterTrustConfig `yaml:"reporter_trust,omitempty" json:"reporter_trust,omitempty"`
+	// AgentProposal holds unacknowledged hive-filed direction proposals out
+	// of the actionable set (the admission-side half of #5117).
+	AgentProposal AgentProposalGateConfig `yaml:"agent_proposal,omitempty" json:"agent_proposal,omitempty"`
 }
 
 // IsZero reports whether the filter is absent/empty — i.e. no filtering at all.
 func (f IssueFilterConfig) IsZero() bool {
-	return len(f.RequireLabels) == 0 && f.HardSuppressLabels.IsZero() && f.ReporterTrust.IsZero()
+	return len(f.RequireLabels) == 0 && f.HardSuppressLabels.IsZero() && f.ReporterTrust.IsZero() && f.AgentProposal.IsZero()
 }
 
 // Equal reports whether two filters are identical (order-sensitive, exact).
@@ -146,7 +149,7 @@ func (f IssueFilterConfig) Equal(o IssueFilterConfig) bool {
 		!equalStringSlices(f.HardSuppressLabels.NeedsSpec, o.HardSuppressLabels.NeedsSpec) {
 		return false
 	}
-	return f.ReporterTrust.Equal(o.ReporterTrust)
+	return f.ReporterTrust.Equal(o.ReporterTrust) && f.AgentProposal.Equal(o.AgentProposal)
 }
 
 // labelMatches reports a case-insensitive exact match, ignoring surrounding

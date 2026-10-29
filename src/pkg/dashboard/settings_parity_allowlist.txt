@@ -348,6 +348,8 @@ project.issue_filter.hard_suppress_labels.needs_decision[] # TODO #11854
 project.issue_filter.hard_suppress_labels.needs_direction[] # TODO #11854
 project.issue_filter.hard_suppress_labels.needs_human[] # TODO #11854
 project.issue_filter.hard_suppress_labels.needs_spec[] # TODO #11854
+project.issue_filter.agent_proposal.labels[] # TODO #11854
+project.issue_filter.agent_proposal.title_prefixes[] # TODO #11854
 project.issue_filter.reporter_trust.awaiting_label # TODO #11854
 project.issue_filter.reporter_trust.clanker_requested # TODO #11854
 project.issue_filter.reporter_trust.clanker_requested_addendum # TODO #11854
