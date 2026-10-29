@@ -102,7 +102,8 @@ The services use the upstream `ghcr.io/hivecommons/hive:v6-latest` image, but
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
-| 2026-10-29 12:47 | hub, reef, school | `tuna/fleet` (= `feat/agent-proposal-gate`) | `911e5c0` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
+| 2026-10-29 16:40 | hub, reef, school | `tuna/fleet` (= `fix/agent-broker-no-proxy`) | `14409c3` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
+| 2026-10-29 12:47 | hub, reef, school | `feat/agent-proposal-gate` | `911e5c0` | same |
 
 Delta of `tuna/fleet` against that upstream base:
 
@@ -111,6 +112,7 @@ Delta of `tuna/fleet` against that upstream base:
 | 4, ending `a9e21b5` | Hub-coordinated shared CLI session pool | Merged upstream as hivecommons/hive#15049; drop on the next rebase |
 | `6ad4ed4` | `SendKick` re-locks before the shared-pool auto-start error return (the crash loop: 114 restarts in two days) | Fixed upstream in #15049; drop on the next rebase |
 | `911e5c0` | `project.issue_filter.agent_proposal`: hold unacknowledged hive-filed proposals at admission | Proposed upstream: hivecommons/hive#15329 |
+| `14409c3` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY`, so the proxy's private-address guard no longer refuses the credential broker (agent CLIs were exiting on start) | Reported upstream: hivecommons/hive#15432 |
 
 Update this table in the same change as any binary swap. Check a running
 service with `docker exec hives-<svc>-1 sha256sum /usr/local/bin/hive` and
