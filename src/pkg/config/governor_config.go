@@ -166,6 +166,9 @@ type GovernorConfig struct {
 	// Zero value = shadow: record what the gate would have held, merge as
 	// before. See ReviewGateConfig.
 	ReviewGate ReviewGateConfig `yaml:"review_gate,omitempty" json:"review_gate,omitempty"`
+	// FreezeWindows pause listed agents on fixed days of a repeating cycle
+	// (see FreezeWindow). Empty means no window.
+	FreezeWindows []FreezeWindow `yaml:"freeze_windows,omitempty" json:"freeze_windows,omitempty"`
 }
 
 // Review gate modes (GovernorConfig.ReviewGate.Mode, hivecommons/hive#12592).

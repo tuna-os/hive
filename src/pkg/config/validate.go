@@ -316,6 +316,11 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 	if !ValidateCoverageTarget(c.Governor.CoverageTarget) {
 		return fmt.Errorf("governor.coverage_target must be between 1 and 100 (got %d)", c.Governor.CoverageTarget)
 	}
+	for _, w := range c.Governor.FreezeWindows {
+		if err := w.Validate(); err != nil {
+			return err
+		}
+	}
 	if c.Governor.EvalIntervalMaxS > 0 && c.Governor.EvalIntervalS > 0 && c.Governor.EvalIntervalMaxS < c.Governor.EvalIntervalS {
 		return fmt.Errorf("governor.eval_interval_max_s must be greater than or equal to governor.eval_interval_s")
 	}

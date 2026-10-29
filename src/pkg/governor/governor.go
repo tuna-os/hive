@@ -255,6 +255,9 @@ type Governor struct {
 	state  State
 	mu     sync.RWMutex
 	logger *slog.Logger
+	// frozen maps an agent to the freeze window holding it, so entering and
+	// leaving a window are each logged once rather than on every eval.
+	frozen map[string]string
 
 	modeHistory                   []ModeChange
 	evalHistory                   []EvalSnapshot
@@ -713,6 +716,10 @@ func (g *Governor) addCadenceForTarget(cadences map[string]AgentCadence, modeNam
 		cadences[key] = AgentCadence{Agent: agentName, Repo: repo, Paused: true}
 		return
 	}
+	if g.frozenLocked(agentName) {
+		cadences[key] = AgentCadence{Agent: agentName, Repo: repo, Paused: true}
+		return
+	}
 
 	if err := cadence.Validate(); err != nil {
 		g.logger.Warn("invalid cadence — agent will receive no timer kicks until fixed",
@@ -749,6 +756,30 @@ func (g *Governor) addCadenceForTarget(cadences map[string]AgentCadence, modeNam
 		}
 	}
 	cadences[key] = entry
+}
+
+// frozenLocked reports whether a governor.freeze_windows entry holds agent
+// now (a replica is held through its base agent) and logs the transitions.
+// Caller must hold g.mu.
+func (g *Governor) frozenLocked(agentName string) bool {
+	baseName := agentName
+	if ac, ok := g.agents[agentName]; ok && ac.ReplicaOf != "" {
+		baseName = ac.ReplicaOf
+	}
+	window := g.cfg.ActiveFreezeWindow(g.now(), agentName, baseName)
+	if g.frozen == nil {
+		g.frozen = make(map[string]string)
+	}
+	if prev := g.frozen[agentName]; prev != window {
+		if window != "" {
+			g.logger.Info("freeze window active — agent paused", "agent", agentName, "window", window)
+			g.frozen[agentName] = window
+		} else {
+			g.logger.Info("freeze window ended — agent resumes its mode cadence", "agent", agentName, "window", prev)
+			delete(g.frozen, agentName)
+		}
+	}
+	return window != ""
 }
 
 func sortedRepoModeKeys(repoModes map[string]Mode) []string {
