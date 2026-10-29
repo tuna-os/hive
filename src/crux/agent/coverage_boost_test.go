@@ -298,6 +298,7 @@ func TestAgentEnvPairs_NonInference_NoAnthropicVars(t *testing.T) {
 }
 
 func TestAgentEnvPairs_NonInference_NoProxyLoopback(t *testing.T) {
+	t.Setenv("OMP_AUTH_BROKER_URL", "")
 	m := NewManager(map[string]config.AgentConfig{
 		"scanner": {Backend: "claude", Model: "sonnet"},
 	}, discardLogger(), ProjectContext{})
@@ -318,6 +319,37 @@ func TestAgentEnvPairs_NonInference_NoProxyLoopback(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("NO_PROXY emitted %d times, want 1", count)
+	}
+}
+
+// The credential broker is usually on a private bridge address, which the
+// proxy's destination guard refuses; the agent must reach it directly or its
+// CLI exits at startup. Only the broker's host is exempted.
+func TestAgentEnvPairs_NoProxyIncludesCredentialBroker(t *testing.T) {
+	t.Setenv("OMP_AUTH_BROKER_URL", "http://172.18.0.1:18765")
+	m := NewManager(map[string]config.AgentConfig{
+		"scanner": {Backend: "claude", Model: "sonnet"},
+	}, discardLogger(), ProjectContext{})
+	ap := &AgentProcess{Name: "scanner", Config: config.AgentConfig{Backend: "claude", Model: "sonnet"}}
+	for _, p := range m.agentEnvPairs(ap) {
+		if p.Key == "NO_PROXY" && p.Value != "127.0.0.1,localhost,::1,172.18.0.1" {
+			t.Errorf("NO_PROXY = %q, want loopback list plus the broker host", p.Value)
+		}
+	}
+}
+
+func TestAgentNoProxy(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                            "127.0.0.1,localhost,::1",
+		"http://172.18.0.1:18765":     "127.0.0.1,localhost,::1,172.18.0.1",
+		" https://broker.internal/v1": "127.0.0.1,localhost,::1,broker.internal",
+		"http://[fd00::1]:8765":       "127.0.0.1,localhost,::1,fd00::1",
+		"not a url":                   "127.0.0.1,localhost,::1",
+		"://":                         "127.0.0.1,localhost,::1",
+	} {
+		if got := agentNoProxy(in); got != want {
+			t.Errorf("agentNoProxy(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

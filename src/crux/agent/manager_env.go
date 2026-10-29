@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -293,9 +294,11 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 	// Loopback must never traverse the hive proxy for any backend: an agent
 	// polling a local dev server would otherwise get proxy-side dial errors
 	// (#14076), and a repo's own tests must see real connection errors
-	// instead of the proxy's 502.
-	vars = append(vars, agentEnvPair{"NO_PROXY", loopbackNoProxy, false})
-	vars = append(vars, agentEnvPair{"no_proxy", loopbackNoProxy, false})
+	// instead of the proxy's 502. The credential broker's host joins it (see
+	// agentNoProxy).
+	noProxy := agentNoProxy(os.Getenv("OMP_AUTH_BROKER_URL"))
+	vars = append(vars, agentEnvPair{"NO_PROXY", noProxy, false})
+	vars = append(vars, agentEnvPair{"no_proxy", noProxy, false})
 	vars = append(vars, agentEnvPair{"HIVE_PROXY_AGENT", agent.Name, false})
 	vars = append(vars, agentEnvPair{"GIT_TERMINAL_PROMPT", "0", false})
 	vars = append(vars, agentEnvPair{"NODE_EXTRA_CA_CERTS", proxyCACertPath, false})
@@ -615,4 +618,25 @@ func (m *Manager) experimentEnvPairs(agent *AgentProcess) []agentEnvPair {
 		pairs = append(pairs, agentEnvPair{k, m.project.ExperimentEnv[k], false})
 	}
 	return pairs
+}
+
+// agentNoProxy is the NO_PROXY list handed to every agent: loopback, plus the
+// host of the operator-configured credential broker when there is one.
+//
+// The broker (OMP_AUTH_BROKER_URL, inherited from the hive's environment) is
+// typically a private address on the host's container bridge. Through the
+// proxy it is refused as "not globally routable", so an agent CLI that needs
+// a fresh credential exits at startup and every kick restarts it. Exempting
+// exactly that host keeps the private-destination guard intact for every
+// other address. An unparsable or host-less URL adds nothing.
+func agentNoProxy(brokerURL string) string {
+	brokerURL = strings.TrimSpace(brokerURL)
+	if brokerURL == "" {
+		return loopbackNoProxy
+	}
+	u, err := url.Parse(brokerURL)
+	if err != nil || u.Hostname() == "" {
+		return loopbackNoProxy
+	}
+	return loopbackNoProxy + "," + u.Hostname()
 }
