@@ -1979,7 +1979,7 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		if !acknowledged && c.isKnownNonHumanAuthor(issue.GetUser()) {
 			if gate, ok := issueFilter.(AgentProposalGate); ok && gate.HoldsAgentProposal(issue.GetTitle(), labels) {
 				breakdown.Filtered++
-				details = append(details, repoWorkIssue(repo, issue, labels, "filtered", agentProposalFilterReason))
+				details = append(details, c.workIssue(repo, issue, labels, "filtered", agentProposalFilterReason))
 				continue
 			}
 		}

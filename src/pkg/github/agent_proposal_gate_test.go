@@ -98,14 +98,14 @@ func TestClassifyWebhookIssue_AgentProposalGate(t *testing.T) {
 		return is
 	}
 	now := time.Now()
-	if got := c.classifyWebhookIssue(repo, issue("hive[bot]", "agent/architect"), []string{"agent/architect"}, now).Bucket; got != WebhookBucketUnknown {
+	if got := c.classifyWebhookIssue(repo, issue("hive[bot]", "agent/architect"), 0, []string{"agent/architect"}, now).Bucket; got != WebhookBucketUnknown {
 		t.Errorf("unacknowledged proposal bucket = %q, want %q (left to the reconcile pass)", got, WebhookBucketUnknown)
 	}
 	acked := []string{"agent/architect", HumanAckLabel}
-	if got := c.classifyWebhookIssue(repo, issue("hive[bot]", acked...), acked, now).Bucket; got != WebhookBucketActionable {
+	if got := c.classifyWebhookIssue(repo, issue("hive[bot]", acked...), 0, acked, now).Bucket; got != WebhookBucketActionable {
 		t.Errorf("approved proposal bucket = %q, want %q", got, WebhookBucketActionable)
 	}
-	if got := c.classifyWebhookIssue(repo, issue("alice", "agent/architect"), []string{"agent/architect"}, now).Bucket; got != WebhookBucketActionable {
+	if got := c.classifyWebhookIssue(repo, issue("alice", "agent/architect"), 0, []string{"agent/architect"}, now).Bucket; got != WebhookBucketActionable {
 		t.Errorf("human-filed issue bucket = %q, want %q", got, WebhookBucketActionable)
 	}
 }
