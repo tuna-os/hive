@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"github.com/hivecommons/hive/crux/config"
 	"github.com/hivecommons/hive/crux/internal/testutil"
 	"sync"
@@ -120,6 +121,32 @@ func TestSharedPoolKickOutcomeEvictsSession(t *testing.T) {
 	if len(pool.released) != 1 || pool.released[0] != "lease-outcome" {
 		t.Fatalf("released leases = %v, want [lease-outcome]", pool.released)
 	}
+}
+
+func TestSharedPoolSendKickAutoStartFailureKeepsLockBalanced(t *testing.T) {
+	if !tmuxAvailable() {
+		t.Skip("tmux not available")
+	}
+	t.Setenv("HIVE_WORK_DIR", t.TempDir())
+	pool := &recordingSharedSessionPool{acquireFn: func(context.Context, string) (string, error) {
+		return "", errors.New("shared session pool is busy")
+	}}
+	m := NewManager(map[string]config.AgentConfig{"scanner": makeAgentConfig("claude", "sonnet")}, discardLogger(), ProjectContext{})
+	m.sharedPool = pool
+	defer cleanupAgent(t, m, "scanner")
+	m.mu.Lock()
+	m.agents["scanner"].State = StateStopped
+	m.mu.Unlock()
+
+	// Before the fix the error return left m.mu unlocked for the deferred
+	// Unlock, which is a non-recoverable runtime fatal.
+	if err := m.SendKick("scanner", "hello"); err == nil {
+		t.Fatal("SendKick succeeded although the pool refused a slot")
+	}
+	if !m.mu.TryLock() {
+		t.Fatal("m.mu still held after SendKick returned an error")
+	}
+	m.mu.Unlock()
 }
 
 func TestWithSharedSessionPoolOption(t *testing.T) {
