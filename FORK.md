@@ -10,12 +10,17 @@ Read this page before opening an issue or a pull request here: several documents
 in this repository are inherited from upstream unchanged and describe the
 upstream project, not this fork.
 
-## Intent: track upstream, keep the delta near zero
+## Intent: pilot features on upstream v6, then upstream them
+
+`tuna/v6` is the fork's pilot line: upstream `v6` plus the features and fixes
+Tuna OS is proving out. New Hive features land there first and run on the
+Tuna OS hives; an upstream RFC or PR follows once a feature has shown its
+numbers on a live hive, not before. Every patch on `tuna/v6` carries a
+disposition (proposed upstream, reported upstream, or pilot only), and a
+patch that upstream merges is dropped at the next rebase onto `v6`.
 
 This `v4` branch tracks the upstream `v4` branch, which upstream froze on
 2026-10-05. **The fleet does not run `v4`** — see "What the fleet runs" below.
-The goal is still to carry **no** local patches beyond what is unavoidably
-org-specific, and to upstream anything that is not.
 
 Current delta against `hivecommons:v4` (after the 2026-09-05 sync in #30):
 
@@ -59,7 +64,8 @@ gh api repos/tuna-os/hive/compare/hivecommons:v4...tuna-os:v4 \
 
 | You have | Send it |
 | --- | --- |
-| A bug or feature idea in Hive itself | Upstream: [`hivecommons/hive` issues](https://github.com/hivecommons/hive/issues) |
+| A feature idea for Hive | Pilot it on `tuna/v6` and run it on a Tuna OS hive first; then upstream, with its live numbers |
+| A bug in Hive itself | Upstream: [`hivecommons/hive` issues](https://github.com/hivecommons/hive/issues), and fix it on `tuna/v6` if the fleet needs it now |
 | A change that any fork would want | Upstream, as a pull request |
 | A security vulnerability in Hive code | Upstream, via private vulnerability reporting on `hivecommons/hive` |
 | Something specific to how Tuna OS runs its fleet — registry, org configuration, the fork's own sync | Here |
@@ -102,10 +108,19 @@ The services use the upstream `ghcr.io/hivecommons/hive:v6-latest` image, but
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
-| 2026-10-29 16:40 | hub, reef, school | `tuna/fleet` (= `fix/agent-broker-no-proxy`) | `14409c3` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
+| 2026-10-29 22:05 | reef (canary) | `tuna/v6` | `fcbc71f` | upstream `v6` @ 2026-10-29 (`463615a`) |
+| 2026-10-29 16:40 | hub, school (reef until 22:05) | `tuna/fleet` (= `fix/agent-broker-no-proxy`) | `14409c3` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
 | 2026-10-29 12:47 | hub, reef, school | `feat/agent-proposal-gate` | `911e5c0` | same |
 
-Delta of `tuna/fleet` against that upstream base:
+Delta of `tuna/v6` against upstream `v6`:
+
+| Commit | Change | Disposition |
+| --- | --- | --- |
+| `eea4d3d` | `**/` path globs match with `path.Match` (`**/*luks*` fires) | Merged upstream on `v5` as hivecommons/hive#15387; drop when it reaches `v6` |
+| `504b6bc`, `fcbc71f` | `project.issue_filter.agent_proposal`: hold unacknowledged hive-filed proposals at admission | Pilot; RFC hivecommons/hive#15329 |
+| `e51c5c7` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY` | Upstream PR hivecommons/hive#15433 (contributor) |
+
+Delta of `tuna/fleet` (the `v5`-based line, retired once every service runs `tuna/v6`) against its upstream base:
 
 | Commits | Change | Disposition |
 | --- | --- | --- |
