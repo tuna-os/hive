@@ -1,0 +1,2 @@
+- Rewrites the hub and spoke disaster-recovery guide in Simplified Technical English and lowers the prose budget from 670 to 541 findings ([#37](https://github.com/tuna-os/hive/issues/37)).
+- Corrects the spoke recovery procedure in that guide: a hive boots from `/data/hive.yaml.runtime` whenever the PVC holds one, and merges `/data/hive.yaml.dashboard` over the ConfigMap seed only when it does not, so restoring the overlay alone — or a stale runtime file alongside it — silently drops the dashboard state ([#37](https://github.com/tuna-os/hive/issues/37)).
