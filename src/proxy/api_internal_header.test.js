@@ -184,6 +184,29 @@ async function main() {
     assert.equal(seen.internal, null);
   });
 
+  for (const path of ['/api/gh-user-auth/start', '/api/gh-user-auth/poll']) {
+    await check(`device-flow sign-in POST ${path} reaches the Go API with no trust material`, async () => {
+      // The visitor has no credential yet: this POST is how they get one.
+      const res = await req('POST', path);
+      assert.equal(res.status, 200);
+      const seen = JSON.parse(res.body);
+      assert.equal(seen.internal, null);
+    });
+  }
+
+  await check('device-flow allowance is exact: look-alike and logout POSTs stay 401', async () => {
+    assert.equal((await req('POST', '/api/gh-user-auth/start-admin')).status, 401);
+    assert.equal((await req('POST', '/api/gh-user-auth/logout')).status, 401);
+  });
+
+  await check('POST with a hive_session cookie goes to the Go API, which authenticates it', async () => {
+    const res = await req('POST', '/api/pause', { Cookie: 'theme=dark; hive_session=opaque-id' });
+    assert.equal(res.status, 200);
+    const seen = JSON.parse(res.body);
+    // The session is the Go API's to resolve; the proxy adds no owner trust.
+    assert.equal(seen.internal, null);
+  });
+
   await stopProxy(proxy);
 
   // ── hosted mode: no shared token exists at all ──────────────────────────

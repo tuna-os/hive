@@ -1007,6 +1007,12 @@ app.use(async (req, res, next) => {
 });
 
 const PUBLIC_POST_PATHS = ['/api/contribute/register', '/api/contribute/reissue-token'];
+// Device-flow sign-in on a direct-route spoke. The Go API lists both as public
+// (isPublicPath) and the dashboard root page POSTs to them before the visitor
+// has any credential, so gating them here made sign-in impossible behind this
+// proxy. /poll only completes a flow for the holder of its flow_id secret.
+// Exact matches: a prefix would also open any future sibling route.
+const PUBLIC_POST_EXACT = new Set(['/api/gh-user-auth/start', '/api/gh-user-auth/poll']);
 app.use((req, res, next) => {
   // SECURITY (CWE-306): decide ONCE, for every method, whether this request
   // actually presented the shared dashboard token. apiProxy injects the
@@ -1020,6 +1026,13 @@ app.use((req, res, next) => {
   req.hiveTokenVerified = bearerTokenMatches(req.headers.authorization);
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
     if (PUBLIC_POST_PATHS.some(p => req.url.startsWith(p))) return next();
+    if (PUBLIC_POST_EXACT.has(req.url.split('?')[0])) return next();
+    // A per-user device-flow session (hive_session) is authenticated by the Go
+    // API itself: it resolves the session and re-checks the user's role
+    // against the live allowlist on every request. No X-Hive-Internal is
+    // injected for it (hiveTokenVerified stays false), and the cookie is
+    // SameSite=Lax, so a cross-site form cannot replay it.
+    if (parseCookies(req.headers.cookie).hive_session) return next();
     return requireAuth(req, res, next);
   }
   next();
