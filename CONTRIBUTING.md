@@ -158,7 +158,7 @@ git add changelog.d/fixed-1234-relay-drop.md
 git commit -s
 ```
 
-`changelog.d/README.md` has the full format, the `no-changelog` exemption, and the release-marker escape hatch. Transition note: direct `CHANGELOG.md` edits are still accepted until 2026-09-09 so in-flight PRs can land unreworked.
+`changelog.d/README.md` has the full format, the `no-changelog` exemption, and the release-marker escape hatch. Direct edits to `CHANGELOG.md`'s `## Unreleased` section are rejected by `changelog-fragment-guard`; put user-visible entries in a fragment file instead.
 
 ## Maintainer resources
 
