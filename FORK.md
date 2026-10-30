@@ -104,10 +104,14 @@ the live hosts and the health check that shows each one is up. Since
 
 The services use the upstream `ghcr.io/hivecommons/hive:v6-latest` image, but
 `/srv/hives/compose.override.yaml` bind-mounts a fork-built binary over
-`/usr/local/bin/hive`, so the image tag does not say what runs.
+`/usr/local/bin/hive`, so the image tag does not say what runs. On school and
+reef it also mounts `/srv/hives/proxy/server.js` over the image's Node proxy:
+the image's own file plus the `bb82aed` change below
+(`/srv/hives/proxy/server.image.js` is the unpatched original).
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
+| 2026-10-30 03:31 | hub, reef, school | `tuna/v6` | `62dbda5` | same |
 | 2026-10-29 22:25 | hub, reef, school | `tuna/v6` | `a60b5cf` | upstream `v6` @ 2026-10-29 (`463615a`) |
 | 2026-10-29 22:05 | reef (canary) | `tuna/v6` | `fcbc71f` | same |
 | 2026-10-29 16:40 | hub, school (reef until 22:05) | `tuna/fleet` (= `fix/agent-broker-no-proxy`) | `14409c3` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
@@ -121,6 +125,9 @@ Delta of `tuna/v6` against upstream `v6`:
 | `504b6bc`, `fcbc71f` | `project.issue_filter.agent_proposal`: hold unacknowledged hive-filed proposals at admission | Pilot; RFC hivecommons/hive#15329 |
 | `e51c5c7` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY` | Upstream PR hivecommons/hive#15433 (contributor) |
 | `a60b5cf` | `governor.freeze_windows`: pause listed agents on fixed days of a repeating cycle. School runs `iso-weekend` (7-day cycle from Mon 2026-11-02, days 6–7 UTC: architect, strategist, outreach) ahead of the Sunday 22:00 UTC ISO publish | Pilot |
+| `bb82aed` | Node proxy admits `POST /api/gh-user-auth/start` and `/poll` and passes `hive_session` requests to the Go API, so device-flow sign-in works on direct-route spokes. Also mounted as `proxy/server.js` | Pilot; file upstream |
+| `d33143c` | Hub reads spoke proof tokens from `/data/saas/spoke-tokens/<hive-id>` before trying `kubectl`, so hub-proxied single sign-on works for a Compose fleet. Staged, not in use until the hub has a GitHub OAuth app | Pilot |
+| `62dbda5` | `ioscan.classifier.backend: omp`: the semantic classifier runs through omp and the auth broker (school and reef: `anthropic/claude-haiku-4-5`; agents moved from `github-copilot/gpt-6-luna` to `openai-codex/gpt-6-luna` the same night) | Pilot |
 
 Delta of `tuna/fleet` (the `v5`-based line, retired 2026-10-29 22:25 when every service moved to `tuna/v6`) against its upstream base:
 
