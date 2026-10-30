@@ -100,6 +100,22 @@ func adviceFor(kind string, h HiveReport) Advice {
 		return Advice{
 			Human: []string{"The configured read-role session expired or was revoked. Log in to " + h.URL + " as the read-role probe account and update the Actions secret (see tools/hive-health/README.md)."},
 		}
+	case "model-discovery":
+		return Advice{
+			Diagnose: []string{
+				"The Hive answered " + h.URL + "/api/config/backends with its built-in static model list for a backend agents run on, which means that backend's discovery probe failed (expired or absent CLI credentials, or the provider's models endpoint refusing the call). Name the backend and say which agents sit on it.",
+				"While a backend serves a static list, nothing — not the dashboard, not this probe — can tell that a newer model exists. Treat a model table built on it as frozen, not current.",
+			},
+			Human: []string{"Re-authenticate that backend's CLI on the Hive (the same credential the agents use), then re-run the probe and confirm `model-discovery` passes."},
+		}
+	case "model-drift":
+		return Advice{
+			Diagnose: []string{
+				"The agent is pinned to a model id its backend has not listed on the last two runs — usually a renamed or retired id. Check the backend's current ids at " + h.URL + "/api/config/backends and name the closest surviving one.",
+				"This is config, not liveness: the agent keeps running until it restarts, and then fails at start.",
+			},
+			Human: []string{"Point the agent at a model the backend still offers (dashboard model picker, or the rotation config that pins it)."},
+		}
 	}
 	return Advice{}
 }

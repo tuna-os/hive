@@ -64,6 +64,14 @@ func liveRoutes(t *testing.T) map[string]Fetched {
 	st := fixtureBytes(t, "status-school.json")
 	st = bytes.Replace(st, []byte(`"hiveId": "hive-school-tunaos"`), []byte(`"hiveId": "hive-school-tunaos", "echo": "`+secretSession+`"`), 1)
 	r["https://school.tunaos.org/api/status"] = Fetched{Status: 200, Body: st}
+	// The model catalog is the probe's second credentialed GET; it echoes the
+	// session too, so the scrubber is exercised on both responses. copilot
+	// serves a static fallback list (school runs copilot agents), vllm is an
+	// inference backend the census must leave out.
+	r["https://school.tunaos.org/api/config/backends"] = Fetched{Status: 200, Body: []byte(
+		`[{"id":"claude","name":"Claude Code","models":["claude-opus-5"],"fallback":false,"echo":"` + secretSession + `"},` +
+			`{"id":"copilot","name":"GitHub Copilot","models":["gpt-5"],"fallback":true},` +
+			`{"id":"vllm","name":"vLLM (self-hosted)","models":["qwen3"],"inference":true}]`)}
 	return r
 }
 
@@ -129,7 +137,9 @@ func TestRunSessionIsScopedAndNeverPrinted(t *testing.T) {
 		if len(c.headers) == 0 {
 			continue
 		}
-		if !strings.HasSuffix(c.url, "/api/status") {
+		// The ONLY paths a credential may ever reach, both read-only GETs on
+		// the configured host.
+		if !strings.HasSuffix(c.url, "/api/status") && !strings.HasSuffix(c.url, "/api/config/backends") {
 			t.Fatalf("credential sent to %s", c.url)
 		}
 		if strings.Contains(c.url, "reilly") {
@@ -156,6 +166,23 @@ func TestRunSessionIsScopedAndNeverPrinted(t *testing.T) {
 	}
 	if tiers["school"] != "session" || tiers["reef"] != "session-rejected" || tiers["reilly"] != "public" {
 		t.Fatalf("tiers = %v", tiers)
+	}
+
+	// The session tier records what each CLI backend offers, so the next run
+	// can tell a new model from one that was always there.
+	var school *HiveReport
+	for i := range rep.Hives {
+		if rep.Hives[i].Name == "school" {
+			school = &rep.Hives[i]
+		}
+	}
+	if school == nil || len(school.Models) == 0 {
+		t.Fatal("session tier recorded no model census")
+	}
+	for _, b := range school.Models {
+		if b.ID == "vllm" {
+			t.Fatalf("inference backend in the census: %+v", school.Models)
+		}
 	}
 }
 
