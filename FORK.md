@@ -111,6 +111,7 @@ the image's own file plus the `bb82aed` change below
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
+| 2026-10-30 20:30 | hub, reef, school (reef canary from 20:25) | `tuna/v6` | `230f745` | same |
 | 2026-10-30 03:31 | hub, reef, school | `tuna/v6` | `62dbda5` | same |
 | 2026-10-29 22:25 | hub, reef, school | `tuna/v6` | `a60b5cf` | upstream `v6` @ 2026-10-29 (`463615a`) |
 | 2026-10-29 22:05 | reef (canary) | `tuna/v6` | `fcbc71f` | same |
@@ -123,11 +124,12 @@ Delta of `tuna/v6` against upstream `v6`:
 | --- | --- | --- |
 | `eea4d3d` | `**/` path globs match with `path.Match` (`**/*luks*` fires) | Merged upstream on `v5` as hivecommons/hive#15387; drop when it reaches `v6` |
 | `504b6bc`, `fcbc71f` | `project.issue_filter.agent_proposal`: hold unacknowledged hive-filed proposals at admission | Pilot; RFC hivecommons/hive#15329 |
-| `e51c5c7` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY` | Upstream PR hivecommons/hive#15433 (contributor) |
+| `e51c5c7` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY` | Merged upstream on `v5` as hivecommons/hive#15649; drop when it reaches `v6` |
 | `a60b5cf` | `governor.freeze_windows`: pause listed agents on fixed days of a repeating cycle. School runs `iso-weekend` (7-day cycle from Mon 2026-11-02, days 6–7 UTC: architect, strategist, outreach) ahead of the Sunday 22:00 UTC ISO publish | Pilot |
-| `bb82aed` | Node proxy admits `POST /api/gh-user-auth/start` and `/poll` and passes `hive_session` requests to the Go API, so device-flow sign-in works on direct-route spokes. Also mounted as `proxy/server.js` | Pilot; file upstream |
+| `bb82aed` | Node proxy admits `POST /api/gh-user-auth/start` and `/poll` and passes `hive_session` requests to the Go API, so device-flow sign-in works on direct-route spokes. Also mounted as `proxy/server.js` | Reported upstream: hivecommons/hive#15872 |
 | `d33143c` | Hub reads spoke proof tokens from `/data/saas/spoke-tokens/<hive-id>` before trying `kubectl`, so hub-proxied single sign-on works for a Compose fleet. Staged, not in use until the hub has a GitHub OAuth app | Pilot |
-| `62dbda5` | `ioscan.classifier.backend: omp`: the semantic classifier runs through omp and the auth broker (school and reef: `anthropic/claude-haiku-4-5`; agents moved from `github-copilot/gpt-6-luna` to `openai-codex/gpt-6-luna` the same night) | Pilot |
+| `62dbda5` | `ioscan.classifier.backend: omp`: the semantic classifier runs through omp and the auth broker (school and reef: `anthropic/claude-haiku-4-5`; agents moved from `github-copilot/gpt-6-luna` to `openai-codex/gpt-6-luna` the same night) | Proposed upstream: hivecommons/hive#15873 |
+| `230f745` | `revert_sheriff`: when a merge turns a required check red on the default branch, find the merge, re-run its failing job once, and (propose mode) open a held `hive/revert` + `fixes-main` revert PR ([tuna-os/hive#170](https://github.com/tuna-os/hive/pull/170)). School runs it in **shadow** mode for `tunaos`, `tunaos-packages`, `corral`, `tacklebox` | Pilot (SDLC HIVE-8 / TUNA-4) |
 
 Delta of `tuna/fleet` (the `v5`-based line, retired 2026-10-29 22:25 when every service moved to `tuna/v6`) against its upstream base:
 
