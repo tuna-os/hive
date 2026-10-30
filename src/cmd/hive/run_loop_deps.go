@@ -96,6 +96,7 @@ func defaultRunLoopDeps() runLoopDeps {
 				runDuplicateFixSweepIfDue(b.ctx, b.ghClient, b.cfg, b.dashSrv, &b.lastDuplicateFixSweep, b.logger)
 				runSharedCIRerunSweepIfDue(b.ctx, b.ghClient, b.cfg, b.dashSrv, &b.lastSharedCIRerunSweep, b.logger)
 				runRedMainSweepIfDue(b.ctx, b.ghClient, &b.lastRedMainSweep, b.logger)
+				runRevertSheriffSweepIfDue(b.ctx, b.ghClient, b.cfg, b.dashSrv, &b.lastRevertSheriffSweep, b.logger)
 				runBlockedIssuesSweepIfDue(b.ctx, b.ghClient, b.cfg, b.dashSrv, &b.lastBlockedIssuesSweep, b.logger)
 			}
 			if decision.SkipOptional {

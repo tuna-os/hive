@@ -425,6 +425,12 @@ repeat_failure.threshold # yaml-only until the check reaches the dashboard (#145
 repeat_failure.window_s # yaml-only until the check reaches the dashboard (#14550)
 retro.lesson_confidence_cap # TODO #11854
 retro.lesson_confidence_step # TODO #11854
+revert_sheriff.confirm_timeout # tuna-os pilot (revert sheriff); yaml-only
+revert_sheriff.hold # tuna-os pilot (revert sheriff); yaml-only
+revert_sheriff.lookback # tuna-os pilot (revert sheriff); yaml-only
+revert_sheriff.max_per_day # tuna-os pilot (revert sheriff); yaml-only
+revert_sheriff.mode # tuna-os pilot (revert sheriff); yaml-only
+revert_sheriff.repos[] # tuna-os pilot (revert sheriff); yaml-only
 review.backlog.labels[] # TODO #11854
 review.bot_author_full_review_paths[] # TODO #14625
 review.bot_author_model # TODO #14625

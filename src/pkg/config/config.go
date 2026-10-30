@@ -148,6 +148,10 @@ type Config struct {
 	// `<!-- hive-shared-ci-<n> -->` once incident #n closes
 	// (hivecommons/hive#12253). Default on.
 	SharedCIRerun SharedCIRerunConfig `yaml:"shared_ci_rerun,omitempty" json:"shared_ci_rerun,omitempty"`
+	// RevertSheriff opts repos into proposing a revert of the merge that
+	// broke a required check on the default branch (tuna-os pilot,
+	// tuna-os/tunaOS#4072). Nil means off.
+	RevertSheriff *RevertSheriffConfig `yaml:"revert_sheriff,omitempty" json:"revert_sheriff,omitempty"`
 	// Search controls the portfolio search indexer (hivecommons/hive#14635).
 	// Default off.
 	Search  SearchConfig  `yaml:"search,omitempty" json:"search,omitempty"`

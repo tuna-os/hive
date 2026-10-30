@@ -24,6 +24,7 @@ import (
 	"github.com/hivecommons/hive/pkg/ioscan"
 	"github.com/hivecommons/hive/pkg/issueclaim"
 	"github.com/hivecommons/hive/pkg/redmain"
+	"github.com/hivecommons/hive/pkg/revertsheriff"
 	"github.com/hivecommons/hive/pkg/review"
 	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/stagelabels"
@@ -264,6 +265,10 @@ type Client struct {
 	// hivecommons/hive#13645). Guarded by openHeldMu.
 	openHeld   openHeldPRState
 	openHeldMu sync.Mutex
+	// revertSheriff holds the revert sheriff's cases (revert_sheriff.go);
+	// created once by revertSheriffLedger.
+	revertSheriff     *revertsheriff.Ledger
+	revertSheriffOnce sync.Once
 	// combinedPerspectivesFn / maxReviewsPerHeadFn feed the per-head review
 	// backstop (perHeadReviewRefusal); read live so a dashboard change applies
 	// without a client rebuild. maxReviewsPerHeadFn returning 0 means derive;

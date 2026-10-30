@@ -253,6 +253,8 @@ type boot struct {
 	lastDuplicateFixSweep  time.Time
 	lastSharedCIRerunSweep time.Time
 	lastRedMainSweep       time.Time
+	// lastRevertSheriffSweep gates runRevertSheriffSweepIfDue (tuna-os pilot).
+	lastRevertSheriffSweep time.Time
 	lastBlockedIssuesSweep time.Time
 	lastIssueUnparkSweep   time.Time
 	lastClosedIssueSweep   time.Time
