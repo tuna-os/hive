@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -274,6 +276,9 @@ func TestLoadAppPrivateKeyKubectlFails(t *testing.T) {
 }
 
 func TestLoadSpokeAuthToken(t *testing.T) {
+	oldDir := spokeProofTokenDir
+	spokeProofTokenDir = t.TempDir()
+	t.Cleanup(func() { spokeProofTokenDir = oldDir })
 	s := newWebhookHub()
 	// No cluster -> "".
 	if got := s.loadSpokeAuthToken(&RegistryEntry{ID: "h1"}); got != "" {
@@ -283,6 +288,45 @@ func TestLoadSpokeAuthToken(t *testing.T) {
 	s.clusters["hive-oke"] = ClusterConfig{ID: "hive-oke"}
 	if got := s.loadSpokeAuthToken(&RegistryEntry{ID: "h1", ClusterID: "hive-oke"}); got != "" {
 		t.Errorf("expected empty token on kubectl failure, got %q", got)
+	}
+}
+
+// A hub whose spokes are not in a cluster it can read (a Compose fleet) gets
+// the proof from the operator's per-hive file, before any kubectl attempt.
+func TestLoadSpokeAuthToken_ProofFile(t *testing.T) {
+	oldDir, oldHives := spokeProofTokenDir, saasHivesDir
+	spokeProofTokenDir, saasHivesDir = t.TempDir(), t.TempDir()
+	t.Cleanup(func() { spokeProofTokenDir, saasHivesDir = oldDir, oldHives })
+	if err := os.WriteFile(filepath.Join(spokeProofTokenDir, "school"), []byte("tok-school\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newWebhookHub()
+
+	if got := s.loadSpokeAuthToken(&RegistryEntry{ID: "school"}); got != "tok-school" {
+		t.Errorf("proof file: got %q, want tok-school", got)
+	}
+	if got := s.loadSpokeAuthToken(&RegistryEntry{ID: "reef"}); got != "" {
+		t.Errorf("hive without a file: got %q, want empty", got)
+	}
+	for _, id := range []string{"../school", "x/../school", `..\school`} {
+		if got := s.loadSpokeProofTokenFile(id); got != "" {
+			t.Errorf("hive id %q escaped the proof dir: got %q", id, got)
+		}
+	}
+
+	// Once the hub knows the spoke's reported token hash, a file that does not
+	// match it is refused rather than sent as a proof the spoke would reject.
+	if err := saveSaaSHive(&SaaSHive{ID: "school", DashboardTokenHash: HashDashboardToken("rotated")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.loadSpokeAuthToken(&RegistryEntry{ID: "school"}); got != "" {
+		t.Errorf("mismatched proof file: got %q, want empty", got)
+	}
+	if err := saveSaaSHive(&SaaSHive{ID: "school", DashboardTokenHash: HashDashboardToken("tok-school")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.loadSpokeAuthToken(&RegistryEntry{ID: "school"}); got != "tok-school" {
+		t.Errorf("matching proof file: got %q, want tok-school", got)
 	}
 }
 

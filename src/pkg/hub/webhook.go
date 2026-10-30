@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -20,6 +21,13 @@ const (
 	webhookMaxBodyBytes = 256 * 1024
 	webhookPushRetries  = 3
 )
+
+// spokeProofTokenDir holds one file per hive (named by hive ID, mode 0600)
+// containing that spoke's dashboard token. It is the proof source for hubs
+// whose spokes do not run in a Kubernetes cluster the hub can read secrets
+// from, such as a Docker Compose fleet behind one reverse proxy. A var so
+// tests can point it at a temp dir.
+var spokeProofTokenDir = "/data/saas/spoke-tokens"
 
 // webhookRetryDelay is the backoff between spoke config-push retries, and
 // webhookPushTimeout bounds each push attempt. Both are vars (not consts) so
@@ -475,6 +483,9 @@ func (s *HubServer) loadAppPrivateKey(hive *RegistryEntry) string {
 }
 
 func (s *HubServer) loadSpokeAuthToken(hive *RegistryEntry) string {
+	if token := s.loadSpokeProofTokenFile(hive.ID); token != "" {
+		return token
+	}
 	ns := "hive-hosted-" + hive.ID
 	clusterID := hive.ClusterID
 	if clusterID == "" {
@@ -497,6 +508,32 @@ func (s *HubServer) loadSpokeAuthToken(hive *RegistryEntry) string {
 		return ""
 	}
 	return decoded
+}
+
+// loadSpokeProofTokenFile returns the operator-provisioned dashboard token for
+// hiveID from spokeProofTokenDir, or "" when there is none. When the hub holds
+// the spoke's heartbeat-reported token hash, a file that does not match it is
+// refused: sending a wrong proof makes the spoke reject every hub-signed-in
+// user, and a missing proof at least lets the auth-check warning name the cause.
+func (s *HubServer) loadSpokeProofTokenFile(hiveID string) string {
+	if hiveID == "" || strings.ContainsAny(hiveID, `/\`) || strings.Contains(hiveID, "..") {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(spokeProofTokenDir, hiveID))
+	if err != nil {
+		return ""
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return ""
+	}
+	if h := loadSaaSHive(hiveID); h != nil && h.DashboardTokenHash != "" &&
+		!secureCompareHub(HashDashboardToken(token), h.DashboardTokenHash) {
+		s.logger.Warn("spoke proof token file does not match the hive's reported dashboard-token hash; not using it",
+			"hive", hiveID, "dir", spokeProofTokenDir)
+		return ""
+	}
+	return token
 }
 
 func loadWebhookSecret() string {
