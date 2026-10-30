@@ -321,6 +321,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 			return err
 		}
 	}
+	if err := c.RevertSheriff.Validate(); err != nil {
+		return err
+	}
 	if c.Governor.EvalIntervalMaxS > 0 && c.Governor.EvalIntervalS > 0 && c.Governor.EvalIntervalMaxS < c.Governor.EvalIntervalS {
 		return fmt.Errorf("governor.eval_interval_max_s must be greater than or equal to governor.eval_interval_s")
 	}

@@ -443,3 +443,21 @@ func (t *Tracker) Active(repo string, threshold time.Duration, now time.Time) *F
 	}
 	return best
 }
+
+// Red returns the default branch repo was last observed on and the required
+// checks red on its tip, sorted, whatever their age. The revert sheriff uses
+// it to act before the breaker's threshold trips.
+func (t *Tracker) Red(repo string) (string, []string) {
+	if t == nil {
+		return "", nil
+	}
+	key := repoKey(repo)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	checks := make([]string, 0, len(t.repos[key]))
+	for check := range t.repos[key] {
+		checks = append(checks, check)
+	}
+	sort.Strings(checks)
+	return t.branches[key], checks
+}
