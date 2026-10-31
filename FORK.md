@@ -164,9 +164,21 @@ passed 27 jobs, with three skipped, on the exact deployed commit.
 Both spokes run the matching binary; Hub was not restarted.
 Both original feeds returned `seq: 0` despite School completing a 254-PR
 sentinel pass: short configured repository names could not match the qualified
-Matrix allowlist. Live capture/rendering after the fix remains under observation:
-Reef's initial cold-start reconciliation exhausted its App quota and skipped
-optional sweeps before the source could initialize. No budget guard was bypassed.
+Matrix allowlist. After the fix, live captures were observed at 23:11 UTC
+(School) and 23:18 UTC (Reef); both later returned `seq: 1200` and 1,200 lines.
+Reef's first cold-start reconciliation had exhausted its App quota and skipped
+optional sweeps; capture recovered after quota reset without bypassing a guard.
+
+The real browser surfaces rendered Rain and Ghost on Reef, Cascade and Terminal
+on School. Reef's P-key pause/resume changed the visible status as expected.
+A sample from each feed matched a genuine added line, after the source's
+whitespace trimming, in public [tuna-os/Tavern#323](https://github.com/tuna-os/Tavern/pull/323),
+`src/url_security.py`, head `ac9349dba541c1c9297a4282565ce577ceabd7a9`.
+The same PR can appear in both feeds because their watched repositories overlap;
+these are per-spoke counts, not a deduplicated hub total.
+Authorized responses were HTTP 200 with `Cache-Control: no-store`; anonymous
+requests, including a forged `X-Hive-Role: owner`, returned 401 on both spokes.
+This proves buffered PR-patch capture/playback, not live editor keystrokes.
 
 Matrix is opt-in in each spoke's seed **and** runtime config, with explicit
 public-repository allowlists and additional config/deployment-path exclusions.
