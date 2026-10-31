@@ -15,8 +15,13 @@
 // Tracker sounds are on by default in kiosk mode (the streamer captures them
 // through a PulseAudio null sink); `&sound=off` keeps the display silent.
 (function(){
-  var kiosk=false, sound=true;
-  try { kiosk=new URL(window.location.href).searchParams.get('kiosk')==='1'; sound=new URL(window.location.href).searchParams.get('sound')!=='off'; } catch(e) {}
+  var kiosk=false, view='', sound=true;
+  try { var u=new URL(window.location.href); kiosk=u.searchParams.get('kiosk')==='1'; view=u.searchParams.get('view'); sound=u.searchParams.get('sound')!=='off'; } catch(e) {}
+  window.HIVE_MATRIX = kiosk && view === 'matrix';
+  if(window.HIVE_MATRIX){
+    document.body.classList.add('matrix-mode');
+    document.addEventListener('DOMContentLoaded', function(){ typeof hiveMatrixStart === 'function' && hiveMatrixStart(); });
+  }
   window.HIVE_KIOSK=kiosk;
   window.HIVE_KIOSK_SOUND=kiosk&&sound;
   window.hiveKioskMode=function(){ return !!window.HIVE_KIOSK; };

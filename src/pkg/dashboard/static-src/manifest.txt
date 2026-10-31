@@ -31,8 +31,10 @@ css/recipes-utilities.css
 css/welcome.css
 css/review-campaigns.css
 css/kiosk.css
+css/matrix.css
 css/variables.css
 glue/style-close-body-open.html
+js/matrix.js
 js/boot.js
 glue/boot-script-close.html
 html/auth.html
