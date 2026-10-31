@@ -155,7 +155,7 @@ const RegressedLabel = Prefix + "regressed"
 // lists; the health marker is red; role/* is neutral grey except the one
 // tier that means "the hive will merge this". The author/* kinds each get
 // their own hue so the three read apart at a glance: human is the same
-// neutral grey as the non-trusted roles, clanker (a contributor's hive)
+// neutral grey as the non-trusted roles, clanker (a contributor's own agent)
 // is purple, hive (this repo's own hive) is blue.
 const (
 	StageColor         = "f5a623"
@@ -279,10 +279,28 @@ var Table = []Definition{
 	{Stage: MergeQueue, Number: MergeQueueNumber, Slug: "merge-queue", Description: "Lane admitted and soak complete: merge-eligible, waiting for tide / the merge window", Dwell: 3 * time.Hour, PR: true},
 }
 
+// WaitsOnPush reports whether s is a stage where the hive waits for the
+// author (or their clanker) to push: 071 needs-author and 072
+// returned-to-contributor (hivecommons/hive#15784).
+func (s Stage) WaitsOnPush() bool {
+	return s == NeedsAuthor || s == ReturnedToContributor
+}
+
+// TracksPush reports whether s sits in the CI / Review column, where a head
+// change is progress the dashboard shows as "pushed" until CI and the
+// re-review for that head settle (hivecommons/hive#15784).
+func (s Stage) TracksPush() bool {
+	switch s {
+	case ReviewPending, Reviewed, Fixing, NeedsAuthor, ReturnedToContributor, AdoptedByHive:
+		return true
+	}
+	return false
+}
+
 // FixingStageFor is the "author must act" stage for a red or blocked PR by
 // who wrote it: the hive's own PR (selfAuthored, or author/hive) goes to 070
 // fixing — a hive agent reworks it; an author/clanker PR goes to 072
-// returned-to-contributor — the contributor's hive is handed it back; a
+// returned-to-contributor — the contributor's clanker is handed it back; a
 // human (or unknown-kind) PR goes to 071 needs-author — the person must act.
 // The three carry the same evidence and leave through the same transitions;
 // only who is on the hook differs (docs: "Stage 07x by author kind").

@@ -147,6 +147,10 @@ type DeltaContext struct {
 	// BaseSync is set when the planner carries an approve across a hive
 	// base-sync (DeltaDiff.BaseSyncOnly) rather than a trivial delta.
 	BaseSync bool
+	// BaseDiffEmpty is set when the PR itself has no diff against its base
+	// (hivecommons/hive#15499); the delta is trivial whatever the compare
+	// from the previous head shows.
+	BaseDiffEmpty bool `json:"base_diff_empty,omitempty"`
 }
 
 // DeltaReviewInfo is recorded on an aggregate produced by a delta re-review,
@@ -272,6 +276,15 @@ func planDelta(pr PullRequest, artifact Artifact, opts DispatchOptions, now time
 		PreviousPerspectives: prior.Perspectives,
 		PreviousFindings:     prior.Findings,
 	}
+	if pr.BaseDiffEmpty {
+		// The PR has no diff against its base: the new head only absorbed
+		// base commits (a merge-from-base shows them in the compare from
+		// the previous head, so the delta looks non-trivial). Nothing new
+		// to read; the prior verdict stands (hivecommons/hive#15499).
+		ctx.DiffKnown = true
+		ctx.BaseDiffEmpty = true
+		return deltaModeTrivial, ctx, prior
+	}
 	diff := pr.DeltaDiff
 	if diff == nil || !diff.Known || !SameHeadSHA(diff.PreviousHead, prior.HeadSHA) {
 		return deltaModeDelta, ctx, prior
@@ -334,6 +347,9 @@ func restampAggregate(prior Aggregate, pr PullRequest, ctx DeltaContext, now tim
 		note = fmt.Sprintf("re-stamped from %s: hive base-sync; the base's changes (%d file(s), %d line(s)) are disjoint from the PR's files", shortSHA(ctx.PreviousHead), len(ctx.Files), ctx.ChangedLines)
 	case ctx.DiffKnown && len(ctx.Files) == 0:
 		note = fmt.Sprintf("re-stamped from %s: identical tree", shortSHA(ctx.PreviousHead))
+	}
+	if ctx.BaseDiffEmpty {
+		note = fmt.Sprintf("re-stamped from %s: PR has no diff against its base", shortSHA(ctx.PreviousHead))
 	}
 	agg.Delta = &DeltaReviewInfo{PreviousHead: ctx.PreviousHead, Trivial: true, BaseSync: ctx.BaseSync, ChangedLines: ctx.ChangedLines, Note: note}
 	agg.Reasons = append(append([]string(nil), prior.Reasons...), "delta re-review: "+note)
@@ -406,6 +422,7 @@ func deltaSection(pr PullRequest, ctx *DeltaContext) string {
 		b.WriteString("The previous review recorded no findings, so there is nothing to re-check beyond the delta itself.\n")
 	}
 	b.WriteString("Your verdict is for the WHOLE PR at the new head: a previous finding that is still present keeps its verdict; a clean delta on a previously approved PR is approve. Record it with the usual head_sha above.\n")
+	b.WriteString("Say fixed / still present / no longer applies in your summary. Do not list a still-present out-of-scope finding again under findings: it is already in the backlog, and a re-report (\"Previous … still present\") is discarded, not filed. Cite its backlog issue with `<!-- hive-refers-to: #N -->` if you need to point at it. Only in-scope findings that still bear on the verdict, and genuinely new findings in the delta, go under findings.\n")
 	return b.String()
 }
 

@@ -3,7 +3,7 @@ package stageengine
 import "github.com/hivecommons/hive/pkg/stagelabels"
 
 // diagramEdges is the expected-transition table, generated from the
-// `stateDiagram-v2` block in src/docs/labels-and-control-signals.md. One
+// `stateDiagram-v2` block in src/docs/labels-and-control-signals/stage-labels.md. One
 // entry per `sNNN --> sMMM` line, in diagram order; `[*]` edges are
 // implied by Expected (None is always expected). transition_table_test.go
 // parses the fenced block and fails when this table and the diagram drift,
@@ -47,6 +47,7 @@ var diagramEdges = map[Edge]bool{
 	{stagelabels.MergeQueue, stagelabels.Fixing}:                        true, // new head red (backward hop, commented)
 	{stagelabels.MergeQueue, stagelabels.ReturnedToContributor}:         true, // contributor head red (backward hop, commented)
 	{stagelabels.Fixing, stagelabels.ReviewPending}:                     true, // fixed head pushed
+	{stagelabels.Fixing, stagelabels.NeedsDecision}:                     true, // hive adoption copy still conflicting after two fixer rebase attempts (rebase-failed-twice)
 	{stagelabels.NeedsAuthor, stagelabels.ReviewPending}:                true, // author pushes a new head
 	{stagelabels.ReturnedToContributor, stagelabels.ReviewPending}:      true, // author pushes a new head
 	{stagelabels.ReturnedToContributor, stagelabels.AdoptedByHive}:      true, // clanker unavailable, adopted

@@ -165,7 +165,7 @@ sentinel alert, parked-on-decision), human-merge paths and head-SHA pinning —
 before `hive-merge` merges it. A refusal is terminal for that request (`.denied`),
 names the failing gate in the result the agent sees (for example
 `contributor-lane:claim-tier-untrusted (author tier "untrusted", require_tiers
-merger, trusted)` or `contributor-lane:soaking(remaining=27m)`), and is audited
+merger, trusted)` or `contributor-lane:soaking, 27m0s remaining`), and is audited
 as `merge_request_refused`. An agent cannot use the relay to land a contributor
 PR the lane would not merge; the lane still merges it on its own tick once the
 gates clear. Hive-authored PRs keep the relay's existing checks.
@@ -256,6 +256,32 @@ takes effect without a restart.
   has read the reviewer's objection and decided the head lands as-is. The
   outcome becomes `human-approved` and the merge proceeds.
 - **off**: no evaluation.
+
+**A decision is head-scoped — except across the hive's own base refresh.**
+A recorded operator decision (dashboard Approve, `/hive decision …`, a
+hand-applied return label) names the exact head the person saw; a new head
+is a new tree nobody has decided on, so the record is superseded and the
+reviewer's `decision_requested` question stands again. The one head change
+that does not supersede it is the hive's own `require_current_base` refresh:
+a merge commit authored by the App whose parents are the decided head and a
+commit on the base branch, and whose three-dot diff against the base is
+file-for-file (name, status, blob, line counts, patch) identical to the
+decided head's. Up to five such refreshes may stack before any gate reads
+the PR: the carry walks the first-parent chain back from the new head and
+every hop must itself pass the same check, so two App merge-from-base
+commits in a row still carry while a content commit anywhere in the chain
+does not ([#15766](https://github.com/hivecommons/hive/issues/15766)).
+Before any gate reads the new head — the reviewer-verdict
+stage route, the automerge review gate, operator admission and the hold
+guard — the decision is re-recorded on it with `carried_from_head` naming
+the original, and one INFO line `decision carried over base refresh` is
+logged; the reviewer route then reads `decision_answered=true` instead of
+parking the PR at `stage/085-needs-decision` a second time
+([#15751](https://github.com/hivecommons/hive/issues/15751), seen on #15649). A content push,
+a merge by anyone but the App, a rebase, a refresh whose diff differs, and
+GitHub review approvals (which are never moved between heads) all keep the
+record where it was. The answer for a (PR, head) pair is memoised, so the
+check costs one commit read and two compares per new head.
 
 Each evaluation writes one audit line, action `review_evaluated`, detail
 `lane=<self-merge|trusted-bot|trusted-author> would_hold=<bool> reason=<code> enforce=<bool> head=<sha>`,
@@ -376,6 +402,61 @@ auto_merge:
   bot_takeover:
     enabled: true   # default; set false to leave such PRs held
 ```
+
+### Breaking-titled or `needs-owner-merge` PRs wait for a human
+
+A PR whose trimmed title starts with `⚠️` (U+26A0, with or without the VS16
+selector — the PR-title convention for a breaking change) or that carries a
+`needs-owner-merge` label is never merged by hive. One shared predicate,
+`automerge.RequiresHumanMerge(pr)`, is evaluated once per PR where each lane
+already computes eligibility (the App self-merge, label-queued, trusted-author
+and contributor prefilters, and the refetch just before a merge), so the merge
+train — which draws its candidates from the same prefilters — never fronts or
+carries such a PR either. The prefixes and labels are configurable via
+`auto_merge.human_merge_title_prefixes` and `auto_merge.human_merge_labels`
+(see the operator reference); an empty list turns that half of the rule off.
+
+When the PR is otherwise merge-ready (green checks, approvals satisfied) the
+stage tracker parks it at **090 Ready for human merge** with the chip
+*human merge* and the reason *breaking change — owner merges*; the owner
+merges it with **Merge now as maintainer** (the existing gated operator
+path; **Approve and let hive merge** is greyed, since the lanes never
+merge a breaking change) or on GitHub. Hive posts one comment, through the writeback
+gate, saying it will wait for a human. The rule exists because a ⚠️-titled
+PR was auto-merged by the trusted-author lane while its owner was still
+deciding whether to ship it.
+
+### Merge train: ready PRs lead
+
+Every lane groups its candidates on one base whose changed files overlap
+into a **merge train** (`auto_merge.merge_train.*`, [#15117](https://github.com/hivecommons/hive/issues/15117))
+and merges one front at a time; the siblings park at stage/080 with lane
+reason `merge-train:queued-behind#<front>:<pos>/<size>:…` and, the moment
+the front merges, are update-branched (`behind`) or handed to the rebase
+resolver (`dirty`) so the next front is evaluated on a current base. Hive's
+own repo also runs the current-base gate (`require_current_base`), which
+holds a behind head until the update lands; the two cooperate — the train
+refreshes, the gate waits for the refresh.
+
+The train's order is **readiness first**. Each pass the lane sorts the
+members by what it last saw of their heads: a head at the merge gate —
+green, approved, soaking or waiting on a sweep — leads; a head the lane has
+not evaluated since it was pushed comes next (so it is evaluated and
+sorted); a head still at CI / Review trails; a blocked head (red required
+check, terminal hold) trails everything and never fronts. Within a tier the
+old tiebreak holds (clean-mergeable first, then oldest, then number). The
+order is recomputed every pass, so a member that turns green moves up and
+one that turns red moves back. The front of a train is therefore always a
+ready member when the train has one; a train whose every member is still
+short of the gate has a *provisional* front, and the Activity Monitor says
+so rather than reading "1st in the merge queue".
+
+This replaced the age-first order after hive's own #15741, still at CI /
+Review, led #15748 and #15755 — both green and queued at 080 — and nothing
+merged until its checks finished. In the Activity Monitor only members at
+080 and beyond ride a train chip in the *Merge queue* column; a member still
+at CI / Review keeps its chevron in its own column with a muted
+"train · joins behind #N when green" note.
 
 ### Trusted-author auto-merge
 
@@ -542,9 +623,18 @@ A PR merges through this tier only when all of the following hold:
     walked first; only when it is short does one `search/issues` query
     (`is:pr is:merged author:<login> repo:… repo:…`) find which other hive
     repos hold the author's merges, and only those are walked for revert
-    evidence — a revert or sentinel hit in any repository blocks. The sweep
-    posts a `<!-- hive:contributor-auto-promoted author=… merged=N scope=hive
-    repos=hive:4,docs:1 -->` audit comment once per PR and logs
+    evidence — a revert or sentinel hit in any repository blocks. Promotion
+    is a property of the author in the hive, not of a PR, so the sweep
+    announces it **once per (hive, author)**: the first PR that earns it
+    gets a `<!-- hive:trust-promoted login=… merged=N scope=hive
+    repos=hive:4,docs:1 -->` comment ("@login is now trusted for
+    contributor-lane merging in this hive … Applies to their open and
+    future PRs here"), and the author's other open PRs, later PRs and PRs
+    after a restart post nothing — the "announced" fact lives in the stage
+    store (`trust-promoted:<login>`), with the PR's own marker as a
+    fallback when the store was rebuilt. Revert or sentinel evidence that
+    withdraws the promotion forgets the announcement, so regaining it is
+    announced once more (#15443). Every admission still logs
     `contributor-lane admitted reason=contributor-lane:auto-promoted
     merged_prs=5 scope=hive repos=hive:4,docs:1`. `auto_promotion_scope:
     repo` restores the per-repository count.
@@ -610,8 +700,13 @@ A PR merges through this tier only when all of the following hold:
   went green — the latest `completed_at` over its check runs, read once per
   (repo, PR, head) and then pinned in process — so a pod restart or upgrade
   does not restart it; a new push restarts
-  the soak and the skip reason reports the time left
-  (`contributor-lane:soaking(remaining=25m0s)`).
+  the soak. The skip reason is the stable `contributor-lane:soaking`; the
+  soak head, start and window are recorded once on the stage record, so the
+  stage tracker computes "N left" from that deadline at request time instead
+  of the hive re-stamping its note every pass. The window is also editable
+  from the Activity Monitor's ⚙ → Toasts & timing ("Pre-merge soak"), which
+  writes `soak_minutes` through `PUT /api/config/auto-merge`; the lane reads
+  the knob on every pass, so a running soak follows the new window.
 
 Merges squash through the same effect-claimed `MergePR` path as the other tiers,
 log `automerge merged tier=contributor-lane admitted_by=<path>`, record the
@@ -664,6 +759,24 @@ unattended (for example `mrbobbytables`):
 A claim keeps the tier the contributor held when it was taken, so grant the
 tier before the issue is leased.
 
+**No decision during CI/Review; the operator has the last word on
+untrusted merges.** A contributor PR is not parked at
+`stage/085-needs-decision` on a reviewer decision marker alone. While it is
+in CI/Review the hive runs CI and the review swarm to completion and the
+row always names its mover; the only early exit is a concrete security /
+trust finding (`review.IsSecuritySensitiveFinding`: high-risk marker,
+security perspective hold, security-class question, finding on a sensitive
+path — `sentinel.sensitive_paths` plus `security.sensitive_paths` — or
+insecure behaviour flagged), recorded as `decision_finding` and printed as
+`the review found: …`. Anything else goes back to the clanker or is
+advisory and the PR keeps moving. At the merge gate a contributor the lane
+cannot vouch for parks at `stage/090-ready-for-human-merge`
+(`contributor-lane:claim-tier-untrusted`, `untrusted-author-role`, the
+human-merge rule) and waits for the operator's merge — the hive never
+auto-merges an untrusted author's PR, however green, approved and soaked.
+See [review-swarm.md](review-swarm.md) ("Contributor and human-authored
+PRs: no decision in CI/Review").
+
 ### Issue-author credit at merge time
 
 Every merge the hive performs — the self-authored, trusted-author,
@@ -696,6 +809,34 @@ report them. If the branch's commits cannot be read at merge time, the hive
 falls back to GitHub's default message rather than risk dropping a sign-off.
 Switch it off with `auto_merge.credit_issue_authors: false` (#14581).
 
+### Issues close only after the merge
+
+The hive never closes an issue for a pull request that has not merged. The
+only PR-driven close path is close-on-merge (`CloseOnMergeLedgerSweep`,
+`close_on_merge.go`), which reads the PR back from the forge and returns
+`pr_not_merged` without touching the issue unless `merged_at` is set (or
+`merged` is true); opening a PR, admitting it to the merge train or the
+pre-merge soak, and a `Fixes #N` in its body change nothing on the issue. On
+GitHub's default branch GitHub itself closes the issue in the same instant
+the PR merges, attributed to whoever pressed merge; on a release line the
+hive's sweep does it on the next pass, with a "Fixed by #N (merged …)"
+comment. Every such close goes through the central `CloseIssue` (which
+refuses tracking issues and honours the reporter-confirmation gate) and is
+counted by the direct-write ratchet, so no other code path can grow a close
+of its own.
+
+The tracker shows the consequence honestly. A follow-up or duplicate PR whose
+body names an issue an *earlier* PR already delivered — `Refs #15422` on
+#15425 after #15426 merged, `extending #15058` on #15431 after #15068 merged —
+sits under the struck-through issue with the chip **closed by #N**, linking
+to the merged PR GitHub records as the closer
+(`closedByPullRequestsReferences`, with the hive's merged ledger as the
+fallback). Only a merged PR is ever named: an open PR with `Fixes #N` is
+listed under the same relation and has closed nothing. When no merged closer
+can be found the chip reads **closed · this PR unmerged**, never a bare
+`closed` that could be read as the issue having been closed before its fix
+merged.
+
 ### Stage labels
 
 Every sweep cycle also writes the hive-owned `stage/NNN-*` label for each PR
@@ -727,7 +868,7 @@ why a person merges: `workflow-files` (`contributor-lane:workflow-path`),
 (`reviewer-verdict:requires_human` a trusted merger approved), and `policy` for
 any other lane reason, quoted in the tooltip; #14658), merged → no stage), plus one `role/*` label saying
 which admission tier the lane actually used, one `author/*` label saying who
-wrote the PR (`human`, `clanker` = a contributor's hive, `hive` = this repo's
+wrote the PR (`human`, `clanker` = a contributor's own agent, `hive` = this repo's
 own; #12581) and `stage/stalled` when nobody
 but the hive has touched the PR for the stage's dwell (never while checks run
 or the reviewer verdict is pending). Backward moves are a one-line stage
@@ -737,7 +878,7 @@ the planned set differs from the labels already on the PR, under the
 `governor.labels.stage.enabled`. The mapping table, numbering rules, dwell
 thresholds, the mermaid state machine and the off-happy-path flow
 (072 → nudge → 074 → takeover) are in
-[labels-and-control-signals.md](labels-and-control-signals.md#stage-labels-stagennn--the-pipeline-state-machine);
+[labels-and-control-signals.md](labels-and-control-signals/stage-labels.md#stage-labels-stagennn--the-pipeline-state-machine);
 the code is `src/pkg/stagelabels` and
 `src/pkg/github/automerge/automerge_stage_labels.go`. Adoption
 (`stage/074-adopted-by-hive`, `automerge_contributor_adopt.go`) reuses this
@@ -808,6 +949,35 @@ writes the same stage on each linked issue (`stage/040-covered-by-pr` until
 then), so the issue list and the PR list read the same
 ([#12436](https://github.com/hivecommons/hive/issues/12436)).
 
+An adoption pair is one logical PR everywhere a person might otherwise be
+asked to pick between PRs (hivecommons/hive#15495). A clanker- or
+hive-authored original closes in the adopting pass by policy
+(`governor.labels.stage.adoption.close_superseded: on_adopt`, the default;
+`on_merge` keeps it open until the copy merges): the write-back gate admits
+the close as `superseded-agent-pr` without the repo opt-in label the
+`contributor_adopt` kind otherwise wants, because the copy carries the same
+commits and sign-off (hivecommons/hive#15526 sat open beside hive's #15574
+as "Adopted → #15574 · superseded" with the gate saying
+`needs-opt-in-label`). A human-authored original still needs that opt-in
+label to close in the adopting pass; without it the gate keeps it open after
+supersession (`needs-opt-in-label`, or a fork the hive cannot edit) and it
+sits at 072 "superseded by #N" until the copy merges. Either way the
+superseded original draws in the Activity Monitor as one muted,
+chevron-less line under the issue (greyed title, no stage strip) whose
+trailing note reads "superseded · hive adopted → #M" — or "superseded ·
+closed · hive adopted → #M" once it is closed — on a single line (the title
+ellipsizes first); the hover carries the long form ("Hive re-authored this
+PR as #M with the same commits and sign-off. This PR closes as superseded
+when #M merges." / "…is closed as superseded."). The tracker marks it
+`superseded_by: M`; the line stays only while #M is open and listed and
+drops once #M merges or closes. The issue's caption, open-PR count, parked-PR check and "Let hive decide — all N
+PRs" fan-out all see only the hive's copy: the original's review verdict never
+gates the issue, and the copy's body carries every `Fixes #N` / `Refs #N` line
+of the original (an annotated `Refs #N — partial` travels as the bare
+reference, so the copy keeps the issue link). The original counts again only
+when the copy is closed without merging (`adopted_by_state` closed /
+closed-twice / copy-failed).
+
 A clanker PR entering `stage/072-returned-to-contributor` also triggers the
 contributor nudge: the sweep posts one `<!-- hive:contributor-nudge head=…
 -->` comment per head naming the failing checks / review asks (re-nudged
@@ -819,6 +989,134 @@ queued fixes are served before new work ("contributors should clean up their
 mess before taking on new stuff"). Code:
 `src/pkg/github/automerge/automerge_contributor_nudge.go`, `src/pkg/fixqueue`
 and `src/pkg/dashboard/contribute_fixqueue.go`.
+
+One exception: a PR the merge train holds because **another open PR already
+fixes the same issue** (lane reason `merge-train:duplicate-of#<winner>:…`)
+is parked with its author — 072 for a relay contributor, 071 for a person,
+070 for the App's own — as *superseded*, not at the merge gate as "Approved;
+waiting its turn", and the 07x pass neither nudges nor adopts it: there is
+nothing to fix, and adopting it would land the issue twice. Its one notice
+is the duplicate-fix sweep's gated `<!-- hive:duplicate-fix -->` comment;
+the tracker pill reads *Duplicate of #winner · needs a pick*, and *Let hive
+decide* on either row closes it as superseded
+([#15469](https://github.com/hivecommons/hive/issues/15469)). Upstream of
+the train, an open PR's webhook that covers an issue also releases any
+contributor task already dispatched on it (see
+[operator-reference.md § Open-PR dispatch guard](operator-reference.md#open-pr-dispatch-guard-and-duplicate-fix-sweep-scanner)),
+so the hive does not open the second PR in the first place.
+
+The duplicate pick above sees one lane at a time. When the two PRs sit in
+**different lanes** — the hive's own PR in the self lane and a trusted
+human's PR in the trusted lane both closing one issue, as #15783 and
+#15793 did for #15773 — neither lane's winner rule saw the other and both
+marched toward merge. Every lane therefore also runs a **same-issue claim
+gate** before its trains are grouped: a candidate whose closing issue any
+other open PR of the repository also claims (`Fixes`/`Closes`/`Resolves`;
+a `Refs` line is not a claim; an adoption copy and the original it
+`Supersedes` are one change, not a pair) is held with lane reason
+`merge-train:claim-conflict#<other>:<issue>/0:0/0:` and the log line
+`same-issue claim conflict undecided: #A vs #B` — in every lane, so
+**neither PR is admitted** while the conflict stands. The hive does not
+pick: the stage engine parks the held PR at 085, the tracker chevron reads
+*held · duplicate of #B · needs decision*, the row's options name the
+concrete PRs (*Keep #A — admit it to the merge queue*, *Close #A as
+superseded by #B*), and *Let hive decide* only recommends ("Hold both: #A
+and #B claim issue #N. Keep #B, close #A — or keep #A, close #B"). A
+recorded trusted decision on a PR's head (the tracker's Approve, or any
+`/hive decision` on it — the downstream gates still judge the merge) is
+what lifts the gate for that PR; closing the other ends it
+([#15810](https://github.com/hivecommons/hive/issues/15810)).
+
+### Empty-diff PRs of the hive's own
+
+A PR of the hive's own (the App's, or an adoption it opened) whose diff
+against its base is **empty** — GitHub reports zero changed files, and the
+`base...head` compare agrees — carries nothing the base does not already
+have. This is what an adoption looks like once the original's fix landed
+through another PR. The hive closes it itself, through the writeback gate,
+with the sweep's edited-in-place comment naming the PR that carries the
+change (`<!-- hive-redundant-of: #N -->`, the marker the reviewer's verdict
+set) and the `hive/superseded` label, and raises **no** human decision. The
+same guards as the superseded rule hold: `governor.auto_close_superseded` on,
+ACMM L6, not held / keep-open / draft / parked by a person, and a head at
+least 15 minutes old so a branch mid-push is not read as empty. A *person's*
+empty PR is never closed by the hive; it gets the decision prompt as before.
+Code: `src/pkg/github/pr_empty_diff_hive_autoclose.go`, hooked from the
+self-authored sweep and from the 085 route
+([#15499](https://github.com/hivecommons/hive/pull/15499)).
+
+Three things made #15499 sit a day at 085 instead:
+
+- The adoption's dispatch records carried no `author_agent`, so the relay
+  judged the App's own PR non-hive and its decision question went down the
+  **contributor** lane (`contributor-lane:decision-requested`) to a person.
+  Dispatch records now carry `hive_authored`, and the relay falls back to
+  the PR author's login against the hive identity; an adoption routes
+  through the self lane.
+- Every merge-from-base pushed by the hive's own `update-branch` was a new
+  head with no verdict, so the swarm re-reviewed and re-asked the same
+  question (six heads, ~16 "Decision needed" reviews and 085 comments). A
+  PR with no diff against its base now re-stamps its prior verdict on each
+  head (`review.delta_rereview`); a decision question is identified by its
+  `hive-redundant-of` PR (else its normalised words), and a second ask with
+  the same identity refreshes the standing review in place and posts no
+  second 085 entry comment.
+- The tracker's *Decision needed* popover read the verdict at the current
+  head only, so during a re-review it fell back to "a reviewer handed this
+  PR to a person without a specific question". A row parked on a reviewer
+  decision now quotes the newest decision-requested verdict on any head,
+  shows a *redundant of #N* chip, and leads with **Close as superseded**.
+
+**Already landed, by the reviewer's word.** #15647 and #15648 (adoptions of
+#15324 / #15343) still parked at 085 with the question "should decide
+whether to close this adoption … as already landed, since v5 already
+contains the identical change via #15506": the empty-diff closer ran, but
+its 15-minute freshness guard read the PR's `updated_at`, which the hive's
+own labels and comments bump every pass, so the head was "too fresh"
+forever. "Already landed / redundant / no-op" is the hive's own decision
+about its own PR, not a person's. The 085 route now takes the
+**already-landed** entry when the verdict for the head says so — the
+`hive-redundant-of` marker, or wording that names the landing PR
+explicitly ("already landed … via #N", "identical change merged in #N";
+a question that merely mentions a PR is not a claim, and two candidate
+numbers are ambiguous and name none). On that entry there is no
+freshness guard (a reviewer confirmed this head), a head whose files
+are each byte-identical on the base tip counts as empty when GitHub
+still reports a diff, and the landing PR is taken from the marker or
+the words; with no number the compare alone must prove redundancy. The
+close is logged once with reason `self-authored:already-landed`
+(tracker caption "already landed via #N — closing as superseded"),
+and settles the adoption's lineage: each original the copy declared
+`Supersedes #M` whose record names this copy is told, marked superseded
+on the stage store (so the orphan recovery does not re-adopt a head the
+base already has) and closed, and issues the copy would have closed are
+closed with the redundant-of note. Only when the verdict names no PR
+*and* the compare is not empty does the PR fall through to 085 as before
+([#15647](https://github.com/hivecommons/hive/pull/15647)).
+
+**Already landed, any author.** That entry was the hive's own: #15544, a
+trusted contributor's PR for #15543, was +0/−0 against `v5` because
+#15545 (merged) carried the identical change, and the reviewer's "should
+decide whether #15544 can be closed as a no-op now that #15545 (merged)
+carries this change" still parked it at 085 for nine hours. Whether a
+change is already on the base is a measurement, not a trust call, so the
+already-landed entry now takes any author's PR when the evidence is
+unambiguous: the diff against the current base is empty (no files, or
+every file byte-identical on the base tip) **and** the landing is proven
+— the PR the reviewer named is merged, the issue this PR closes was
+closed by a merged PR, or the compare lists no commits (the head is
+contained in the base). "#N (merged)" in the reviewer's words names the
+landing PR like "via #N" does. The hive comments "already landed via #N
+— closing as superseded; thank you @author", closes the PR through the
+supersession-close write-back gate, and logs
+`already-landed:<author_kind>` (the caption is the same "already landed
+via #N — closing as superseded"). A trusted author is treated exactly
+like anyone else. A PR with a real diff, an empty PR whose landing is not
+proven, a held or `keep-open` PR, or one a person parked keeps the
+reviewer's question as before. The "Let hive decide" preview for such a
+PR gives the evidence as its reason — "diff is empty — the change already
+landed via #N (merged)" — never the author's standing
+([#15732](https://github.com/hivecommons/hive/issues/15732)).
 
 ## Usage
 

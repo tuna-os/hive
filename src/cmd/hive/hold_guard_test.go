@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/holdguard"
+	"github.com/hivecommons/hive/pkg/review"
 )
 
 func swapHoldGuardStore(t *testing.T, s *holdguard.Store) {
@@ -107,6 +109,15 @@ type holdGuardServer struct {
 	// (#14534: proving the merged parent of a hygiene merge is a base commit).
 	baseContains map[string]bool
 	compareCalls int
+
+	// commitBySHA serves GET /repos/{o}/{r}/commits/{sha}, pulls serves
+	// GET /repos/{o}/{r}/pulls/{n} and compareResult overrides the compare
+	// payload for "base...head" (#15649: the decision carry proves a head
+	// is the hive's own base refresh before accepting an approval on the
+	// previous head). Unknown SHAs and PRs are 404s.
+	commitBySHA   map[string]map[string]any
+	pulls         map[int]map[string]any
+	compareResult map[string]map[string]any
 }
 
 func (s *holdGuardServer) handler(t *testing.T) http.Handler {
@@ -118,12 +129,31 @@ func (s *holdGuardServer) handler(t *testing.T) http.Handler {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/compare/"):
 			s.compareCalls++
 			spec := r.URL.Path[strings.Index(r.URL.Path, "/compare/")+len("/compare/"):]
+			if payload, ok := s.compareResult[spec]; ok {
+				_ = json.NewEncoder(w).Encode(payload)
+				return
+			}
 			_, head, _ := strings.Cut(spec, "...")
 			status := "diverged"
 			if s.baseContains[head] {
 				status = "behind"
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": status})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/commits/") && !strings.Contains(r.URL.Path, "/pulls/"):
+			sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			commit, ok := s.commitBySHA[sha]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(commit)
+		case r.Method == http.MethodGet && holdGuardPullPath.MatchString(r.URL.Path):
+			pr, ok := s.pulls[pathPRNumber(t, r.URL.Path)]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(pr)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/commits"):
 			if s.failCommits {
 				http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
@@ -227,6 +257,9 @@ func (s *holdGuardServer) handler(t *testing.T) http.Handler {
 		}
 	})
 }
+
+// holdGuardPullPath matches GET /repos/{o}/{r}/pulls/{n} and nothing under it.
+var holdGuardPullPath = regexp.MustCompile(`/pulls/\d+$`)
 
 func pathPRNumber(t *testing.T, path string) int {
 	t.Helper()
@@ -1056,5 +1089,174 @@ func TestWriteMergeEligibleExcludesHoldDriftPRs(t *testing.T) {
 	}
 	if len(failing.CIFailing) != 1 || failing.CIFailing[0].Number != 8 || !failing.CIFailing[0].Held {
 		t.Fatalf("ci_failing = %+v, want only drifted red PR 8 flagged held", failing.CIFailing)
+	}
+}
+
+// swapHoldGuardHumanChangeRequests points the guard's operator-approval
+// lookup at a memory-only decision ledger for the test's lifetime.
+func swapHoldGuardHumanChangeRequests(t *testing.T) *review.HumanChangeRequests {
+	t.Helper()
+	store := review.NewHumanChangeRequests("")
+	old := holdGuardHumanChangeRequests
+	holdGuardHumanChangeRequests = func() review.HumanChangeRequestStore { return store }
+	t.Cleanup(func() { holdGuardHumanChangeRequests = old })
+	return store
+}
+
+func recordHoldGuardDecision(t *testing.T, store *review.HumanChangeRequests, head, actor, kind string) {
+	t.Helper()
+	if err := store.Record(review.HumanChangeRequest{
+		Repo: "acme/widgets", Number: 7, HeadSHA: head, Source: review.HumanChangeRequestSourceDecision,
+		SourceID: 1, Actor: actor, Body: kind, Kind: kind,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// hive#15482: the contributor pushed while the PR sat behind the sentinel
+// gate; the operator then pressed Approve on the dashboard for that exact
+// head and the hive removed the gate label on their behalf. The timeline
+// shows a hive lift, which can never cover the head — but the head-keyed
+// approval record by a trusted merger is the fresh review, so the guard must
+// accept the head instead of re-applying `hold` over the approval.
+func TestEnforceHoldGuardOperatorApprovalOnCurrentHeadAcceptsHiveLift(t *testing.T) {
+	store := newTestHoldGuardStore(t)
+	decisions := swapHoldGuardHumanChangeRequests(t)
+	recordHoldGuardDecision(t, decisions, "p1", "clubanderson", review.HumanChangeRequestKindApprove)
+	fake := &holdGuardServer{commits: map[int][]map[string]any{
+		7: {ghCommit("c1", "odttlnt", "deploy: monitoring"), ghCommit("p1", "odttlnt", "deploy: patch secret")},
+	}}
+	fake.timeline = map[int][]map[string]any{
+		7: gateLiftTimeline("sentinel-alert", "kubestellar-hive[bot]", "Bot", "2026-10-22T18:19:00Z"),
+	}
+	client := newHoldGuardClient(t, fake)
+	client.SetAppBotLogin("kubestellar-hive[bot]")
+	cfg := escalationTestConfig()
+	cfg.Dashboard.AuthorizedUsers = []string{"clubanderson:owner"}
+	store.Snapshot("acme/widgets", 7, "c1", []holdguard.Commit{{SHA: "c1", Author: "odttlnt"}})
+	store.Touch("acme/widgets", 7, "p1")
+
+	got := enforceHoldGuard(context.Background(), cfg, client, client,
+		actionableWith(github.PullRequest{Repo: "widgets", Number: 7, Author: "odttlnt", HeadSHA: "p1"}), discardLogger())
+	if got["widgets/7"] {
+		t.Fatalf("head approved by a trusted merger must not be re-review-gated, got %v", got)
+	}
+	if len(fake.comments) != 0 || len(fake.labels) != 0 {
+		t.Fatalf("comments=%v labels=%v, want no drift comment and no re-hold", fake.comments, fake.labels)
+	}
+	if _, ok := store.Recorded("acme/widgets", 7); ok {
+		t.Fatal("snapshot must clear once the approved head is accepted")
+	}
+}
+
+// hivecommons/hive#15649: the operator approved the PR on head c1 and the
+// hive's require_current_base gate then merged the base into the branch —
+// a merge commit by the App that left the PR's diff untouched. That head
+// change is the hive's own doing, so the approval follows the PR onto m1
+// and the guard accepts the head. A merge by a person, or a refresh that
+// changed the diff, is drift as before.
+func TestEnforceHoldGuardOperatorApprovalCarriesOverHiveBaseRefresh(t *testing.T) {
+	files := func(blob string) []map[string]any {
+		return []map[string]any{{"filename": "deploy/monitoring.yaml", "status": "modified", "sha": blob, "additions": 2, "deletions": 0, "changes": 2, "patch": "@@ " + blob}}
+	}
+	for _, tc := range []struct {
+		name, mergeAuthor, newBlob string
+		carried                    bool
+	}{
+		{name: "pure base refresh by the App", mergeAuthor: "kubestellar-hive[bot]", newBlob: "blob1", carried: true},
+		{name: "base merged by a person", mergeAuthor: "odttlnt", newBlob: "blob1"},
+		{name: "refresh that changed the diff", mergeAuthor: "kubestellar-hive[bot]", newBlob: "blob9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestHoldGuardStore(t)
+			decisions := swapHoldGuardHumanChangeRequests(t)
+			recordHoldGuardDecision(t, decisions, "c1", "clubanderson", review.HumanChangeRequestKindApprove)
+			fake := &holdGuardServer{commits: map[int][]map[string]any{
+				7: {ghCommit("c1", "odttlnt", "deploy: monitoring"), ghCommit("m1", tc.mergeAuthor, "Merge branch 'main' into deploy")},
+			}}
+			fake.timeline = map[int][]map[string]any{
+				7: gateLiftTimeline("sentinel-alert", "kubestellar-hive[bot]", "Bot", "2026-10-22T18:19:00Z"),
+			}
+			fake.pulls = map[int]map[string]any{7: {"number": 7, "head": map[string]any{"sha": "m1"}, "base": map[string]any{"ref": "main"}}}
+			fake.commitBySHA = map[string]map[string]any{"m1": {
+				"sha": "m1", "author": map[string]any{"login": tc.mergeAuthor}, "committer": map[string]any{"login": "web-flow"},
+				"parents": []map[string]any{{"sha": "c1"}, {"sha": "b1"}},
+			}}
+			fake.compareResult = map[string]map[string]any{
+				"main...c1": {"status": "ahead", "merge_base_commit": map[string]any{"sha": "b0"}, "files": files("blob1")},
+				"main...m1": {"status": "ahead", "merge_base_commit": map[string]any{"sha": "b1"}, "files": files(tc.newBlob)},
+			}
+			client := newHoldGuardClient(t, fake)
+			client.SetAppBotLogin("kubestellar-hive[bot]")
+			cfg := escalationTestConfig()
+			cfg.Dashboard.AuthorizedUsers = []string{"clubanderson:owner"}
+			store.Snapshot("acme/widgets", 7, "c1", []holdguard.Commit{{SHA: "c1", Author: "odttlnt"}})
+
+			got := enforceHoldGuard(context.Background(), cfg, client, client,
+				actionableWith(github.PullRequest{Repo: "widgets", Number: 7, Author: "odttlnt", HeadSHA: "m1"}), discardLogger())
+			if got["widgets/7"] == tc.carried {
+				t.Fatalf("re-review-gated=%v, want %v", got["widgets/7"], !tc.carried)
+			}
+			if tc.carried {
+				if len(fake.comments) != 0 || len(fake.labels) != 0 {
+					t.Fatalf("comments=%v labels=%v, want no drift comment and no re-hold", fake.comments, fake.labels)
+				}
+				if _, ok := store.Recorded("acme/widgets", 7); ok {
+					t.Fatal("snapshot must clear once the carried approval covers the head")
+				}
+				carried, ok := decisions.For("acme/widgets", 7, "m1")
+				if !ok || !carried.IsApproval() || carried.CarriedFromHead != "c1" || carried.Actor != "clubanderson" {
+					t.Fatalf("carried decision = %+v ok=%v", carried, ok)
+				}
+				return
+			}
+			if len(fake.labels) != 1 || fake.labels[0] != holdguard.ReHoldLabel {
+				t.Fatalf("labels=%v, want re-hold", fake.labels)
+			}
+			if _, ok := decisions.For("acme/widgets", 7, "c1"); !ok {
+				t.Fatal("the approval must stay on the head the person actually approved")
+			}
+		})
+	}
+}
+
+// The approval must name the head on the branch now: one recorded on the
+// pre-push head, or by someone outside the merger tier, is not a review of
+// the current tree and the drift path stands.
+func TestEnforceHoldGuardOperatorApprovalMustCoverCurrentHeadByTrustedMerger(t *testing.T) {
+	cases := []struct {
+		name, head, actor string
+		users             []string
+	}{
+		{name: "approval on the old head", head: "c1", actor: "clubanderson", users: []string{"clubanderson:owner"}},
+		{name: "approver below merger tier", head: "p1", actor: "visitor", users: []string{"visitor:read-write"}},
+		{name: "approver not authorized", head: "p1", actor: "stranger", users: []string{"clubanderson:owner"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestHoldGuardStore(t)
+			decisions := swapHoldGuardHumanChangeRequests(t)
+			recordHoldGuardDecision(t, decisions, tc.head, tc.actor, review.HumanChangeRequestKindApprove)
+			fake := &holdGuardServer{commits: map[int][]map[string]any{
+				7: {ghCommit("c1", "odttlnt", "deploy: monitoring"), ghCommit("p1", "odttlnt", "deploy: patch secret")},
+			}}
+			fake.timeline = map[int][]map[string]any{
+				7: gateLiftTimeline("sentinel-alert", "kubestellar-hive[bot]", "Bot", "2026-10-22T18:19:00Z"),
+			}
+			client := newHoldGuardClient(t, fake)
+			client.SetAppBotLogin("kubestellar-hive[bot]")
+			cfg := escalationTestConfig()
+			cfg.Dashboard.AuthorizedUsers = tc.users
+			store.Snapshot("acme/widgets", 7, "c1", []holdguard.Commit{{SHA: "c1", Author: "odttlnt"}})
+
+			got := enforceHoldGuard(context.Background(), cfg, client, client,
+				actionableWith(github.PullRequest{Repo: "widgets", Number: 7, Author: "odttlnt", HeadSHA: "p1"}), discardLogger())
+			if !got["widgets/7"] {
+				t.Fatalf("must still be re-review-gated, got %v", got)
+			}
+			if len(fake.labels) != 1 || fake.labels[0] != holdguard.ReHoldLabel {
+				t.Fatalf("labels=%v, want re-hold", fake.labels)
+			}
+		})
 	}
 }

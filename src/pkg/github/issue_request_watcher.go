@@ -22,6 +22,7 @@ import (
 	"github.com/hivecommons/hive/pkg/effects"
 	"github.com/hivecommons/hive/pkg/issueshape"
 	"github.com/hivecommons/hive/pkg/stagelabels"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // IssueRequestDir is where agents drop issue-create and comment requests. An
@@ -573,6 +574,23 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		body = withParentMarker(body, req.Parent)
 	}
 	if kind == "issue" {
+		// An empty dedupe checklist is not an issue (hivecommons/hive#15381):
+		// a pass that found nothing to act on goes to the hive's own log,
+		// not to the maintainers' queue. Terminal, like a prior-art refusal.
+		if f, isChecklist := ParseDedupeChecklistFindings(body); isChecklist && !f.Actionable() {
+			refusal := "not filed: dedupe checklist has no actionable findings (" + f.Summary() + "); merge-order reminders, cross-links and checked-not-duplicates are notes, not work — report them in your kick output instead"
+			c.recordWriteAudit(AuditActionAgentIssueEmptyAdvisoryRefused, meta,
+				WriteTarget{Repo: req.Repo}, "findings", f.Summary())
+			if c.priorArtFilingRecord != nil {
+				c.priorArtFilingRecord("dedupe pass found nothing to act on: "+strings.TrimSpace(req.Title), f.Summary(), req.Agent, req.Repo)
+			}
+			c.logger.Info("issue-request watcher: refused empty dedupe advisory",
+				slog.String("repo", req.Repo), slog.String("agent", req.Agent), slog.String("findings", f.Summary()))
+			c.writeIssueResult(path, IssueResponse{OK: false, Error: refusal, At: nowFn().UTC().Format(time.RFC3339)})
+			_ = os.Remove(path)
+			c.issueClearRetry(path)
+			return
+		}
 		// Prior-art filing verdict (hivecommons/hive#13879). A refusal is
 		// terminal: retrying the same request cannot change the match.
 		var refusal string
@@ -1298,6 +1316,36 @@ func (r CreateIssueRequest) OriginLabel() string {
 	return config.OriginLabelForAgent(r.Origin)
 }
 
+// TitleFiler returns the agent or subsystem name the issue title is tagged
+// with (`[<filer>] …`): the Origin's agent lane (`reviewer-2` → `reviewer`),
+// else a non-lane origin/* label the caller chose (the convergence publisher
+// filing through the forge seam), else the Origin source as written
+// (`governor`, `selfreport`, `dashboard`), else the source of the resolved
+// provenance label.
+func (r CreateIssueRequest) TitleFiler() string {
+	lane := config.OriginLaneFromAgent(r.Origin)
+	if lane != "" && config.IsKnownOriginLane(lane) {
+		return lane
+	}
+	for _, l := range r.Labels {
+		if source := config.OriginSourceOf(l); source != "" && !config.IsKnownOriginLane(source) {
+			return source
+		}
+	}
+	if lane != "" {
+		return lane
+	}
+	if source := config.OriginSourceOf(r.OriginLabel()); source != "" {
+		return source
+	}
+	for _, l := range r.Labels {
+		if source := config.OriginSourceOf(l); source != "" {
+			return source
+		}
+	}
+	return ""
+}
+
 // ErrOriginRequired is returned when a create carries no provenance label and
 // names no Origin source.
 var ErrOriginRequired = errors.New("CreateIssue: provenance is required (set Origin or pass an origin/* label)")
@@ -1337,6 +1385,11 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 	if title == "" {
 		return CreateIssueResult{}, fmt.Errorf("CreateIssue: title is required")
 	}
+	// Every issue the hive files names its filer in the title (`[reviewer]
+	// Review backlog (security): …`). Hive-internal filers and the watcher
+	// both land here, so a caller cannot forget it; AgentIssueTitle is idempotent
+	// for a title an agent already tagged.
+	title = issueshape.AgentIssueTitle(req.TitleFiler(), title)
 	// Same posture and same placement as validateRepoRef above: a request that
 	// is still carrying its template cannot become a useful issue, and unlike a
 	// bad repo ref it would SUCCEED, leaving a human to triage an empty report
@@ -1384,7 +1437,7 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 	// twin (#13906). An exact-title match is the same finding and stays
 	// unguarded.
 	if err == nil && scan.subject != nil && req.FoldMatch != nil &&
-		strings.TrimSpace(scan.subject.GetTitle()) != title &&
+		!issueshape.SameTitle(scan.subject.GetTitle(), title) &&
 		!req.FoldMatch(scan.subject.GetTitle(), scan.subject.GetBody()) {
 		scan.subject = nil
 	}
@@ -1448,8 +1501,14 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 			if err := c.commentOnHumanFiledTwin(ctx, owner, repoName, fileSetTwin, comment); err != nil {
 				return CreateIssueResult{}, err
 			}
-		} else if err := c.CreateIssueComment(ctx, owner+"/"+repoName, fileSetTwin.GetNumber(), comment); err != nil {
-			return CreateIssueResult{}, fmt.Errorf("CreateIssue: consolidating into open issue #%d in %s/%s: %w", fileSetTwin.GetNumber(), owner, repoName, err)
+		} else {
+			item := c.WritebackItemForIssue(Issue{Number: fileSetTwin.GetNumber(), Author: safeGetLogin(fileSetTwin.GetUser()), Labels: issueLabelNames(fileSetTwin.Labels), CreatedAt: fileSetTwin.GetCreatedAt().Time})
+			if d := c.WritebackAllowed(owner+"/"+repoName, item, writeback.KindGateComment, comment); !d.Allowed {
+				return CreateIssueResult{}, fmt.Errorf("%w: %s", writeback.ErrSuppressed, d.Detail)
+			}
+			if err := c.CreateIssueComment(ctx, owner+"/"+repoName, fileSetTwin.GetNumber(), comment); err != nil { // writeback:gated
+				return CreateIssueResult{}, fmt.Errorf("CreateIssue: consolidating into open issue #%d in %s/%s: %w", fileSetTwin.GetNumber(), owner, repoName, err)
+			}
 		}
 		c.logger.Info("CreateIssue: consolidated finding into open issue over the same file set",
 			slog.String("repo", repoName), slog.Int("number", fileSetTwin.GetNumber()),
@@ -1860,7 +1919,10 @@ func (c *Client) scanOpenIssues(ctx context.Context, owner, repo, title, body st
 				continue
 			}
 			candidate := strings.TrimSpace(is.GetTitle())
-			if candidate == title {
+			// Exact match ignores the leading `[<agent>]` tag so an issue
+			// filed before titles carried the filer still dedupes its
+			// prefixed re-filing instead of gaining a twin.
+			if candidate == title || issueshape.SameTitle(candidate, title) || reviewBacklogTitlesEqual(candidate, title) {
 				return openIssueMatches{subject: is}, nil
 			}
 			// Pages arrive newest-first, so overwriting leaves the oldest
@@ -2033,7 +2095,11 @@ func (c *Client) commentOnHumanFiledTwin(ctx context.Context, owner, repo string
 			slog.String("repo", repo), slog.Int("number", twin.GetNumber()))
 		return nil
 	}
-	if err := c.CreateIssueComment(ctx, owner+"/"+repo, twin.GetNumber(), comment); err != nil {
+	item := c.WritebackItemForIssue(Issue{Number: twin.GetNumber(), Author: safeGetLogin(twin.GetUser()), Labels: issueLabelNames(twin.Labels), CreatedAt: twin.GetCreatedAt().Time})
+	if d := c.WritebackAllowed(owner+"/"+repo, item, writeback.KindGateComment, comment); !d.Allowed {
+		return fmt.Errorf("%w: %s", writeback.ErrSuppressed, d.Detail)
+	}
+	if err := c.CreateIssueComment(ctx, owner+"/"+repo, twin.GetNumber(), comment); err != nil { // writeback:gated
 		return fmt.Errorf("CreateIssue: commenting on human-filed issue #%d in %s/%s: %w", twin.GetNumber(), owner, repo, err)
 	}
 	return nil
@@ -2208,7 +2274,7 @@ func (c *Client) ensureCreateIssueLabel(ctx context.Context, owner, repo, name s
 	_, _, err := c.client.Issues.CreateLabel(ctx, owner, repo, &gh.Label{
 		Name:        gh.Ptr(name),
 		Color:       gh.Ptr(color),
-		Description: gh.Ptr(description),
+		Description: gh.Ptr(clampLabelDescription(description)),
 	})
 	if ghErr, ok := err.(*gh.ErrorResponse); ok && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusUnprocessableEntity {
 		if _, _, getErr := c.client.Issues.GetLabel(ctx, owner, repo, name); getErr == nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -153,6 +154,15 @@ func newStageAPI(t *testing.T, api *stageAPI) *httptest.Server {
 				out = []map[string]any{}
 			}
 			_ = json.NewEncoder(w).Encode(out)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/pulls/") && !strings.Contains(strings.TrimPrefix(path, "/repos/acme/widget/pulls/"), "/"):
+			// The decision carry (#15649) asks the PR for its base branch
+			// before proving a new head is the hive's own base refresh.
+			n, _ := strconv.Atoi(strings.TrimPrefix(path, "/repos/acme/widget/pulls/"))
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": n, "base": map[string]any{"ref": "main"}})
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/commits/"):
+			// No single-commit detail is seeded: a new head is never a base
+			// refresh here, so a recorded decision stays on its own head.
+			http.NotFound(w, r)
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/pulls/") && strings.HasSuffix(path, "/commits"):
 			n, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(path, "/repos/acme/widget/pulls/"), "/commits"))
 			api.commitReads++
@@ -413,6 +423,12 @@ func TestClassifyStageMapping(t *testing.T) {
 		{name: "no claim but needs-rebase", obs: stageObservation{AuthorKind: authorkind.Clanker, Lane: stageLaneContributor, Reason: contributorLaneReasonNoClaim, Labels: []string{"needs-rebase"}}, want: stagelabels.ReturnedToContributor, rank: stageRankOwned},
 		{name: "untrusted role weak", obs: stageObservation{Lane: stageLaneTrusted, Reason: "untrusted-author-role"}, want: stagelabels.ReadyForHumanMerge, rank: stageRankRole},
 		{name: "human merge path", obs: stageObservation{Lane: stageLaneSelf, Reason: autoMergeReasonHumanMergePath}, want: stagelabels.NeedsDecision, rank: stageRankOwned},
+		// A breaking-titled / needs-owner-merge PR owes no decision, only
+		// the owner's merge click: an OWNED 090 whatever the lane
+		// (hivecommons/hive#15442), fixing while it wears needs-rebase.
+		{name: "human merge required is owned 090", obs: stageObservation{Lane: stageLaneTrusted, Reason: autoMergeReasonHumanMergeRequired, Detail: approve}, want: stagelabels.ReadyForHumanMerge, rank: stageRankOwned},
+		{name: "human merge required self lane", obs: stageObservation{Lane: stageLaneSelf, Reason: autoMergeReasonHumanMergeRequired}, want: stagelabels.ReadyForHumanMerge, rank: stageRankOwned},
+		{name: "human merge required needs-rebase", obs: stageObservation{Lane: stageLaneSelf, Reason: autoMergeReasonHumanMergeRequired, Labels: []string{"needs-rebase"}}, want: stagelabels.Fixing, rank: stageRankOwned},
 		// A merge GitHub refuses for a missing approving review or a
 		// disabled merge method is not imminent: a person acts (085).
 		{name: "merge refused review required", obs: stageObservation{Lane: stageLaneSelf, Reason: autoMergeReasonMergeRefusedReview, Detail: approve}, want: stagelabels.NeedsDecision, rank: stageRankOwned},
@@ -1386,6 +1402,9 @@ func TestApplyStageLabelsRequiresHumanBeatsAdmissionReason(t *testing.T) {
 	ctx := context.Background()
 	observe := func(labels []string) {
 		pr := stagePR(336, labels...)
+		// A clanker PR: a person's requires_human routes to 071 instead
+		// (hivecommons/hive#15202).
+		pr.Body = gh.Ptr("Fixes the widget.\n\n— hive: backend=pi model=gpt-6\n")
 		e.recordStage(stageLaneTrusted, "acme/widget", "acme", "widget", pr, "untrusted-author-role", false, nil)
 		e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonAuthorAssociation, false, nil)
 		e.noteStageRole("acme", "widget", 336, stagelabels.RoleContributor)
@@ -1396,7 +1415,7 @@ func TestApplyStageLabelsRequiresHumanBeatsAdmissionReason(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	observe([]string{"stage/050-review-pending", "role/contributor", "author/human"})
+	observe([]string{"stage/050-review-pending", "role/contributor", "author/clanker"})
 	if !reflect.DeepEqual(api.added, [][]string{{"stage/085-needs-decision"}}) {
 		t.Fatalf("requires_human must hand off to 085: added=%v", api.added)
 	}
@@ -1405,7 +1424,7 @@ func TestApplyStageLabelsRequiresHumanBeatsAdmissionReason(t *testing.T) {
 	}
 	api.reset()
 	clock.advance(48 * time.Hour)
-	observe([]string{"stage/085-needs-decision", "role/contributor", "author/human"})
+	observe([]string{"stage/085-needs-decision", "role/contributor", "author/clanker"})
 	if api.writes() != 0 {
 		t.Fatalf("085 has no dwell and never stalls: added=%v", api.added)
 	}
@@ -2595,5 +2614,262 @@ func TestApplyStageLabelsHonoursStageEngineOptions(t *testing.T) {
 	}
 	if rec, ok := store.Get(stageKey("acme", "widget", 1)); !ok || rec.Stage != stagelabels.Reviewed || rec.Reason != "engine says reviewed" {
 		t.Fatalf("store %+v", rec)
+	}
+}
+
+// hivecommons/hive#15499: a decision question that names the PR already
+// carrying the change is the superseded question itself and warrants the
+// closer; any other decision question stays a person's.
+func TestSupersededCheckWarrantedForRedundantOfDecision(t *testing.T) {
+	human := stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Reason: stageReasonVerdictRequiresHuman, Human: true}
+	redundant := stageObservation{Detail: stageDetail{VerdictKnown: true, Verdict: ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true, DecisionQuestion: "close as a no-op?", RedundantOf: 15427}}}
+	other := stageObservation{Detail: stageDetail{VerdictKnown: true, Verdict: ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true, DecisionQuestion: "rename the flag?"}}}
+	if !supersededCheckWarranted(human, redundant) {
+		t.Fatal("redundant-of decision must run the superseded/empty-diff closer")
+	}
+	if supersededCheckWarranted(human, other) {
+		t.Fatal("an ordinary decision question is not a supersession check")
+	}
+	// hivecommons/hive#15647: the reviewer said it in words, no marker.
+	worded := stageObservation{Detail: stageDetail{VerdictKnown: true, Verdict: ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true, DecisionQuestion: "@clubanderson should decide whether to close this adoption of #15324 as already landed, since v5 already contains the identical two-line test change via #15506"}}}
+	if !supersededCheckWarranted(human, worded) {
+		t.Fatal("an already-landed decision in words must run the closer")
+	}
+	lineage := stageObservation{Detail: stageDetail{VerdictKnown: true, Verdict: ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true, DecisionQuestion: "@clubanderson should decide whether this adoption of #15324 should keep the contributor's flag rename"}}}
+	if supersededCheckWarranted(human, lineage) {
+		t.Fatal("a PR mention that is not about redundancy is a person's decision")
+	}
+}
+
+// alreadyLandedCloserSpy stands in for the hgithub closers on the stage
+// engine's transport: the superseded rule keeps the PR, the already-landed
+// rule closes it.
+type alreadyLandedCloserSpy struct {
+	Transport
+	stage           stageReconcilerTransport
+	supersededCalls []int
+	landedCalls     []int
+	redundantOf     []int
+	result          hgithub.HiveEmptyDiffClose
+}
+
+func (s *alreadyLandedCloserSpy) StageReconciler(store *stagelabels.Store, opts *stageengine.Options, logger *slog.Logger) stageengine.Reconciler {
+	return s.stage.StageReconciler(store, opts, logger)
+}
+
+func (s *alreadyLandedCloserSpy) CloseSupersededHivePRIfEligible(_ context.Context, _ string, pr *gh.PullRequest) (hgithub.HiveSupersededClose, error) {
+	s.supersededCalls = append(s.supersededCalls, pr.GetNumber())
+	return hgithub.HiveSupersededClose{Reason: "issue-open"}, nil
+}
+
+func (s *alreadyLandedCloserSpy) CloseAlreadyLandedHivePRIfEligible(_ context.Context, _ string, pr *gh.PullRequest, redundantOf int) (hgithub.HiveEmptyDiffClose, error) {
+	s.landedCalls = append(s.landedCalls, pr.GetNumber())
+	s.redundantOf = append(s.redundantOf, redundantOf)
+	return s.result, nil
+}
+
+// TestApplyStageLabelsHiveAlreadyLandedClosesInsteadOfDecision is
+// hivecommons/hive#15647: a hive-authored adoption whose reviewer verdict
+// says the change already landed via another PR is closed as superseded
+// (and its adopted original settled) — never parked at 085.
+func TestApplyStageLabelsHiveAlreadyLandedClosesInsteadOfDecision(t *testing.T) {
+	const copy, original, landed = 15647, 15324, 15506
+	var closedOriginal bool
+	var originalComments []string
+	api := &stageAPI{}
+	api.extra = func(w http.ResponseWriter, r *http.Request) bool {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/15647":
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": copy, "state": "open", "user": map[string]any{"login": testHiveAppBotLogin},
+				"body": "Supersedes #15324 (adopted after CI went red; original commits by @onkar717 preserved).",
+				"head": map[string]any{"sha": "h1", "ref": "hive/adopt-15324"}, "base": map[string]any{"ref": "v5"}})
+			return true
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/15324":
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": original, "state": "open", "user": map[string]any{"login": "onkar717"},
+				"head": map[string]any{"sha": "o1", "ref": "fix"}, "base": map[string]any{"ref": "v5"}})
+			return true
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/acme/widget/pulls/15324":
+			closedOriginal = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": original, "state": "closed"})
+			return true
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widget/issues/15324/comments":
+			var c struct{ Body string }
+			_ = json.NewDecoder(r.Body).Decode(&c)
+			originalComments = append(originalComments, c.Body)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			return true
+		}
+		return false
+	}
+	srv := newStageAPI(t, api)
+	defer srv.Close()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 20, 3, 41, 0, 0, time.UTC)}
+	e, _, store := newStageEngine(t, srv.URL, clock)
+	e.trustedAuthorPolicy = func() TrustedAuthorPolicy { return TrustedAuthorPolicy{Enabled: true} }
+	e.contributorLanePolicy = func() ContributorLanePolicy { return ContributorLanePolicy{} }
+	stage, ok := e.transport.(stageReconcilerTransport)
+	if !ok {
+		t.Fatal("engine transport provides no stage writer")
+	}
+	spy := &alreadyLandedCloserSpy{Transport: e.transport, stage: stage, result: hgithub.HiveEmptyDiffClose{Closed: true, Empty: true, RedundantOf: landed, Reason: hgithub.SupersessionActionClosedAlreadyLanded, Supersedes: []int{original}}}
+	e.transport = spy
+	ctx := context.Background()
+
+	// The original is on record as adopted (supersede mode) by the copy.
+	origKey := stageKey("acme", "widget", original)
+	store.Observe(origKey, stagelabels.AdoptedByHive, "adopted")
+	store.MarkAdopted(origKey, "o1", copy, clock.at)
+
+	pr := stagePR(copy)
+	pr.User = &gh.User{Login: gh.Ptr(testHiveAppBotLogin)}
+	e.recordStage(stageLaneSelf, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
+	e.noteStageRole("acme", "widget", copy, stagelabels.RoleTrusted)
+	e.noteStageVerdict("acme", "widget", copy, ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true,
+		DecisionQuestion: "@clubanderson should decide whether to close this adoption of #15324 as already landed, since v5 already contains the identical two-line test change via #15506"})
+	res, err := e.ApplyStageLabels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ClosedSuperseded != 1 {
+		t.Fatalf("ClosedSuperseded=%d want 1", res.ClosedSuperseded)
+	}
+	for _, batch := range api.added {
+		for _, l := range batch {
+			if l == "stage/085-needs-decision" {
+				t.Fatalf("already-landed hive PR routed to 085: added=%v", api.added)
+			}
+		}
+	}
+	if !reflect.DeepEqual(spy.landedCalls, []int{copy}) || !reflect.DeepEqual(spy.redundantOf, []int{landed}) {
+		t.Fatalf("already-landed closer calls=%v redundant_of=%v", spy.landedCalls, spy.redundantOf)
+	}
+	if !closedOriginal || len(originalComments) != 1 || !strings.Contains(originalComments[0], "via #15506") {
+		t.Fatalf("original lineage: closed=%v comments=%q", closedOriginal, originalComments)
+	}
+	rec, _ := store.Get(origKey)
+	if rec.SupersededBy != copy || rec.SupersededOpen {
+		t.Fatalf("original record not marked superseded: %+v", rec)
+	}
+	if _, ok := store.Get(stageKey("acme", "widget", copy)); ok {
+		t.Fatal("closed copy still on the store")
+	}
+}
+
+// TestApplyStageLabelsAnyAuthorAlreadyLandedClosesInsteadOfDecision is
+// hivecommons/hive#15732: #15544 by a trusted contributor, +0/−0 against
+// v5 because #15545 (merged) carried the change, parked at 085 for 9h on
+// "@clubanderson should decide whether #15544 can be closed as a no-op".
+// Any author's PR with an already-landed verdict goes to the closer, which
+// proves the landing; it never reaches 085. The hive's own superseded rule
+// is not asked for another author's PR.
+func TestApplyStageLabelsAnyAuthorAlreadyLandedClosesInsteadOfDecision(t *testing.T) {
+	const number, landed = 15544, 15545
+	cases := []struct {
+		name  string
+		lane  string
+		role  stagelabels.Role
+		login string
+	}{
+		{"contributor", stageLaneContributor, stagelabels.RoleUntrusted, "karibhou"},
+		{"trusted", stageLaneTrusted, stagelabels.RoleTrusted, "karibhou"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &stageAPI{}
+			api.extra = func(w http.ResponseWriter, r *http.Request) bool {
+				if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/15544" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"number": number, "state": "open", "user": map[string]any{"login": tc.login},
+						"head": map[string]any{"sha": "k1", "ref": "fix"}, "base": map[string]any{"ref": "v5"}})
+					return true
+				}
+				return false
+			}
+			srv := newStageAPI(t, api)
+			defer srv.Close()
+			clock := &contributorLaneClock{at: time.Date(2026, 10, 20, 3, 41, 0, 0, time.UTC)}
+			e, _, store := newStageEngine(t, srv.URL, clock)
+			e.trustedAuthorPolicy = func() TrustedAuthorPolicy { return TrustedAuthorPolicy{Enabled: true} }
+			e.contributorLanePolicy = func() ContributorLanePolicy { return ContributorLanePolicy{} }
+			stage, ok := e.transport.(stageReconcilerTransport)
+			if !ok {
+				t.Fatal("engine transport provides no stage writer")
+			}
+			spy := &alreadyLandedCloserSpy{Transport: e.transport, stage: stage, result: hgithub.HiveEmptyDiffClose{Closed: true, Empty: true, RedundantOf: landed, Reason: hgithub.SupersessionActionClosedEmptyDiff}}
+			e.transport = spy
+
+			pr := stagePR(number)
+			pr.User = &gh.User{Login: gh.Ptr(tc.login)}
+			e.recordStage(tc.lane, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
+			e.noteStageRole("acme", "widget", number, tc.role)
+			e.noteStageVerdict("acme", "widget", number, ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true,
+				DecisionQuestion: "@clubanderson should decide whether #15544 can be closed as a no-op now that #15545 (merged) carries this change"})
+			res, err := e.ApplyStageLabels(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.ClosedSuperseded != 1 {
+				t.Fatalf("ClosedSuperseded=%d want 1", res.ClosedSuperseded)
+			}
+			for _, batch := range api.added {
+				if slices.Contains(batch, "stage/085-needs-decision") {
+					t.Fatalf("already-landed %s PR routed to 085: added=%v", tc.name, api.added)
+				}
+			}
+			if !reflect.DeepEqual(spy.landedCalls, []int{number}) || !reflect.DeepEqual(spy.redundantOf, []int{landed}) {
+				t.Fatalf("already-landed closer calls=%v redundant_of=%v", spy.landedCalls, spy.redundantOf)
+			}
+			if len(spy.supersededCalls) != 0 {
+				t.Fatalf("the hive's own superseded rule asked about a %s PR: %v", tc.name, spy.supersededCalls)
+			}
+			if _, ok := store.Get(stageKey("acme", "widget", number)); ok {
+				t.Fatal("closed PR still on the store")
+			}
+		})
+	}
+}
+
+// TestApplyStageLabelsAnyAuthorAlreadyLandedKeptStillParks: when the closer
+// keeps a contributor PR (a real diff, an unproven landing) the decision
+// goes to a person as before.
+func TestApplyStageLabelsAnyAuthorAlreadyLandedKeptStillParks(t *testing.T) {
+	const number = 15544
+	api := &stageAPI{}
+	api.extra = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/15544" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": number, "state": "open", "user": map[string]any{"login": "karibhou"},
+				"head": map[string]any{"sha": "k1", "ref": "fix"}, "base": map[string]any{"ref": "v5"}})
+			return true
+		}
+		return false
+	}
+	srv := newStageAPI(t, api)
+	defer srv.Close()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 20, 3, 41, 0, 0, time.UTC)}
+	e, _, _ := newStageEngine(t, srv.URL, clock)
+	e.trustedAuthorPolicy = func() TrustedAuthorPolicy { return TrustedAuthorPolicy{Enabled: true} }
+	e.contributorLanePolicy = func() ContributorLanePolicy { return ContributorLanePolicy{} }
+	stage, _ := e.transport.(stageReconcilerTransport)
+	spy := &alreadyLandedCloserSpy{Transport: e.transport, stage: stage, result: hgithub.HiveEmptyDiffClose{Verdict: "keep", Reason: "has-diff"}}
+	e.transport = spy
+
+	pr := stagePR(number)
+	pr.User = &gh.User{Login: gh.Ptr("karibhou")}
+	e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
+	e.noteStageRole("acme", "widget", number, stagelabels.RoleUntrusted)
+	e.noteStageVerdict("acme", "widget", number, ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true,
+		DecisionQuestion: "@clubanderson should decide whether #15544 can be closed as a no-op now that #15545 (merged) carries this change"})
+	res, err := e.ApplyStageLabels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ClosedSuperseded != 0 || !reflect.DeepEqual(spy.landedCalls, []int{number}) {
+		t.Fatalf("ClosedSuperseded=%d landedCalls=%v", res.ClosedSuperseded, spy.landedCalls)
+	}
+	parked := false
+	for _, batch := range api.added {
+		parked = parked || slices.Contains(batch, "stage/085-needs-decision")
+	}
+	if !parked {
+		t.Fatalf("kept contributor PR must still reach 085: added=%v", api.added)
 	}
 }
