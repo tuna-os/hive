@@ -1,0 +1,1 @@
+- Repo-wide CI failure detection no longer treats dependency bots or anonymous PRs as independent human controls, preventing unrelated bot failures from hiding an agent PR's own broken checks.
