@@ -350,7 +350,7 @@ func mqIssueLabels(t *testing.T, captured map[string]interface{}) []string {
 }
 
 // AC32: organization-owned repos (and repos whose owner type cannot be read)
-// keep today's ticket: same title, body and labels.
+// keep the gap content and labels, with v6's dashboard title provenance.
 func TestACMMIssue_MergeQueueOrgTicketUnchanged(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -366,7 +366,7 @@ func TestACMMIssue_MergeQueueOrgTicketUnchanged(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
 			}
-			if got := captured["title"]; got != "[ACMM L6] Add Merge queue" {
+			if got := captured["title"]; got != "[dashboard] [ACMM L6] Add Merge queue" {
 				t.Fatalf("title = %q", got)
 			}
 			if got := captured["body"]; got != acmmOrgMergeQueueGolden {

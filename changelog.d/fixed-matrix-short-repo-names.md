@@ -1,0 +1,1 @@
+- Matrix mode now shows patches from repositories configured by short name under `project.org`: the sentinel hands the Matrix allowlist the full `owner/name` instead of the short name, which matched no allowlist entry.

@@ -110,24 +110,69 @@ func TestStageTrackerAdoptionNeverSaysSo(t *testing.T) {
 	}
 }
 
-// adopt (default): nothing is held, so the row only reports the wait, the
-// nudges and the presence; no Adopt is offered.
+// hivecommons/hive#15692: the engine only reads the author's repository
+// permission once adoption is due (automerge_contributor_adopt.go), so a
+// never-policy row that has not reached that moment yet has no
+// AdoptionBlocked record — nothing distinguishes it, in the dashboard's
+// own data, from a row the hive will truly auto-adopt. Before this fix the
+// row read "hive adopts it in Nm" right up to the due moment, then flipped
+// to "not adopted: maintainer_policy is never" for a maintainer's PR. The
+// row now names the exception instead of promising an outcome it cannot
+// back for every author.
+func TestStageTrackerAdoptionNeverHedgesBeforeDue(t *testing.T) {
+	now := time.Date(2026, 10, 28, 16, 0, 0, 0, time.UTC)
+	s, store, status := adoptionFixture(t, now, config.AdoptionMaintainerPolicyNever, offlinePresence(now.Add(-3*time.Hour)))
+	a := trackerItem(t, s.buildStageTracker(status, store, now), "pr", 14524).Adoption
+	if a == nil || a.Due || a.BlockedBy != "" || a.Action != "" || a.Policy != "never" || !a.AutoDue {
+		t.Fatalf("adoption = %+v", a)
+	}
+	if a.Text != "waiting on @hanthor (offline 3h, 2 nudges) — hive adopts it on the next sweep unless the author maintains this repository" {
+		t.Fatalf("text = %q", a.Text)
+	}
+	// Nudged 13 minutes ago, offline: the pending countdown carries the
+	// same hedge.
+	store2 := stagelabels.NewStore("", func() time.Time { return now })
+	key := stagelabels.Key("hivecommons/hive", 14524)
+	store2.Observe(key, stagelabels.ReturnedToContributor, "conflicting")
+	store2.MarkNudged(key, "feed", 1, false, now.Add(-13*time.Minute))
+	s.stageStore = store2
+	s.presenceLookup = offlinePresence(now.Add(-13 * time.Minute))
+	if a = trackerItem(t, s.buildStageTracker(status, store2, now), "pr", 14524).Adoption; a == nil || a.AutoDue || a.AutoAdoptAt == nil || !a.AutoAdoptAt.Equal(now.Add(2*time.Minute)) || a.Text != "waiting on @hanthor (offline 13m, 1 nudge) — hive adopts it in 2m unless a new head lands or the author maintains this repository" {
+		t.Fatalf("pending text = %+v", a)
+	}
+}
+
+// adopt (default): nothing is held, so the row reports the wait, the
+// nudges, the presence and — since the engine's own predicate
+// (automerge.AutoAdoption) is what the row reads — that the hive adopts
+// on its next sweep; no Adopt click is asked for.
 func TestStageTrackerAdoptionDefaultReportsWait(t *testing.T) {
 	now := time.Date(2026, 10, 28, 16, 0, 0, 0, time.UTC)
 	s, store, status := adoptionFixture(t, now, "", offlinePresence(now.Add(-3*time.Hour)))
 	a := trackerItem(t, s.buildStageTracker(status, store, now), "pr", 14524).Adoption
-	if a == nil || a.Due || a.BlockedBy != "" || a.Action != "" || a.Policy != "adopt" {
+	if a == nil || a.Due || a.BlockedBy != "" || a.Action != "" || a.Policy != "adopt" || !a.AutoDue {
 		t.Fatalf("adoption = %+v", a)
 	}
-	if a.Text != "waiting on @hanthor (offline 3h, 2 nudges)" {
+	if a.Text != "waiting on @hanthor (offline 3h, 2 nudges) — hive adopts it on the next sweep" {
 		t.Fatalf("text = %q", a.Text)
 	}
-	// Online author: no offline span.
+	// Online author: no offline span; 26h past the first nudge is past the
+	// 2h online grace too.
 	s.presenceLookup = func(string) (automerge.ContributorPresence, bool) {
 		return automerge.ContributorPresence{Registered: true, Online: true}, true
 	}
-	if a = trackerItem(t, s.buildStageTracker(status, store, now), "pr", 14524).Adoption; a == nil || a.Text != "waiting on @hanthor (online, 2 nudges)" {
+	if a = trackerItem(t, s.buildStageTracker(status, store, now), "pr", 14524).Adoption; a == nil || a.Text != "waiting on @hanthor (online, 2 nudges) — hive adopts it on the next sweep" {
 		t.Fatalf("online text = %+v", a)
+	}
+	// Nudged 13 minutes ago, offline: the row says when the hive adopts.
+	store2 := stagelabels.NewStore("", func() time.Time { return now })
+	key := stagelabels.Key("hivecommons/hive", 14524)
+	store2.Observe(key, stagelabels.ReturnedToContributor, "conflicting")
+	store2.MarkNudged(key, "feed", 1, false, now.Add(-13*time.Minute))
+	s.stageStore = store2
+	s.presenceLookup = offlinePresence(now.Add(-13 * time.Minute))
+	if a = trackerItem(t, s.buildStageTracker(status, store2, now), "pr", 14524).Adoption; a == nil || a.AutoDue || a.AutoAdoptAt == nil || !a.AutoAdoptAt.Equal(now.Add(2*time.Minute)) || a.Text != "waiting on @hanthor (offline 13m, 1 nudge) — hive adopts it in 2m unless a new head lands" {
+		t.Fatalf("pending text = %+v", a)
 	}
 }
 
@@ -336,5 +381,133 @@ func TestStageTrackerAdoptionEndpointShape(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), `"blocked_by":"author-is-maintainer"`) {
 		t.Fatalf("endpoint body lacks adoption: %s", rr.Body.String())
+	}
+}
+
+// hivecommons/hive#15202: an owner's / author-human PR the engine refused to
+// adopt says so on its row, with no Adopt offer and no nudge clock needed.
+func TestStageTrackerAdoptionPersonAuthoredSaysNotAdopted(t *testing.T) {
+	now := time.Date(2026, 10, 28, 20, 30, 0, 0, time.UTC)
+	s := newTestServer()
+	store := stagelabels.NewStore("", func() time.Time { return now })
+	s.stageStore = store
+	s.deps = &Dependencies{Config: &config.Config{}}
+	key := stagelabels.Key("hivecommons/hive", 15157)
+	store.Observe(key, stagelabels.NeedsDecision, "contributor-lane:decision-requested")
+	store.NoteAdoptionBlocked(key, "cafe", stagelabels.AdoptBlockedAuthorPerson, now.Add(-2*time.Minute))
+	status := minimalPayload()
+	status.HiveID = "hive"
+	status.Repos = []FrontendRepo{{
+		Name: "hive", Full: "hivecommons/hive",
+		OpenPrs: []any{FrontendPR{PullRequest: github.PullRequest{Number: 15157, Title: "Owner change", Author: "clubanderson", HeadSHA: "cafe", Labels: []string{"stage/085-needs-decision", "author/human", "role/trusted"}}}},
+	}}
+	s.UpdateStatus(status)
+	it := trackerItem(t, s.buildStageTracker(status, store, now), "pr", 15157)
+	a := it.Adoption
+	if a == nil || !a.Due || a.BlockedBy != stagelabels.AdoptBlockedAuthorPerson || a.Action != "" {
+		t.Fatalf("adoption = %+v", a)
+	}
+	if a.Text != "@clubanderson pushed this PR themselves — not adopted: the hive asks them, not adopts" {
+		t.Fatalf("text = %q", a.Text)
+	}
+	if !strings.Contains(it.Caption, "not adopted") {
+		t.Fatalf("caption = %q", it.Caption)
+	}
+	if d := it.DecisionNeeded; d != nil {
+		for _, o := range d.Options {
+			if o.Action == decisionActionAdopt {
+				t.Fatalf("adopt offered on a person's PR: %+v", d)
+			}
+		}
+	}
+}
+
+// hivecommons/hive#15159: a clanker-authored 072 row names whose clanker
+// the PR went back to and who sent it; the "@x must act" tail — a person's
+// turn — goes.
+func TestStageTrackerReturnedToHiveCaption(t *testing.T) {
+	cases := []struct {
+		caption    string
+		requesters []string
+		want       string
+	}{
+		{"Returned to @thatguywob — a maintainer requested changes — @thatguywob must act", []string{"clubanderson"}, "Returned to @thatguywob's clanker — @clubanderson requested changes"},
+		{"Returned to @thatguywob — a maintainer requested changes — @thatguywob must act", nil, "Returned to @thatguywob's clanker — a maintainer requested changes"},
+		{"Returned to @thatguywob — a maintainer requested changes — @thatguywob must act (2 nudges sent)", []string{"a", "b"}, "Returned to @thatguywob's clanker — @a and @b requested changes (2 nudges sent)"},
+		{"Returned to @thatguywob — review swarm requested changes — @thatguywob must act", []string{"clubanderson"}, "Returned to @thatguywob's clanker — review swarm requested changes"},
+		{"Returned to @thatguywob — review swarm requested changes — waiting on @thatguywob (offline 2h)", nil, "Returned to @thatguywob's clanker — review swarm requested changes — waiting on @thatguywob (offline 2h)"},
+		{"Returned to contributor", nil, "Returned to contributor"},
+	}
+	for _, tc := range cases {
+		if got := stageTrackerReturnedToHiveCaption(tc.caption, "thatguywob", tc.requesters); got != tc.want {
+			t.Errorf("%q → %q, want %q", tc.caption, got, tc.want)
+		}
+	}
+	if got := stageTrackerReturnedToHiveCaption("Returned to @x — @x must act", "", nil); got != "Returned to @x — @x must act" {
+		t.Errorf("no author changed the caption: %q", got)
+	}
+}
+
+// hive#15565/#15566/#15609 and #15312: PRs by an offline clanker sat at 072
+// with "waiting on @Karibhou (offline 13m, 1 nudge)" until a person clicked
+// Adopt. The row now says when the hive adopts, offers Adopt now only as an
+// override, and the fork-not-editable row names its blocker.
+func TestStageTrackerAutoAdoptionExampleCaptions(t *testing.T) {
+	now := time.Date(2026, 10, 29, 22, 45, 0, 0, time.UTC)
+	s := newTestServer()
+	store := stagelabels.NewStore("", func() time.Time { return now })
+	s.stageStore = store
+	s.deps = &Dependencies{Config: &config.Config{}}
+	nudged := now.Add(-13 * time.Minute)
+	s.presenceLookup = func(login string) (automerge.ContributorPresence, bool) {
+		// One heartbeat a minute after the nudge: acknowledged, then gone.
+		return automerge.ContributorPresence{Registered: true, Online: false, LastSeen: nudged.Add(time.Minute)}, true
+	}
+	rows := []struct {
+		number int
+		reason string
+		author string
+		want   string
+	}{
+		{15565, "conflicting", "Karibhou", "conflicting"},
+		{15566, "contributor-lane:changes-requested", "Karibhou", "changes requested"},
+		{15609, "optional-check-failing:overlayfs-exec-guard", "Karibhou", "overlayfs-exec-guard"},
+		{15312, "fork-not-editable", "odttlnt", "fork not editable by hive"},
+	}
+	status := minimalPayload()
+	status.HiveID = "hive"
+	var prs []any
+	for _, r := range rows {
+		key := stagelabels.Key("hivecommons/hive", r.number)
+		store.Observe(key, stagelabels.ReturnedToContributor, r.reason)
+		store.MarkNudged(key, "feed", 1, false, nudged)
+		prs = append(prs, FrontendPR{PullRequest: github.PullRequest{Number: r.number, Title: "Change", Author: r.author, HeadSHA: "feed", Labels: []string{"stage/072-returned-to-contributor", "author/clanker", "role/contributor"}}})
+	}
+	status.Repos = []FrontendRepo{{Name: "hive", Full: "hivecommons/hive", OpenPrs: prs}}
+	s.UpdateStatus(status)
+
+	for _, r := range rows {
+		it := trackerItem(t, s.buildStageTracker(status, store, now), "pr", r.number)
+		wantTail := "waiting on @" + r.author + " (offline 12m, 1 nudge) — hive adopts it in 3m unless a new head lands"
+		if !strings.Contains(it.Caption, r.want) || !strings.HasSuffix(it.Caption, wantTail) {
+			t.Fatalf("#%d caption = %q, want %q … %q", r.number, it.Caption, r.want, wantTail)
+		}
+		if strings.Contains(it.Caption, "No stage recorded yet") {
+			t.Fatalf("#%d caption keeps the empty-stage clause: %q", r.number, it.Caption)
+		}
+		if it.Adoption == nil || it.Adoption.AutoDue || it.Adoption.AutoAdoptAt == nil || !it.Adoption.AutoAdoptAt.Equal(nudged.Add(16*time.Minute)) {
+			t.Fatalf("#%d adoption = %+v", r.number, it.Adoption)
+		}
+		if it.Takeover == nil || !it.Takeover.AdoptNow || it.Takeover.GraceElapsed || it.Takeover.AutoAdoptAt == nil {
+			t.Fatalf("#%d takeover = %+v", r.number, it.Takeover)
+		}
+	}
+	// Three minutes on: the sweep's clock has run out; the row says so.
+	later := nudged.Add(16 * time.Minute)
+	for _, r := range rows {
+		it := trackerItem(t, s.buildStageTracker(status, store, later), "pr", r.number)
+		if !strings.HasSuffix(it.Caption, "— hive adopts it on the next sweep") || it.Adoption == nil || !it.Adoption.AutoDue || it.Takeover == nil || !it.Takeover.GraceElapsed {
+			t.Fatalf("#%d at +16m: caption=%q adoption=%+v takeover=%+v", r.number, it.Caption, it.Adoption, it.Takeover)
+		}
 	}
 }

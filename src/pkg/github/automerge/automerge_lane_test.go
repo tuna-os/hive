@@ -53,6 +53,55 @@ func greenSelfPR(number int) selfAuthoredPR {
 	return selfAuthoredPR{number: number, author: testHiveAppBotLogin, mergeableState: "clean", statusState: "success", checkStatus: "completed", checkConclusion: "success"}
 }
 
+type laneNativeQueueTransport struct {
+	*nativeQueueFake
+	gate hgithub.SerializedLaneGate
+}
+
+func (f *laneNativeQueueTransport) SerializedLane() (func(string) string, hgithub.SerializedLaneGate) {
+	return func(string) string { return config.MergeStrategyHiveSerialized }, f.gate
+}
+
+func TestLaneSweep_SerializedStrategyKeepsNativeQueueBehindItsGate(t *testing.T) {
+	for _, lane := range []string{stageLaneSelf, nativeQueueLaneQueued} {
+		for _, state := range []string{"clean", "behind"} {
+			for _, skipBase := range []bool{false, true} {
+				t.Run(lane+"/"+state+"/"+map[bool]string{false: "gate-kept", true: "gate-skipped"}[skipBase], func(t *testing.T) {
+					pr := greenLanePR(7)
+					pr.nodeID = "PR_7"
+					pr.mergeableState = state
+					if lane == stageLaneSelf {
+						pr.author = testHiveAppBotLogin
+					}
+					var merged []int
+					api := newAutoMergeSweepAPI(t, hgithub.AutoMergeQueuedLabel, []sweepPR{pr}, &merged)
+					defer api.Close()
+					g := &laneGate{answer: laneAnswer(hgithub.LaneOutcomeDeferred, "deferred: not at the front of the lane")}
+					c := newLaneSweepEngine(api.URL, config.MergeStrategyHiveSerialized, g.gate, Options{})
+					c.requireCurrentBase = func(string) bool { return true }
+					f := &nativeQueueFake{Transport: c.transport, state: hgithub.NativeMergeQueueState{ID: "PR_7", HeadRefOid: "sha7", IsMergeQueueEnabled: true}}
+					c.transport = &laneNativeQueueTransport{nativeQueueFake: f, gate: g.gate}
+					enableNativeQueue(c, NativeMergeQueuePolicy{Enabled: true, SkipCurrentBaseGate: skipBase})
+					var event AutoMergeSweepEvent
+					var reason string
+					var err error
+					if lane == stageLaneSelf {
+						event, reason, err = c.trySweepSelfAuthoredPR(context.Background(), "widget", "acme", "widget", 7, false)
+					} else {
+						event, reason, err = c.trySweepQueuedPR(context.Background(), "widget", "acme", "widget", 7, hgithub.AutoMergeQueuedLabel)
+					}
+					if err != nil || reason != "deferred: not at the front of the lane" || event.Number != 0 {
+						t.Fatalf("event=%+v reason=%q error=%v, want the serialized deferral", event, reason, err)
+					}
+					if len(g.reqs) != 1 || g.reqs[0].FrontOnly || f.enqueues != 0 || len(merged) != 0 {
+						t.Fatalf("lane requests=%+v native enqueues=%d direct merges=%v", g.reqs, f.enqueues, merged)
+					}
+				})
+			}
+		}
+	}
+}
+
 // AC2: a direct repo never consults the lane and merges exactly as today.
 func TestLaneSweep_DirectRepoMergesAsToday(t *testing.T) {
 	var merged []int

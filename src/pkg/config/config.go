@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"sync"
+
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // saveMu serializes all Config.Save() calls process-wide. Multiple goroutines
@@ -63,8 +65,10 @@ type Config struct {
 	Hub                HubConfig           `yaml:"hub"`
 	// Issues tunes issue lifecycle automation. Zero value keeps the safe
 	// defaults: close issues after their fix PR merges, and backfill hourly.
-	Issues     IssuesConfig     `yaml:"issues,omitempty" json:"issues,omitempty"`
-	Fleet      FleetConfig      `yaml:"fleet,omitempty" json:"fleet,omitempty"`
+	Issues IssuesConfig `yaml:"issues,omitempty" json:"issues,omitempty"`
+	Fleet  FleetConfig  `yaml:"fleet,omitempty" json:"fleet,omitempty"`
+	// Dedupe tunes the dedupe lane's follow-through on its checklists.
+	Dedupe     DedupeLaneConfig `yaml:"dedupe,omitempty" json:"dedupe,omitempty"`
 	Contribute ContributeConfig `yaml:"contribute,omitempty" json:"contribute,omitempty"`
 	HiveID     string           `yaml:"hive_id"`
 	ACMMLevel  *int             `yaml:"acmm_level,omitempty" json:"acmm_level"`
@@ -109,9 +113,16 @@ type Config struct {
 	// Sentinel flags PRs that look like security overrides, privilege
 	// escalation or codebase damage, from any author. Default on; see
 	// SentinelConfig.
-	Sentinel   SentinelConfig   `yaml:"sentinel,omitempty" json:"sentinel,omitempty"`
+	Sentinel SentinelConfig `yaml:"sentinel,omitempty" json:"sentinel,omitempty"`
+	// Security holds the hive-wide security knobs that are not one agent's
+	// or one sweep's; see SecurityConfig.
+	Security SecurityConfig `yaml:"security,omitempty" json:"security,omitempty"`
+	// Evidence controls the review evidence bundles the review relay writes
+	// (hivecommons/hive#11060). Default on, unsigned; see EvidenceConfig.
+	Evidence EvidenceConfig `yaml:"evidence,omitempty" json:"evidence,omitempty"`
+	// Compliance selects framework profiles; see ComplianceConfig.
+	Compliance ComplianceConfig `yaml:"compliance,omitempty" json:"compliance,omitempty"`
 	Escalation EscalationConfig `yaml:"escalation,omitempty" json:"escalation,omitempty"`
-	Evidence   EvidenceConfig   `yaml:"evidence,omitempty" json:"evidence,omitempty"`
 	// Jev configures the shared Jev (TypeSafe AI typed-decision model) client
 	// that agents with jev_mode: assist reach through the hive's local decision
 	// endpoint (hivecommons/hive#8939). Zero value: OpenRouter-hosted
@@ -120,17 +131,20 @@ type Config struct {
 	Jev JevConfig `yaml:"jev,omitempty" json:"jev,omitempty"`
 	// Runs tunes long-running runs and the opt-in Spektacular stage runner
 	// (hivecommons/hive#8303). Zero value: runner off, default retry budget.
-	Runs       RunsConfig       `yaml:"runs,omitempty" json:"runs,omitempty"`
-	Retro      RetroConfig      `yaml:"retro,omitempty" json:"retro,omitempty"`
-	Swarm      SwarmConfig      `yaml:"swarm,omitempty" json:"swarm,omitempty"`
-	Autonomy   AutonomyConfig   `yaml:"autonomy,omitempty" json:"autonomy,omitempty"`
-	Review     ReviewConfig     `yaml:"review,omitempty" json:"review,omitempty"`
-	Compliance ComplianceConfig `yaml:"compliance,omitempty" json:"compliance,omitempty"`
-	AutoMerge  AutoMergeConfig  `yaml:"auto_merge,omitempty" json:"auto_merge,omitempty"`
+	Runs      RunsConfig      `yaml:"runs,omitempty" json:"runs,omitempty"`
+	Retro     RetroConfig     `yaml:"retro,omitempty" json:"retro,omitempty"`
+	Swarm     SwarmConfig     `yaml:"swarm,omitempty" json:"swarm,omitempty"`
+	Autonomy  AutonomyConfig  `yaml:"autonomy,omitempty" json:"autonomy,omitempty"`
+	Review    ReviewConfig    `yaml:"review,omitempty" json:"review,omitempty"`
+	AutoMerge AutoMergeConfig `yaml:"auto_merge,omitempty" json:"auto_merge,omitempty"`
 	// Decisions tunes how decisions on needs-human items are recorded; its
 	// `delegate` block gates the activity monitor's "Let hive decide"
 	// action (default on).
 	Decisions DecisionsConfig `yaml:"decisions,omitempty" json:"decisions,omitempty"`
+	// Writeback is the unsolicited GitHub write-back containment gate
+	// (per-kind ACMM floor + review opt-in label, per-repo mode, backfill
+	// guard). Zero value = all three knobs on with the default matrix.
+	Writeback writeback.Config `yaml:"writeback,omitempty" json:"writeback,omitempty"`
 	// Chat tunes the dashboard Hive Chat panel; its `grounded_answers`
 	// block gates the model-backed answer path (default on).
 	Chat ChatConfig `yaml:"chat,omitempty" json:"chat,omitempty"`
@@ -220,6 +234,11 @@ type Config struct {
 	RemovedAgents []string `yaml:"removed_agents,omitempty" json:"removed_agents,omitempty"`
 
 	SourcePath string `yaml:"-" json:"-"`
+	// LaunchCmdDegradations lists the base-config agents whose launch_cmd the
+	// loader dropped because it contradicted the agent's backend, so the
+	// dashboard can raise a banner for each. Runtime-only; see
+	// DegradeContradictingLaunchCmds.
+	LaunchCmdDegradations []LaunchCmdDegradation `yaml:"-" json:"-"`
 	// ReviewerAutoscaleActive is the reviewer autoscaler's current target
 	// replica count for the autoscaled lane (hivecommons/hive#14685).
 	// Runtime-only: it is never persisted, is carried across config reloads
@@ -227,6 +246,7 @@ type Config struct {
 	// via SetReviewerAutoscaleActive.
 	ReviewerAutoscaleActive int `yaml:"-" json:"-"`
 }
+
 
 type DataConfig struct {
 	MetricsDir         string `yaml:"metrics_dir"`

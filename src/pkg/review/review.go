@@ -152,6 +152,12 @@ type PerspectiveReport struct {
 	// to the author, but explicitly deferred a maintainer/product decision.
 	DecisionRequested bool   `json:"decision_requested,omitempty"`
 	DecisionQuestion  string `json:"decision_question,omitempty"`
+	// RedundantOf is the PR the review found already carries this change
+	// (`<!-- hive-redundant-of: #N -->`), set by the relay from the review
+	// body. A decision question that names one is never self-resolved to
+	// approve: the answer is a close, which the superseded closer performs
+	// for the hive's own PRs (hivecommons/hive#15499).
+	RedundantOf int `json:"redundant_of,omitempty"`
 	// DecisionRiskHigh is the reviewer's explicit escape hatch: the review
 	// body carried `<!-- hive-decision-risk: high -->`, so the question parks
 	// the PR for a person even when its wording matches no risk class.
@@ -190,6 +196,11 @@ type AggregateOptions struct {
 	// a decision question that matches no DecisionRiskClass and carries no
 	// `hive-decision-risk: high` marker.
 	SelfAuthoredDecisionPolicy string
+	// SensitivePaths are the operator's extra `security.sensitive_paths`
+	// globs; a contributor-PR finding on one of them (or on a
+	// sentinel.DefaultSensitivePaths path) is a security finding that may
+	// park the PR for a person during CI/Review (IsSecuritySensitiveFinding).
+	SensitivePaths []string
 	// MaxPerspectivesPerPR mirrors DispatchOptions.MaxPerspectivesPerPR. A
 	// perspective the dispatcher never hands out cannot approve, so unanimity
 	// must be judged against what the PR was eligible to receive. Zero means
@@ -218,28 +229,39 @@ type AggregateOptions struct {
 }
 
 type Aggregate struct {
-	Repo              string                  `json:"repo"`
-	Number            int                     `json:"number"`
-	HeadSHA           string                  `json:"head_sha,omitempty"`
-	BodyDigest        string                  `json:"body_digest,omitempty"`
-	AuthorModel       string                  `json:"author_model,omitempty"`
-	ReviewModel       string                  `json:"review_model,omitempty"`
-	HiveAuthored      bool                    `json:"hive_authored,omitempty"`
-	HiveAuthoredKnown bool                    `json:"hive_authored_known,omitempty"`
-	Verdict           Verdict                 `json:"verdict"`
-	MergeEligible     bool                    `json:"merge_eligible"`
-	FixCycle          bool                    `json:"fix_cycle"`
-	RequiresHuman     bool                    `json:"requires_human"`
-	CloseRecommended  bool                    `json:"close_recommended"`
-	DecisionRequested bool                    `json:"decision_requested,omitempty"`
-	DecisionQuestion  string                  `json:"decision_question,omitempty"`
-	HumanSummaries    []string                `json:"human_summaries,omitempty"`
-	FixAttempts       int                     `json:"fix_attempts,omitempty"`
-	MaxFixAttempts    int                     `json:"max_fix_attempts,omitempty"`
-	Threshold         outputschema.Severity   `json:"human_threshold"`
-	Reasons           []string                `json:"reasons,omitempty"`
-	Findings          []PerspectiveFinding    `json:"findings,omitempty"`
-	Perspectives      map[Perspective]Verdict `json:"perspectives"`
+	Repo              string  `json:"repo"`
+	Number            int     `json:"number"`
+	HeadSHA           string  `json:"head_sha,omitempty"`
+	BodyDigest        string  `json:"body_digest,omitempty"`
+	AuthorModel       string  `json:"author_model,omitempty"`
+	ReviewModel       string  `json:"review_model,omitempty"`
+	HiveAuthored      bool    `json:"hive_authored,omitempty"`
+	HiveAuthoredKnown bool    `json:"hive_authored_known,omitempty"`
+	Verdict           Verdict `json:"verdict"`
+	MergeEligible     bool    `json:"merge_eligible"`
+	FixCycle          bool    `json:"fix_cycle"`
+	RequiresHuman     bool    `json:"requires_human"`
+	CloseRecommended  bool    `json:"close_recommended"`
+	DecisionRequested bool    `json:"decision_requested,omitempty"`
+	DecisionQuestion  string  `json:"decision_question,omitempty"`
+	// DecisionFinding names what the review found that makes the decision
+	// question a person's to answer — a duplicate, a finding at or above
+	// the human threshold, a risk-class question (workflow, security, …)
+	// or the reviewer's explicit high-risk marker. A question with no
+	// finding behind it never parks a PR in CI/Review (owner rule, see
+	// contributorDecisionBacking); the text is what the tracker and the
+	// 085 comment print as "the review found".
+	DecisionFinding string `json:"decision_finding,omitempty"`
+	// RedundantOf is the PR a reviewer named as already carrying this
+	// change, carried from the first report that set one.
+	RedundantOf    int                     `json:"redundant_of,omitempty"`
+	HumanSummaries []string                `json:"human_summaries,omitempty"`
+	FixAttempts    int                     `json:"fix_attempts,omitempty"`
+	MaxFixAttempts int                     `json:"max_fix_attempts,omitempty"`
+	Threshold      outputschema.Severity   `json:"human_threshold"`
+	Reasons        []string                `json:"reasons,omitempty"`
+	Findings       []PerspectiveFinding    `json:"findings,omitempty"`
+	Perspectives   map[Perspective]Verdict `json:"perspectives"`
 	// Heads lists, per perspective, the review heads whose reports this
 	// aggregate holds. Empty unless reports came from review_heads; with
 	// several heads Perspectives holds the strictest of their verdicts.
@@ -389,6 +411,7 @@ func aggregatePlainReports(reports []PerspectiveReport, opts AggregateOptions) A
 
 func aggregateReports(reports []PerspectiveReport, opts AggregateOptions) Aggregate {
 	threshold := opts.HumanThreshold
+	sensitivePaths := SecuritySensitivePaths(opts.SensitivePaths)
 	if threshold == "" {
 		threshold = DefaultHumanThreshold
 	}
@@ -468,6 +491,9 @@ func aggregateReports(reports []PerspectiveReport, opts AggregateOptions) Aggreg
 		if reportRequiresRiskEscalation(r) {
 			riskEscalation = true
 		}
+		if r.RedundantOf > 0 && agg.RedundantOf == 0 {
+			agg.RedundantOf = r.RedundantOf
+		}
 		if r.DecisionRequested {
 			decisionRequested = true
 			if decisionQuestion == "" {
@@ -493,6 +519,18 @@ func aggregateReports(reports []PerspectiveReport, opts AggregateOptions) Aggreg
 	sort.Strings(agg.HumanSummaries)
 
 	if decisionRequested {
+		if finding, backed := securityFindingAcross(reports, sensitivePaths); !backed && contributorHandsFree(agg, opts) {
+			// Owner rule (hivecommons/hive#15640): no human decision while
+			// a contributor's PR is in CI/Review unless the review found
+			// something fishy or insecure. A question with no security
+			// finding behind it is advisory: the PR keeps moving and the
+			// person has the last word at the merge gate (090), where the
+			// untrusted-author merge is theirs. Twelve of hive's own PRs
+			// sat 3–21h on such questions.
+			return contributorHandsFreeAggregate(agg, opts, hasChanges || reportsHaveInScopeFinding(reports), maxFix, decisionQuestions)
+		} else if backed {
+			agg.DecisionFinding = finding
+		}
 		if resolveSelfAuthoredDecisionQuestions(reports, opts, decisionQuestions, hasReject || riskEscalation || unresolvedRequiresHuman) {
 			if hasChanges || selfAuthoredHumanWithConcreteRemediation {
 				if opts.FixAttempts >= maxFix {
@@ -545,6 +583,15 @@ func aggregateReports(reports []PerspectiveReport, opts AggregateOptions) Aggreg
 		return agg
 	}
 	if len(agg.Reasons) > 0 || seenVerdicts[VerdictRequiresHuman] {
+		if seenVerdicts[VerdictRequiresHuman] && contributorHandsFree(agg, opts) {
+			// Same rule for a bare requires_human on a contributor's PR
+			// (hivecommons/hive#15640): only a security finding parks it.
+			if finding, backed := securityFindingAcross(reports, sensitivePaths); backed {
+				agg.DecisionFinding = finding
+			} else {
+				return contributorHandsFreeAggregate(agg, opts, hasChanges || reportsHaveInScopeFinding(reports), maxFix, agg.HumanSummaries)
+			}
+		}
 		if !riskEscalation && selfAuthoredHumanWithConcreteRemediation {
 			if opts.FixAttempts >= maxFix {
 				agg.Verdict = VerdictRequiresHuman
@@ -647,6 +694,21 @@ func markRequiresHumanPerspectivesAsChangesRequested(a *Aggregate) {
 	for p, v := range a.Perspectives {
 		if v == VerdictRequiresHuman {
 			a.Perspectives[p] = VerdictChangesRequested
+		}
+	}
+}
+
+// markRequiresHumanPerspectivesAsApprove is the approve counterpart: the
+// relay stamps every perspective of a decision-requested review
+// requires_human, so once the question is resolved as advisory the
+// perspectives read as the approvals they were.
+func markRequiresHumanPerspectivesAsApprove(a *Aggregate) {
+	if a == nil || len(a.Perspectives) == 0 {
+		return
+	}
+	for p, v := range a.Perspectives {
+		if v == VerdictRequiresHuman {
+			a.Perspectives[p] = VerdictApprove
 		}
 	}
 }
@@ -844,7 +906,10 @@ func reportsHiveAuthored(reports []PerspectiveReport) bool {
 // answer the linked issue had already written down.
 func selfAuthoredDecisionResolvable(r PerspectiveReport) bool {
 	q := strings.TrimSpace(r.DecisionQuestion)
-	if q == "" || r.DecisionRiskHigh {
+	if q == "" || r.DecisionRiskHigh || r.RedundantOf > 0 {
+		// A redundancy question ("close as a no-op, #N already landed
+		// it?") has no approve answer: resolving it would merge an empty
+		// PR. It stays a decision so the superseded closer can act.
 		return false
 	}
 	_, risk := DecisionQuestionRiskClassFor(q, r.PermissionsTighteningOnly)

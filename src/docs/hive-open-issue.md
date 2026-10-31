@@ -52,7 +52,7 @@ hive-open-issue request-review --repo <owner/repo> <number|url> [--reviewer a,b]
 | Flag | Aliases | Applies to | Notes |
 | --- | --- | --- | --- |
 | `--repo` | `-R` | all | required |
-| `--title` | `-t` | issue | required for `issue` |
+| `--title` | `-t` | issue | required for `issue`; must start with `[<your agent name>]` (`[scanner] …`) — the watcher and the proxy's `gh issue create` path both add the tag when it is missing and never double it |
 | `--body` | `-b` | issue, comment | required for `issue` and `comment`; not used by `claim` |
 | `--body-file` | `-F` | issue, comment | reads body from a file; `-` reads stdin |
 | `--label` | `-l`, `--add-label` | issue, label | repeatable; comma-separated values are split |
@@ -139,7 +139,7 @@ the relation survives a failed link. Once every child of `n` is closed the
 issue stage sweep closes `n` as completed, and while any child is open `n`
 is never marked `stage/stalled`
 ([#12857](https://github.com/hivecommons/hive/issues/12857); see
-[labels-and-control-signals.md](labels-and-control-signals.md#decomposed-parents--closed-by-their-children-never-stalled)).
+[labels-and-control-signals.md](labels-and-control-signals/stage-labels.md#decomposed-parents--closed-by-their-children-never-stalled)).
 
 `--blocked-by <n[,n]>` records that the new issue must wait for issue(s) `n`
 in the same repo, as GitHub "blocked by" dependencies

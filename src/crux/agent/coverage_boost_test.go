@@ -308,6 +308,7 @@ func TestAgentEnvPairs_NonInference_NoProxyLoopback(t *testing.T) {
 		Config: config.AgentConfig{Backend: "claude", Model: "sonnet"},
 	}
 
+	t.Setenv("OMP_AUTH_BROKER_URL", "")
 	count := 0
 	for _, p := range m.agentEnvPairs(ap) {
 		if p.Key == "NO_PROXY" {
@@ -338,7 +339,7 @@ func TestAgentEnvPairs_NoProxyIncludesCredentialBroker(t *testing.T) {
 	}
 }
 
-func TestAgentNoProxy(t *testing.T) {
+func TestAgentNoProxyBrokerURL(t *testing.T) {
 	for in, want := range map[string]string{
 		"":                            "127.0.0.1,localhost,::1",
 		"http://172.18.0.1:18765":     "127.0.0.1,localhost,::1,172.18.0.1",
@@ -347,8 +348,9 @@ func TestAgentNoProxy(t *testing.T) {
 		"not a url":                   "127.0.0.1,localhost,::1",
 		"://":                         "127.0.0.1,localhost,::1",
 	} {
-		if got := agentNoProxy(in); got != want {
-			t.Errorf("agentNoProxy(%q) = %q, want %q", in, got, want)
+		t.Setenv("OMP_AUTH_BROKER_URL", in)
+		if got := agentNoProxy(); got != want {
+			t.Errorf("agentNoProxy() with broker %q = %q, want %q", in, got, want)
 		}
 	}
 }

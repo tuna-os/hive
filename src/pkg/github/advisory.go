@@ -15,6 +15,7 @@ import (
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/crux/logscrub"
 	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/issueshape"
 	"github.com/hivecommons/hive/pkg/effects"
 )
 
@@ -24,6 +25,14 @@ const (
 	advisoryLabelDesc = "Pinned advisory report from Hive agents"
 	advisoryLabelClr  = "0e8a16"
 )
+
+// isAdvisoryTitle reports whether title is the advisory issue's, with the
+// leading `[governor]` tag ignored: an advisory issue filed before titles
+// carried the filer is the same standing issue as one filed after, so a
+// hive upgrade never opens a second advisory per repo.
+func isAdvisoryTitle(title string) bool {
+	return issueshape.SameTitle(title, advisoryTitle)
+}
 
 // IssuesDisabledError reports that the advisory issue cannot be created or
 // resolved because the target repo has its Issues feature turned off
@@ -238,7 +247,7 @@ func (c *Client) EnsureAdvisoryIssue(ctx context.Context, repo string) (int, err
 	}
 
 	req := &gh.IssueRequest{
-		Title: gh.Ptr(advisoryTitle),
+		Title: gh.Ptr(issueshape.AgentIssueTitle(config.OriginSourceGovernor, advisoryTitle)),
 		Body:  gh.Ptr(body),
 	}
 	var labels []string
@@ -365,6 +374,25 @@ func (c *Client) PostAdvisoryDigest(ctx context.Context, repo string, issueNum i
 		return ErrNoGitHubClient
 	}
 	owner, repoName := c.splitRepo(repo)
+
+	// Repo pause (#6203) means NO hive write against the repo, and the digest
+	// is a write: an edit of the pinned comment, or a fresh comment when the
+	// pinned one is out of reach. It is checked before the unchanged-skip
+	// below so a paused repo never reaches the forge at all, and nothing
+	// about the process-memory hash state is touched, so the first cycle
+	// after the pause is lifted posts exactly as the first after boot does.
+	if perr, paused := c.repoPausedError(repo); paused {
+		c.logger.Info("advisory digest skipped: repo paused",
+			slog.String("repo", repo), slog.Int("issue", issueNum),
+			slog.String("by", perr.By), slog.String("reason", perr.Reason))
+		c.recordWriteAudit(AuditActionAdvisoryDigestSuppressed, InvocationMeta{Agent: AttributionAgentGovernor},
+			WriteTarget{Repo: owner + "/" + repoName, Number: issueNum},
+			"reason", "repo-paused",
+			"paused_by", perr.By,
+			"pause_reason", perr.Reason,
+			"flow", "advisory-digest")
+		return perr
+	}
 
 	// Canary-gated like CreateIssue/CreatePR/CreateIssueComment
 	// (kubestellar/hive#4960): the digest aggregates agent-sourced advisory
@@ -760,7 +788,7 @@ func (c *Client) findAdvisoryIssueListed(ctx context.Context, owner, repo string
 	})
 	if err == nil {
 		for _, issue := range result.Issues {
-			if issue.GetTitle() == advisoryTitle {
+			if isAdvisoryTitle(issue.GetTitle()) {
 				return issue.GetNumber(), nil
 			}
 		}
@@ -777,7 +805,7 @@ func (c *Client) findAdvisoryIssueListed(ctx context.Context, owner, repo string
 	issues, _, listErr := c.client.Issues.ListByRepo(ctx, owner, repo, opts)
 	if listErr == nil {
 		for _, issue := range issues {
-			if issue.GetTitle() == advisoryTitle {
+			if isAdvisoryTitle(issue.GetTitle()) {
 				return issue.GetNumber(), nil
 			}
 		}
@@ -801,7 +829,7 @@ func (c *Client) findAdvisoryIssueListed(ctx context.Context, owner, repo string
 			if issue.IsPullRequest() {
 				continue
 			}
-			if issue.GetTitle() == advisoryTitle {
+			if isAdvisoryTitle(issue.GetTitle()) {
 				c.logger.Info("found advisory issue via title scan (missing label)", slog.Int("number", issue.GetNumber()))
 				c.ensureAdvisoryLabel(ctx, owner, repo, issue.GetNumber())
 				return issue.GetNumber(), nil
@@ -855,7 +883,7 @@ func (c *Client) findClosedAdvisoryIssue(ctx context.Context, owner, repo string
 		if issue.IsPullRequest() {
 			continue
 		}
-		if issue.GetTitle() == advisoryTitle {
+		if isAdvisoryTitle(issue.GetTitle()) {
 			return issue.GetNumber(), true
 		}
 	}
