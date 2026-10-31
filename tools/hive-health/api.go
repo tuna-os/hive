@@ -116,6 +116,25 @@ type ContributeActivity struct {
 	} `json:"activity"`
 }
 
+// BackendCatalog is one entry of GET /api/config/backends: a backend and the
+// models it offers right now. The Hive discovers these itself, per backend
+// (src/pkg/dashboard/cli_models.go: the Copilot models endpoint, Anthropic
+// /v1/models, the Gemini models API, goose's ACP session, codex app-server,
+// `agy models`) — no third-party benchmark API and no extra credential.
+type BackendCatalog struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Models []string `json:"models"`
+	// Fallback is true when discovery FAILED and the Hive substituted its
+	// built-in static list. Such a list says what someone hand-wrote, not
+	// what the backend offers, so nothing may be diffed against it.
+	Fallback bool `json:"fallback"`
+	// Inference marks the vllm / llm-d / litellm entries. This endpoint
+	// serves those without a fallback flag, so a degraded list is
+	// indistinguishable from a real one: they are left out of the census.
+	Inference bool `json:"inference"`
+}
+
 // StatusDoc is the subset of GET /api/status the probe reads.
 type StatusDoc struct {
 	HiveID   string `json:"hiveId"`
@@ -184,6 +203,7 @@ type StatusAgent struct {
 	NeedsLogin       bool        `json:"needsLogin"`
 	Cadence          string      `json:"cadence"`
 	CLI              string      `json:"cli,omitempty"`
+	Model            string      `json:"model,omitempty"`
 	Restarts         int         `json:"restarts"`
 	StructuredStatus string      `json:"structuredStatus,omitempty"`
 	StatusEvidence   string      `json:"statusEvidence,omitempty"`

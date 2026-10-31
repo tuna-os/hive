@@ -144,7 +144,12 @@ type Raw struct {
 	StatusFetch *Fetched
 	// StatusSource: "" (not attempted), "session", "status-file".
 	StatusSource string
-	Hub          *HubSnapshot
+	// Backends is GET /api/config/backends (session tier only), the Hive's
+	// own per-backend model discovery. BackendsFetch is nil when the probe
+	// never asked (public tier, or a status file supplied offline).
+	Backends      []BackendCatalog
+	BackendsFetch *Fetched
+	Hub           *HubSnapshot
 }
 
 // Collector gathers Raw data for each target.
@@ -214,13 +219,24 @@ func (c *Collector) Collect(ctx context.Context, t Target, hub *HubSnapshot) Raw
 	if t.SessionEnv != "" && c.Env != nil {
 		if sess := strings.TrimSpace(c.Env(t.SessionEnv)); sess != "" {
 			r.StatusSource = "session"
-			// The only credentialed request the probe makes: a GET of
-			// /api/status on the configured host with the session cookie.
-			f := c.Get.Get(ctx, t.URL+"/api/status", map[string]string{"Cookie": "hive_session=" + sess})
-			f.Body = []byte(strings.ReplaceAll(string(f.Body), sess, "[REDACTED]"))
+			cookie := map[string]string{"Cookie": "hive_session=" + sess}
+			// Named so it never shadows the package-level redact().
+			scrubSession := func(f Fetched) Fetched {
+				f.Body = []byte(strings.ReplaceAll(string(f.Body), sess, "[REDACTED]"))
+				return f
+			}
+			// The credentialed requests the probe makes, both GETs on the
+			// configured host with the session cookie: /api/status, and
+			// /api/config/backends for the Hive's own model discovery.
+			f := scrubSession(c.Get.Get(ctx, t.URL+"/api/status", cookie))
 			r.StatusFetch = &f
 			if sd, err := decode[StatusDoc](f); err == nil {
 				r.Status = sd
+			}
+			bf := scrubSession(c.Get.Get(ctx, t.URL+"/api/config/backends", cookie))
+			r.BackendsFetch = &bf
+			if bl, err := decode[[]BackendCatalog](bf); err == nil {
+				r.Backends = *bl
 			}
 		}
 	}
