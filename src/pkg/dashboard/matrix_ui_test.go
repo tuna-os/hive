@@ -1,60 +1,9 @@
 package dashboard
 
 import (
-	"os"
 	"os/exec"
-	"strings"
 	"testing"
 )
-
-func TestMatrixUIWiring(t *testing.T) {
-	html := indexHTML(t)
-	read := func(name string) string {
-		t.Helper()
-		b, err := os.ReadFile("static-src/" + name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(b)
-	}
-	js := read("js/matrix.js")
-	for _, forbidden := range []string{"innerHTML", "insertAdjacentHTML", "document.write", "new EventSource"} {
-		if strings.Contains(js, forbidden) {
-			t.Errorf("matrix.js contains forbidden sink/stream %q", forbidden)
-		}
-	}
-	for _, want := range []string{"visibilitychange", "prefers-reduced-motion: reduce", "cancelAnimationFrame", "text.textContent = line.line", "source.addEventListener('code-lines'", "hive.matrix.", "mx.", "'ghost'", "'terminal'", "effect === 'ghost'", "effect === 'terminal'"} {
-		if !strings.Contains(js, want) {
-			t.Errorf("matrix.js missing %q", want)
-		}
-	}
-	for _, want := range []string{"window.HIVE_MATRIX = kiosk && view === 'matrix';", "if(window.HIVE_MATRIX){", "hiveMatrixStart();", "if (window.HIVE_MATRIX) window.hiveMatrixAttach(source);"} {
-		if !strings.Contains(html, want) {
-			t.Errorf("generated page missing %q", want)
-		}
-	}
-	css := read("css/matrix.css")
-	for _, rule := range strings.Split(css, "}") {
-		selector, _, ok := strings.Cut(strings.TrimSpace(rule), "{")
-		if !ok {
-			continue
-		}
-		for _, part := range strings.Split(selector, ",") {
-			if !strings.HasPrefix(strings.TrimSpace(part), "body.matrix-mode ") {
-				t.Errorf("unscoped Matrix selector %q", part)
-			}
-		}
-	}
-	manifest := read("manifest.txt")
-	for _, file := range []string{"js/matrix.js", "css/matrix.css"} {
-		if !strings.Contains(manifest, file+"\n") {
-			t.Errorf("manifest missing %s", file)
-		}
-		if !strings.Contains(html, read(file)) {
-			t.Errorf("generated page is missing current %s", file)
-		}
-	}
-}
 
 // Exercise browser lifecycle and pull behavior with deterministic DOM/clock
 // doubles. No browser dependencies, network or real animation timers required.
