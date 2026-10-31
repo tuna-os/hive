@@ -6,8 +6,6 @@ name: Tuna pilot binary
 on:
   push:
     branches: [tuna/v6, deploy/upstream-v6-matrix]
-  pull_request:
-    branches: [tuna/v6]
   workflow_dispatch:
 
 permissions:

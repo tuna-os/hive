@@ -47,6 +47,9 @@ release_lines: [v4, v5]
 # somebody has to justify, and a new release line still has to be added or
 # explicitly excluded here before the guard goes green again.
 pinned:
+  # Fork-only binary artifacts for the Spindle pilot; no upstream release
+  # channels or image publication. Feature pushes already build the exact head.
+  tuna-pilot-binary.yml: [tuna/v6, deploy/upstream-v6-matrix, -v4, -v5]
   # PR-level guard for the changelog.d/ fragment convention (#5675). v4 only:
   # changelog.d/ and src/scripts/compile-changelog.sh exist only on v4, v2 is
   # sunset, and a PR targeting v2 runs the v2 merge-ref's workflows anyway,
