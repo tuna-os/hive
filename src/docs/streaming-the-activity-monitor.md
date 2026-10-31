@@ -259,8 +259,8 @@ capture and encode without a stream key.
 
 The `tuna-os/hive` pilot combines upstream v6 with the upstream v5 Matrix
 feature commits. This does not enable a Twitch broadcast. School and Reef
-use the same authenticated dashboard origins as before; the hub is upgraded
-with the same pinned binary but does not aggregate code lines.
+use the same authenticated dashboard origins as before. Hub intentionally
+remains on its prior pin; this pilot does not aggregate code lines.
 
 `.github/workflows/tuna-pilot-binary.yml` builds stamped Linux ARM64 and AMD64
 binaries from the exact fork commit and uploads `COMMIT` and `SHA256SUMS`.
@@ -270,10 +270,14 @@ test-suite verdict. The workflows must be enabled on the fork.
 
 On Spindle, keep the previous binary and take a stopped-service data snapshot
 before changing its Compose bind mount. Roll Reef first, verify authenticated
-Matrix API access and anonymous denial, then roll School and Hub. Change both
-the seed config and `hive.yaml.runtime` because runtime config wins on restart.
+Matrix API access and anonymous denial, then roll School. Do not restart Hub
+for this display pilot. Change both the seed config and `hive.yaml.runtime`
+because runtime config wins on restart.
 Allowlist only independently verified public repositories already watched by
 that spoke. Keep the sentinel's normal security and author-exemption gates.
+The Node proxy also needs the dashboard HTML matching the deployed code.
+Exact pins, HTML mounts and rollback snapshots are recorded in the
+[fleet ledger](https://github.com/tuna-os/hive/pull/173).
 
 Open `/?kiosk=1&view=matrix&sound=off&mx.effect=rain` on the spoke dashboard;
 `cascade`, `ghost`, and `terminal` select the other effects. An empty backlog
