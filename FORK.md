@@ -112,11 +112,12 @@ The Matrix pilot also mounts its commit-matched dashboard HTML over
 `/opt/hive/proxy/public/index.html`: replacing only the Go binary leaves the
 public browser UI on the old image's page.
 
-Current pins: Reef canary `637bae44f`, School `71ce0ef56`; Hub remains on `230f745`.
+Current pins: Reef and School `637bae44f`; Hub remains on `230f745`.
 The operator scoped this rollout to testing Matrix on the two spokes.
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
+| 2026-10-31 22:36 | school | `deploy/upstream-v6-matrix` | `637bae44f` | same v6/Matrix base and repository-name fix as Reef |
 | 2026-10-31 21:56 | reef (repo-name fix canary) | `deploy/upstream-v6-matrix` | `637bae44f` | same v6/Matrix base, plus qualified repository names for patch observers |
 | 2026-10-31 18:23 | school | `deploy/upstream-v6-matrix` | `71ce0ef56` | upstream `v6` `6f6a5ca63`, plus Matrix ports from `v5` |
 | 2026-10-31 18:08 | reef (canary) | `deploy/upstream-v6-matrix` | `71ce0ef56` | upstream `v6` `6f6a5ca63`, plus Matrix ports from `v5` ([#172](https://github.com/tuna-os/hive/pull/172)) |
@@ -140,7 +141,7 @@ Pilot-line patches and upstream dispositions:
 | `62dbda5` | `ioscan.classifier.backend: omp`: the semantic classifier runs through omp and the auth broker (school and reef: `anthropic/claude-haiku-4-5`; agents moved from `github-copilot/gpt-6-luna` to `openai-codex/gpt-6-luna` the same night) | Proposed upstream: hivecommons/hive#15873 |
 | `230f745` | `revert_sheriff`: when a merge turns a required check red on the default branch, find the merge, re-run its failing job once, and (propose mode) open a held `hive/revert` + `fixes-main` revert PR ([tuna-os/hive#170](https://github.com/tuna-os/hive/pull/170)). School runs it in **shadow** mode for `tunaos`, `tunaos-packages`, `corral`, `tacklebox` | Pilot (SDLC HIVE-8 / TUNA-4) |
 | `71ce0ef56` | Ambient Matrix pilot: Rain, Cascade, Ghost coder and Terminal effects from upstream #15945, #15946, #15967, #15982, #15977, #16020, #15985 and #16046, adapted to v6. Also gates sheriff CI recovery through upstream's shared `ci_rerun` writeback policy | Upstream feature ports, fork integration [#172](https://github.com/tuna-os/hive/pull/172); opt-in per spoke, no Twitch broadcast |
-| `637bae44f` | Matrix observations use resolved `owner/name`, not a short `project.repos` display name. Short names otherwise fail the exact Matrix allowlist and silently discard every patch | Fork fix with regression case; Reef-only canary while full-suite CI is pending |
+| `637bae44f` | Matrix observations use resolved `owner/name`, not a short `project.repos` display name. Short names otherwise fail the exact Matrix allowlist and silently discard every patch | Fork fix with regression case; CI passed, deployed to Reef and School |
 
 For `71ce0ef56`, the ARM64 binary SHA-256 is
 `9f25d95df53ea24e03f267f7b5c097b1686b91318323e82122f77facb781e0ca`;
@@ -159,10 +160,13 @@ The `637bae44f` ARM64 binary SHA-256 is
 It reuses the byte-identical `dashboard-71ce0ef56.html` mount.
 [Its binary build](https://github.com/tuna-os/hive/actions/runs/41233789674)
 passed; [its full-suite run](https://github.com/tuna-os/hive/actions/runs/41233790530)
-is still pending. Reef is a reversible canary; School has not received the fix.
+passed 27 jobs, with three skipped, on the exact deployed commit.
+Both spokes run the matching binary; Hub was not restarted.
 Both original feeds returned `seq: 0` despite School completing a 254-PR
 sentinel pass: short configured repository names could not match the qualified
-Matrix allowlist. Real-line capture and rendering on the canary are not yet verified.
+Matrix allowlist. Live capture/rendering after the fix remains under observation:
+Reef's initial cold-start reconciliation exhausted its App quota and skipped
+optional sweeps before the source could initialize. No budget guard was bypassed.
 
 Matrix is opt-in in each spoke's seed **and** runtime config, with explicit
 public-repository allowlists and additional config/deployment-path exclusions.
@@ -173,6 +177,8 @@ Data, both configs and the Compose override were backed up before each restart:
 Reef `20261031T180544Z`, School `20261031T182146Z`, under `/srv/hives/backups/`.
 The Reef fix canary has a fresh consistent snapshot and config/override backups
 at stamp `20261031T215350Z`; its immediate previous binary is `71ce0ef56`.
+School's fix snapshot/config/override backup stamp is `20261031T223247Z`,
+also rolling back to `71ce0ef56` without a data-format downgrade.
 Keep the old binary and restore matching config/UI pins for rollback; do not
 restore a stale data snapshot over newer agent work unless downgrade requires it.
 
