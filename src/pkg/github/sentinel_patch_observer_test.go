@@ -88,6 +88,22 @@ func TestSentinelPatchObserverPublicRepoNotPrivate(t *testing.T) {
 	}
 }
 
+// A hive may configure its repos by short name under project.org; the
+// observation still carries owner/name, the only form the Matrix allowlist
+// matches.
+func TestSentinelPatchObserverQualifiesShortConfiguredRepo(t *testing.T) {
+	f := observerFixture("alice", false)
+	srv := newSentinelServer(t, f)
+	defer srv.Close()
+	c := newTestClient(t, srv, "o", []string{"r"})
+	var obs observations
+	opts := defaultSentinelOpts(nil)
+	opts.PatchObserver = obs.add
+	if _, err := c.SweepSentinel(context.Background(), opts); err != nil || len(obs.got) != 1 || obs.got[0].Repo != "o/r" {
+		t.Fatalf("err=%v obs=%+v", err, obs.got)
+	}
+}
+
 func TestSentinelPatchObserverNotCalledOnFetchFailure(t *testing.T) {
 	f := observerFixture("alice", false)
 	f.filesStatus = 502

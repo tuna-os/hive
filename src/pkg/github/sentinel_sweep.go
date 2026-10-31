@@ -484,7 +484,10 @@ func (c *Client) trySentinelPR(ctx context.Context, displayRepo, owner, repo str
 		return SentinelSweepEvent{}, false, err
 	}
 	if opts.PatchObserver != nil {
-		c.observeSentinelPatch(displayRepo, pr, files, opts.PatchObserver)
+		// Observers match owner/name (dashboard.matrix.repos accepts nothing
+		// else), while displayRepo is the configured name, which may be short
+		// under project.org; a short name would fail every allowlist check.
+		c.observeSentinelPatch(owner+"/"+repo, pr, files, opts.PatchObserver)
 	}
 	findings := sentinel.Evaluate(sentinel.PR{Author: author, Title: pr.GetTitle(), Files: files}, opts.Evaluator)
 	if len(findings) == 0 {
