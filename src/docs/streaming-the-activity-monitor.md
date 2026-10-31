@@ -254,3 +254,29 @@ docker compose up --build
 Dry run without Twitch: `STREAM_OUTPUT=null STREAM_SECONDS=20 docker compose up`
 (or `STREAM_OUTPUT=/run/stream/out/test.flv` with `./out` mounted) proves
 capture and encode without a stream key.
+
+## Tuna fork pilot on Spindle
+
+The `tuna-os/hive` pilot combines upstream v6 with the upstream v5 Matrix
+feature commits. This does not enable a Twitch broadcast. School and Reef
+use the same authenticated dashboard origins as before; the hub is upgraded
+with the same pinned binary but does not aggregate code lines.
+
+`.github/workflows/tuna-pilot-binary.yml` builds stamped Linux ARM64 and AMD64
+binaries from the exact fork commit and uploads `COMMIT` and `SHA256SUMS`.
+Run the existing `v2 Tests` workflow against that commit and inspect its
+verdict before deploying an artifact; the artifact build alone is not a
+test-suite verdict. The workflows must be enabled on the fork.
+
+On Spindle, keep the previous binary and take a stopped-service data snapshot
+before changing its Compose bind mount. Roll Reef first, verify authenticated
+Matrix API access and anonymous denial, then roll School and Hub. Change both
+the seed config and `hive.yaml.runtime` because runtime config wins on restart.
+Allowlist only independently verified public repositories already watched by
+that spoke. Keep the sentinel's normal security and author-exemption gates.
+
+Open `/?kiosk=1&view=matrix&sound=off&mx.effect=rain` on the spoke dashboard;
+`cascade`, `ghost`, and `terminal` select the other effects. An empty backlog
+or animated replay is not proof of fresh ingestion: compare a returned line's
+repository, PR, head and path with the real GitHub patch before calling the
+pilot verified. Do not place dashboard tokens in these URLs.
