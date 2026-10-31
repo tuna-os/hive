@@ -94,6 +94,9 @@ type DashboardConfig struct {
 	//
 	// Deprecated: set dashboard.experiment_lab instead.
 	StrategyLab bool `yaml:"strategy_lab,omitempty" json:"strategy_lab,omitempty"`
+	// Matrix is the experimental, default-off Activity Monitor Matrix block
+	// (#15862); see dashboard_matrix.go.
+	Matrix DashboardMatrixConfig `yaml:"matrix,omitempty" json:"matrix,omitempty"`
 	// IssueBands configures the Repositories card's display-only issue taxonomy.
 	// It is intentionally separate from governor/project eligibility labels:
 	// queue policy decides what agents may work; these labels only decide which

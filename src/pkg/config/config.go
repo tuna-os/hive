@@ -247,6 +247,7 @@ type Config struct {
 	ReviewerAutoscaleActive int `yaml:"-" json:"-"`
 }
 
+
 type DataConfig struct {
 	MetricsDir         string `yaml:"metrics_dir"`
 	LogsDir            string `yaml:"logs_dir"`
