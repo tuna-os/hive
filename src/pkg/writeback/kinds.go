@@ -82,7 +82,8 @@ const (
 	// foreign item to opt in, so RequireLabel never applies; per-repo mode
 	// `off` is the only thing that stops it.
 	KindIssueFile Kind = "issue_file"
-	// KindCIRerun re-runs a workflow or posts `/ok-to-test` on a PR.
+	// KindCIRerun governs CI recovery: workflow reruns, /ok-to-test and the
+	// revert sheriff's held revert proposal after a confirmed failure.
 	KindCIRerun Kind = "ci_rerun"
 )
 

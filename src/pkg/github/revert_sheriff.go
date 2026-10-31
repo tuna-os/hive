@@ -12,6 +12,7 @@ import (
 	"github.com/hivecommons/hive/pkg/intent"
 	"github.com/hivecommons/hive/pkg/redmain"
 	"github.com/hivecommons/hive/pkg/revertsheriff"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // RevertSheriffOptions configures one SweepRevertSheriff pass.
@@ -151,6 +152,16 @@ func (c *Client) revertSheriffCheck(ctx context.Context, ledger *revertsheriff.L
 	ev := RevertSheriffEvent{Repo: key, Check: check, Culprit: cs.Finding.Culprit, PR: cs.PR}
 	switch cs.Advance(obs, now, opts.ConfirmTimeout) {
 	case revertsheriff.RequestRerun:
+		pr, _, err := c.client.PullRequests.Get(ctx, owner, name, cs.PR)
+		if err != nil {
+			return fmt.Errorf("reading culprit PR before CI recovery: %w", err)
+		}
+		if d := c.WritebackAllowed(key, c.sentinelWritebackItem(pr), writeback.KindCIRerun, "revert sheriff: rerun failing job"); !d.Allowed {
+			cs.Finish(false, d.Detail, now)
+			ev.Action, ev.Reason = "refused", d.Detail
+			audit(ev)
+			return nil
+		}
 		rerr := c.revertSheriffRerun(ctx, owner, name, run)
 		cs.Rerun(rerr, now)
 		ev.Action, ev.Reason = "rerun", "re-ran the failing job to rule out a flake"
@@ -318,6 +329,10 @@ func (c *Client) revertSheriffAct(ctx context.Context, ledger *revertsheriff.Led
 		audit(ev)
 		return
 	}
+	if d := c.WritebackAllowed(cs.Repo, c.sentinelWritebackItem(pr), writeback.KindCIRerun, "revert sheriff: propose a held revert after confirmed CI failure"); !d.Allowed {
+		refuse(d.Detail)
+		return
+	}
 	number, url, err := c.openRevertPR(ctx, owner, name, pr, cs, branch, runURL, opts.Hold)
 	if err != nil {
 		cs.Finish(false, "revert failed: "+err.Error(), now)
@@ -398,14 +413,14 @@ func (c *Client) openRevertPR(ctx context.Context, owner, name string, pr *gh.Pu
 	if hold {
 		labels = append(labels, "hold")
 	}
-	if err := c.AddLabels(ctx, repo, number, labels); err != nil {
+	if err := c.AddLabels(ctx, repo, number, labels); err != nil { // writeback:gated by revertSheriffAct (ci_rerun)
 		c.logger.Warn("revert sheriff: labels not added", "repo", repo, "pr", number, "error", err)
 	}
 	note := fmt.Sprintf("The Hive revert sheriff opened #%d to revert this PR: the required check `%s` failed on `%s` at its merge commit and again on re-run.", number, cs.Check, branch)
 	if runURL != "" {
 		note += " Failing run: " + runURL
 	}
-	if err := c.CreateIssueComment(ctx, repo, pr.GetNumber(), note); err != nil {
+	if err := c.CreateIssueComment(ctx, repo, pr.GetNumber(), note); err != nil { // writeback:gated by revertSheriffAct (ci_rerun)
 		c.logger.Warn("revert sheriff: culprit not notified", "repo", repo, "pr", pr.GetNumber(), "error", err)
 	}
 	return number, url, nil
