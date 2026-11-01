@@ -142,6 +142,42 @@ func TestMatrixWorkspaceDiscoveryRejectsUnmanagedAndSymlinkedCheckouts(t *testin
 	}
 }
 
+func TestMatrixTemporaryWorkspacesRequireKnownOwnerAndRejectReplacement(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "agent-clones", ".github")
+	outside := t.TempDir()
+	matrixGitFixture(t, repo)
+	matrixGitFixture(t, outside)
+	if err := os.Symlink(outside, filepath.Join(root, "linked-checkout")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	cfg := matrixTestConfig()
+	uid := os.Getuid()
+	found := matrixDiscoverTemporaryWorkspaces(context.Background(), root, map[int]string{uid: "quality"}, cfg, 64)
+	if len(found) != 1 || found[0].dir != repo || found[0].agent != "quality" || !found[0].temporary {
+		t.Fatalf("agent-owned temporary clone or hidden repository was not scoped correctly: %+v", found)
+	}
+	for _, owners := range []map[int]string{{uid + 1: "quality"}, {uid: ""}, nil} {
+		if got := matrixDiscoverTemporaryWorkspaces(context.Background(), root, owners, cfg, 64); len(got) != 0 {
+			t.Fatalf("unregistered or ambiguous directory owner authorized capture: %+v", got)
+		}
+	}
+	wrongOwner := found[0]
+	wrongOwner.ownerUID++
+	if _, _, err := wrongOwner.snapshot(context.Background(), cfg); err == nil {
+		t.Fatal("changed ownership after discovery still authorized a sample")
+	}
+	if err := os.Rename(repo, repo+"-moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := found[0].snapshot(context.Background(), cfg); err == nil {
+		t.Fatal("a temporary checkout replaced by a symlink still authorized a sample")
+	}
+}
+
 func TestMatrixWorkspaceVisibilityFailsClosed(t *testing.T) {
 	for _, body := range []string{`{"private":true}`, `{}`, `{"private":false}`} {
 		t.Run(body, func(t *testing.T) {

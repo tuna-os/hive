@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -26,6 +27,8 @@ const matrixWorkspaceCap = 64
 
 type matrixWorkspace struct {
 	dir, agent, repo string
+	ownerUID         int
+	temporary        bool
 }
 
 type matrixVisibility struct {
@@ -34,8 +37,8 @@ type matrixVisibility struct {
 }
 
 // watchMatrixWorkspaces samples changes against HEAD, not terminal output or
-// keystrokes. Discovery never follows symlinks or leaves a configured agent's
-// managed directory. At most two workspaces are sampled per two-second tick.
+// keystrokes. Discovery is confined to configured agent directories and
+// temporary directories owned by registered isolated agent UIDs.
 func (s *Server) watchMatrixWorkspaces(m *matrixSource) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -67,6 +70,9 @@ func (s *Server) watchMatrixWorkspaces(m *matrixSource) {
 			now := time.Now()
 			if !now.Before(discoverAt) {
 				workspaces = matrixDiscoverWorkspaces(ctx, crux.WorkDir(), s.deps.Config.Agents, cfg)
+				if len(workspaces) < matrixWorkspaceCap {
+					workspaces = append(workspaces, matrixDiscoverTemporaryWorkspaces(ctx, os.TempDir(), s.matrixTemporaryWorkspaceOwners(), cfg, matrixWorkspaceCap-len(workspaces))...)
+				}
 				live := make(map[string]bool, len(workspaces))
 				for _, w := range workspaces {
 					live[w.dir] = true
@@ -131,11 +137,29 @@ func (s *Server) watchMatrixWorkspaces(m *matrixSource) {
 	}
 }
 
+func (s *Server) matrixTemporaryWorkspaceOwners() map[int]string {
+	owners := make(map[int]string)
+	if s.deps == nil || s.deps.Config == nil || s.deps.AgentMgr == nil {
+		return owners
+	}
+	for name := range s.deps.Config.Agents {
+		proc, err := s.deps.AgentMgr.GetStatusFast(name)
+		if err != nil || proc == nil || proc.UID <= 0 || proc.UID == os.Getuid() {
+			continue
+		}
+		if _, duplicate := owners[proc.UID]; duplicate {
+			owners[proc.UID] = ""
+		} else {
+			owners[proc.UID] = name
+		}
+	}
+	return owners
+}
+
 // matrixDiscoverWorkspaces only inspects directory and Git-origin metadata.
 // Code is not read until a separate authoritative public-repository check.
 func matrixDiscoverWorkspaces(ctx context.Context, root string, agents map[string]config.AgentConfig, cfg config.DashboardMatrixConfig) []matrixWorkspace {
-	var err error
-	root, err = filepath.Abs(root)
+	root, err := filepath.Abs(root)
 	if err != nil {
 		return nil
 	}
@@ -145,38 +169,93 @@ func matrixDiscoverWorkspaces(ctx context.Context, root string, agents map[strin
 		if _, managed := agents[entry.Name()]; !managed || !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
-		agentRoot := filepath.Join(root, entry.Name())
-		visited := 0
-		_ = filepath.WalkDir(agentRoot, func(p string, d fs.DirEntry, err error) error {
-			visited++
-			if len(out) >= matrixWorkspaceCap || visited > 4096 || ctx.Err() != nil {
-				return fs.SkipAll
-			}
-			if err != nil || !d.IsDir() {
-				return nil
-			}
-			rel, _ := filepath.Rel(agentRoot, p)
-			if p != agentRoot && (strings.HasPrefix(d.Name(), ".") || strings.Count(rel, string(filepath.Separator)) >= 5 || d.Name() == "node_modules" || d.Name() == "vendor") {
-				return filepath.SkipDir
-			}
-			git, err := os.Lstat(filepath.Join(p, ".git"))
-			if err != nil || (!git.IsDir() && !git.Mode().IsRegular()) {
-				return nil
-			}
-			origin, err := matrixGit(ctx, p, 8192, "config", "--get", "remote.origin.url")
-			if err == nil {
-				repo := matrixOriginRepo(strings.TrimSpace(string(origin)))
-				if cfg.RepoAllowed(repo) {
-					out = append(out, matrixWorkspace{dir: p, agent: entry.Name(), repo: repo})
-				}
-			}
-			return filepath.SkipDir
-		})
+		out = matrixFindWorkspaces(ctx, filepath.Join(root, entry.Name()), entry.Name(), -1, cfg, out, matrixWorkspaceCap)
 		if len(out) >= matrixWorkspaceCap {
 			break
 		}
 	}
 	return out
+}
+
+// Only registered isolated owners authorize a temporary subtree. Other users,
+// shared/root UIDs and symlinked directories never grant discovery permission.
+func matrixDiscoverTemporaryWorkspaces(ctx context.Context, root string, owners map[int]string, cfg config.DashboardMatrixConfig, limit int) []matrixWorkspace {
+	if len(owners) == 0 || limit <= 0 || matrixDirectoryUID(root) < 0 {
+		return nil
+	}
+	root, err := filepath.Abs(root)
+	if err != nil || root == string(filepath.Separator) {
+		return nil
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		return nil
+	}
+	entries, _ := dir.ReadDir(4096)
+	_ = dir.Close()
+	var out []matrixWorkspace
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		agentRoot := filepath.Join(root, entry.Name())
+		uid := matrixDirectoryUID(agentRoot)
+		if name := owners[uid]; name != "" {
+			out = matrixFindWorkspaces(ctx, agentRoot, name, uid, cfg, out, min(limit, matrixWorkspaceCap))
+		}
+		if len(out) >= limit || ctx.Err() != nil {
+			break
+		}
+	}
+	return out
+}
+
+func matrixFindWorkspaces(ctx context.Context, root, name string, ownerUID int, cfg config.DashboardMatrixConfig, out []matrixWorkspace, limit int) []matrixWorkspace {
+	visited := 0
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		visited++
+		if len(out) >= limit || visited > 4096 || ctx.Err() != nil {
+			return fs.SkipAll
+		}
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		if p != root && (strings.Count(rel, string(filepath.Separator)) >= 5 || d.Name() == "node_modules" || d.Name() == "vendor") {
+			return filepath.SkipDir
+		}
+		if ownerUID >= 0 && matrixDirectoryUID(p) != ownerUID {
+			return filepath.SkipDir
+		}
+		git, err := os.Lstat(filepath.Join(p, ".git"))
+		if err == nil && (git.IsDir() || git.Mode().IsRegular()) {
+			origin, err := matrixGit(ctx, p, 8192, "config", "--get", "remote.origin.url")
+			if err == nil {
+				repo := matrixOriginRepo(strings.TrimSpace(string(origin)))
+				if cfg.RepoAllowed(repo) {
+					out = append(out, matrixWorkspace{dir: p, agent: name, repo: repo, ownerUID: ownerUID, temporary: ownerUID >= 0})
+				}
+			}
+			return filepath.SkipDir
+		}
+		if p != root && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return out
+}
+
+func matrixDirectoryUID(path string) int {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		return -1
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1
+	}
+	return int(stat.Uid)
 }
 
 func matrixOriginRepo(origin string) string {
@@ -210,6 +289,12 @@ func (w matrixWorkspace) snapshot(ctx context.Context, cfg config.DashboardMatri
 	defer cancel()
 	obs := matrixObservation{Repo: w.repo, HiveIdentified: true, At: time.Now(),
 		stage: "in-progress", agent: w.agent, workspace: w.dir}
+	if w.temporary {
+		resolved, err := filepath.EvalSymlinks(w.dir)
+		if err != nil || resolved != w.dir || matrixDirectoryUID(w.dir) != w.ownerUID {
+			return obs, [sha256.Size]byte{}, errors.New("temporary workspace ownership no longer admitted")
+		}
+	}
 	// Revalidate origin on every sample: a reused checkout may have changed
 	// repositories since discovery or its public-visibility proof.
 	origin, err := matrixGit(ctx, w.dir, 8192, "config", "--get", "remote.origin.url")

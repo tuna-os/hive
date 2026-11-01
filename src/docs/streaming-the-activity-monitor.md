@@ -197,13 +197,17 @@ dashboard:
     exclude_paths: ["deploy/**"]
 ```
 
-Workspace discovery stays under configured agents in `$HIVE_WORK_DIR`
-(`/data/agents` by default). It does not follow symlinked directories, inspect
-agent terminals, or scan arbitrary host paths. Clones and linked worktrees
-must be inside a managed agent directory. Discovery runs every 30 seconds;
-two workspaces are sampled per two-second batch, round-robin, with a
-64-workspace bound. New files, edits and deletions are included. Git commands
-are read-only, time-bounded and output-bounded; external diff drivers, text
+Workspace discovery includes configured agents under `$HIVE_WORK_DIR`
+(`/data/agents` by default) and temporary subtrees owned by a registered,
+isolated agent UID. Shared, root and dashboard-service UIDs cannot authorize
+temporary capture. Symlinked directories are not followed; ownership is checked
+again before sampling temporary checkouts. Existing filesystem permissions
+remain in force; unreadable checkouts are skipped. Agent terminals and arbitrary
+host paths are not inspected. Discovery runs every 30 seconds, inspecting at most
+4,096 top-level temporary entries; two workspaces are sampled per two-second
+batch, round-robin, with a shared 64-workspace bound. New files, edits and
+deletions are included. Git commands are read-only, time-bounded and
+output-bounded; external diff drivers, text
 converters and configured clean/process filters are disabled. The collector
 verifies repository visibility on GitHub before publishing a changed workspace
 snapshot. Unknown visibility, private repositories and origins outside the
