@@ -1,0 +1,1 @@
+- Replace Cascade's scattered lines with a passive, readable code activity view: complete green additions and red removals, clearly labeled pushed PR checkpoints and separately opted-in managed-workspace snapshots, pause-to-inspect controls, and explicit buffered replay.

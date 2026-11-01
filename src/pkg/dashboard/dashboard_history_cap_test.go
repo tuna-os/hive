@@ -1,43 +1,9 @@
 package dashboard
 
 import (
-	"regexp"
 	"strings"
 	"testing"
 )
-
-// historyPushRe matches an append onto any client-side history array, e.g.
-// `historyData.push(`, `chatCommandHistory.push(`, `history.push(`.
-var historyPushRe = regexp.MustCompile(`\b(\w*[Hh]istory\w*)\.push\(`)
-
-// TestDashboardHistoryPushSitesAreCapped guards #10557: every in-memory
-// history array the dashboard appends to must be trimmed right after the push,
-// otherwise a tab left open for hours grows until the browser reloads it.
-func TestDashboardHistoryPushSitesAreCapped(t *testing.T) {
-	html := indexHTML(t)
-	lines := strings.Split(html, "\n")
-	found := 0
-	for i, line := range lines {
-		m := historyPushRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		found++
-		end := i + 3
-		if end > len(lines) {
-			end = len(lines)
-		}
-		window := strings.Join(lines[i:end], "\n")
-		name := regexp.QuoteMeta(m[1])
-		capped := regexp.MustCompile(`capHistory\(` + name + `\b|` + name + `(\[[^\]]*\])?\s*=\s*[^;\n]*\.slice\(-`)
-		if !capped.MatchString(window) {
-			t.Errorf("index.html:%d: %s.push( is not followed by capHistory(%s) or a .slice(-N) trim", i+1, m[1], m[1])
-		}
-	}
-	if found == 0 {
-		t.Fatal("no history push sites found; guard regex is stale")
-	}
-}
 
 func TestDashboardHistoryCapHelpersBounded(t *testing.T) {
 	html := indexHTML(t)

@@ -1,0 +1,535 @@
+package dashboard
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"io/fs"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/pkg/config"
+)
+
+const matrixWorkspaceCap = 64
+
+type matrixWorkspace struct {
+	dir, agent, repo string
+	ownerUID         int
+	temporary        bool
+}
+
+type matrixVisibility struct {
+	public bool
+	until  time.Time
+}
+
+// watchMatrixWorkspaces samples changes against HEAD, not terminal output or
+// keystrokes. Discovery is confined to configured agent directories and
+// temporary directories owned by registered isolated agent UIDs.
+func (s *Server) watchMatrixWorkspaces(m *matrixSource) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-m.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	var workspaces []matrixWorkspace
+	last := make(map[string][sha256.Size]byte)
+	visibility := make(map[string]matrixVisibility)
+	var discoverAt time.Time
+	var epoch uint64
+	next := 0
+	for {
+		cfg := s.currentMatrixConfig()
+		m.setConfig(cfg)
+		if current := m.generation.Load(); current != epoch {
+			clear(last)
+			clear(visibility)
+			discoverAt = time.Time{}
+			epoch = current
+		}
+		if cfg.Active() && cfg.Workspaces && s.deps != nil && s.deps.Config != nil {
+			now := time.Now()
+			if !now.Before(discoverAt) {
+				workspaces = matrixDiscoverWorkspaces(ctx, crux.WorkDir(), s.deps.Config.Agents, cfg)
+				if len(workspaces) < matrixWorkspaceCap {
+					workspaces = append(workspaces, matrixDiscoverTemporaryWorkspaces(ctx, os.TempDir(), s.matrixTemporaryWorkspaceOwners(), cfg, matrixWorkspaceCap-len(workspaces))...)
+				}
+				live := make(map[string]bool, len(workspaces))
+				for _, w := range workspaces {
+					live[w.dir] = true
+				}
+				for dir := range last {
+					if !live[dir] {
+						delete(last, dir)
+					}
+				}
+				for repo := range visibility {
+					if !cfg.RepoAllowed(repo) {
+						delete(visibility, repo)
+					}
+				}
+				discoverAt = now.Add(30 * time.Second)
+			}
+			for range min(2, len(workspaces)) {
+				w := workspaces[next%len(workspaces)]
+				next++
+				proof := visibility[w.repo]
+				if !now.Before(proof.until) {
+					wasPublic := proof.public
+					proof = matrixVisibility{public: s.matrixWorkspacePublic(ctx, w.repo), until: now.Add(5 * time.Minute)}
+					visibility[w.repo] = proof
+					if wasPublic && !proof.public {
+						m.reset()
+					}
+				}
+				if !proof.public || !cfg.RepoAllowed(w.repo) {
+					continue
+				}
+				obs, digest, err := w.snapshot(ctx, cfg)
+				if err != nil {
+					continue
+				}
+				if prior, ok := last[w.dir]; ok && prior == digest {
+					continue
+				}
+				// A cached discovery proof never authorizes publishing new
+				// unpublished text: verify every changed snapshot again.
+				if len(obs.Files) > 0 && !s.matrixWorkspacePublic(ctx, w.repo) {
+					visibility[w.repo] = matrixVisibility{until: now.Add(5 * time.Minute)}
+					m.reset()
+					continue
+				}
+				last[w.dir] = digest
+				if len(obs.Files) > 0 {
+					m.enqueue(obs)
+				}
+			}
+		} else {
+			workspaces = nil
+			clear(last)
+			clear(visibility)
+			discoverAt = time.Time{}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) matrixTemporaryWorkspaceOwners() map[int]string {
+	owners := make(map[int]string)
+	if s.deps == nil || s.deps.Config == nil || s.deps.AgentMgr == nil {
+		return owners
+	}
+	for name := range s.deps.Config.Agents {
+		proc, err := s.deps.AgentMgr.GetStatusFast(name)
+		if err != nil || proc == nil || proc.UID <= 0 || proc.UID == os.Getuid() {
+			continue
+		}
+		if _, duplicate := owners[proc.UID]; duplicate {
+			owners[proc.UID] = ""
+		} else {
+			owners[proc.UID] = name
+		}
+	}
+	return owners
+}
+
+// matrixDiscoverWorkspaces only inspects directory and Git-origin metadata.
+// Code is not read until a separate authoritative public-repository check.
+func matrixDiscoverWorkspaces(ctx context.Context, root string, agents map[string]config.AgentConfig, cfg config.DashboardMatrixConfig) []matrixWorkspace {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil
+	}
+	var out []matrixWorkspace
+	entries, _ := os.ReadDir(root)
+	for _, entry := range entries {
+		if _, managed := agents[entry.Name()]; !managed || !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		out = matrixFindWorkspaces(ctx, filepath.Join(root, entry.Name()), entry.Name(), -1, cfg, out, matrixWorkspaceCap)
+		if len(out) >= matrixWorkspaceCap {
+			break
+		}
+	}
+	return out
+}
+
+// Only registered isolated owners authorize a temporary subtree. Other users,
+// shared/root UIDs and symlinked directories never grant discovery permission.
+func matrixDiscoverTemporaryWorkspaces(ctx context.Context, root string, owners map[int]string, cfg config.DashboardMatrixConfig, limit int) []matrixWorkspace {
+	if len(owners) == 0 || limit <= 0 || matrixDirectoryUID(root) < 0 {
+		return nil
+	}
+	root, err := filepath.Abs(root)
+	if err != nil || root == string(filepath.Separator) {
+		return nil
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		return nil
+	}
+	entries, _ := dir.ReadDir(4096)
+	_ = dir.Close()
+	var out []matrixWorkspace
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		agentRoot := filepath.Join(root, entry.Name())
+		uid := matrixDirectoryUID(agentRoot)
+		if name := owners[uid]; name != "" {
+			out = matrixFindWorkspaces(ctx, agentRoot, name, uid, cfg, out, min(limit, matrixWorkspaceCap))
+		}
+		if len(out) >= limit || ctx.Err() != nil {
+			break
+		}
+	}
+	return out
+}
+
+func matrixFindWorkspaces(ctx context.Context, root, name string, ownerUID int, cfg config.DashboardMatrixConfig, out []matrixWorkspace, limit int) []matrixWorkspace {
+	visited := 0
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		visited++
+		if len(out) >= limit || visited > 4096 || ctx.Err() != nil {
+			return fs.SkipAll
+		}
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		if p != root && (strings.Count(rel, string(filepath.Separator)) >= 5 || d.Name() == "node_modules" || d.Name() == "vendor") {
+			return filepath.SkipDir
+		}
+		if ownerUID >= 0 && matrixDirectoryUID(p) != ownerUID {
+			return filepath.SkipDir
+		}
+		git, err := os.Lstat(filepath.Join(p, ".git"))
+		if err == nil && (git.IsDir() || git.Mode().IsRegular()) {
+			origin, err := matrixGit(ctx, p, 8192, "config", "--get", "remote.origin.url")
+			if err == nil {
+				repo := matrixOriginRepo(strings.TrimSpace(string(origin)))
+				if cfg.RepoAllowed(repo) {
+					out = append(out, matrixWorkspace{dir: p, agent: name, repo: repo, ownerUID: ownerUID, temporary: ownerUID >= 0})
+				}
+			}
+			return filepath.SkipDir
+		}
+		if p != root && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return out
+}
+
+func matrixDirectoryUID(path string) int {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		return -1
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1
+	}
+	return int(stat.Uid)
+}
+
+func matrixOriginRepo(origin string) string {
+	var repo string
+	if strings.HasPrefix(origin, "git@github.com:") {
+		repo = strings.TrimPrefix(origin, "git@github.com:")
+	} else if u, err := url.Parse(origin); err == nil && strings.EqualFold(u.Hostname(), "github.com") && (u.Scheme == "https" || u.Scheme == "ssh") {
+		repo = strings.TrimPrefix(u.Path, "/")
+	}
+	repo = strings.TrimSuffix(repo, ".git")
+	if (config.DashboardMatrixConfig{Repos: []string{repo}}).Validate() != nil {
+		return ""
+	}
+	return strings.Clone(strings.ToLower(repo))
+}
+
+func matrixWorkspacePath(p string, cfg config.DashboardMatrixConfig) bool {
+	if p == "" || !utf8.ValidString(p) || filepath.IsAbs(p) || filepath.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") || matrixPathDenied(p, cfg.ExcludePaths) {
+		return false
+	}
+	for _, r := range p {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func (w matrixWorkspace) snapshot(ctx context.Context, cfg config.DashboardMatrixConfig) (matrixObservation, [sha256.Size]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	obs := matrixObservation{Repo: w.repo, HiveIdentified: true, At: time.Now(),
+		stage: "in-progress", agent: w.agent, workspace: w.dir}
+	if w.temporary {
+		resolved, err := filepath.EvalSymlinks(w.dir)
+		if err != nil || resolved != w.dir || matrixDirectoryUID(w.dir) != w.ownerUID {
+			return obs, [sha256.Size]byte{}, errors.New("temporary workspace ownership no longer admitted")
+		}
+	}
+	// Revalidate origin on every sample: a reused checkout may have changed
+	// repositories since discovery or its public-visibility proof.
+	origin, err := matrixGit(ctx, w.dir, 8192, "config", "--get", "remote.origin.url")
+	if err != nil || matrixOriginRepo(strings.TrimSpace(string(origin))) != w.repo || !cfg.RepoAllowed(w.repo) {
+		return obs, [sha256.Size]byte{}, errors.New("workspace origin no longer admitted")
+	}
+	head, headErr := matrixGit(ctx, w.dir, 256, "rev-parse", "--verify", "HEAD")
+	obs.HeadSHA = strings.TrimSpace(string(head))
+	var tracked []byte
+	if headErr == nil {
+		tracked, err = matrixGit(ctx, w.dir, 64<<10, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=all", "--name-only", "-z", "HEAD", "--")
+		if err != nil {
+			return obs, [sha256.Size]byte{}, err
+		}
+	} else {
+		tracked, err = matrixGit(ctx, w.dir, 64<<10, "ls-files", "--cached", "-z")
+		if err != nil {
+			return obs, [sha256.Size]byte{}, err
+		}
+	}
+	var paths []string
+	for p := range strings.SplitSeq(string(tracked), "\x00") {
+		if matrixWorkspacePath(p, cfg) && len(paths) < matrixMaxFilesPerObs {
+			paths = append(paths, p)
+		}
+	}
+	remaining := matrixMaxPatchBytes
+	if headErr == nil && len(paths) > 0 {
+		args := []string{"diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--ignore-submodules=all", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/", "--output-indicator-new=+", "--output-indicator-old=-", "--output-indicator-context= ", "HEAD", "--"}
+		patch, err := matrixGit(ctx, w.dir, remaining, append(args, paths...)...)
+		if err != nil {
+			return obs, [sha256.Size]byte{}, err
+		}
+		obs.Files = matrixWorkspaceFiles(string(patch), cfg)
+		remaining -= len(patch)
+		paths = nil
+	}
+	untracked, err := matrixGit(ctx, w.dir, 64<<10, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return obs, [sha256.Size]byte{}, err
+	}
+	for p := range strings.SplitSeq(string(untracked), "\x00") {
+		if matrixWorkspacePath(p, cfg) && len(paths)+len(obs.Files) < matrixMaxFilesPerObs {
+			paths = append(paths, p)
+		}
+	}
+	if len(paths) > 0 {
+		root, err := os.OpenRoot(w.dir)
+		if err != nil {
+			return obs, [sha256.Size]byte{}, err
+		}
+		defer root.Close()
+		for _, p := range paths {
+			patch, err := matrixUntrackedPatch(root, p, remaining)
+			if err != nil || patch == "" {
+				continue
+			}
+			remaining -= len(patch)
+			obs.Files = append(obs.Files, matrixFile{Path: p, Patch: patch})
+		}
+	}
+	hash := sha256.New()
+	for _, f := range obs.Files {
+		_, _ = io.WriteString(hash, f.Path)
+		_, _ = hash.Write([]byte{0})
+		_, _ = io.WriteString(hash, f.Patch)
+	}
+	var digest [sha256.Size]byte
+	hash.Sum(digest[:0])
+	obs.revision = hex.EncodeToString(digest[:])
+	return obs, digest, nil
+}
+
+// matrixWorkspaceFiles reads filenames only before a file's first hunk.
+// Header-like source text inside a hunk is never interpreted as metadata.
+func matrixWorkspaceFiles(patch string, cfg config.DashboardMatrixConfig) []matrixFile {
+	var files []matrixFile
+	var start int
+	flush := func(end int) {
+		part := patch[start:end]
+		old, name := "", ""
+		for line := range strings.SplitSeq(part, "\n") {
+			if strings.HasPrefix(line, "@@ ") {
+				if name == "/dev/null" {
+					name = old
+				}
+				if matrixWorkspacePath(name, cfg) {
+					files = append(files, matrixFile{Path: strings.Clone(name), Patch: part})
+				}
+				return
+			}
+			if strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") {
+				p := strings.TrimSuffix(line[4:], "\t")
+				if strings.HasPrefix(p, "\"") {
+					decoded, err := strconv.Unquote(p)
+					if err != nil {
+						return
+					}
+					p = decoded
+				}
+				if strings.HasPrefix(line, "--- ") {
+					old = strings.TrimPrefix(p, "a/")
+				} else {
+					name = strings.TrimPrefix(p, "b/")
+				}
+			}
+		}
+	}
+	offset := 0
+	for line := range strings.SplitSeq(patch, "\n") {
+		if strings.HasPrefix(line, "diff --git ") && offset > start {
+			flush(offset)
+			start = offset
+		}
+		offset = min(len(patch), offset+len(line)+1)
+	}
+	flush(len(patch))
+	return files
+}
+
+type matrixGitBuffer struct {
+	buf      bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (b *matrixGitBuffer) Write(p []byte) (int, error) {
+	if len(p) > b.limit-b.buf.Len() {
+		b.overflow = true
+		return 0, io.ErrShortBuffer
+	}
+	return b.buf.Write(p)
+}
+
+// Git is read-only, output-bounded and time-bounded. Diff calls also disable
+// configured clean/process filters, in addition to external diff/text converters.
+func matrixGit(parent context.Context, dir string, limit int, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	base := []string{"--no-pager", "--literal-pathspecs", "--work-tree=" + dir, "-c", "safe.directory=" + dir, "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"}
+	if len(args) > 0 && args[0] == "diff" {
+		filters, err := matrixGit(ctx, dir, 8192, "config", "--null", "--name-only", "--get-regexp", `^filter\..*\.(clean|process)$`)
+		var exit *exec.ExitError
+		if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1) {
+			return nil, err
+		}
+		for _, key := range strings.Split(string(filters), "\x00") {
+			if key == "" {
+				continue
+			}
+			driver := key[:strings.LastIndexByte(key, '.')]
+			base = append(base, "-c", key+"=", "-c", driver+".required=false")
+		}
+	}
+	cmd := exec.CommandContext(ctx, "git", append(base, args...)...)
+	cmd.Dir = dir
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"}
+	out := &matrixGitBuffer{limit: limit}
+	cmd.Stdout, cmd.Stderr = out, io.Discard
+	err := cmd.Run()
+	if out.overflow {
+		return nil, io.ErrShortBuffer
+	}
+	return out.buf.Bytes(), err
+}
+
+func (s *Server) matrixWorkspacePublic(parent context.Context, repo string) bool {
+	if s.deps == nil || s.deps.GHClient == nil {
+		return false
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	r, _, err := s.deps.GHClient.GetRepo(ctx, owner, name)
+	return err == nil && r != nil && r.Private != nil && !r.GetPrivate()
+}
+
+// Rooted reads prevent a renamed parent or symlink race from turning a new
+// source file into an arbitrary host-file read. New files are all additions.
+func matrixUntrackedPatch(root *os.Root, path string, limit int) (string, error) {
+	info, err := root.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Size() > int64(limit) {
+		return "", errors.New("new file is not a bounded regular file")
+	}
+	f, err := root.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if info, err = f.Stat(); err != nil || !info.Mode().IsRegular() {
+		return "", errors.New("new file changed type")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", nil
+	}
+	if len(data) > limit || !utf8.Valid(data) || bytes.ContainsRune(data, 0) {
+		return "", errors.New("new file is oversized or binary")
+	}
+	lines := bytes.Count(data, []byte{'\n'})
+	trailing := data[len(data)-1] == '\n'
+	if !trailing {
+		lines++
+	}
+	// Include prefix, hunk header and no-newline metadata in the byte budget.
+	if len(data)+lines+64 > limit {
+		return "", io.ErrShortBuffer
+	}
+	var patch strings.Builder
+	patch.Grow(len(data) + lines + 64)
+	patch.WriteString("@@ -0,0 +1,")
+	var number [20]byte
+	patch.Write(strconv.AppendInt(number[:0], int64(lines), 10))
+	patch.WriteString(" @@\n")
+	offset := 0
+	for line := range bytes.SplitSeq(data, []byte{'\n'}) {
+		if offset == len(data) && len(line) == 0 {
+			break
+		}
+		patch.WriteByte('+')
+		patch.Write(line)
+		patch.WriteByte('\n')
+		offset += len(line) + 1
+	}
+	if !trailing {
+		patch.WriteString("\\ No newline at end of file\n")
+	}
+	return patch.String(), nil
+}

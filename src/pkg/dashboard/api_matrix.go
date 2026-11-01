@@ -55,8 +55,8 @@ func (s *Server) currentMatrixConfig() config.DashboardMatrixConfig {
 	return config.DashboardMatrixConfig{}
 }
 
-// matrixActiveSource returns the active matrix line source and its active config,
-// or (nil, nil) if the source is nil or the flag is off/inactive.
+// matrixActiveSource starts an enabled source independently of sentinel sweeps,
+// so workspace edits do not wait for a PR push or a GitHub polling cycle.
 func (s *Server) matrixActiveSource() (*matrixSource, *config.DashboardMatrixConfig) {
 	if s == nil {
 		return nil, nil
@@ -65,22 +65,23 @@ func (s *Server) matrixActiveSource() (*matrixSource, *config.DashboardMatrixCon
 	if !cfg.Active() {
 		return nil, nil
 	}
+	s.MatrixObserver(cfg)
 	s.matrixMu.Lock()
-	defer s.matrixMu.Unlock()
-	if s.matrix == nil {
-		return nil, nil
+	m := s.matrix
+	s.matrixMu.Unlock()
+	if s.deps != nil && s.deps.AgentMgr != nil {
+		m.workspaceOnce.Do(func() { go s.watchMatrixWorkspaces(m) })
 	}
-	mCfg := s.matrix.cfg.Load()
-	if mCfg == nil || !mCfg.Active() {
-		return nil, nil
-	}
-	return s.matrix, &cfg
+	return m, &cfg
 }
 
 type matrixLinesResponse struct {
-	Seq    uint64       `json:"seq"`
-	Source string       `json:"source"`
-	Lines  []matrixLine `json:"lines"`
+	Seq        uint64       `json:"seq"`
+	Latest     uint64       `json:"latest"`
+	Epoch      uint64       `json:"epoch"`
+	Source     string       `json:"source"`
+	Workspaces bool         `json:"workspaces"`
+	Lines      []matrixLine `json:"lines"`
 }
 
 // handleMatrixLines serves GET /api/matrix/lines?since=<seq>&max=<n>
@@ -118,20 +119,16 @@ func (s *Server) handleMatrixLines(w http.ResponseWriter, r *http.Request) {
 		limit = matrixBacklogCap // 2000
 	}
 
-	rawLines, latest := src.Since(since, limit)
-
-	lines := make([]matrixLine, 0, len(rawLines))
-	for _, l := range rawLines {
-		if cfg.RepoAllowed(l.Repo) {
-			lines = append(lines, l)
-		}
-	}
+	lines, cursor, latest, epoch := src.Since(since, limit, cfg)
 
 	w.Header().Set("Content-Type", "application/json")
 	resp := matrixLinesResponse{
-		Seq:    latest,
-		Source: "pushed-lines",
-		Lines:  lines,
+		Seq:        cursor,
+		Latest:     latest,
+		Epoch:      epoch,
+		Source:     "code-activity",
+		Workspaces: cfg.Workspaces,
+		Lines:      lines,
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
