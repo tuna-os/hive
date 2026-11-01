@@ -13,4 +13,22 @@ body.matrix-mode .matrix-notice { position: absolute; top: 2rem; left: 1rem; rig
 body.matrix-mode .matrix-list { position: absolute; inset: 4rem 1rem 8rem; overflow: hidden; }
 body.matrix-mode .matrix-list pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .3rem 0 1rem; }
 body.matrix-mode .matrix-list small { color: var(--matrix-muted); }
+.matrix-toolbar{position:absolute;inset:0 0 auto;min-height:3.25rem;display:flex;align-items:center;gap:1rem;padding:.65rem 1rem;background:#001009;border-bottom:1px solid #214032;z-index:2;flex-wrap:wrap}
+.matrix-toolbar h1{font-size:1rem;margin:0 auto 0 0;color:#e8f5eb}
+.matrix-toolbar button,.matrix-toolbar a{color:#e8f5eb;background:#0b2518;border:1px solid #365b45;border-radius:.35rem;padding:.3rem .65rem;font:inherit;text-decoration:none}
+.matrix-toolbar label{font-size:.85rem;color:#b8ccbb}
+.matrix-cascade{position:absolute;inset:4.5rem 0 7rem;overflow:auto;overflow-anchor:none;scrollbar-color:#365b45 #000804;padding:0 max(1rem,calc((100vw - 1100px)/2));outline-offset:-2px}
+.matrix-cascade-track{display:flow-root;min-height:1px}
+.matrix-diff{margin:0 0 1rem;border:1px solid #294537;border-radius:.5rem;overflow:hidden;background:#03120a}
+.matrix-diff header{display:flex;flex-wrap:wrap;gap:.4rem 1rem;padding:.75rem 1rem;background:#0a1b12;border-bottom:1px solid #294537;color:#e8f5eb}
+.matrix-diff header span{flex:1 1 60%;overflow-wrap:anywhere}
+.matrix-diff header small{color:#b8ccbb}
+.matrix-diff header a{color:#b6d9ff}
+.matrix-diff pre{margin:0;padding:.8rem 1rem;white-space:break-spaces;overflow-wrap:anywhere;tab-size:4;font:clamp(14px,1.35vw,18px)/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+.matrix-diff-add{color:#86efac;background:#062214;border-left:3px solid #4ade80}
+.matrix-diff-remove{color:#fda4af;background:#2c1016;border-left:3px solid #fb7185}
+.matrix-stage-local{color:#fcd68a}
+.matrix-stage-pushed{color:#a8cfff}
+.matrix-cascade~.matrix-notice{top:auto;bottom:5rem;pointer-events:none;font-size:.85rem}
+@media(max-width:640px){.matrix-cascade{top:7rem}.matrix-toolbar{gap:.5rem}.matrix-toolbar h1{flex-basis:100%}.matrix-labels{font-size:.75rem}}
 body.matrix-mode #hive-matrix [hidden] { display: none !important; }

@@ -7053,6 +7053,24 @@ body.matrix-mode .matrix-notice { position: absolute; top: 2rem; left: 1rem; rig
 body.matrix-mode .matrix-list { position: absolute; inset: 4rem 1rem 8rem; overflow: hidden; }
 body.matrix-mode .matrix-list pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .3rem 0 1rem; }
 body.matrix-mode .matrix-list small { color: var(--matrix-muted); }
+.matrix-toolbar{position:absolute;inset:0 0 auto;min-height:3.25rem;display:flex;align-items:center;gap:1rem;padding:.65rem 1rem;background:#001009;border-bottom:1px solid #214032;z-index:2;flex-wrap:wrap}
+.matrix-toolbar h1{font-size:1rem;margin:0 auto 0 0;color:#e8f5eb}
+.matrix-toolbar button,.matrix-toolbar a{color:#e8f5eb;background:#0b2518;border:1px solid #365b45;border-radius:.35rem;padding:.3rem .65rem;font:inherit;text-decoration:none}
+.matrix-toolbar label{font-size:.85rem;color:#b8ccbb}
+.matrix-cascade{position:absolute;inset:4.5rem 0 7rem;overflow:auto;overflow-anchor:none;scrollbar-color:#365b45 #000804;padding:0 max(1rem,calc((100vw - 1100px)/2));outline-offset:-2px}
+.matrix-cascade-track{display:flow-root;min-height:1px}
+.matrix-diff{margin:0 0 1rem;border:1px solid #294537;border-radius:.5rem;overflow:hidden;background:#03120a}
+.matrix-diff header{display:flex;flex-wrap:wrap;gap:.4rem 1rem;padding:.75rem 1rem;background:#0a1b12;border-bottom:1px solid #294537;color:#e8f5eb}
+.matrix-diff header span{flex:1 1 60%;overflow-wrap:anywhere}
+.matrix-diff header small{color:#b8ccbb}
+.matrix-diff header a{color:#b6d9ff}
+.matrix-diff pre{margin:0;padding:.8rem 1rem;white-space:break-spaces;overflow-wrap:anywhere;tab-size:4;font:clamp(14px,1.35vw,18px)/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+.matrix-diff-add{color:#86efac;background:#062214;border-left:3px solid #4ade80}
+.matrix-diff-remove{color:#fda4af;background:#2c1016;border-left:3px solid #fb7185}
+.matrix-stage-local{color:#fcd68a}
+.matrix-stage-pushed{color:#a8cfff}
+.matrix-cascade~.matrix-notice{top:auto;bottom:5rem;pointer-events:none;font-size:.85rem}
+@media(max-width:640px){.matrix-cascade{top:7rem}.matrix-toolbar{gap:.5rem}.matrix-toolbar h1{flex-basis:100%}.matrix-labels{font-size:.75rem}}
 body.matrix-mode #hive-matrix [hidden] { display: none !important; }
     .var-empty{color:var(--muted);font-size:var(--fs-sm);padding:var(--sp-2) var(--sp-0)}
     .var-section{margin-top:var(--sp-6);border-top:1px solid var(--border);padding-top:var(--sp-5)}
@@ -7096,8 +7114,8 @@ body.matrix-mode #hive-matrix [hidden] { display: none !important; }
       var value = Number(option(name, String(fallback)));
       return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
     }
-    var effect = option('effect', 'rain');
-    if (['rain', 'cascade', 'ghost', 'terminal'].indexOf(effect) < 0) effect = 'rain';
+    var effect = option('effect', 'cascade');
+    if (['rain', 'cascade', 'ghost', 'terminal'].indexOf(effect) < 0) effect = 'cascade';
     var captions = option('captions', 'on') !== 'off';
     var speed = number('speed', 1, 0.1, 5), fps = number('fps', 30, 1, 60);
     var palette = option('palette', 'green');
@@ -7115,19 +7133,47 @@ body.matrix-mode #hive-matrix [hidden] { display: none !important; }
       return el;
     }
     var canvas = element('canvas', 'matrix-canvas');
-    canvas.setAttribute('aria-label', 'Pushed code lines · Matrix ' + effect);
+    canvas.setAttribute('aria-label', 'Observed code changes · ' + effect);
     var list = element('div', 'matrix-list');
-    var notice = element('p', 'matrix-notice', 'Waiting for pushed lines…');
+    var cascade = element('section', 'matrix-cascade');
+    cascade.setAttribute('aria-label', 'Code activity');
+    cascade.tabIndex = 0;
+    var track = document.createElement('div');
+    track.className = 'matrix-cascade-track';
+    cascade.appendChild(track);
+    var toolbar = element('header', 'matrix-toolbar');
+    toolbar.hidden = effect !== 'cascade';
+    var title = document.createElement('h1');
+    title.textContent = 'Hive code activity';
+    var pauseButton = document.createElement('button');
+    pauseButton.type = 'button';
+    pauseButton.addEventListener('click', function(){ manualPause = !manualPause; sync(); });
+    var replayLabel = document.createElement('label');
+    var replayInput = document.createElement('input');
+    replayInput.type = 'checkbox'; replayInput.checked = option('replay', 'off') === 'on';
+    replayInput.addEventListener('change', function(){
+      try { localStorage.setItem('hive.matrix.replay', replayInput.checked ? 'on' : 'off'); } catch(e) {}
+      if (replayInput.checked && !ready.length) ready = history.slice();
+      sync();
+    });
+    replayLabel.append(replayInput, document.createTextNode(' Replay buffered changes'));
+    var back = document.createElement('a');
+    back.href = window.location.pathname; back.textContent = 'Dashboard';
+    toolbar.append(title, pauseButton, replayLabel, back);
+    var notice = element('p', 'matrix-notice', 'Waiting for observed changes…');
     notice.setAttribute('role', 'status');
     var labels = element('div', 'matrix-labels');
     var source = document.createElement('div');
-    source.textContent = 'Source: lines pushed by hive · public allowlisted repos';
+    source.textContent = 'Observed diffs · public allowlisted repositories · filtered';
     var freshness = document.createElement('div');
     var pausedLabel = document.createElement('div');
     labels.append(source, freshness, pausedLabel);
     var ctx = canvas.getContext('2d');
     var motion = window.matchMedia('(prefers-reduced-motion: reduce)');
-    var lines = [], lastSeq = 0, lastAt = 0, startedAt = Date.now();
+    var lines = [], lastSeq = 0, lastEpoch = 0, initialLatest = 0, lastAt = 0, startedAt = Date.now(), hasSnapshot = false;
+    // Whole blocks, bounded by both line count and a conservative UTF-8 byte
+    // budget. The display never invents edits or silently loops old activity.
+    var history = [], ready = [], cards = [], historyLines = 0, historyBytes = 0, cascadeExtent = 0;
     var enabled = false, manualPause = false, loading = false, pending = false;
     var frame = 0, previous = 0, page = 0, pageTimer = 0, drops = [];
     var atlas = document.createElement('canvas'), glyphs = new Map();
@@ -7154,29 +7200,127 @@ body.matrix-mode #hive-matrix [hidden] { display: none !important; }
       drops = [];
       ctx.font = '16px monospace';
       charW = (ctx.measureText && ctx.measureText('M').width) || 10;
+      cascadeExtent = Math.max(0, cascade.scrollHeight - cascade.clientHeight);
     }
     function resetText(){ queue = []; tabs = []; typing = null; termRows = []; termHead = ''; termClock = 0; }
+    function forgetContent(){
+      lines = []; drops = []; glyphs.clear(); resetText();
+      history = []; ready = []; cards = []; historyLines = 0; historyBytes = 0; cascadeExtent = 0;
+      track.replaceChildren(); cascade.scrollTop = 0; list.replaceChildren();
+    }
     function clearContent(message){
-      enabled = false; lines = []; drops = []; glyphs.clear(); resetText();
-      lastSeq = 0; lastAt = 0;
-      list.replaceChildren(); ctx.clearRect(0, 0, width, height);
+      enabled = false; forgetContent();
+      lastSeq = 0; lastEpoch = 0; lastAt = 0; hasSnapshot = false;
+      ctx.clearRect(0, 0, width, height);
       notice.textContent = message;
       sync();
     }
     function updateLabels(){
       var minutes = Math.floor(Math.max(0, Date.now() - (lastAt || startedAt)) / 60000);
-      freshness.textContent = minutes >= 10 ? 'stale · no new lines for ' + minutes + 'm' :
-        (lastAt ? 'last line ' + (minutes ? minutes + 'm ago' : 'just now') : 'waiting for first line');
-      pausedLabel.textContent = paused() ? 'paused' : 'p / Space to pause';
+      freshness.textContent = lastAt ? 'Last observed change ' + (minutes ? minutes + 'm ago' : 'just now') : 'Waiting for the first observed change';
+      pausedLabel.textContent = paused() ? 'Paused · scroll to inspect' : 'P / Space to pause · scroll to inspect';
+      pauseButton.textContent = manualPause ? 'Resume' : 'Pause';
+      pauseButton.setAttribute('aria-pressed', String(manualPause));
     }
-    function caption(line){ return line.repo + '#' + line.pr + ' · ' + line.path; }
-    function prKey(line){ return line.repo + '#' + line.pr; }
+    function caption(line){ return line.repo + (line.pr ? '#' + line.pr : '') + (line.agent ? ' · workspace ' + line.agent : '') + ' · ' + line.path; }
+    function prKey(line){ return line.repo + (line.pr ? '#' + line.pr : ':' + (line.agent || '')); }
     function nextLine(key){
       if (!queue.length) queue = lines.slice();
       var at = 0;
       for (var i = 0; key && i < queue.length; i++) if (prKey(queue[i]) === key) { at = i; break; }
       return queue.splice(at, 1)[0] || null;
     }
+    function rememberBlocks(incoming){
+      var blocks = [];
+      incoming.forEach(function(line){
+        var block = blocks[blocks.length - 1];
+        if (!block || block.id !== line.block) {
+          block = {id: line.block, rows: [], bytes: 0, fresh: line.seq > initialLatest}; blocks.push(block);
+        }
+        block.rows.push(line);
+        block.bytes += 3 * line.line.length + 1;
+      });
+      blocks.forEach(function(block){
+        history.push(block); historyLines += block.rows.length; historyBytes += block.bytes;
+      });
+      ready = blocks.filter(function(block){ return block.fresh; }).concat(ready, blocks.filter(function(block){ return !block.fresh; }));
+      while (historyLines > 1200 || historyBytes > 256 * 1024) {
+        var old = history.shift();
+        historyLines -= old.rows.length; historyBytes -= old.bytes;
+        ready = ready.filter(function(block){ return block.id !== old.id; });
+      }
+      if (ready.length > 64) ready = ready[0].fresh ? ready.slice(0, 64) : ready.slice(-64);
+    }
+    function blockCard(block, replay){
+      var first = block.rows[0], article = document.createElement('article');
+      article.className = 'matrix-diff';
+      var header = document.createElement('header');
+      var stage = document.createElement('strong');
+      stage.className = first.stage === 'in-progress' ? 'matrix-stage-local' : 'matrix-stage-pushed';
+      stage.textContent = first.stage === 'in-progress' ? 'In progress · workspace vs HEAD' : 'Pushed PR';
+      var label = document.createElement('span');
+      label.textContent = caption(first);
+      var observed = document.createElement('small');
+      var at = Date.parse(first.at);
+      observed.textContent = (replay ? 'Buffered replay' : block.fresh ? 'Newly received' : 'Buffered snapshot') +
+        ' · observed ' + (Number.isFinite(at) ? new Date(at).toLocaleTimeString() : 'at an unavailable time');
+      header.append(stage, label, observed);
+      if (first.pr) {
+        var link = document.createElement('a');
+        link.href = 'https://github.com/' + first.repo + '/pull/' + first.pr;
+        link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Open PR';
+        header.appendChild(link);
+      }
+      article.appendChild(header);
+      var run = null, change = '', text = [];
+      function flush(){
+        if (!run) return;
+        run.textContent = text.join('\n'); article.appendChild(run);
+      }
+      block.rows.forEach(function(line){
+        if (change !== line.change) {
+          flush(); change = line.change; text = [];
+          run = document.createElement('pre');
+          run.className = change === 'remove' ? 'matrix-diff-remove' : 'matrix-diff-add';
+        }
+        text.push((change === 'remove' ? '− ' : '+ ') + line.line);
+      });
+      flush();
+      return article;
+    }
+    function fillCascade(){
+      if (motion.matches) return;
+      // Keep just the visible blocks and a bounded lookahead in the DOM.
+      while (ready.length && cards.length < 32 && track.offsetHeight < cascade.clientHeight * 2) {
+        var block = ready.shift(), card = blockCard(block, !block.fresh && hasSnapshot && replayInput.checked);
+        track.appendChild(card); cards.push(card);
+      }
+      cascadeExtent = Math.max(0, cascade.scrollHeight - cascade.clientHeight);
+    }
+    function staticCascade(){
+      track.replaceChildren(); cards = [];
+      history.slice(-8).forEach(function(block){
+        var card = blockCard(block, false); track.appendChild(card); cards.push(card);
+      });
+      ready = [];
+    }
+    function drawCascade(dt){
+      fillCascade();
+      cascade.scrollTop = Math.min(cascadeExtent, cascade.scrollTop + dt * 16);
+      // Recycle only a fully departed block. Never cut off its remaining lines.
+      while (cards.length > 1 && cards[0].offsetHeight <= cascade.scrollTop) {
+        var top = cascade.scrollTop - cards[0].offsetHeight;
+        cards.shift().remove(); cascade.scrollTop = top;
+        fillCascade();
+      }
+      if (!ready.length && cascade.scrollTop >= cascadeExtent - 1) {
+        if (replayInput.checked && history.length) {
+          ready = history.map(function(block){ return {id: block.id, rows: block.rows, bytes: block.bytes, fresh: false}; });
+        } else notice.textContent = history.length ? 'Caught up · waiting for changes' : 'Waiting for observed changes…';
+      } else notice.textContent = '';
+    }
+    cascade.addEventListener('wheel', function(){ manualPause = true; sync(); }, {passive: true});
+    cascade.addEventListener('touchstart', function(){ manualPause = true; sync(); }, {passive: true});
     // Minimal keyword/string/comment/number colouring keyed on the extension;
     // unknown extensions render in the palette colour.
     function tokens(path, text){
@@ -7275,6 +7419,7 @@ body.matrix-mode #hive-matrix [hidden] { display: none !important; }
       });
     }
     function staticPage(){
+      if (effect === 'cascade') { staticCascade(); return; }
       list.replaceChildren();
       var latest = lines.slice(-60).reverse();
       if (page * 8 >= latest.length) page = 0;
@@ -7313,31 +7458,26 @@ body.matrix-mode #hive-matrix [hidden] { display: none !important; }
       if (elapsed >= 1000 / fps) {
         previous = now;
         var dt = Math.min(elapsed, 100) / 1000 * speed;
-        ctx.fillStyle = effect === 'rain' ? 'rgba(0, 8, 4, 0.18)' : '#000804';
-        ctx.fillRect(0, 0, width, height);
-        ctx.font = '16px monospace';
-        if (lines.length && effect === 'ghost') drawGhost(dt, now);
-        else if (lines.length && effect === 'terminal') drawTerminal(dt);
-        else if (lines.length) {
-          var count = effect === 'rain' ? Math.ceil(width / cell) : 12;
-          while (drops.length < count) drops.push(spawn(effect === 'rain' ? drops.length * cell : Math.random() * width * 0.5));
-          drops.forEach(function(drop, i){
-            drop.y += drop.speed * dt;
-            if (drop.y > height + 40) { drops[i] = spawn(drop.x); return; }
-            if (effect === 'cascade') {
-              ctx.fillStyle = color; ctx.fillText(drop.line.line, drop.x, drop.y, width - drop.x);
-              if (captions) {
-                ctx.fillStyle = '#b8ccbb'; ctx.font = '12px monospace';
-                ctx.fillText(caption(drop.line), drop.x, drop.y + 18, width - drop.x);
-                ctx.font = '16px monospace';
-              }
-            } else if (drop.chars.length) {
+        if (effect === 'cascade') drawCascade(dt);
+        else {
+          ctx.fillStyle = effect === 'rain' ? 'rgba(0, 8, 4, 0.18)' : '#000804';
+          ctx.fillRect(0, 0, width, height);
+          ctx.font = '16px monospace';
+          if (lines.length && effect === 'ghost') drawGhost(dt, now);
+          else if (lines.length && effect === 'terminal') drawTerminal(dt);
+          else if (lines.length) {
+            var count = Math.ceil(width / cell);
+            while (drops.length < count) drops.push(spawn(drops.length * cell));
+            drops.forEach(function(drop, i){
+              drop.y += drop.speed * dt;
+              if (drop.y > height + 40) { drops[i] = spawn(drop.x); return; }
+              if (!drop.chars.length) return;
               var g = drop.chars[Math.floor(drop.y / cell + drop.chars.length * 100) % drop.chars.length];
               var index = glyphs.get(g);
               if (index !== undefined) ctx.drawImage(atlas, (index % 64) * cell, Math.floor(index / 64) * cell, cell, cell, drop.x, drop.y, cell, cell);
               ctx.fillStyle = '#effff2'; ctx.fillText(g, drop.x, drop.y + 16);
-            }
-          });
+            });
+          }
         }
       }
       frame = requestAnimationFrame(draw);
@@ -7347,57 +7487,77 @@ body.matrix-mode #hive-matrix [hidden] { display: none !important; }
       frame = 0; previous = 0;
       clearTimeout(pageTimer); pageTimer = 0;
       updateLabels();
-      canvas.hidden = motion.matches || !enabled;
-      list.hidden = !motion.matches || !enabled;
-      if (!enabled || paused()) return;
+      canvas.hidden = effect === 'cascade' || motion.matches || !enabled;
+      list.hidden = effect === 'cascade' || !motion.matches || !enabled;
+      cascade.hidden = effect !== 'cascade' || !enabled;
+      if (!enabled) return;
+      if (paused()) return;
+      if (effect === 'cascade' && motion.matches) { staticCascade(); return; }
       if (motion.matches) {
         staticPage();
         pageTimer = setTimeout(function(){ page++; sync(); }, 15000);
-      } else frame = requestAnimationFrame(draw);
+      } else {
+        if (effect === 'cascade') fillCascade();
+        frame = requestAnimationFrame(draw);
+      }
     }
     pull = function(){
       if (loading) { pending = true; return; }
       loading = true; pending = false;
       fetch('/api/matrix/lines?since=' + lastSeq, {cache: 'no-store', credentials: 'same-origin'})
         .then(function(response){
-          if (response.status === 404) { clearContent('Matrix mode is not enabled on this hive'); return null; }
-          if (response.status === 401 || response.status === 403) { clearContent('Sign in with permission to read Matrix lines'); return null; }
-          if (!response.ok) throw new Error('Matrix pull failed');
+          if (response.status === 404) { clearContent('Code activity is not enabled on this hive'); return null; }
+          if (response.status === 401 || response.status === 403) { clearContent('Sign in with permission to read code activity'); return null; }
+          if (!response.ok) throw new Error('Code activity pull failed');
           return response.json();
         }).then(function(data){
           if (!data) return;
-          var incoming = (Array.isArray(data.lines) ? data.lines : []).filter(function(line){ return typeof line.line === 'string'; });
-          var seq = Number(data.seq) || 0;
-          // A restarted hive can reset its sequence; replace the old backlog.
-          if (seq < lastSeq) { lines = []; drops = []; resetText(); }
-          if (seq !== lastSeq && incoming.length) {
+          var seq = Number(data.seq) || 0, latest = Number(data.latest) || seq, epoch = Number(data.epoch) || 0;
+          if (epoch !== lastEpoch || latest < lastSeq) { forgetContent(); hasSnapshot = false; }
+          if (!hasSnapshot) initialLatest = latest;
+          var incoming = (Array.isArray(data.lines) ? data.lines : []).filter(function(line){
+            return typeof line.line === 'string' && Number.isSafeInteger(line.block) && line.block > 0 &&
+              (line.change === 'add' || line.change === 'remove') && (line.seq > lastSeq || latest < lastSeq || epoch !== lastEpoch);
+          });
+          if (incoming.length) {
             var at = Date.parse(incoming[incoming.length - 1].at);
-            lastAt = Number.isFinite(at) ? at : Date.now();
+            if (Number.isFinite(at)) lastAt = at;
+            rememberBlocks(incoming);
           }
-          lastSeq = seq;
-          lines = lines.concat(incoming).slice(-120);
-          queue = queue.concat(incoming).slice(-120);
+          lastSeq = seq; lastEpoch = epoch; hasSnapshot = true;
+          // Decorative effects remain addition-only and retain their small,
+          // trimmed line window. Complete paragraphs belong to Code activity.
+          var added = incoming.filter(function(line){ return line.change === 'add' && line.line.trim() && Array.from(line.line.trim()).length <= 160; })
+            .map(function(line){ return Object.assign({}, line, {line: line.line.trim()}); });
+          lines = lines.concat(added).slice(-120);
+          queue = queue.concat(added).slice(-120);
           enabled = true;
-          notice.textContent = lines.length ? '' : 'Waiting for pushed lines…';
-          if (!motion.matches) buildAtlas();
+          source.textContent = (data.workspaces ? 'In-progress workspace snapshots + pushed PR checkpoints' : 'Pushed PR checkpoints · workspace capture off') +
+            ' · public allowlisted repositories · filtered';
+          notice.textContent = (effect === 'cascade' ? history.length : lines.length) ? '' : 'Waiting for eligible changes…';
+          if (!motion.matches && effect === 'rain') buildAtlas();
           sync();
-        }).catch(function(){ clearContent('Matrix lines unavailable · retrying'); })
+          if (seq < latest) pending = true;
+        }).catch(function(){ clearContent('Code activity unavailable · retrying'); })
         .finally(function(){ loading = false; if (pending) pull(); });
     };
     document.addEventListener('visibilitychange', function(){ sync(); if (!document.hidden) pull(); });
     document.addEventListener('keydown', function(event){
       if (event.ctrlKey || event.metaKey || event.altKey || event.repeat ||
           /INPUT|TEXTAREA|SELECT/.test(event.target.tagName) || event.target.isContentEditable) return;
+      if (effect === 'cascade' && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].indexOf(event.key) >= 0) {
+        manualPause = true; sync(); return;
+      }
       if (event.key === 'p' || event.key === 'P' || event.code === 'Space') {
         event.preventDefault(); manualPause = !manualPause; sync();
       }
     });
     motion.addEventListener('change', function(){
       ctx.clearRect(0, 0, width, height);
-      if (!motion.matches) buildAtlas();
+      if (!motion.matches && effect === 'rain') buildAtlas();
       sync();
     });
-    window.addEventListener('resize', resize);
+    window.addEventListener('resize', function(){ resize(); sync(); });
     resize(); sync(); pull();
     // Recover from missed nudges, endpoint activation and transient failures.
     if (typeof dashboardSetInterval === 'function') {
@@ -8371,6 +8531,7 @@ body.matrix-mode #hive-matrix [hidden] { display: none !important; }
         <label class="ham-repo-filter"><span>Per page</span><select id="activity-monitor-size" class="ham-select" data-change-action="hamFilter" data-arg0="size" data-arg-types="s,v"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option></select></label>
         <button type="button" class="ham-chip ham-reset" id="activity-monitor-reset" data-action="hamFilter" data-arg0="reset" hidden>Clear filters</button>
         <button type="button" class="ham-chip ham-sound" id="activity-monitor-sound" data-action="hamSoundToggle" aria-pressed="false" aria-label="Sound off — turn on (merge zap + new-item buzz; plays a test of each)" title="Sound off — turn on (merge zap + new-item buzz; plays a test of each)">🔇</button>
+        <a class="ham-chip" href="?kiosk=1&amp;view=matrix&amp;mx.effect=cascade" target="_blank" rel="noopener" title="Read real in-progress edits and pushed PR diffs in a passive fullscreen view">Code activity</a>
       </div>
       <div class="ham-labels" id="activity-monitor-labels" role="group" aria-label="Filter by label"></div>
       <div class="ham-meta" id="activity-monitor-meta" aria-live="polite"></div>

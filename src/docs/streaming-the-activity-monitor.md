@@ -169,36 +169,99 @@ repositories without reviewing what the tracker would show.
 The main `twitch.tv/hivecommons` stream never shows Matrix; it remains the
 full-screen Activity Monitor.
 
-## Matrix mode (separate channel)
+## Code activity and Matrix mode
 
-Matrix is an experimental, default-off code display for a separate channel,
-[`twitch.tv/hivecommonsmatrix`](https://www.twitch.tv/hivecommonsmatrix).
-It shows pushed added lines only, from positively identified hive identities,
-on public repositories explicitly allowlisted in `dashboard.matrix.repos`.
-Private patches, unverified authors and excluded paths are never shown. Lines
-touched by scrubbing are dropped entirely rather than displayed with redactions;
-the built-in secret/path filters and `dashboard.matrix.exclude_paths` apply.
-Dashboard authentication alone does not make a code stream safe for public
-Twitch broadcasting: the public allowlist, author restriction and scrub/drop
-rules are required.
+Use **Code activity** in the Activity Monitor toolbar to open a passive,
+full-screen diff reader. Its URL is
+`/?kiosk=1&view=matrix&mx.effect=cascade`. This is a code activity view, not
+a simulated editor. It shows complete changed regions, in order, with green
+`+` additions and red `−` removals. Indentation, blank lines and repeated lines
+stay intact. Long paragraphs wrap. Unchanged context is not collected.
 
-The display's look is chosen with `mx.*` URL parameters; each value is also
-remembered in the browser (`hive.matrix.*` in local storage) for later visits.
-Every effect renders only lines already delivered by `/api/matrix/lines`.
+Each block names its repository, file and observation time. **Pushed PR**
+blocks link to the real pull request. **In progress** blocks name the managed
+agent workspace and compare its unpublished changes with Git HEAD. Workspace
+ownership is not proof that a particular model wrote every byte. A snapshot
+is not a keystroke stream and does not prove an edit was tested or retained.
+
+Both sources require dashboard read access and an explicit public-repository
+allowlist. Published patches also require a positively identified hive author.
+Unpublished edits require a separate, default-off opt-in:
+
+```yaml
+dashboard:
+  matrix:
+    enabled: true
+    workspaces: true
+    repos: [owner/public-repository]
+    exclude_paths: ["deploy/**"]
+```
+
+Workspace discovery stays under configured agents in `$HIVE_WORK_DIR`
+(`/data/agents` by default). It does not follow symlinked directories, inspect
+agent terminals, or scan arbitrary host paths. Clones and linked worktrees
+must be inside a managed agent directory. Discovery runs every 30 seconds;
+two workspaces are sampled per two-second batch, round-robin, with a
+64-workspace bound. New files, edits and deletions are included. Git commands
+are read-only, time-bounded and output-bounded; external diff drivers and text
+converters are disabled. The collector verifies repository visibility on
+GitHub before publishing a changed workspace snapshot. Unknown visibility,
+private repositories and origins outside the allowlist fail closed.
+
+Both sides of a diff pass the same secret, entropy and path filters. An unsafe
+line drops its whole changed region; oversized regions are omitted, not cut
+into fragments. Limits are 4,096 runes per line, 16 KiB per block, 200 changed
+lines per head/snapshot, 600 per minute, and a 2,000-line / 512-KiB text
+backlog. Blocks are admitted, paged and evicted whole. Policy changes clear
+the backlog and advance its epoch so browsers forget old code.
+
+**Unpublished edits can contain sensitive work even in a public repository.**
+Secret detection is heuristic, not a disclosure guarantee. Keep `workspaces`
+off for public broadcasts unless the owner separately approves exposing
+unfinished work. Dashboard authentication alone does not make broadcasting
+safe. The existing Matrix Twitch channel and overlay remain default-off.
+
+The reader scrolls slowly and holds when caught up. **Pause**, `P`, Space,
+scrolling and touch let a viewer inspect a paragraph. Hidden tabs pause.
+Reduced motion uses a static, scrollable set of whole blocks, not auto-pages.
+Buffered replay is off by default. Enable **Replay buffered changes** or
+`mx.replay=on` to loop the bounded history; those blocks say **Buffered replay**.
+The browser retains at most 1,200 lines / 256 KiB of estimated text, and the
+animated viewport holds at most 32 whole block cards.
+
+Display options use `mx.*` URL parameters and `hive.matrix.*` local storage:
 
 | `mx.effect` | Display |
 |---|---|
-| `rain` (default) | Falling columns built from the characters of the latest lines. Unknown values fall back to `rain`. |
-| `cascade` | Whole lines drift down the screen, each with its `repo#PR · path` caption. |
-| `ghost` | Ghost coder: a fake editor with one tab per PR (`repo#PR`), titled with the file path; at most six tabs, the oldest closes first. Lines are typed character by character behind a blinking cursor, with light keyword/string/comment/number colouring by file extension. |
-| `terminal` | An endless `git log -p`-style scroll: each line printed as a green `+ <line>`, with a `repo#PR · path` header whenever the PR or file changes. |
+| `cascade` (default) | Readable code activity: complete green additions and red removals. Unknown effects use this view. |
+| `rain` | Decorative falling characters from added lines only. |
+| `ghost` | Decorative editor-style typing of added lines, grouped by PR, with at most six tabs. |
+| `terminal` | Decorative green added-line scroll with repository and file captions. |
 
-`mx.speed` (0.1–5, default 1) and `mx.fps` (1–60, default 30) set the
-animation and typing speed, `mx.palette` is `green` (default), `amber` or
-`gold`, and `mx.captions=off` hides the `repo#PR · path` captions and headers
-on the canvas. `p` or Space pauses; a hidden tab pauses too. With the
-operating system's *reduce motion* setting on, every effect is replaced by
-static pages of the latest lines with their captions.
+The three decorative effects retain a 120-line addition-only window and
+omit blank or over-160-rune lines. They can replay old lines; their animation
+is not proof of fresh activity. `mx.speed` (0.1–5, default 1) and `mx.fps`
+(1–60, default 30) set playback speed. `mx.palette` and `mx.captions` apply to
+the decorative canvas; the diff reader keeps its red/green semantics and
+provenance labels.
+
+### Pull contract
+
+`GET /api/matrix/lines?since=<seq>&max=<n>` is authenticated and `no-store`.
+Each row includes `seq`, `block`, `change` (`add` or `remove`), `stage`
+(`in-progress` or `pushed`), repository, file, head and observation time.
+Workspace rows include `agent`; their PR number is zero, not a fabricated PR.
+`seq` in the response is the continuation cursor; `latest` is the newest
+available sequence, and `epoch` identifies the current capture policy.
+Keep paging while `seq < latest`. A page never splits a block; a small `max`
+can return one whole block of up to 200 lines. The `code-lines` SSE event
+still contains only a sequence nudge, never source text.
+
+### Separate Twitch channel
+
+[`twitch.tv/hivecommonsmatrix`](https://www.twitch.tv/hivecommonsmatrix) is
+separate from the main Activity Monitor channel. Do not enable workspace
+capture just to fill an unattended public stream.
 
 [`overlays/hive-hosted-matrix/`](../deploy/stream/overlays/hive-hosted-matrix/kustomization.yaml)
 reuses the streamer image and base as a separate instance. It renders Deployment,
@@ -279,8 +342,11 @@ The Node proxy also needs the dashboard HTML matching the deployed code.
 Exact pins, HTML mounts and rollback snapshots are recorded in the
 [fleet ledger](https://github.com/tuna-os/hive/pull/173).
 
-Open `/?kiosk=1&view=matrix&sound=off&mx.effect=rain` on the spoke dashboard;
-`cascade`, `ghost`, and `terminal` select the other effects. An empty backlog
-or animated replay is not proof of fresh ingestion: compare a returned line's
-repository, PR, head and path with the real GitHub patch before calling the
-pilot verified. Do not place dashboard tokens in these URLs.
+Open **Code activity** in the Activity Monitor toolbar, or
+`/?kiosk=1&view=matrix&sound=off&mx.effect=cascade`, on the spoke dashboard.
+`rain`, `ghost`, and `terminal` select the decorative effects. Verify both
+stages separately: compare a pushed block with the actual GitHub patch and
+exercise a controlled unpublished workspace edit. Check deletion color,
+paragraph integrity, pause, reduced motion and anonymous denial. Quiet managed
+workspaces produce no local activity; code outside those workspaces is not
+captured. Do not place dashboard tokens in these URLs.

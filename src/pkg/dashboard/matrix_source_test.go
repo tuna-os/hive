@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,22 +31,30 @@ func newTestMatrixSource(t *testing.T, cfg config.DashboardMatrixConfig) (*matri
 	return m, clk
 }
 
-func matrixObs(number int, head string, files ...sentinel.File) github.SentinelPatchObservation {
-	return github.SentinelPatchObservation{
+func matrixObs(number int, head string, files ...sentinel.File) matrixObservation {
+	return matrixObservation{stage: "pushed", SentinelPatchObservation: github.SentinelPatchObservation{
 		Repo:           matrixTestRepo,
 		Number:         number,
 		HeadSHA:        head,
 		Author:         "hive-bot",
 		HiveIdentified: true,
 		Files:          files,
-	}
+	}}
 }
 
 func matrixPatch(lines ...string) string {
 	var b strings.Builder
-	b.WriteString("--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n")
+	b.WriteString("@@ -0,0 +1 @@\n")
 	for _, l := range lines {
 		b.WriteString("+" + l + "\n")
+	}
+	return b.String()
+}
+
+func matrixSeparatedPatch(lines ...string) string {
+	var b strings.Builder
+	for _, line := range lines {
+		b.WriteString("@@ -0,0 +1 @@\n+" + line + "\n")
 	}
 	return b.String()
 }
@@ -59,7 +68,7 @@ func matrixUniqueLines(prefix string, n int) []string {
 }
 
 func matrixAllLines(m *matrixSource) []matrixLine {
-	lines, _ := m.Since(0, matrixBacklogCap+1)
+	lines, _, _, _ := m.Since(0, matrixBacklogCap+1, nil)
 	return lines
 }
 
@@ -71,7 +80,7 @@ func TestMatrixSourceDropsSecretsFromFixturePatch(t *testing.T) {
 	paneToken := "key: sk-" + "abc123def"
 	files := []sentinel.File{
 		{Path: "pkg/client.go", Patch: matrixPatch(
-			"func main() {",
+			"func main() {") + matrixPatch(
 			"token := \""+ghToken+"\"",
 			scrubbed,
 			paneToken,
@@ -80,8 +89,7 @@ func TestMatrixSourceDropsSecretsFromFixturePatch(t *testing.T) {
 			"MIIEowIBAAKCAQEA",
 			"abc",
 			"-----END RSA PRIVATE KEY-----",
-			"return nil",
-		)},
+		) + matrixPatch("return nil")},
 		{Path: "certs/server.pem", Patch: matrixPatch("pem visible line")},
 		{Path: ".env", Patch: matrixPatch("DB_HOST=localhost")},
 		{Path: "deploy/secrets.yaml", Patch: matrixPatch("password: hunter2")},
@@ -128,9 +136,9 @@ func TestMatrixSourceObservationGates(t *testing.T) {
 			m, _ := newTestMatrixSource(t, tc.cfg)
 			obs := matrixObs(7, "h", file)
 			if tc.mutate != nil {
-				tc.mutate(&obs)
+				tc.mutate(&obs.SentinelPatchObservation)
 			}
-			m.Observe(obs)
+			m.Observe(obs.SentinelPatchObservation)
 			if tc.want == 0 && len(m.in) != 0 {
 				t.Fatalf("Observe queued a rejected observation")
 			}
@@ -191,13 +199,13 @@ func TestMatrixAcceptLine(t *testing.T) {
 		want string
 		ok   bool
 	}{
-		{name: "plain", in: "  return x + y  ", want: "return x + y", ok: true},
-		{name: "empty", in: "   "},
+		{name: "whitespace preserved", in: "  return x + y  ", want: "  return x + y  ", ok: true},
+		{name: "blank preserved", in: "   ", want: "   ", ok: true},
 		{name: "invalid utf8", in: "bad \xff byte"},
 		{name: "control char", in: "esc \x1b[31m red"},
 		{name: "tab allowed", in: "a\tb", want: "a\tb", ok: true},
-		{name: "exactly 160 runes", in: strings.Repeat("ab ", 53) + "x", want: strings.Repeat("ab ", 53) + "x", ok: true},
-		{name: "over 160 runes dropped not truncated", in: strings.Repeat("ab ", 54)},
+		{name: "full paragraph at rune bound", in: strings.Repeat("ab ", 1365) + "x", want: strings.Repeat("ab ", 1365) + "x", ok: true},
+		{name: "over rune bound dropped not truncated", in: strings.Repeat("ab ", 1366)},
 		{name: "entropy run", in: "sum := " + strings.Repeat("0f", 16)},
 		{name: "entropy run 31 ok", in: "id " + strings.Repeat("a", 31), want: "id " + strings.Repeat("a", 31), ok: true},
 		{name: "redaction marker", in: "value <redacted> here"},
@@ -224,16 +232,25 @@ func TestMatrixAcceptLine(t *testing.T) {
 	}
 }
 
-func TestMatrixAddedLines(t *testing.T) {
-	if got := matrixAddedLines(""); got != nil {
-		t.Fatalf("empty patch = %q", got)
+func TestMatrixDiffBlocksPreserveParagraphsAndRejectUnsafeRegions(t *testing.T) {
+	patch := "--- a/f\n+++ b/f\n@@ -1,2 +1,4 @@\n-old paragraph\n+  new paragraph\n+\n+}\n+}\n context\n+safe neighbour\n+password: hunter2\n context\n+--- actual code, not a header\n"
+	blocks := matrixDiffBlocks(patch)
+	if len(blocks) != 2 {
+		t.Fatalf("got %d safe regions, want the replacement and final addition", len(blocks))
 	}
-	if got := matrixAddedLines("+a\x00b"); got != nil {
-		t.Fatalf("binary patch = %q", got)
+	want := []matrixPatchLine{{"remove", "old paragraph"}, {"add", "  new paragraph"}, {"add", ""}, {"add", "}"}, {"add", "}"}}
+	if !slices.Equal(blocks[0].lines, want) || blocks[1].lines[0].text != "--- actual code, not a header" {
+		t.Fatalf("paragraph changed: %#v", blocks)
 	}
-	got := matrixAddedLines("+++ b/f\n@@\n context\n-removed\n+added\n+-----BEGIN X-----\n+body\n+-----END X-----\n+after")
-	if strings.Join(got, "|") != "added|after" {
-		t.Fatalf("added lines = %q", got)
+	for name, patch := range map[string]string{
+		"empty": "", "binary": "@@\n+a\x00b", "blank only": matrixPatch("", "  "),
+		"removed secret":      "@@\n-password: hunter2\n+safe looking replacement\n",
+		"context armour":      "@@\n -----BEGIN X-----\n-abc\n+def\n@@\n ghi\n+short fragment\n -----END X-----\n",
+		"oversized paragraph": matrixPatch(matrixUniqueLines("line", matrixMaxLinesPerHead+1)...),
+	} {
+		if got := matrixDiffBlocks(patch); len(got) != 0 {
+			t.Errorf("%s leaked a partial/unsafe region: %#v", name, got)
+		}
 	}
 }
 
@@ -248,35 +265,35 @@ func TestMatrixLang(t *testing.T) {
 func TestMatrixSourceDedup(t *testing.T) {
 	m, clk := newTestMatrixSource(t, matrixTestConfig())
 	file := sentinel.File{Path: "a.go", Patch: matrixPatch("one", "two", "one")}
-	if got := m.ingest(matrixObs(1, "h1", file)); got != 2 {
-		t.Fatalf("first ingest = %d, want 2", got)
+	if got := m.ingest(matrixObs(1, "h1", file)); got != 3 {
+		t.Fatalf("repeated paragraph line lost: got %d, want 3", got)
 	}
 	if got := m.ingest(matrixObs(1, "h1", file)); got != 0 {
 		t.Fatalf("same head re-observed added %d", got)
 	}
 	rebased := sentinel.File{Path: "a.go", Patch: matrixPatch("one", "two", "three")}
-	if got := m.ingest(matrixObs(1, "h2", rebased)); got != 1 {
-		t.Fatalf("rebased head added %d, want 1 new line", got)
+	if got := m.ingest(matrixObs(1, "h2", rebased)); got != 3 {
+		t.Fatalf("changed paragraph must remain complete: got %d, want 3", got)
 	}
 	other := sentinel.File{Path: "b.go", Patch: matrixPatch("one")}
 	if got := m.ingest(matrixObs(1, "h2", other)); got != 1 {
 		t.Fatalf("same line in another file added %d, want 1", got)
 	}
-	if got := m.ingest(matrixObs(2, "h1", file)); got != 2 {
-		t.Fatalf("another PR added %d, want 2", got)
+	if got := m.ingest(matrixObs(2, "h1", file)); got != 3 {
+		t.Fatalf("another PR lost paragraph lines: got %d, want 3", got)
 	}
 	clk.advance(matrixDedupTTL + time.Minute)
 	if got := m.ingest(matrixObs(3, "h", sentinel.File{Path: "c.go", Patch: matrixPatch("z")})); got != 1 {
 		t.Fatalf("fresh PR added %d", got)
 	}
-	if _, ok := m.prs[matrixTestRepo+"#1"]; ok {
+	if _, ok := m.prs[matrixTestRepo+"#1:"]; ok {
 		t.Fatalf("PR set older than the TTL was not pruned")
 	}
 	if m.totalHashes != 1 {
 		t.Fatalf("totalHashes = %d after prune, want 1", m.totalHashes)
 	}
-	if got := m.ingest(matrixObs(1, "h2", file)); got != 2 {
-		t.Fatalf("after TTL expiry re-observed head added %d, want 2", got)
+	if got := m.ingest(matrixObs(1, "h2", file)); got != 3 {
+		t.Fatalf("expired paragraph lost lines: got %d, want 3", got)
 	}
 }
 
@@ -286,13 +303,17 @@ func TestMatrixSourcePerHeadCap(t *testing.T) {
 		{Path: "a.go", Patch: matrixPatch(matrixUniqueLines("a", 150)...)},
 		{Path: "b.go", Patch: matrixPatch(matrixUniqueLines("b", 150)...)},
 	}
-	if got := m.ingest(matrixObs(1, "h1", files...)); got != matrixMaxLinesPerHead {
-		t.Fatalf("ingest = %d, want %d", got, matrixMaxLinesPerHead)
+	if got := m.ingest(matrixObs(1, "h1", files...)); got != 150 {
+		t.Fatalf("head budget split a paragraph: got %d, want 150", got)
 	}
-	if got := m.ingest(matrixObs(1, "h1", sentinel.File{Path: "c.go", Patch: matrixPatch("more")})); got != 0 {
-		t.Fatalf("head over its cap still added %d", got)
+	tail := sentinel.File{Path: "c.go", Patch: matrixPatch(matrixUniqueLines("tail", 50)...)}
+	if got := m.ingest(matrixObs(1, "h1", tail)); got != 50 {
+		t.Fatalf("exact-fit paragraph = %d, want 50", got)
 	}
-	if got := m.ingest(matrixObs(1, "h2", sentinel.File{Path: "c.go", Patch: matrixPatch("more")})); got != 1 {
+	if got := m.ingest(matrixObs(1, "h1", sentinel.File{Path: "d.go", Patch: matrixPatch("overflow")})); got != 0 {
+		t.Fatalf("head over cap still added %d", got)
+	}
+	if got := m.ingest(matrixObs(1, "h2", sentinel.File{Path: "d.go", Patch: matrixPatch("new head")})); got != 1 {
 		t.Fatalf("new head added %d, want 1", got)
 	}
 }
@@ -310,15 +331,19 @@ func TestMatrixSourceRingBound(t *testing.T) {
 	if lines[0].Seq != 1001 || lines[len(lines)-1].Seq != 3000 || m.Latest() != 3000 {
 		t.Fatalf("ring order wrong: first=%d last=%d latest=%d", lines[0].Seq, lines[len(lines)-1].Seq, m.Latest())
 	}
-	page, latest := m.Since(2990, 0)
-	if len(page) != 10 || page[0].Seq != 2991 || latest != 3000 {
-		t.Fatalf("Since(2990) = %d lines from %d, latest %d", len(page), page[0].Seq, latest)
+	page, cursor, latest, _ := m.Since(2800, 0, nil)
+	if len(page) != 200 || page[0].Seq != 2801 || cursor != 3000 || latest != 3000 {
+		t.Fatalf("last complete page: rows=%d cursor=%d latest=%d", len(page), cursor, latest)
 	}
-	page, _ = m.Since(0, 5)
-	if len(page) != 5 || page[0].Seq != 1001 {
-		t.Fatalf("Since(0, 5) = %d lines from %d", len(page), page[0].Seq)
+	page, cursor, _, _ = m.Since(2990, 0, nil)
+	if len(page) != 0 || cursor != 3000 {
+		t.Fatalf("a cursor inside a paragraph returned a fragment: rows=%d cursor=%d", len(page), cursor)
 	}
-	page, _ = m.Since(0, -1)
+	page, cursor, latest, _ = m.Since(0, 5, nil)
+	if len(page) != 200 || page[0].Seq != 1001 || cursor != 1200 || latest != 3000 {
+		t.Fatalf("small page did not make whole-block progress: rows=%d cursor=%d latest=%d", len(page), cursor, latest)
+	}
+	page, _, _, _ = m.Since(0, -1, nil)
 	if len(page) != matrixDefaultSinceMax {
 		t.Fatalf("Since default page = %d", len(page))
 	}
@@ -330,8 +355,8 @@ func TestMatrixSourceRateLimit(t *testing.T) {
 	for pr := 1; pr <= 4; pr++ {
 		total += m.ingest(matrixObs(pr, "h", sentinel.File{Path: "a.go", Patch: matrixPatch(matrixUniqueLines(fmt.Sprint(pr), 175)...)}))
 	}
-	if total != matrixMaxLinesPerRate || m.rateDropped != 1 {
-		t.Fatalf("accepted %d (dropped %d), want %d", total, m.rateDropped, matrixMaxLinesPerRate)
+	if total != 525 || m.rateDropped != 1 {
+		t.Fatalf("rate budget split a paragraph: accepted %d (dropped %d), want 525", total, m.rateDropped)
 	}
 	clk.advance(matrixRateWindow)
 	if got := m.ingest(matrixObs(5, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("next window")})); got != 1 {
@@ -348,7 +373,7 @@ func TestMatrixSourceDedupBounds(t *testing.T) {
 	if len(m.prs) != matrixMaxTrackedPRs {
 		t.Fatalf("tracked PRs = %d, want %d", len(m.prs), matrixMaxTrackedPRs)
 	}
-	if _, ok := m.prs[matrixTestRepo+"#1"]; ok {
+	if _, ok := m.prs[matrixTestRepo+"#1:"]; ok {
 		t.Fatalf("oldest PR set was not evicted")
 	}
 
@@ -358,13 +383,13 @@ func TestMatrixSourceDedupBounds(t *testing.T) {
 	m2, clk2 := newTestMatrixSource(t, matrixTestConfig())
 	for pr := 1; pr <= 4; pr++ {
 		clk2.advance(time.Second)
-		m2.ingest(matrixObs(pr, "h", sentinel.File{Path: "a.go", Patch: matrixPatch(matrixUniqueLines(fmt.Sprint(pr), 20)...)}))
+		m2.ingest(matrixObs(pr, "h", sentinel.File{Path: "a.go", Patch: matrixSeparatedPatch(matrixUniqueLines(fmt.Sprint(pr), 20)...)}))
 	}
 	if m2.totalHashes > matrixMaxDedupHashes || len(m2.prs) != 2 {
 		t.Fatalf("hash cap not held: total=%d prs=%d", m2.totalHashes, len(m2.prs))
 	}
 	m3, _ := newTestMatrixSource(t, matrixTestConfig())
-	m3.ingest(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch(matrixUniqueLines("x", 60)...)}))
+	m3.ingest(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixSeparatedPatch(matrixUniqueLines("x", 60)...)}))
 	if m3.totalHashes != 0 || len(m3.prs) != 0 {
 		t.Fatalf("single over-cap PR kept: total=%d prs=%d", m3.totalHashes, len(m3.prs))
 	}
@@ -389,7 +414,7 @@ func TestMatrixSourceObserveNeverBlocks(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < matrixIngestCap+10; i++ {
-			m.Observe(obs)
+			m.Observe(obs.SentinelPatchObservation)
 		}
 	}()
 	select {
@@ -418,8 +443,8 @@ func TestMatrixSourceRunNotifiesAndRecovers(t *testing.T) {
 	})
 	m.start()
 	m.start()
-	m.Observe(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("first")}))
-	m.Observe(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("second")}))
+	m.Observe(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("first")}).SentinelPatchObservation)
+	m.Observe(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("second")}).SentinelPatchObservation)
 	select {
 	case seq := <-seqs:
 		if seq != 2 {
@@ -470,7 +495,7 @@ func TestServerMatrixObserver(t *testing.T) {
 	if s.MatrixObserver(config.DashboardMatrixConfig{}) != nil {
 		t.Fatal("disabling still returned an observer")
 	}
-	if lines, latest := src.Since(0, 10); len(lines) != 0 || latest != 1 || len(src.prs) != 0 {
+	if lines, _, latest, _ := src.Since(0, 10, nil); len(lines) != 0 || latest != 1 || len(src.prs) != 0 {
 		t.Fatalf("disabling kept content: %d lines, latest %d, %d PRs", len(lines), latest, len(src.prs))
 	}
 	if got := src.ingest(matrixObs(2, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("late")})); got != 0 {
@@ -484,7 +509,7 @@ func TestMatrixSourceExpiredHashInLivePR(t *testing.T) {
 	clk.advance(matrixDedupTTL - time.Hour)
 	m.ingest(matrixObs(1, "h2", sentinel.File{Path: "a.go", Patch: matrixPatch("b")}))
 	clk.advance(2 * time.Hour)
-	if got := m.ingest(matrixObs(1, "h3", sentinel.File{Path: "a.go", Patch: matrixPatch("a", "b")})); got != 1 {
+	if got := m.ingest(matrixObs(1, "h3", sentinel.File{Path: "a.go", Patch: matrixSeparatedPatch("a", "b")})); got != 1 {
 		t.Fatalf("expired hash re-ingest added %d, want 1", got)
 	}
 	if m.totalHashes != 2 {
