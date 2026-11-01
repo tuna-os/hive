@@ -112,11 +112,13 @@ The Matrix pilot also mounts its commit-matched dashboard HTML over
 `/opt/hive/proxy/public/index.html`: replacing only the Go binary leaves the
 public browser UI on the old image's page.
 
-Current pins: Reef and School `637bae44f`; Hub remains on `230f745`.
-The operator scoped this rollout to testing Matrix on the two spokes.
+Current pins: Reef and School `e0c044e15`; Hub remains on `230f745`.
+The operator scoped this rollout to passive Code activity on the two spokes.
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
+| 2026-11-01 02:44 | school | `feature/matrix-cascade-diffs` | `e0c044e15` | existing v6/Matrix pilot plus readable diffs and opt-in workspace snapshots; final verification-buffer reset |
+| 2026-11-01 02:43 | reef (canary first) | `feature/matrix-cascade-diffs` | `e0c044e15` | same; matched binary and Node-served HTML |
 | 2026-10-31 22:36 | school | `deploy/upstream-v6-matrix` | `637bae44f` | same v6/Matrix base and repository-name fix as Reef |
 | 2026-10-31 21:56 | reef (repo-name fix canary) | `deploy/upstream-v6-matrix` | `637bae44f` | same v6/Matrix base, plus qualified repository names for patch observers |
 | 2026-10-31 18:23 | school | `deploy/upstream-v6-matrix` | `71ce0ef56` | upstream `v6` `6f6a5ca63`, plus Matrix ports from `v5` |
@@ -142,6 +144,7 @@ Pilot-line patches and upstream dispositions:
 | `230f745` | `revert_sheriff`: when a merge turns a required check red on the default branch, find the merge, re-run its failing job once, and (propose mode) open a held `hive/revert` + `fixes-main` revert PR ([tuna-os/hive#170](https://github.com/tuna-os/hive/pull/170)). School runs it in **shadow** mode for `tunaos`, `tunaos-packages`, `corral`, `tacklebox` | Pilot (SDLC HIVE-8 / TUNA-4) |
 | `71ce0ef56` | Ambient Matrix pilot: Rain, Cascade, Ghost coder and Terminal effects from upstream #15945, #15946, #15967, #15982, #15977, #16020, #15985 and #16046, adapted to v6. Also gates sheriff CI recovery through upstream's shared `ci_rerun` writeback policy | Upstream feature ports, fork integration [#172](https://github.com/tuna-os/hive/pull/172); opt-in per spoke, no Twitch broadcast |
 | `637bae44f` | Matrix observations use resolved `owner/name`, not a short `project.repos` display name. Short names otherwise fail the exact Matrix allowlist and silently discard every patch | Fork fix with regression case; CI passed, deployed to Reef and School |
+| `e0c044e15` | Passive Code activity: full green additions/red removals, separate in-progress/pushed provenance, managed and isolated-agent-owned temporary workspace snapshots, whole-block privacy/bounds, pause and explicit replay | Fork [#174](https://github.com/tuna-os/hive/pull/174); exact-source CI passed; deployed to Reef and School with separate workspace consent |
 
 For `71ce0ef56`, the ARM64 binary SHA-256 is
 `9f25d95df53ea24e03f267f7b5c097b1686b91318323e82122f77facb781e0ca`;
@@ -180,10 +183,54 @@ Authorized responses were HTTP 200 with `Cache-Control: no-store`; anonymous
 requests, including a forged `X-Hive-Role: owner`, returned 401 on both spokes.
 This proves buffered PR-patch capture/playback, not live editor keystrokes.
 
+The `e0c044e159d7c0c0fa45edd07897aea3e196c9cc` Code activity pilot replaces
+Cascade's scattered lines with a readable diff reader. The Activity Monitor's
+**Code activity** link opens `/?kiosk=1&view=matrix&mx.effect=cascade`.
+In-progress snapshots compare a managed workspace with HEAD; pushed checkpoints
+retain their real PR links. Observation time and workspace ownership are not
+claims of typing time or model authorship. Replay is explicit and off by default.
+
+[Exact-source full CI](https://github.com/tuna-os/hive/actions/runs/41263978136)
+passed 27 jobs, with three skipped and no coverage verdict.
+[Both stamped architecture builds](https://github.com/tuna-os/hive/actions/runs/41263978117)
+passed. The ARM64 binary SHA-256 is
+`a2b755acffbf76a6b33b72175b266df6757d883c3e8d21add727a853fdb2deb4`;
+matching `dashboard-e0c044e15.html` SHA-256 is
+`403a5a9befcc98def6fd2f711a8c408af6828c49ee00f2680cc422819b908688`.
+Both running mounts and the ARM64 version output matched these artifacts.
+
+Controlled, explicitly non-agent-authored edits in genuine public Tavern clones
+proved native capture on Reef's managed directory and School's isolated-agent
+temporary directory. Each feed advanced from 12 to 24 real changed lines after
+a second filesystem edit. Native browsers showed complete red/green paragraphs,
+blanks, indentation, repeated lines, correct provenance and newly-received labels.
+The fake-credential region was omitted whole. Pause held the native scroll;
+390px reduced-motion rendering wrapped without horizontal overflow. The actual
+dashboard link opened the reader. Authorized APIs returned 200 with `no-store`;
+anonymous and forged-role requests remained 401 on both spokes.
+
+Verification fixtures were removed and their transient buffers cleared with
+same-container restarts. Both clean APIs then returned `source: "code-activity"`,
+`workspaces: true`, `latest: 0`, without verification rows or rendered cards.
+No synthetic checkpoint was injected. Published rendering was exercised with
+the actual public Tavern #323 diff; a fresh native pushed checkpoint after this
+rollout was not forced or claimed. The existing sentinel author/change detection,
+polling and quota gates still control that source.
+
+Stopped snapshots are `/srv/hives/backups/reef-code-activity-20261101T022412Z/`
+and `school-code-activity-20261101T023300Z/`: data, both configs, the override,
+and temporary files. School's two temporary Git subtrees were archived separately
+and restored before the replacement container started, with numeric ownership and
+permissions preserved. Both spokes deliberately enable `dashboard.matrix.workspaces`
+in seed and runtime; public allowlists and additional exclusions are unchanged.
+Hub's `2026-10-30T20:30:55.719198892Z` start time is unchanged.
+
+
 Matrix is opt-in in each spoke's seed **and** runtime config, with explicit
 public-repository allowlists and additional config/deployment-path exclusions.
-The first sentinel sweep initializes the source after reconciliation, so a
-cold start can temporarily return 404 even with `dashboard.matrix.enabled: true`.
+The original Matrix builds initialized after reconciliation's sentinel sweep and
+could return 404 while cold. The Code activity build initializes an enabled source
+on an authenticated read; no eligible data is a 200 empty feed, not invented motion.
 Anonymous public Matrix requests returned 401/403; kiosk is not an auth bypass.
 Data, both configs and the Compose override were backed up before each restart:
 Reef `20261031T180544Z`, School `20261031T182146Z`, under `/srv/hives/backups/`.
@@ -191,8 +238,11 @@ The Reef fix canary has a fresh consistent snapshot and config/override backups
 at stamp `20261031T215350Z`; its immediate previous binary is `71ce0ef56`.
 School's fix snapshot/config/override backup stamp is `20261031T223247Z`,
 also rolling back to `71ce0ef56` without a data-format downgrade.
-Keep the old binary and restore matching config/UI pins for rollback; do not
-restore a stale data snapshot over newer agent work unless downgrade requires it.
+For rollback, restore only the affected spoke's previous binary, matching HTML
+and both configs; preserve other services' pins. The Code activity pilot's previous
+pair is `hive-637bae44f` with `dashboard-71ce0ef56.html`. Restore temporary Git
+archives before starting a recreated container. Do not restore a stale data
+snapshot over newer agent work unless downgrade compatibility requires it.
 
 Delta of `tuna/fleet` (the `v5`-based line, retired 2026-10-29 22:25 when every service moved to `tuna/v6`) against its upstream base:
 
