@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"os"
 	"os/exec"
 	"testing"
 )
@@ -13,6 +14,7 @@ func TestMatrixUIBehavior(t *testing.T) {
 		t.Skip("node unavailable")
 	}
 	cmd := exec.Command(node, "-e", matrixBrowserTest)
+	cmd.Env = append(os.Environ(), "TZ=Pacific/Honolulu")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Matrix browser behavior: %v\n%s", err, out)
 	}
@@ -24,6 +26,8 @@ const fs = require('fs');
 const vm = require('vm');
 const matrix = fs.readFileSync('static-src/js/matrix.js', 'utf8');
 const boot = fs.readFileSync('static-src/js/boot.js', 'utf8').split('})();')[0] + '})();';
+const refresh = fs.readFileSync('static-src/js/refresh.js', 'utf8');
+const timezoneHelpers = refresh.slice(refresh.indexOf('const DASHBOARD_TIMEZONE_STORAGE_KEY'), refresh.indexOf('function formatNumber('));
 const at = '2026-10-31T12:00:00Z';
 function row(seq, block, change, line, extra = {}) {
   return Object.assign({seq, block, change, line, repo: 'org/repo', pr: 2, path: 'main.go', stage: 'pushed', at}, extra);
@@ -67,7 +71,7 @@ async function scenario(query, reduced = false, initial = rows) {
   const win = {location: {href: 'https://hive.test/' + query, pathname: '/'}, innerWidth: 800, innerHeight: 600,
     matchMedia(){return motion}, addEventListener(){}};
   const c = vm.createContext({window: win, document: doc, URL, location: {hash: '#activity'},
-    history: {replaceState(){}}, localStorage: {getItem(){return null}, setItem(){}},
+    history: {replaceState(){}}, localStorage: {getItem(key){return key === 'hive-dashboard-display-timezone' ? 'UTC' : null}, setItem(){}},
     requestAnimationFrame(fn){raf.set(++id, fn); return id}, cancelAnimationFrame(i){raf.delete(i)},
     setTimeout(fn){timers.set(++id, fn); return id}, clearTimeout(i){timers.delete(i)}, setInterval(){}, dashboardSetInterval(){},
     fetch(url){
@@ -80,6 +84,7 @@ async function scenario(query, reduced = false, initial = rows) {
       return Promise.resolve({status: responseStatus, ok: responseStatus === 200,
         json(){return Promise.resolve({seq: page.at(-1)?.seq || latest, latest, epoch, workspaces: true, lines: page})}});
     }, Date, Math});
+  vm.runInContext(timezoneHelpers, c);
   vm.runInContext(matrix, c); c.hiveMatrixStart = win.hiveMatrixStart;
   vm.runInContext(boot, c);
   for (const fn of docEvents.DOMContentLoaded || []) fn();
@@ -106,6 +111,7 @@ function paragraphs(h) {
     const h = await scenario('?kiosk=1&view=matrix&mx.effect=cascade', reduced);
     assert.deepEqual(paragraphs(h), ['− Ωold paragraph', '+   new <script>alert(1)</script>\n+ \n+ }\n+ }', '− deleted paragraph', '+ another task']);
     assert.equal(h.byClass('matrix-cascade-track').children.length, 3, 'different blocks and PRs must not merge');
+    assert(h.byClass('matrix-cascade-track').children.every(card => card.children[0].children[2].textContent.includes('UTC')), 'observed timestamps must honor the viewer timezone, not the browser timezone');
     assert.equal(h.raf.size, reduced ? 0 : 1);
     if (reduced) assert.equal(h.timers.size, 0, 'reduced-motion code must not auto-page');
     const active = h.byClass('matrix-cascade-track').children[0];

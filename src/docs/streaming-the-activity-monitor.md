@@ -203,10 +203,11 @@ agent terminals, or scan arbitrary host paths. Clones and linked worktrees
 must be inside a managed agent directory. Discovery runs every 30 seconds;
 two workspaces are sampled per two-second batch, round-robin, with a
 64-workspace bound. New files, edits and deletions are included. Git commands
-are read-only, time-bounded and output-bounded; external diff drivers and text
-converters are disabled. The collector verifies repository visibility on
-GitHub before publishing a changed workspace snapshot. Unknown visibility,
-private repositories and origins outside the allowlist fail closed.
+are read-only, time-bounded and output-bounded; external diff drivers, text
+converters and configured clean/process filters are disabled. The collector
+verifies repository visibility on GitHub before publishing a changed workspace
+snapshot. Unknown visibility, private repositories and origins outside the
+allowlist fail closed.
 
 Both sides of a diff pass the same secret, entropy and path filters. An unsafe
 line drops its whole changed region; oversized regions are omitted, not cut

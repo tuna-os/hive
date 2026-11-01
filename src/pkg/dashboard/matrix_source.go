@@ -65,16 +65,27 @@ type matrixPRState struct {
 	touched   time.Time
 }
 
-// matrixObservation adds local provenance without changing the sentinel's
-// published-PR contract. Workspace identity is internal, never a host path
-// sent to the browser.
+type matrixFile struct {
+	Path  string
+	Patch string
+}
+
+// matrixObservation is the dashboard's source-independent diff snapshot.
+// Workspace identity is internal, never a host path sent to the browser.
 type matrixObservation struct {
-	github.SentinelPatchObservation
-	stage     string
-	agent     string
-	workspace string
-	revision  string
-	epoch     uint64
+	Repo           string
+	Number         int
+	HeadSHA        string
+	Author         string
+	HiveIdentified bool
+	Private        bool
+	Files          []matrixFile
+	At             time.Time
+	stage          string
+	agent          string
+	workspace      string
+	revision       string
+	epoch          uint64
 }
 
 // matrixSource turns published patches and managed-workspace snapshots into a
@@ -157,7 +168,22 @@ func (m *matrixSource) admits(obs matrixObservation) bool {
 // it off without blocking: when the ingest channel is full the observation
 // is dropped and counted.
 func (m *matrixSource) Observe(obs github.SentinelPatchObservation) {
-	m.enqueue(matrixObservation{SentinelPatchObservation: obs, stage: "pushed"})
+	packet := matrixObservation{Repo: obs.Repo, Number: obs.Number, HeadSHA: obs.HeadSHA, Author: obs.Author,
+		HiveIdentified: obs.HiveIdentified, Private: obs.Private, At: obs.At, stage: "pushed"}
+	if !m.admits(packet) {
+		return
+	}
+	files := obs.Files[:min(len(obs.Files), matrixMaxFilesPerObs)]
+	packet.Files = make([]matrixFile, 0, len(files))
+	bytes := 0
+	for _, file := range files {
+		if bytes+len(file.Patch) > matrixMaxPatchBytes {
+			continue
+		}
+		bytes += len(file.Patch)
+		packet.Files = append(packet.Files, matrixFile{Path: file.Path, Patch: file.Patch})
+	}
+	m.enqueue(packet)
 }
 
 func (m *matrixSource) enqueue(obs matrixObservation) {

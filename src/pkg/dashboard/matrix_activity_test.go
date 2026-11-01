@@ -28,7 +28,12 @@ func matrixGitFixture(t *testing.T, dir string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"init"}, {"config", "user.name", "Matrix fixture"}, {"config", "user.email", "matrix@example.invalid"}, {"remote", "add", "origin", "https://github.com/" + matrixTestRepo + ".git"}} {
+	init := exec.Command("git", "init", dir)
+	init.Env = []string{"PATH=" + os.Getenv("PATH"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull}
+	if out, err := init.CombinedOutput(); err != nil {
+		t.Fatalf("fixture repository initialization: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{{"config", "user.name", "Matrix fixture"}, {"config", "user.email", "matrix@example.invalid"}, {"remote", "add", "origin", "https://github.com/" + matrixTestRepo + ".git"}} {
 		if _, err := matrixGit(context.Background(), dir, 8192, args...); err != nil {
 			t.Fatalf("fixture Git %s: %v", args[0], err)
 		}
@@ -51,6 +56,10 @@ func TestMatrixWorkspaceRealDiffsPreserveBothSidesAndFilterSecrets(t *testing.T)
 		if _, err := matrixGit(context.Background(), dir, 8192, args...); err != nil {
 			t.Fatal(err)
 		}
+	}
+	matrixWriteFixture(t, dir, ".gitattributes", "*.go filter=matrix-trap\n")
+	if _, err := matrixGit(context.Background(), dir, 8192, "config", "filter.matrix-trap.clean", "touch filter-ran; cat"); err != nil {
+		t.Fatal(err)
 	}
 	matrixWriteFixture(t, dir, "source file.go", "func newer() {\n\treturn true\n\n}\n")
 	matrixWriteFixture(t, dir, "new.go", "new unpublished paragraph\n\nsecond line\n")
@@ -102,6 +111,9 @@ func TestMatrixWorkspaceRealDiffsPreserveBothSidesAndFilterSecrets(t *testing.T)
 	_, again, err := w.snapshot(context.Background(), cfg)
 	if err != nil || digest != again {
 		t.Fatalf("unchanged workspace produced a different snapshot: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "filter-ran")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspecting a workspace executed its configured clean filter: %v", err)
 	}
 	if _, err := matrixGit(context.Background(), dir, 8192, "remote", "set-url", "origin", "https://github.com/private/other.git"); err != nil {
 		t.Fatal(err)

@@ -20,8 +20,6 @@ import (
 
 	"github.com/hivecommons/hive/crux"
 	"github.com/hivecommons/hive/pkg/config"
-	"github.com/hivecommons/hive/pkg/github"
-	"github.com/hivecommons/hive/pkg/sentinel"
 )
 
 const matrixWorkspaceCap = 64
@@ -210,10 +208,8 @@ func matrixWorkspacePath(p string, cfg config.DashboardMatrixConfig) bool {
 func (w matrixWorkspace) snapshot(ctx context.Context, cfg config.DashboardMatrixConfig) (matrixObservation, [sha256.Size]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	obs := matrixObservation{
-		SentinelPatchObservation: github.SentinelPatchObservation{Repo: w.repo, HiveIdentified: true, At: time.Now()},
-		stage:                    "in-progress", agent: w.agent, workspace: w.dir,
-	}
+	obs := matrixObservation{Repo: w.repo, HiveIdentified: true, At: time.Now(),
+		stage: "in-progress", agent: w.agent, workspace: w.dir}
 	// Revalidate origin on every sample: a reused checkout may have changed
 	// repositories since discovery or its public-visibility proof.
 	origin, err := matrixGit(ctx, w.dir, 8192, "config", "--get", "remote.origin.url")
@@ -272,7 +268,7 @@ func (w matrixWorkspace) snapshot(ctx context.Context, cfg config.DashboardMatri
 				continue
 			}
 			remaining -= len(patch)
-			obs.Files = append(obs.Files, sentinel.File{Path: p, Patch: patch})
+			obs.Files = append(obs.Files, matrixFile{Path: p, Patch: patch})
 		}
 	}
 	hash := sha256.New()
@@ -289,8 +285,8 @@ func (w matrixWorkspace) snapshot(ctx context.Context, cfg config.DashboardMatri
 
 // matrixWorkspaceFiles reads filenames only before a file's first hunk.
 // Header-like source text inside a hunk is never interpreted as metadata.
-func matrixWorkspaceFiles(patch string, cfg config.DashboardMatrixConfig) []sentinel.File {
-	var files []sentinel.File
+func matrixWorkspaceFiles(patch string, cfg config.DashboardMatrixConfig) []matrixFile {
+	var files []matrixFile
 	var start int
 	flush := func(end int) {
 		part := patch[start:end]
@@ -301,7 +297,7 @@ func matrixWorkspaceFiles(patch string, cfg config.DashboardMatrixConfig) []sent
 					name = old
 				}
 				if matrixWorkspacePath(name, cfg) {
-					files = append(files, sentinel.File{Path: strings.Clone(name), Patch: part})
+					files = append(files, matrixFile{Path: strings.Clone(name), Patch: part})
 				}
 				return
 			}
@@ -348,15 +344,29 @@ func (b *matrixGitBuffer) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
 }
 
-// Git is read-only, output-bounded, time-bounded and cannot invoke configured
-// external diff drivers, text converters, pagers or filesystem monitors.
+// Git is read-only, output-bounded and time-bounded. Diff calls also disable
+// configured clean/process filters, in addition to external diff/text converters.
 func matrixGit(parent context.Context, dir string, limit int, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
 	base := []string{"--no-pager", "--literal-pathspecs", "--work-tree=" + dir, "-c", "safe.directory=" + dir, "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"}
+	if len(args) > 0 && args[0] == "diff" {
+		filters, err := matrixGit(ctx, dir, 8192, "config", "--null", "--name-only", "--get-regexp", `^filter\..*\.(clean|process)$`)
+		var exit *exec.ExitError
+		if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1) {
+			return nil, err
+		}
+		for _, key := range strings.Split(string(filters), "\x00") {
+			if key == "" {
+				continue
+			}
+			driver := key[:strings.LastIndexByte(key, '.')]
+			base = append(base, "-c", key+"=", "-c", driver+".required=false")
+		}
+	}
 	cmd := exec.CommandContext(ctx, "git", append(base, args...)...)
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0"}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"}
 	out := &matrixGitBuffer{limit: limit}
 	cmd.Stdout, cmd.Stderr = out, io.Discard
 	err := cmd.Run()

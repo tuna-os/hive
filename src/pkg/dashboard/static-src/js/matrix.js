@@ -172,7 +172,7 @@
       var observed = document.createElement('small');
       var at = Date.parse(first.at);
       observed.textContent = (replay ? 'Buffered replay' : block.fresh ? 'Newly received' : 'Buffered snapshot') +
-        ' · observed ' + (Number.isFinite(at) ? new Date(at).toLocaleTimeString() : 'at an unavailable time');
+        ' · observed ' + (Number.isFinite(at) ? formatDashboardTime(at) : 'at an unavailable time');
       header.append(stage, label, observed);
       if (first.pr) {
         var link = document.createElement('a');

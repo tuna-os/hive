@@ -32,14 +32,21 @@ func newTestMatrixSource(t *testing.T, cfg config.DashboardMatrixConfig) (*matri
 }
 
 func matrixObs(number int, head string, files ...sentinel.File) matrixObservation {
-	return matrixObservation{stage: "pushed", SentinelPatchObservation: github.SentinelPatchObservation{
-		Repo:           matrixTestRepo,
-		Number:         number,
-		HeadSHA:        head,
-		Author:         "hive-bot",
-		HiveIdentified: true,
-		Files:          files,
-	}}
+	obs := matrixObservation{stage: "pushed", Repo: matrixTestRepo, Number: number, HeadSHA: head,
+		Author: "hive-bot", HiveIdentified: true}
+	for _, file := range files {
+		obs.Files = append(obs.Files, matrixFile{Path: file.Path, Patch: file.Patch})
+	}
+	return obs
+}
+
+func matrixPRFixture(obs matrixObservation) github.SentinelPatchObservation {
+	out := github.SentinelPatchObservation{Repo: obs.Repo, Number: obs.Number, HeadSHA: obs.HeadSHA,
+		Author: obs.Author, HiveIdentified: obs.HiveIdentified, Private: obs.Private, At: obs.At}
+	for _, file := range obs.Files {
+		out.Files = append(out.Files, sentinel.File{Path: file.Path, Patch: file.Patch})
+	}
+	return out
 }
 
 func matrixPatch(lines ...string) string {
@@ -121,13 +128,13 @@ func TestMatrixSourceObservationGates(t *testing.T) {
 	tests := []struct {
 		name   string
 		cfg    config.DashboardMatrixConfig
-		mutate func(*github.SentinelPatchObservation)
+		mutate func(*matrixObservation)
 		want   int
 	}{
 		{name: "accepted", cfg: matrixTestConfig(), want: 1},
-		{name: "not hive identified", cfg: matrixTestConfig(), mutate: func(o *github.SentinelPatchObservation) { o.HiveIdentified = false }},
-		{name: "private repo", cfg: matrixTestConfig(), mutate: func(o *github.SentinelPatchObservation) { o.Private = true }},
-		{name: "repo not allowlisted", cfg: matrixTestConfig(), mutate: func(o *github.SentinelPatchObservation) { o.Repo = "other/repo" }},
+		{name: "not hive identified", cfg: matrixTestConfig(), mutate: func(o *matrixObservation) { o.HiveIdentified = false }},
+		{name: "private repo", cfg: matrixTestConfig(), mutate: func(o *matrixObservation) { o.Private = true }},
+		{name: "repo not allowlisted", cfg: matrixTestConfig(), mutate: func(o *matrixObservation) { o.Repo = "other/repo" }},
 		{name: "disabled", cfg: config.DashboardMatrixConfig{Repos: []string{matrixTestRepo}}},
 		{name: "empty allowlist", cfg: config.DashboardMatrixConfig{Enabled: true}},
 	}
@@ -136,9 +143,9 @@ func TestMatrixSourceObservationGates(t *testing.T) {
 			m, _ := newTestMatrixSource(t, tc.cfg)
 			obs := matrixObs(7, "h", file)
 			if tc.mutate != nil {
-				tc.mutate(&obs.SentinelPatchObservation)
+				tc.mutate(&obs)
 			}
-			m.Observe(obs.SentinelPatchObservation)
+			m.Observe(matrixPRFixture(obs))
 			if tc.want == 0 && len(m.in) != 0 {
 				t.Fatalf("Observe queued a rejected observation")
 			}
@@ -414,7 +421,7 @@ func TestMatrixSourceObserveNeverBlocks(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < matrixIngestCap+10; i++ {
-			m.Observe(obs.SentinelPatchObservation)
+			m.Observe(matrixPRFixture(obs))
 		}
 	}()
 	select {
@@ -443,8 +450,8 @@ func TestMatrixSourceRunNotifiesAndRecovers(t *testing.T) {
 	})
 	m.start()
 	m.start()
-	m.Observe(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("first")}).SentinelPatchObservation)
-	m.Observe(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("second")}).SentinelPatchObservation)
+	m.Observe(matrixPRFixture(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("first")})))
+	m.Observe(matrixPRFixture(matrixObs(1, "h", sentinel.File{Path: "a.go", Patch: matrixPatch("second")})))
 	select {
 	case seq := <-seqs:
 		if seq != 2 {
