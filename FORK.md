@@ -108,28 +108,141 @@ The services use the upstream `ghcr.io/hivecommons/hive:v6-latest` image, but
 reef it also mounts `/srv/hives/proxy/server.js` over the image's Node proxy:
 the image's own file plus the `bb82aed` change below
 (`/srv/hives/proxy/server.image.js` is the unpatched original).
+The Matrix pilot also mounts its commit-matched dashboard HTML over
+`/opt/hive/proxy/public/index.html`: replacing only the Go binary leaves the
+public browser UI on the old image's page.
+
+Current pins: Reef and School `e0c044e15`; Hub remains on `230f745`.
+The operator scoped this rollout to passive Code activity on the two spokes.
 
 | Since (UTC) | Services | Branch | Commit | Base |
 | --- | --- | --- | --- | --- |
-| 2026-10-30 20:30 | hub, reef, school (reef canary from 20:25) | `tuna/v6` | `230f745` | same |
+| 2026-11-01 02:44 | school | `feature/matrix-cascade-diffs` | `e0c044e15` | existing v6/Matrix pilot plus readable diffs and opt-in workspace snapshots; final verification-buffer reset |
+| 2026-11-01 02:43 | reef (canary first) | `feature/matrix-cascade-diffs` | `e0c044e15` | same; matched binary and Node-served HTML |
+| 2026-10-31 22:36 | school | `deploy/upstream-v6-matrix` | `637bae44f` | same v6/Matrix base and repository-name fix as Reef |
+| 2026-10-31 21:56 | reef (repo-name fix canary) | `deploy/upstream-v6-matrix` | `637bae44f` | same v6/Matrix base, plus qualified repository names for patch observers |
+| 2026-10-31 18:23 | school | `deploy/upstream-v6-matrix` | `71ce0ef56` | upstream `v6` `6f6a5ca63`, plus Matrix ports from `v5` |
+| 2026-10-31 18:08 | reef (canary) | `deploy/upstream-v6-matrix` | `71ce0ef56` | upstream `v6` `6f6a5ca63`, plus Matrix ports from `v5` ([#172](https://github.com/tuna-os/hive/pull/172)) |
+| 2026-10-30 20:30 | hub, reef, school (reef canary from 20:25) | `tuna/v6` | `230f745` | upstream `v6` `463615a` |
 | 2026-10-30 03:31 | hub, reef, school | `tuna/v6` | `62dbda5` | same |
 | 2026-10-29 22:25 | hub, reef, school | `tuna/v6` | `a60b5cf` | upstream `v6` @ 2026-10-29 (`463615a`) |
 | 2026-10-29 22:05 | reef (canary) | `tuna/v6` | `fcbc71f` | same |
 | 2026-10-29 16:40 | hub, school (reef until 22:05) | `tuna/fleet` (= `fix/agent-broker-no-proxy`) | `14409c3` | upstream `v5` @ 2026-10-27 (`5e8a689`) |
 | 2026-10-29 12:47 | hub, reef, school | `feat/agent-proposal-gate` | `911e5c0` | same |
 
-Delta of `tuna/v6` against upstream `v6`:
+Pilot-line patches and upstream dispositions:
 
 | Commit | Change | Disposition |
 | --- | --- | --- |
-| `eea4d3d` | `**/` path globs match with `path.Match` (`**/*luks*` fires) | Merged upstream on `v5` as hivecommons/hive#15387; drop when it reaches `v6` |
+| `eea4d3d` | `**/` path globs match with `path.Match` (`**/*luks*` fires) | Merged upstream as hivecommons/hive#15387; included in the `6f6a5ca63` refresh |
 | `504b6bc`, `fcbc71f` | `project.issue_filter.agent_proposal`: hold unacknowledged hive-filed proposals at admission | Pilot; RFC hivecommons/hive#15329 |
-| `e51c5c7` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY` | Merged upstream on `v5` as hivecommons/hive#15649; drop when it reaches `v6` |
+| `e51c5c7` | Agents get the `OMP_AUTH_BROKER_URL` host in `NO_PROXY` | Merged upstream as hivecommons/hive#15649; refresh adopts upstream's hardened helper and removes the duplicate fork helper |
 | `a60b5cf` | `governor.freeze_windows`: pause listed agents on fixed days of a repeating cycle. School runs `iso-weekend` (7-day cycle from Mon 2026-11-02, days 6–7 UTC: architect, strategist, outreach) ahead of the Sunday 22:00 UTC ISO publish | Pilot |
 | `bb82aed` | Node proxy admits `POST /api/gh-user-auth/start` and `/poll` and passes `hive_session` requests to the Go API, so device-flow sign-in works on direct-route spokes. Also mounted as `proxy/server.js` | Reported upstream: hivecommons/hive#15872 |
 | `d33143c` | Hub reads spoke proof tokens from `/data/saas/spoke-tokens/<hive-id>` before trying `kubectl`, so hub-proxied single sign-on works for a Compose fleet. Staged, not in use until the hub has a GitHub OAuth app | Pilot |
 | `62dbda5` | `ioscan.classifier.backend: omp`: the semantic classifier runs through omp and the auth broker (school and reef: `anthropic/claude-haiku-4-5`; agents moved from `github-copilot/gpt-6-luna` to `openai-codex/gpt-6-luna` the same night) | Proposed upstream: hivecommons/hive#15873 |
 | `230f745` | `revert_sheriff`: when a merge turns a required check red on the default branch, find the merge, re-run its failing job once, and (propose mode) open a held `hive/revert` + `fixes-main` revert PR ([tuna-os/hive#170](https://github.com/tuna-os/hive/pull/170)). School runs it in **shadow** mode for `tunaos`, `tunaos-packages`, `corral`, `tacklebox` | Pilot (SDLC HIVE-8 / TUNA-4) |
+| `71ce0ef56` | Ambient Matrix pilot: Rain, Cascade, Ghost coder and Terminal effects from upstream #15945, #15946, #15967, #15982, #15977, #16020, #15985 and #16046, adapted to v6. Also gates sheriff CI recovery through upstream's shared `ci_rerun` writeback policy | Upstream feature ports, fork integration [#172](https://github.com/tuna-os/hive/pull/172); opt-in per spoke, no Twitch broadcast |
+| `637bae44f` | Matrix observations use resolved `owner/name`, not a short `project.repos` display name. Short names otherwise fail the exact Matrix allowlist and silently discard every patch | Fork fix with regression case; CI passed, deployed to Reef and School |
+| `e0c044e15` | Passive Code activity: full green additions/red removals, separate in-progress/pushed provenance, managed and isolated-agent-owned temporary workspace snapshots, whole-block privacy/bounds, pause and explicit replay | Fork [#174](https://github.com/tuna-os/hive/pull/174); exact-source CI passed; deployed to Reef and School with separate workspace consent. Proposed upstream as held [RFC #16137](https://github.com/hivecommons/hive/issues/16137) to supersede the Matrix code view, with screenshots; workspace capture is a separate maintainer decision and neither is accepted upstream |
+
+For `71ce0ef56`, the ARM64 binary SHA-256 is
+`9f25d95df53ea24e03f267f7b5c097b1686b91318323e82122f77facb781e0ca`;
+matching Node-served dashboard HTML:
+`0ae9f9575e0f4b5cf44e431b387ac870b10473f486d0db622a8ff5b9175b9444`.
+[Full Go CI](https://github.com/tuna-os/hive/actions/runs/41227099240)
+passed 27 jobs (three skipped; no coverage verdict), and
+[both architecture builds](https://github.com/tuna-os/hive/actions/runs/41227085681)
+passed their version smoke. PR #172 remains unmerged: the inherited DCO
+squash-attribution policy does not recognize the imported upstream v6 history.
+That successful test run covers `71ce0ef56`; it does not certify later commits.
+The pilot is separate from merge approval and does not bypass merge policy.
+
+The `637bae44f` ARM64 binary SHA-256 is
+`b930b03e3d4e2d88baf9dc963cae995859d2ea5c659ef407e10b5b355b4ae5c6`.
+It reuses the byte-identical `dashboard-71ce0ef56.html` mount.
+[Its binary build](https://github.com/tuna-os/hive/actions/runs/41233789674)
+passed; [its full-suite run](https://github.com/tuna-os/hive/actions/runs/41233790530)
+passed 27 jobs, with three skipped, on the exact deployed commit.
+Both spokes run the matching binary; Hub was not restarted.
+Both original feeds returned `seq: 0` despite School completing a 254-PR
+sentinel pass: short configured repository names could not match the qualified
+Matrix allowlist. After the fix, live captures were observed at 23:11 UTC
+(School) and 23:18 UTC (Reef); both later returned `seq: 1200` and 1,200 lines.
+Reef's first cold-start reconciliation had exhausted its App quota and skipped
+optional sweeps; capture recovered after quota reset without bypassing a guard.
+
+The real browser surfaces rendered Rain and Ghost on Reef, Cascade and Terminal
+on School. Reef's P-key pause/resume changed the visible status as expected.
+A sample from each feed matched a genuine added line, after the source's
+whitespace trimming, in public [tuna-os/Tavern#323](https://github.com/tuna-os/Tavern/pull/323),
+`src/url_security.py`, head `ac9349dba541c1c9297a4282565ce577ceabd7a9`.
+The same PR can appear in both feeds because their watched repositories overlap;
+these are per-spoke counts, not a deduplicated hub total.
+Authorized responses were HTTP 200 with `Cache-Control: no-store`; anonymous
+requests, including a forged `X-Hive-Role: owner`, returned 401 on both spokes.
+This proves buffered PR-patch capture/playback, not live editor keystrokes.
+
+The `e0c044e159d7c0c0fa45edd07897aea3e196c9cc` Code activity pilot replaces
+Cascade's scattered lines with a readable diff reader. The Activity Monitor's
+**Code activity** link opens `/?kiosk=1&view=matrix&mx.effect=cascade`.
+In-progress snapshots compare a managed workspace with HEAD; pushed checkpoints
+retain their real PR links. Observation time and workspace ownership are not
+claims of typing time or model authorship. Replay is explicit and off by default.
+
+[Exact-source full CI](https://github.com/tuna-os/hive/actions/runs/41263978136)
+passed 27 jobs, with three skipped and no coverage verdict.
+[Both stamped architecture builds](https://github.com/tuna-os/hive/actions/runs/41263978117)
+passed. The ARM64 binary SHA-256 is
+`a2b755acffbf76a6b33b72175b266df6757d883c3e8d21add727a853fdb2deb4`;
+matching `dashboard-e0c044e15.html` SHA-256 is
+`403a5a9befcc98def6fd2f711a8c408af6828c49ee00f2680cc422819b908688`.
+Both running mounts and the ARM64 version output matched these artifacts.
+
+Controlled, explicitly non-agent-authored edits in genuine public Tavern clones
+proved native capture on Reef's managed directory and School's isolated-agent
+temporary directory. Each feed advanced from 12 to 24 real changed lines after
+a second filesystem edit. Native browsers showed complete red/green paragraphs,
+blanks, indentation, repeated lines, correct provenance and newly-received labels.
+The fake-credential region was omitted whole. Pause held the native scroll;
+390px reduced-motion rendering wrapped without horizontal overflow. The actual
+dashboard link opened the reader. Authorized APIs returned 200 with `no-store`;
+anonymous and forged-role requests remained 401 on both spokes.
+
+Verification fixtures were removed and their transient buffers cleared with
+same-container restarts. Both clean APIs then returned `source: "code-activity"`,
+`workspaces: true`, `latest: 0`, without verification rows or rendered cards.
+No synthetic checkpoint was injected. Published rendering was exercised with
+the actual public Tavern #323 diff; a fresh native pushed checkpoint after this
+rollout was not forced or claimed. The existing sentinel author/change detection,
+polling and quota gates still control that source.
+
+Stopped snapshots are `/srv/hives/backups/reef-code-activity-20261101T022412Z/`
+and `school-code-activity-20261101T023300Z/`: data, both configs, the override,
+and temporary files. School's two temporary Git subtrees were archived separately
+and restored before the replacement container started, with numeric ownership and
+permissions preserved. Both spokes deliberately enable `dashboard.matrix.workspaces`
+in seed and runtime; public allowlists and additional exclusions are unchanged.
+Hub's `2026-10-30T20:30:55.719198892Z` start time is unchanged.
+
+
+Matrix is opt-in in each spoke's seed **and** runtime config, with explicit
+public-repository allowlists and additional config/deployment-path exclusions.
+The original Matrix builds initialized after reconciliation's sentinel sweep and
+could return 404 while cold. The Code activity build initializes an enabled source
+on an authenticated read; no eligible data is a 200 empty feed, not invented motion.
+Anonymous public Matrix requests returned 401/403; kiosk is not an auth bypass.
+Data, both configs and the Compose override were backed up before each restart:
+Reef `20261031T180544Z`, School `20261031T182146Z`, under `/srv/hives/backups/`.
+The Reef fix canary has a fresh consistent snapshot and config/override backups
+at stamp `20261031T215350Z`; its immediate previous binary is `71ce0ef56`.
+School's fix snapshot/config/override backup stamp is `20261031T223247Z`,
+also rolling back to `71ce0ef56` without a data-format downgrade.
+For rollback, restore only the affected spoke's previous binary, matching HTML
+and both configs; preserve other services' pins. The Code activity pilot's previous
+pair is `hive-637bae44f` with `dashboard-71ce0ef56.html`. Restore temporary Git
+archives before starting a recreated container. Do not restore a stale data
+snapshot over newer agent work unless downgrade compatibility requires it.
 
 Delta of `tuna/fleet` (the `v5`-based line, retired 2026-10-29 22:25 when every service moved to `tuna/v6`) against its upstream base:
 
