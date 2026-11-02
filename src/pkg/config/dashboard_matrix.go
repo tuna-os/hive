@@ -11,7 +11,9 @@ import (
 // the built-in deny-list. There are deliberately no authors or private_repos
 // keys.
 type DashboardMatrixConfig struct {
-	Enabled      bool     `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Workspaces separately opts into unpublished edits in managed workspaces.
+	Workspaces   bool     `yaml:"workspaces,omitempty" json:"workspaces,omitempty"`
 	Repos        []string `yaml:"repos,omitempty" json:"repos,omitempty"`
 	ExcludePaths []string `yaml:"exclude_paths,omitempty" json:"exclude_paths,omitempty"`
 }

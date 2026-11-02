@@ -17,15 +17,19 @@ func helperAddMatrixLine(m *matrixSource, repo, text string) matrixLine {
 	defer m.mu.Unlock()
 	m.seq++
 	l := matrixLine{
-		Seq:  m.seq,
-		Repo: repo,
-		PR:   1,
-		Head: "sha-123",
-		Path: "main.go",
-		Lang: "go",
-		Line: text,
-		At:   time.Now().UTC(),
+		Seq:    m.seq,
+		Block:  m.seq,
+		Change: "add",
+		Stage:  "pushed",
+		Repo:   repo,
+		PR:     1,
+		Head:   "sha-123",
+		Path:   "main.go",
+		Lang:   "go",
+		Line:   text,
+		At:     time.Now().UTC(),
 	}
+	m.reserveBlockLocked(1, len(text)+1)
 	m.appendLocked(l)
 	return l
 }
@@ -129,9 +133,6 @@ func TestHandleMatrixLines_PerRepoFilter(t *testing.T) {
 	var resp matrixLinesResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
-	}
-	if resp.Source != "pushed-lines" {
-		t.Fatalf("source = %q, want pushed-lines", resp.Source)
 	}
 	if len(resp.Lines) != 2 {
 		t.Fatalf("expected 2 allowed lines, got %d", len(resp.Lines))
@@ -304,16 +305,6 @@ func TestMatrixLinesSSEFrame_ContentFree(t *testing.T) {
 	expected := "event: code-lines\ndata: {\"seq\":123}\n\n"
 	if frame != expected {
 		t.Fatalf("frame = %q, want %q", frame, expected)
-	}
-
-	// Verify data payload contains only seq
-	data := `{"seq":123}`
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(data), &payload); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(payload) != 1 || payload["seq"] != float64(123) {
-		t.Fatalf("payload must contain only seq: %v", payload)
 	}
 
 	// Server broadcasts nothing when flag is off

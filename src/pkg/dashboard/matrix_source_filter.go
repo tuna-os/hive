@@ -85,44 +85,102 @@ func matrixPathDenied(p string, excludes []string) bool {
 	return false
 }
 
-// matrixAddedLines returns the candidate lines a patch added: `+` lines
-// without the `+++` header, minus anything inside a BEGIN/END armour block
-// (a PEM key is only recognisable as a whole, never line by line). A patch
-// that is empty or carries NUL bytes is treated as binary and yields nothing.
-func matrixAddedLines(patch string) []string {
+// matrixPatchLine is a changed line, retaining indentation and blank lines.
+type matrixPatchLine struct {
+	change string
+	text   string
+}
+
+// matrixPatchBlock is one contiguous changed region of a unified diff.
+// Context and hunk boundaries separate blocks; neither is displayed as code.
+type matrixPatchBlock struct {
+	lines []matrixPatchLine
+	raw   string
+	bytes int
+}
+
+// matrixDiffBlocks admits complete changed regions, including deletions.
+// A rejected line rejects its whole region, so filtering cannot splice two
+// unrelated pieces into what appears to be a complete paragraph. Armour is
+// tracked through context as well as both changed sides of the diff.
+func matrixDiffBlocks(patch string) []matrixPatchBlock {
 	if patch == "" || strings.ContainsRune(patch, 0) {
 		return nil
 	}
-	var out []string
-	inArmour := false
-	for _, raw := range strings.Split(patch, "\n") {
-		if strings.HasPrefix(raw, "+++") || !strings.HasPrefix(raw, "+") {
+	var out []matrixPatchBlock
+	var lines []matrixPatchLine
+	inHunk, inArmour, rejected, content := false, false, false, false
+	start, end, offset, size := 0, 0, 0, 0
+	flush := func() {
+		if !rejected && content && len(lines) > 0 {
+			out = append(out, matrixPatchBlock{lines: lines, raw: patch[start:end], bytes: size})
+			lines = nil
+		} else {
+			clear(lines)
+			lines = lines[:0]
+		}
+		rejected, content, size = false, false, 0
+	}
+	for raw := range strings.SplitSeq(patch, "\n") {
+		lineStart := offset
+		offset = min(len(patch), offset+len(raw)+1)
+		if strings.HasPrefix(raw, "@@ ") || raw == "@@" {
+			flush()
+			inHunk = true
 			continue
 		}
-		line := raw[1:]
-		if strings.Contains(line, "-----BEGIN ") {
+		if !inHunk || strings.HasPrefix(raw, "\\") {
+			continue
+		}
+		if raw == "" {
+			flush()
+			continue
+		}
+		begin := strings.Contains(raw[1:], "-----BEGIN ")
+		finish := strings.Contains(raw[1:], "-----END ")
+		armoured := inArmour || begin || finish
+		if begin {
 			inArmour = true
 		}
-		if inArmour {
-			if strings.Contains(line, "-----END ") {
-				inArmour = false
-			}
+		if finish {
+			inArmour = false
+		}
+		if raw[0] != '+' && raw[0] != '-' {
+			flush()
 			continue
 		}
-		out = append(out, line)
+		if len(lines) == 0 {
+			start = lineStart
+		}
+		end = offset
+		if armoured {
+			rejected = true
+		}
+		line, ok := matrixAcceptLine(raw[1:])
+		size += len(line) + 1
+		if !ok || len(lines) >= matrixMaxLinesPerHead || size > matrixMaxBlockBytes {
+			rejected = true
+		}
+		if rejected {
+			continue
+		}
+		change := "add"
+		if raw[0] == '-' {
+			change = "remove"
+		}
+		lines = append(lines, matrixPatchLine{change: change, text: line})
+		content = content || strings.TrimSpace(line) != ""
 	}
+	flush()
 	return out
 }
 
-// matrixAcceptLine trims a candidate line and reports whether it may be
-// shown. Every rule drops; nothing is ever masked, so a rejected line never
-// leaves a partial secret behind.
+// matrixAcceptLine preserves whitespace and rejects unsafe or oversized
+// content without masking or truncating it. Blank lines are retained only
+// within a block containing nonblank changed text.
 func matrixAcceptLine(raw string) (string, bool) {
-	line := strings.TrimSpace(raw)
-	if line == "" || !utf8.ValidString(line) {
-		return "", false
-	}
-	if utf8.RuneCountInString(line) > matrixMaxLineRunes {
+	line := strings.TrimSuffix(raw, "\r")
+	if !utf8.ValidString(line) || utf8.RuneCountInString(line) > matrixMaxLineRunes {
 		return "", false
 	}
 	for _, r := range line {

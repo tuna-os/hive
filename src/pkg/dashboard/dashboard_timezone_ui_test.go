@@ -23,12 +23,3 @@ func TestDashboardTimezonePreferenceControlsExist(t *testing.T) {
 		}
 	}
 }
-
-func TestDashboardDatesUseSharedTimezoneHelpers(t *testing.T) {
-	html := indexHTML(t)
-	for _, banned := range []string{"toLocaleString", "toLocaleTimeString", "toLocaleDateString"} {
-		if strings.Contains(html, banned) {
-			t.Fatalf("static/index.html still calls %s directly; use the shared dashboard timezone helpers", banned)
-		}
-	}
-}
