@@ -172,6 +172,9 @@
     "EvalIntervalWebhookS": 900,
     "WebhookWakeDebounceS": 10,
     "WebhookWakeMinGapS": 30,
+    "CIFailureWebhookKick": null,
+    "CIFailureKickCooldownS": 0,
+    "MergeTrainStallWarnS": 0,
     "ConserveIntervalMultiplier": 2,
     "OptionalSweepEveryNCycles": 1,
     "ExplainMode": "",
@@ -200,10 +203,12 @@
           "Enabled": null,
           "AfterOffline": "",
           "AfterUnregistered": "",
+          "OfflineGrace": "",
           "InPlace": null,
           "StrictAttribution": null,
           "AutoMerge": null,
           "MaintainerPolicy": "",
+          "CloseSuperseded": "",
           "Supersede": {
             "CloseFirst": null
           }
@@ -384,6 +389,7 @@
       "StallThresholdS": 0,
       "MaxReplans": 0
     },
+    "reroute": {},
     "AttributionTrailer": null,
     "first_timer_welcome": {},
     "advisory": {
@@ -471,6 +477,7 @@
       }
     },
     "issue_bands": {},
+    "matrix": {},
     "stage_tracker": {}
   },
   "Data": {
@@ -652,6 +659,7 @@
     "rfc_existing_check": {}
   },
   "fleet": {},
+  "dedupe": {},
   "contribute": {},
   "HiveID": "",
   "acmm_level": null,
@@ -701,6 +709,7 @@
       "pagerduty": {}
     }
   },
+  "security": {},
   "evidence": {
     "complexity": {}
   },
@@ -750,10 +759,14 @@
     "trusted_authors": {},
     "contributor_lane": {},
     "contributor_tier": {},
-    "merge_train": {}
+    "merge_train": {},
+    "native_merge_queue": {}
   },
   "decisions": {
     "delegate": {}
+  },
+  "writeback": {
+    "unsolicited": {}
   },
   "chat": {
     "grounded_answers": {}

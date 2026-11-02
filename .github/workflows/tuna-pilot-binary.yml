@@ -1,0 +1,59 @@
+# FORK-ONLY: reproducible binary artifacts for the Spindle Compose pilot.
+# Runtime dependencies stay in the existing pinned images; CI builds the
+# bind-mounted Hive binary from this exact fork checkout, never upstream HEAD.
+name: Tuna pilot binary
+
+on:
+  push:
+    branches: [tuna/v6, deploy/upstream-v6-matrix]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tuna-pilot-binary-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: |
+            src/go.sum
+            src/crux/go.sum
+      - name: Download modules with bounded retries
+        uses: ./.github/actions/go-mod-download-retry
+      - name: Build stamped pilot binaries
+        working-directory: src
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          short=${sha:0:12}
+          branch=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
+          mkdir -p ../pilot-artifacts
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-X main.gitHash=$sha -X main.gitShort=$short -X main.gitBranch=$branch -X main.version=v6-tuna-pilot-$short" \
+              -o "../pilot-artifacts/hive-linux-$arch" ./cmd/hive
+          done
+          ../pilot-artifacts/hive-linux-amd64 --version
+          git rev-parse HEAD > ../pilot-artifacts/COMMIT
+          cd ../pilot-artifacts
+          sha256sum hive-linux-* > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tuna-pilot-binaries-${{ github.event.pull_request.head.sha || github.sha }}
+          path: pilot-artifacts/
+          if-no-files-found: error
+          retention-days: 30

@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/hivecommons/hive/pkg/modelfamily"
+	"github.com/hivecommons/hive/pkg/stageengine/prstage"
 )
 
 func repoListSet(repos []string) map[string]bool {
@@ -553,14 +554,20 @@ type AutoMergeConfig struct {
 	// means no such paths. This key only declares the paths; enforcement
 	// lives in the merge sweeps.
 	HumanMergePaths map[string][]string `yaml:"human_merge_paths,omitempty" json:"human_merge_paths,omitempty"`
+	// Unset uses the default owner-merge rule; explicit empty lists disable
+	// their half of the title/label rule.
+	HumanMergeTitlePrefixes []string `yaml:"human_merge_title_prefixes,omitempty" json:"human_merge_title_prefixes,omitempty"`
+	HumanMergeLabels        []string `yaml:"human_merge_labels,omitempty" json:"human_merge_labels,omitempty"`
 	// RequireCurrentBase lists owner/repo names whose automerge sweeps only
-	// merge a PR head that already contains the current base branch tip.
-	// A head that is green but was tested against an older base is updated
-	// (GitHub update-branch, a merge commit) and merged once CI is green on
-	// the new head, so a semantic conflict with anything merged since shows
-	// up as red CI instead of a broken base. Empty (the default) keeps the
-	// previous behavior: a green head merges even if the base has moved.
+	// merge heads containing the current base tip. Explicit entries are
+	// strict: inability to update the branch never bypasses the gate.
 	RequireCurrentBase []string `yaml:"require_current_base,omitempty" json:"require_current_base,omitempty"`
+	// RequireCurrentBaseDefault applies to repos in neither override list.
+	// Unset is off. Default-only gating may fall back to the tested head
+	// when branch updates are unavailable.
+	RequireCurrentBaseDefault *bool `yaml:"require_current_base_default,omitempty" json:"require_current_base_default,omitempty"`
+	// SkipCurrentBase opts repos out of the default; explicit on wins.
+	SkipCurrentBase []string `yaml:"skip_current_base,omitempty" json:"skip_current_base,omitempty"`
 	// MergeForwardTrustedHuman lists owner/repo names where a role/trusted
 	// author/human PR that GitHub reports as conflicting ("dirty") gets the
 	// base merged into its same-repo head branch as a new App-authored,
@@ -586,16 +593,40 @@ type AutoMergeConfig struct {
 	// the PRs external clankers open, which bypass the hive's own
 	// open-time attribution. nil/unset means ON; `credit_issue_authors:
 	// false` sends the merge with GitHub's default message as before.
-	CreditIssueAuthors *bool                     `yaml:"credit_issue_authors,omitempty" json:"credit_issue_authors,omitempty"`
-	MergeTrain         MergeTrainAutoMergeConfig `yaml:"merge_train,omitempty" json:"merge_train,omitempty"`
+	CreditIssueAuthors *bool `yaml:"credit_issue_authors,omitempty" json:"credit_issue_authors,omitempty"`
+	// MergeTrain orders approved PRs on the same base whose changed files
+	// overlap: one front merges at a time, the siblings wait as
+	// "queued-behind" (stage 080, never a human stage) and are updated or
+	// rebased right after the front lands instead of each going
+	// `conflicting` with nothing owning the repair
+	// (hivecommons/hive#15117). Default ON.
+	MergeTrain MergeTrainAutoMergeConfig `yaml:"merge_train,omitempty" json:"merge_train,omitempty"`
+	// NativeMergeQueue lets the sweep lanes enqueue an eligible PR into
+	// GitHub's native merge queue instead of merging it directly when the
+	// base branch requires one (hivecommons/hive#15198). Default OFF and
+	// opt-in per repo: a hive that never sets it keeps the pre-queue
+	// behaviour, including the `merge-queue-required` park.
+	NativeMergeQueue NativeMergeQueueAutoMergeConfig `yaml:"native_merge_queue,omitempty" json:"native_merge_queue,omitempty"`
 }
 
 type MergeTrainAutoMergeConfig struct {
 	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxRebaseAttempts bounds rebase-resolve tasks before human escalation.
+	MaxRebaseAttempts int `yaml:"max_rebase_attempts,omitempty" json:"max_rebase_attempts,omitempty"`
 }
+
+const DefaultMergeTrainMaxRebaseAttempts = 2
 
 func (m MergeTrainAutoMergeConfig) IsEnabled() bool {
 	return m.Enabled == nil || *m.Enabled
+}
+
+// EffectiveMaxRebaseAttempts applies the default rebase loop guard.
+func (m MergeTrainAutoMergeConfig) EffectiveMaxRebaseAttempts() int {
+	if m.MaxRebaseAttempts <= 0 {
+		return DefaultMergeTrainMaxRebaseAttempts
+	}
+	return m.MaxRebaseAttempts
 }
 
 // CreditIssueAuthorsEnabled reports the auto_merge.credit_issue_authors
@@ -604,10 +635,98 @@ func (a AutoMergeConfig) CreditIssueAuthorsEnabled() bool {
 	return a.CreditIssueAuthors == nil || *a.CreditIssueAuthors
 }
 
-// RequireCurrentBaseFor reports whether repo (owner/repo, matched
-// case-insensitively) is listed in auto_merge.require_current_base.
+// RequireCurrentBaseFor resolves explicit on, explicit off, then the default.
 func (a AutoMergeConfig) RequireCurrentBaseFor(repo string) bool {
+	key := strings.ToLower(strings.TrimSpace(repo))
+	if key == "" {
+		return false
+	}
+	if v := a.CurrentBaseOverrideFor(key); v != nil {
+		return *v
+	}
+	return a.CurrentBaseDefaultEnabled()
+}
+
+// CurrentBaseDefaultEnabled resolves the hive-wide default (unset is off).
+func (a AutoMergeConfig) CurrentBaseDefaultEnabled() bool {
+	return a.RequireCurrentBaseDefault != nil && *a.RequireCurrentBaseDefault
+}
+
+// CurrentBaseOverrideFor returns explicit on/off, or nil to inherit.
+func (a AutoMergeConfig) CurrentBaseOverrideFor(repo string) *bool {
+	key := strings.ToLower(strings.TrimSpace(repo))
+	if key == "" {
+		return nil
+	}
+	if repoListSet(a.RequireCurrentBase)[key] {
+		v := true
+		return &v
+	}
+	if repoListSet(a.SkipCurrentBase)[key] {
+		v := false
+		return &v
+	}
+	return nil
+}
+
+// SetCurrentBaseOverride records the dashboard's per-repo tri-state,
+// removing the repo from the other list (or both when inheriting).
+func (a *AutoMergeConfig) SetCurrentBaseOverride(repo string, value *bool) {
+	if a == nil {
+		return
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return
+	}
+	drop := func(list []string) []string {
+		out := list[:0:0]
+		for _, r := range list {
+			if !strings.EqualFold(strings.TrimSpace(r), repo) {
+				out = append(out, r)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	a.RequireCurrentBase = drop(a.RequireCurrentBase)
+	a.SkipCurrentBase = drop(a.SkipCurrentBase)
+	switch {
+	case value == nil:
+	case *value:
+		a.RequireCurrentBase = append(a.RequireCurrentBase, repo)
+	default:
+		a.SkipCurrentBase = append(a.SkipCurrentBase, repo)
+	}
+}
+
+// RequireCurrentBaseStrictFor reports explicit on, which must not fall back
+// to an un-updated head when update-branch is unavailable.
+func (a AutoMergeConfig) RequireCurrentBaseStrictFor(repo string) bool {
 	return repoListSet(a.RequireCurrentBase)[strings.ToLower(strings.TrimSpace(repo))]
+}
+
+// HumanMergeTitlePrefixesEffective preserves explicit empty lists.
+func (a AutoMergeConfig) HumanMergeTitlePrefixesEffective() []string {
+	if a.HumanMergeTitlePrefixes == nil {
+		return append([]string(nil), prstage.DefaultHumanMergeTitlePrefixes...)
+	}
+	return append(make([]string, 0, len(a.HumanMergeTitlePrefixes)), a.HumanMergeTitlePrefixes...)
+}
+
+// HumanMergeLabelsEffective preserves explicit empty lists.
+func (a AutoMergeConfig) HumanMergeLabelsEffective() []string {
+	if a.HumanMergeLabels == nil {
+		return append([]string(nil), prstage.DefaultHumanMergeLabels...)
+	}
+	return append(make([]string, 0, len(a.HumanMergeLabels)), a.HumanMergeLabels...)
+}
+
+// HumanMergeRule is the shared rule for the automerge lanes and dashboard.
+func (a AutoMergeConfig) HumanMergeRule() prstage.HumanMergeRule {
+	return prstage.HumanMergeRule{TitlePrefixes: a.HumanMergeTitlePrefixesEffective(), Labels: a.HumanMergeLabelsEffective()}
 }
 
 // MergeForwardTrustedHumanFor reports whether repo (owner/repo, matched
@@ -1270,4 +1389,55 @@ func (a AutoMergeConfig) EffectiveMinHeadAge() time.Duration {
 		return a.MinHeadAge
 	}
 	return DefaultAutoMergeMinHeadAge
+}
+
+// NativeMergeQueueAutoMergeConfig is auto_merge.native_merge_queue.*.
+type NativeMergeQueueAutoMergeConfig struct {
+	// Enabled turns the native-queue hand-off on. Default off.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Repos restricts the hand-off to these repositories (owner/repo,
+	// case-insensitive). Empty means every watched repository once Enabled.
+	Repos []string `yaml:"repos,omitempty" json:"repos,omitempty"`
+	// SkipCurrentBaseGate lets a queue-enabled base bypass the
+	// auto_merge.require_current_base gate and the behind update-branch,
+	// because the merge group re-tests the merged result and a new head
+	// would drop the PR from the queue. Default off: the gate stays in
+	// force on queue bases exactly as on any other base.
+	SkipCurrentBaseGate bool `yaml:"skip_current_base_gate,omitempty" json:"skip_current_base_gate,omitempty"`
+	// ProbeTTL bounds how long a base branch's "has a merge queue" answer
+	// is reused before it is re-read from GraphQL. 0/unset means
+	// DefaultNativeMergeQueueProbeTTL.
+	ProbeTTL time.Duration `yaml:"probe_ttl,omitempty" json:"probe_ttl,omitempty"`
+}
+
+// DefaultNativeMergeQueueProbeTTL is how long a base branch's merge-queue
+// probe is cached when auto_merge.native_merge_queue.probe_ttl is unset.
+const DefaultNativeMergeQueueProbeTTL = 30 * time.Minute
+
+// RepoSet is auto_merge.native_merge_queue.repos as a lower-cased membership
+// map; nil means the allow-list is empty (every repo once Enabled).
+func (n NativeMergeQueueAutoMergeConfig) RepoSet() map[string]bool {
+	return repoListSet(n.Repos)
+}
+
+// EnabledFor reports whether repo (owner/repo, matched case-insensitively)
+// may hand PRs to a native merge queue: Enabled and either no allow-list or
+// listed in it.
+func (n NativeMergeQueueAutoMergeConfig) EnabledFor(repo string) bool {
+	if !n.Enabled {
+		return false
+	}
+	set := n.RepoSet()
+	if len(set) == 0 {
+		return true
+	}
+	return set[strings.ToLower(strings.TrimSpace(repo))]
+}
+
+// EffectiveProbeTTL is probe_ttl with the default applied.
+func (n NativeMergeQueueAutoMergeConfig) EffectiveProbeTTL() time.Duration {
+	if n.ProbeTTL <= 0 {
+		return DefaultNativeMergeQueueProbeTTL
+	}
+	return n.ProbeTTL
 }

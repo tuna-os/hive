@@ -351,14 +351,18 @@ func TestEveryRuntimeClassTriggerAndNonTriggerThresholds(t *testing.T) {
 		{class: ClassAgentDirSetupFailed, message: "failed to create per-agent XDG dir"},
 		{class: ClassReviewEvidenceWriteFail, message: "review evidence: could not write bundle"},
 		{class: ClassFeedbackIssueRefreshFailed, message: "feedback: issue refresh failed"},
+		{class: ClassSharedCIRerunForbidden, message: "shared-ci rerun forbidden: the App installation lacks Actions write permission for rerun-failed-jobs"},
 		{class: ClassTranscriptScanSlow, message: "copilot transcript activity scan outlived its interval; agent liveness reads may lag"},
 		{class: ClassBeadFactIngestFailed, message: "failed to ingest bead fact"},
 		{class: ClassSelfReportClearedFailed, message: "fleet report: cleared comment failed"},
 		{class: ClassGitHubAppRepoNotCovered, message: "github app recheck: installation does not cover every configured repo"},
 		{class: ClassGitHubAppNotInstalled, message: "github app installation id is unset — per-agent scoped token NOT delivered"},
 		{class: ClassProxyConnectDialFailed, message: "proxy: CONNECT dial failed"},
+		{class: ClassProxyPlainForwardRefused, message: "proxy: plain HTTP forward refused — destination is not globally routable"},
+		{class: ClassInferenceCallerUnknown, message: "inference request from unidentified caller refused"},
 		{class: ClassInferenceUpstreamError, message: "inference upstream error"},
 		{class: ClassSHAPollCommitMsgUnavail, message: "SHA poll: commit message fetch non-200"},
+		{class: ClassKickFreshnessWithheld, message: "kick withheld: every ref failed the freshness check"},
 		{class: ClassAgentLoginRequired, message: "login required detected"},
 		{class: ClassPRRequestHeadUnpushed, message: "pr-request watcher: head branch is not on the remote — the agent's push did not land (never pushed, or push authentication failed)"},
 		{class: ClassIOScanClassifierUnavail, message: "ioscan classifier failed closed; text withheld"},
@@ -794,6 +798,31 @@ func TestIsGitHubRateLimited(t *testing.T) {
 	}
 }
 
+func TestIsGitHubUpstreamUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"GET https://api.github.com/repos/o/r/pulls/1: 502 Bad Gateway []", true},
+		{"GET https://api.github.com/repos/o/r/pulls/1336: 503  []", true},
+		{"GET https://api.github.com/repos/o/r/pulls/1: 504 Gateway Timeout []", true},
+		{"upstream: Service Unavailable", true},
+		{"GET https://api.github.com/repos/o/r: 503 Service Unavailable []", true},
+		{"issue title mentions service unavailable but request succeeded", false},
+		{`"bad gateway" appears in quoted prose`, false},
+		{"gateway timeout handling was documented", false},
+		{"GET https://api.github.com/repos/o/r: 500 Internal Server Error", false},
+		{"GET https://api.github.com/repos/o/r: 404 Not Found", false},
+		{"GET https://api.github.com/repos/o/r/pulls/503: 404 Not Found", false},
+		{"GET https://api.github.com/repos/o/r/pulls?page=503", false},
+		{"", false},
+	} {
+		if got := IsGitHubUpstreamUnavailable(tc.in); got != tc.want {
+			t.Errorf("IsGitHubUpstreamUnavailable(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestIsBenignMessageReviewPendingExpiry(t *testing.T) {
 	for _, msg := range []string{"review pending expired", "  REVIEW PENDING EXPIRED  "} {
 		if !IsBenignMessage(msg) {
@@ -835,6 +864,25 @@ func TestIsBenignMessageForwardMergeGuard(t *testing.T) {
 	}
 	if IsBenignMessage("forward-merge guard: head-history check failed") {
 		t.Error("head-history check failure wrongly benign")
+	}
+}
+
+// hivecommons/hive#15313: the kick-undeliverable WARN that says it is not
+// self-reporting must not be filed as a repeated runtime defect, while the
+// post-restart kick_failed_repeatedly report and the WARNs that do report
+// stay reportable.
+func TestIsBenignMessageKickUndeliverableBeforeRestart(t *testing.T) {
+	if !IsBenignMessage("kick undeliverable; busy-no-activity restart not yet attempted, not self-reporting") {
+		t.Error("pre-restart kick-undeliverable warning not benign")
+	}
+	for _, m := range []string{
+		"kick undeliverable 4 times in a row after busy-no-activity restart did not recover the session (CLI did not reach input prompt; restarted 1m0s ago at 2026-10-29T05:00:00Z, 1 restart(s) this episode)",
+		"kick undeliverable: TUI menu did not close after Escape",
+		"re-engagement kick undeliverable; budget not charged",
+	} {
+		if IsBenignMessage(m) {
+			t.Errorf("%q wrongly benign", m)
+		}
 	}
 }
 
@@ -982,43 +1030,47 @@ func TestUnclassifiedRepeatedHonoursWindowAndIdleClear(t *testing.T) {
 
 func TestRecurringRuntimeMessagesAreClassified(t *testing.T) {
 	fed := map[string]string{
-		"startup kick dropped: agent restarted or stopped while waiting": ClassStartupKickInterrupted,
-		"tmux has-session failed":                                                     ClassTmuxSessionCheckFailed,
-		"pane content at timeout":                                                     ClassAgentPaneTimeout,
-		"prompt timeout — dumping pane":                                               ClassAgentPaneTimeout,
-		"startup kick dropped: CLI never reached input prompt":                        ClassAgentPaneTimeout,
-		"startup kick dropped: CLI never became ready":                                ClassAgentPaneTimeout,
-		"channel commit date: fetch failed — the row will render without a timestamp": ClassGitHubFetchTransient,
-		"issue stage labels: provisioning failed":                                     ClassLabelProvisioningFailed,
-		"agent CLI crashed or stuck on consent screen, restarting before kick":        ClassAgentCLIRestartLoop,
-		"SHA poll: commit message fetch non-200":                                      ClassSHAPollCommitMsgUnavail,
-		"login required detected":                                                     ClassAgentLoginRequired,
+		"startup kick dropped: agent restarted or stopped while waiting":                                                                     ClassStartupKickInterrupted,
 		"pr-request watcher: head branch is not on the remote — the agent's push did not land (never pushed, or push authentication failed)": ClassPRRequestHeadUnpushed,
-		"ioscan classifier failed closed; text withheld":                                       ClassIOScanClassifierUnavail,
-		"ioscan classifier failed open; text passes on unclassified":                           ClassIOScanClassifierUnavail,
-		"ioscan fail-closed blocked kick":                                                      ClassIOScanClassifierUnavail,
-		"ioscan fail-closed blocked held-PR coordination kick":                                 ClassIOScanClassifierUnavail,
-		"proxy client TLS handshake failed":                                                    ClassProxyTLSHandshakeFailed,
-		"transparent proxy TLS handshake failed":                                               ClassProxyTLSHandshakeFailed,
-		"failed to restore per-agent dir mode":                                                 ClassAgentDirSetupFailed,
-		"failed to restore interactive home mode":                                              ClassAgentDirSetupFailed,
-		"failed to tighten per-agent dir mode":                                                 ClassAgentDirSetupFailed,
-		"failed to tighten interactive home mode":                                              ClassAgentDirSetupFailed,
-		"failed to create per-agent XDG dir":                                                   ClassAgentDirSetupFailed,
-		"review evidence: could not write bundle":                                              ClassReviewEvidenceWriteFail,
-		"feedback: issue refresh failed":                                                       ClassFeedbackIssueRefreshFailed,
-		"failed to restore inference home mode":                                                ClassAgentDirSetupFailed,
-		"failed to tighten inference home mode":                                                ClassAgentDirSetupFailed,
-		"failed to ingest bead fact":                                                           ClassBeadFactIngestFailed,
-		"fleet report: cleared comment failed":                                                 ClassSelfReportClearedFailed,
-		"copilot sniff: client TLS handshake failed":                                           ClassProxyTLSHandshakeFailed,
-		"github app recheck: installation does not cover every configured repo":                ClassGitHubAppRepoNotCovered,
-		"proxy: CONNECT dial failed":                                                           ClassProxyConnectDialFailed,
-		"inference upstream error":                                                             ClassInferenceUpstreamError,
-		"copilot transcript activity scan outlived its interval; agent liveness reads may lag": ClassTranscriptScanSlow,
-		"inference upstream failed":                                                            ClassInferenceUpstreamError,
-		"kick undeliverable; busy-no-activity restart":                                         ClassAgentPaneTimeout,
-		"agent GitHub API hourly cap reached":                                                  ClassAgentGitHubCapReached,
+		"tmux has-session failed":                                                                      ClassTmuxSessionCheckFailed,
+		"pane content at timeout":                                                                      ClassAgentPaneTimeout,
+		"prompt timeout — dumping pane":                                                                ClassAgentPaneTimeout,
+		"startup kick dropped: CLI never reached input prompt":                                         ClassAgentPaneTimeout,
+		"startup kick dropped: CLI never became ready":                                                 ClassAgentPaneTimeout,
+		"channel commit date: fetch failed — the row will render without a timestamp":                  ClassGitHubFetchTransient,
+		"issue stage labels: provisioning failed":                                                      ClassLabelProvisioningFailed,
+		"agent CLI crashed or stuck on consent screen, restarting before kick":                         ClassAgentCLIRestartLoop,
+		"shared-ci rerun forbidden: the App installation lacks Actions write permission":               ClassSharedCIRerunForbidden,
+		"SHA poll: commit message fetch non-200":                                                       ClassSHAPollCommitMsgUnavail,
+		"kick withheld: every ref failed the freshness check":                                          ClassKickFreshnessWithheld,
+		"login required detected":                                                                      ClassAgentLoginRequired,
+		"pr-request watcher: head branch is not on the remote — the agent's push did not authenticate": ClassPRRequestHeadUnpushed,
+		"ioscan classifier failed closed; text withheld":                                               ClassIOScanClassifierUnavail,
+		"ioscan classifier failed open; text passes on unclassified":                                   ClassIOScanClassifierUnavail,
+		"ioscan fail-closed blocked kick":                                                              ClassIOScanClassifierUnavail,
+		"ioscan fail-closed blocked held-PR coordination kick":                                         ClassIOScanClassifierUnavail,
+		"proxy client TLS handshake failed":                                                            ClassProxyTLSHandshakeFailed,
+		"transparent proxy TLS handshake failed":                                                       ClassProxyTLSHandshakeFailed,
+		"failed to restore per-agent dir mode":                                                         ClassAgentDirSetupFailed,
+		"failed to restore interactive home mode":                                                      ClassAgentDirSetupFailed,
+		"failed to tighten per-agent dir mode":                                                         ClassAgentDirSetupFailed,
+		"failed to tighten interactive home mode":                                                      ClassAgentDirSetupFailed,
+		"failed to create per-agent XDG dir":                                                           ClassAgentDirSetupFailed,
+		"review evidence: could not write bundle":                                                      ClassReviewEvidenceWriteFail,
+		"feedback: issue refresh failed":                                                               ClassFeedbackIssueRefreshFailed,
+		"failed to restore inference home mode":                                                        ClassAgentDirSetupFailed,
+		"failed to tighten inference home mode":                                                        ClassAgentDirSetupFailed,
+		"failed to ingest bead fact":                                                                   ClassBeadFactIngestFailed,
+		"fleet report: cleared comment failed":                                                         ClassSelfReportClearedFailed,
+		"copilot sniff: client TLS handshake failed":                                                   ClassProxyTLSHandshakeFailed,
+		"github app recheck: installation does not cover every configured repo":                        ClassGitHubAppRepoNotCovered,
+		"proxy: CONNECT dial failed":                                                                   ClassProxyConnectDialFailed,
+		"inference upstream error":                                                                     ClassInferenceUpstreamError,
+		"copilot transcript activity scan outlived its interval; agent liveness reads may lag":         ClassTranscriptScanSlow,
+		"inference upstream failed":                                                                    ClassInferenceUpstreamError,
+		"kick undeliverable; busy-no-activity restart":                                                 ClassAgentPaneTimeout,
+		"agent GitHub API hourly cap reached":                                                          ClassAgentGitHubCapReached,
+		"proxy: plain HTTP forward refused — destination is not globally routable":                     ClassProxyPlainForwardRefused,
 	}
 	for msg, want := range fed {
 		if got := LogFedClass(msg); got != want {

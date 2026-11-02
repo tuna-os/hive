@@ -3,6 +3,8 @@ package dashboard
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,7 +14,7 @@ import (
 )
 
 // The 072 adoption state on a tracker row (hivecommons/hive#14524: PR
-// #14524 sat at stage/072 for 26h, nudged twice, its author's hive gone,
+// #14524 sat at stage/072 for 26h, nudged twice, its author's clanker gone,
 // while every cycle logged "author maintains the repository; not
 // adopting" and nothing in the UI said so). A nudged contributor PR
 // carries `adoption`: whether the engine found adoption due, what holds it
@@ -51,9 +53,26 @@ type StageTrackerAdoption struct {
 	// Action is the row action that lifts the hold ("decide:adopt"), ""
 	// when nothing is the owner's to decide.
 	Action string `json:"action,omitempty"`
+	// QueuedBy is the operator whose Adopt now is waiting for the sweep:
+	// the row is in its acted state ("Adopting… (queued by @x)") and no
+	// blocker or adopt action is shown.
+	QueuedBy string `json:"queued_by,omitempty"`
+	// AutoAdoptAt is when the engine's predicate (automerge.AutoAdoption)
+	// adopts this head on its own, while its clock runs and nothing holds
+	// it; AutoDue is true once it has fired (the next sweep adopts).
+	AutoAdoptAt *time.Time `json:"auto_adopt_at,omitempty"`
+	AutoDue     bool       `json:"auto_due,omitempty"`
 	// Text is the plain-words pill/tooltip: "waiting on @hanthor
 	// (maintainer, offline 26h) — adopt?".
 	Text string `json:"text"`
+}
+
+// BlockerReason is the hold reason, or "policy" when the engine recorded none.
+func (a StageTrackerAdoption) BlockerReason() string {
+	if a.BlockedBy != "" {
+		return a.BlockedBy
+	}
+	return "policy"
 }
 
 // decisionActionAdopt is the row action id for the owner's Adopt, in the
@@ -92,16 +111,41 @@ func (s *Server) stageTrackerMaintainerPolicy() string {
 // stage/072 from its stage record and the author's live presence; nil
 // when the row was never nudged at its current head (nothing to adopt
 // yet) or is already adopted.
-func stageTrackerAdoption(it StageTrackerItem, rec stagelabels.Record, hasRec bool, presence func(login string) (automerge.ContributorPresence, bool), policy string, now time.Time) *StageTrackerAdoption {
-	if it.Kind != "pr" || !hasRec || rec.NudgeCount == 0 || rec.NudgeStart().IsZero() {
+func stageTrackerAdoption(it StageTrackerItem, rec stagelabels.Record, hasRec bool, presence func(login string) (automerge.ContributorPresence, bool), policy string, clock stageTrackerAdoptionClock, now time.Time) *StageTrackerAdoption {
+	if it.Kind != "pr" || !hasRec {
+		return nil
+	}
+	if rec.AdoptionBlocked(it.Head) == stagelabels.AdoptBlockedAuthorPerson {
+		// A person's PR was asked to be adopted and refused: say so on the
+		// row even though no nudge clock ever ran (hivecommons/hive#15202).
+		out := &StageTrackerAdoption{Author: it.Author, Policy: policy, Due: true, BlockedBy: stagelabels.AdoptBlockedAuthorPerson}
+		if !rec.AdoptBlockedAt.IsZero() {
+			since := rec.AdoptBlockedAt
+			out.Since = &since
+		}
+		out.Text = stageTrackerAdoptionText(it.Author, *out, now)
+		return out
+	}
+	if rec.AdoptedHead != "" && (it.Head == "" || rec.Adopted(it.Head) || rec.AdoptedInPlace()) {
+		return nil
+	}
+	if by, ok := rec.AdoptionForced(); ok && !slices.Contains(it.Modifiers, modHold) {
+		// An operator pressed Adopt now and the sweep has not landed yet:
+		// the row reads as acted on, whatever held adoption before.
+		out := &StageTrackerAdoption{Author: it.Author, Policy: policy, Due: true, QueuedBy: by, Nudges: rec.NudgeCount}
+		if !rec.AdoptForcedAt.IsZero() {
+			since := rec.AdoptForcedAt
+			out.Since = &since
+		}
+		out.Text = stageTrackerAdoptionText(it.Author, *out, now)
+		return out
+	}
+	if rec.NudgeCount == 0 || rec.NudgeStart().IsZero() {
 		return nil
 	}
 	if it.Head != "" && rec.NudgeHead != "" && rec.NudgeHead != it.Head {
 		// The head moved since the nudge: the 072 clock restarts on the
 		// next sweep; nothing to say about adoption yet.
-		return nil
-	}
-	if rec.AdoptedHead != "" && (it.Head == "" || rec.Adopted(it.Head) || rec.AdoptedInPlace()) {
 		return nil
 	}
 	since := rec.NudgeStart()
@@ -125,6 +169,9 @@ func stageTrackerAdoption(it StageTrackerItem, rec stagelabels.Record, hasRec bo
 		if by == stagelabels.AdoptBlockedAuthorMaintainer && policy == config.AdoptionMaintainerPolicyAsk {
 			out.Action = decisionActionAdopt
 		}
+	} else if v := stageTrackerAutoAdoption(it, rec, hasRec, presence, clock, now); v.Running {
+		at := v.At
+		out.AutoAdoptAt, out.AutoDue = &at, v.Due
 	}
 	out.Text = stageTrackerAdoptionText(it.Author, *out, now)
 	return out
@@ -139,6 +186,12 @@ func stageTrackerAdoptionText(author string, a StageTrackerAdoption, now time.Ti
 	who := "the author"
 	if author != "" {
 		who = "@" + author
+	}
+	if a.BlockedBy == stagelabels.AdoptBlockedAuthorPerson {
+		return who + " pushed this PR themselves — not adopted: the hive asks them, not adopts"
+	}
+	if a.QueuedBy != "" {
+		return "Adopting… (queued by @" + a.QueuedBy + "; the hive opens its copy on the next stage pass)"
 	}
 	var facts []string
 	if a.AuthorMaintainer {
@@ -162,8 +215,25 @@ func stageTrackerAdoptionText(author string, a StageTrackerAdoption, now time.Ti
 		text += " — not adopted: a maintainer approved this head; the hive merges it as-is"
 	case a.BlockedBy != "":
 		text += " — not adopted: " + a.BlockedBy
+	case a.AutoDue:
+		text += " — hive adopts it on the next sweep" + stageTrackerAdoptionNeverHedge(a, " unless")
+	case a.AutoAdoptAt != nil && a.AutoAdoptAt.After(now):
+		text += " — hive adopts it in " + stageTrackerShortDuration(max(a.AutoAdoptAt.Sub(now), time.Minute)) + " unless a new head lands" + stageTrackerAdoptionNeverHedge(a, " or")
 	}
 	return text
+}
+
+// stageTrackerAdoptionNeverHedge qualifies the auto-adopt countdown under
+// maintainer_policy: never. The engine has not read the author's repository
+// permission yet (it only does so once due), so a maintainer's head never
+// reaches the promised moment at all and the row cannot promise adoption for
+// every author the way it does under adopt (hivecommons/hive#15692). lead is
+// the conjunction that joins the clause to the text before it.
+func stageTrackerAdoptionNeverHedge(a StageTrackerAdoption, lead string) string {
+	if a.Policy != config.AdoptionMaintainerPolicyNever {
+		return ""
+	}
+	return lead + " the author maintains this repository"
 }
 
 // stageTrackerAdoptionOfflineFor renders " 26h" for the time the author's
@@ -205,4 +275,46 @@ func stageTrackerAdoptionCaption(caption string, a *StageTrackerAdoption) string
 		head = caption[:i]
 	}
 	return head + " — " + a.Text
+}
+
+// stageTrackerSupersedesIndex maps each superseding PR's store key to the
+// closed original it replaced (hivecommons/hive#15135). The original's
+// record carries SupersededBy; the tracker never renders that record as a
+// row (addPR drops it, and a closed PR has no open item), so the live
+// PR's chip is the one trace the tracker keeps. When several originals
+// name the same superseder the lowest-numbered one is kept.
+func stageTrackerSupersedesIndex(store *stagelabels.Store, baseURL string) map[string]StageTrackerSupersedes {
+	out := map[string]StageTrackerSupersedes{}
+	if store == nil {
+		return out
+	}
+	for _, key := range store.Keys() {
+		rec, ok := store.Get(key)
+		if !ok || !rec.Superseded() {
+			continue
+		}
+		repo, numText, found := strings.Cut(key, "#")
+		number, err := strconv.Atoi(numText)
+		if !found || err != nil || number <= 0 || repo == "" {
+			continue
+		}
+		by := stagelabels.Key(repo, rec.SupersededBy)
+		if prev, dup := out[by]; dup && prev.Number <= number {
+			continue
+		}
+		sup := StageTrackerSupersedes{Number: number, URL: overviewItemURL("", repo, number, "pr", baseURL), Open: rec.SupersededOpen}
+		if !rec.SupersededAt.IsZero() {
+			t := rec.SupersededAt
+			sup.ClosedAt = &t
+		}
+		out[by] = sup
+	}
+	return out
+}
+
+// stageTrackerLinkedPRFinished reports whether a PR state the caches
+// resolved (stageTrackerPRStateResolver) means the PR is no longer open
+// work: closed unmerged or merged. Unknown ("") is not finished.
+func stageTrackerLinkedPRFinished(state string) bool {
+	return state == blockedOnPRStateClosed || state == blockedOnPRStateMerged
 }

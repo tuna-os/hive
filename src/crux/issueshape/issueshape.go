@@ -98,3 +98,108 @@ func UnchosenOptionList(text string) (string, bool) {
 	m := unchosenOptionListRE.FindString(text)
 	return m, m != ""
 }
+
+// Every issue the hive files starts with the filing agent in brackets:
+// `[scanner] …`, `[reviewer] …`, `[selfreport] …` (the owner's rule: "agents
+// that need to open issues need to use [agent name]"). A filer tag is the
+// lowercased agent (lane) name as the dashboard shows it, so it has the slug
+// shape filerTagRE describes; a bracketed tag of any other shape
+// (`[ACMM L0]`, `[Tests]`) is part of the subject, not a filer.
+var (
+	// leadingTagRE matches a title's leading `[tag]`, optionally preceded by
+	// a short run of symbols (an emoji convention such as `🐛 [reviewer] …`)
+	// captured in group 1 so the tag can be moved in front of it.
+	leadingTagRE = regexp.MustCompile(`^\s*((?:[^\p{L}\p{N}\[\]\s]+\s*)?)\[([^\]\n]+)\]\s*`)
+	filerTagRE   = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
+)
+
+// AgentIssueTitle returns title carrying a leading `[<agent>]` tag. It is the
+// one function every hive issue-creation path runs a title through, and it
+// is idempotent:
+//   - a title already tagged with this agent (any case, or after a leading
+//     emoji) is normalised to `[agent] …` with the rest unchanged;
+//   - a title another hive filer already tagged (`[selfreport] …` relayed by
+//     the governor) is kept as it is, so a title is never double-tagged;
+//   - a filer-chosen bracket that is not a filer name (`[ACMM L0] …`) is part
+//     of the subject and gets the `[agent]` tag in front of it;
+//   - the tag always comes first, before any emoji the title opens with.
+//
+// An empty agent leaves the title as it is.
+func AgentIssueTitle(agent, title string) string {
+	title = strings.TrimSpace(title)
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" || title == "" {
+		return title
+	}
+	m := leadingTagRE.FindStringSubmatch(title)
+	if m == nil {
+		return "[" + agent + "] " + title
+	}
+	lead, tag, rest := strings.TrimSpace(m[1]), strings.TrimSpace(m[2]), title[len(m[0]):]
+	switch {
+	case strings.EqualFold(tag, agent):
+		return joinTitle("["+agent+"]", lead, rest)
+	case !IsFilerTag(tag):
+		return "[" + agent + "] " + title
+	case lead == "":
+		return title
+	default:
+		return joinTitle("["+tag+"]", lead, rest)
+	}
+}
+
+func joinTitle(parts ...string) string {
+	out := parts[:0]
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+// IsFilerTag reports whether tag (the text inside a title's leading
+// brackets) has the shape of a hive filer name: a lowercase slug.
+func IsFilerTag(tag string) bool {
+	return filerTagRE.MatchString(strings.TrimSpace(tag))
+}
+
+// HasAgentPrefix reports whether title starts with a filer tag (`[scanner] …`).
+func HasAgentPrefix(title string) bool {
+	return AgentPrefix(title) != ""
+}
+
+// AgentPrefix returns the filer tag a title leads with (`[scanner] …` →
+// "scanner"), or "" when the title carries none. A leading bracket that is
+// not filer-shaped (`[ACMM L0] …`) is not a filer tag.
+func AgentPrefix(title string) string {
+	m := leadingTagRE.FindStringSubmatch(title)
+	if m == nil || strings.TrimSpace(m[1]) != "" {
+		return ""
+	}
+	tag := strings.TrimSpace(m[2])
+	if !IsFilerTag(tag) {
+		return ""
+	}
+	return tag
+}
+
+// StripAgentPrefix returns title without its leading filer tag, trimmed. It
+// is the key dedupe compares on so an issue filed before titles carried the
+// filing agent still matches its prefixed re-filing. A non-filer bracket
+// (`[ACMM L0] …`) is part of the subject and stays.
+func StripAgentPrefix(title string) string {
+	title = strings.TrimSpace(title)
+	if AgentPrefix(title) == "" {
+		return title
+	}
+	m := leadingTagRE.FindStringSubmatch(title)
+	return strings.TrimSpace(title[len(m[0]):])
+}
+
+// SameTitle reports whether two issue titles are the same title once the
+// leading `[<agent>]` tag is ignored: `Review backlog (security): x` and
+// `[reviewer] Review backlog (security): x` are one finding, not two.
+func SameTitle(a, b string) bool {
+	return StripAgentPrefix(a) == StripAgentPrefix(b)
+}

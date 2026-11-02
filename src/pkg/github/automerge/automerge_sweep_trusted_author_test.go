@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v72/github"
 	hgithub "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
 type trustedSweepFixture struct {
@@ -32,8 +35,11 @@ type trustedSweepFixture struct {
 	commentStatus   int
 	merges          int
 	comments        int
+	lastComment     string
 	updates         int
 	updateStatus    int
+	labels          []string
+	title           string
 }
 
 func newTrustedSweepAPI(t *testing.T, fx *trustedSweepFixture) *httptest.Server {
@@ -55,13 +61,14 @@ func newTrustedSweepAPI(t *testing.T, fx *trustedSweepFixture) *httptest.Server 
 			}
 			return map[string]any{
 				"number":          7,
+				"title":           fx.title,
 				"state":           "open",
 				"mergeable_state": state,
 				"mergeable":       state == "clean",
 				"user":            map[string]string{"login": author},
 				"head":            map[string]any{"sha": sha, "repo": map[string]string{"full_name": headRepo}},
 				"base":            map[string]any{"repo": map[string]string{"full_name": "acme/widget"}},
-				"labels":          []map[string]string{},
+				"labels":          prLabelObjects(fx.labels),
 			}
 		}
 		switch {
@@ -129,6 +136,11 @@ func newTrustedSweepAPI(t *testing.T, fx *trustedSweepFixture) *httptest.Server 
 			json.NewEncoder(w).Encode(map[string]any{"message": "Updating pull request branch."})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widget/issues/7/comments":
 			fx.comments++
+			var comment struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&comment)
+			fx.lastComment = comment.Body
 			if fx.commentStatus != 0 {
 				http.Error(w, "comment error", fx.commentStatus)
 				return
@@ -191,6 +203,20 @@ func TestTrySweepTrustedAuthorPRFailClosedBranches(t *testing.T) {
 			fx:          trustedSweepFixture{mergeableState: "behind"},
 			wantReason:  "check-pending",
 			wantUpdates: 1,
+		},
+		{
+			// hivecommons/hive#15103: prow's needs-rebase label lags; when
+			// GitHub says "behind" the label must not stop the UpdateBranch
+			// that clears it.
+			name:        "stale needs-rebase label with behind still updates branch",
+			fx:          trustedSweepFixture{mergeableState: "behind", labels: []string{"needs-rebase"}},
+			wantReason:  "check-pending",
+			wantUpdates: 1,
+		},
+		{
+			name:       "needs-rebase label with dirty is left to the fixer",
+			fx:         trustedSweepFixture{mergeableState: "dirty", labels: []string{"needs-rebase"}},
+			wantReason: "label:needs-rebase",
 		},
 		{
 			name:        "required checks expected updates branch",
@@ -349,11 +375,11 @@ func TestPrefilterTrustedAuthorPRHeldLabel(t *testing.T) {
 		Head:   &gh.PullRequestBranch{SHA: gh.Ptr("sha")},
 		Labels: []*gh.Label{{Name: gh.Ptr("hold")}},
 	}
-	if got := engine.prefilterTrustedAuthorPR(pr, policy); got != "label:hold" {
+	if got := engine.prefilterTrustedAuthorPR("acme", "widget", pr, policy); got != "label:hold" {
 		t.Fatalf("prefilterTrustedAuthorPR = %q, want label:hold", got)
 	}
 	pr.Labels = nil
-	if got := engine.prefilterTrustedAuthorPR(pr, policy); got != "untrusted-author-role" {
+	if got := engine.prefilterTrustedAuthorPR("acme", "widget", pr, policy); got != "untrusted-author-role" {
 		t.Fatalf("prefilterTrustedAuthorPR without authorizer = %q, want untrusted-author-role", got)
 	}
 }
@@ -376,7 +402,7 @@ func TestPrefilterTrustedAuthorPRIgnoresSentinelExcludedLabel(t *testing.T) {
 		Head:   &gh.PullRequestBranch{SHA: gh.Ptr("sha")},
 		Labels: []*gh.Label{{Name: gh.Ptr("sentinel-alert")}},
 	}
-	if got := engine.prefilterTrustedAuthorPR(pr, policy); got != "" {
+	if got := engine.prefilterTrustedAuthorPR("acme", "widget", pr, policy); got != "" {
 		t.Fatalf("prefilterTrustedAuthorPR = %q, want eligible", got)
 	}
 }
@@ -503,6 +529,71 @@ func TestTrustedAuthorSweepRunsReviewGate(t *testing.T) {
 			}
 			if len(rec.evals) != 1 || rec.evals[0].Lane != stageLaneTrusted || rec.evals[0].HeadSHA != "sha7" {
 				t.Fatalf("evaluations = %+v, want one on lane %q head sha7", rec.evals, stageLaneTrusted)
+			}
+		})
+	}
+}
+
+func prLabelObjects(names []string) []map[string]string {
+	out := make([]map[string]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, map[string]string{"name": n})
+	}
+	return out
+}
+
+// Regression for "Approve and let hive merge" on an untrusted author's PR:
+// the operator's approval admits the head on the stage record, and the
+// trusted-author tier must honour it instead of parking the PR at
+// untrusted-author-role forever. The merge is attributed to the operator,
+// an admission for another head does not count, and a plain untrusted
+// author is still refused.
+func TestTrySweepTrustedAuthorPROperatorApprovalAdmitsUntrustedAuthor(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		admitHead   string
+		permission  string
+		policy      TrustedAuthorPolicy
+		wantReason  string
+		wantMerges  int
+		wantComment string
+	}{
+		{name: "no approval", wantReason: "untrusted-author-role"},
+		{name: "approval for another head", admitHead: "sha-old", wantReason: "untrusted-author-role"},
+		{name: "approval admits head", admitHead: "sha7", wantMerges: 1, wantComment: "on behalf of @clubanderson"},
+		{
+			name: "approval stands in for repo permission", admitHead: "sha7", permission: "read",
+			policy: TrustedAuthorPolicy{RequireGitHubPermission: true}, wantMerges: 1, wantComment: stagelabels.OperatorApprovalAdmission("clubanderson"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := trustedSweepFixture{author: "mallory", permission: tc.permission}
+			api := newTrustedSweepAPI(t, &fx)
+			defer api.Close()
+			policy := tc.policy
+			policy.Enabled = true
+			policy.RequireRole = "merger"
+			store := stagelabels.NewStore("", nil)
+			key := stageKey("acme", "widget", 7)
+			store.Observe(key, stagelabels.ReadyForHumanMerge, "untrusted-author-role")
+			if tc.admitHead != "" && !store.NoteAdmission(key, tc.admitHead, stagelabels.OperatorApprovalAdmission("clubanderson"), time.Date(2026, 10, 15, 13, 1, 0, 0, time.UTC)) {
+				t.Fatal("NoteAdmission refused the stage record")
+			}
+			engine := newTrustedSweepEngine(api.URL, policy, Options{StageStore: store})
+			event, reason, err := engine.trySweepTrustedAuthorPR(context.Background(), "widget", "acme", "widget", 7, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reason != tc.wantReason || fx.merges != tc.wantMerges {
+				t.Fatalf("reason=%q merges=%d, want %q/%d", reason, fx.merges, tc.wantReason, tc.wantMerges)
+			}
+			if tc.wantMerges == 1 {
+				if event.Author != "mallory" || event.Tier != "trusted-author" {
+					t.Fatalf("event = %+v, want trusted-author merge of mallory's PR", event)
+				}
+				if !strings.Contains(fx.lastComment, tc.wantComment) || strings.Contains(fx.lastComment, "holds role") {
+					t.Fatalf("merge comment must attribute the operator, not the author's role: %q", fx.lastComment)
+				}
 			}
 		})
 	}

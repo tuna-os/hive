@@ -94,6 +94,9 @@ type DashboardConfig struct {
 	//
 	// Deprecated: set dashboard.experiment_lab instead.
 	StrategyLab bool `yaml:"strategy_lab,omitempty" json:"strategy_lab,omitempty"`
+	// Matrix is the experimental, default-off Activity Monitor Matrix block
+	// (#15862); see dashboard_matrix.go.
+	Matrix DashboardMatrixConfig `yaml:"matrix,omitempty" json:"matrix,omitempty"`
 	// IssueBands configures the Repositories card's display-only issue taxonomy.
 	// It is intentionally separate from governor/project eligibility labels:
 	// queue policy decides what agents may work; these labels only decide which
@@ -439,6 +442,19 @@ type DashboardStageTrackerConfig struct {
 	// refused. Each status publish starts a sweep when one is due. 0
 	// means the default (300); a negative value disables it.
 	ClosedSweepIntervalS int `yaml:"closed_sweep_interval_s,omitempty" json:"closed_sweep_interval_s,omitempty"`
+	// WaitingPushStaleH is how many hours a PR row in the CI / Review
+	// column may wait for its author to push before the waiting-on pill's
+	// age takes the muted-stale tone (hivecommons/hive#15784). 0 means the
+	// default (4); a negative value never marks the wait stale.
+	WaitingPushStaleH int `yaml:"waiting_push_stale_h,omitempty" json:"waiting_push_stale_h,omitempty"`
+	// ToastInfoS is how many seconds the activity monitor's informational
+	// toasts (action results, waiting-on-human nudges, the merge banner)
+	// stay up before dismissing themselves (hivecommons/hive#15813).
+	// 0 means the default (15); values are clamped to 3..120.
+	ToastInfoS int `yaml:"toast_info_s,omitempty" json:"toast_info_s,omitempty"`
+	// ToastErrorS is the same for error toasts. 0 means the default (30);
+	// values are clamped to 3..120.
+	ToastErrorS int `yaml:"toast_error_s,omitempty" json:"toast_error_s,omitempty"`
 }
 
 // defaultStageTrackerClosedSweepInterval is the default
@@ -524,6 +540,30 @@ func (c *Config) WebhookWakeMinGap() time.Duration {
 	return DefaultWebhookWakeMinGapS * time.Second
 }
 
+// CIFailureWebhookKick is governor.ci_failure_webhook_kick (default true).
+func (c *Config) CIFailureWebhookKick() bool {
+	if c == nil || c.Governor.CIFailureWebhookKick == nil {
+		return true
+	}
+	return *c.Governor.CIFailureWebhookKick
+}
+
+// CIFailureKickCooldown resolves governor.ci_failure_kick_cooldown_s.
+func (c *Config) CIFailureKickCooldown() time.Duration {
+	if c != nil && c.Governor.CIFailureKickCooldownS > 0 {
+		return time.Duration(c.Governor.CIFailureKickCooldownS) * time.Second
+	}
+	return DefaultCIFailureKickCooldownS * time.Second
+}
+
+// MergeTrainStallWarn resolves governor.merge_train_stall_warn_s.
+func (c *Config) MergeTrainStallWarn() time.Duration {
+	if c != nil && c.Governor.MergeTrainStallWarnS > 0 {
+		return time.Duration(c.Governor.MergeTrainStallWarnS) * time.Second
+	}
+	return DefaultMergeTrainStallWarnS * time.Second
+}
+
 // OwnerLogins returns the AuthorizedUsers entries that hold the owner role
 // (the first entry without an explicit role, plus any ":owner" entry), in
 // their raw identity form ("alice", "github:alice"); non-GitHub identities
@@ -543,4 +583,58 @@ func (d DashboardConfig) OwnerLogins() []string {
 		}
 	}
 	return out
+}
+
+// Defaults and bounds for dashboard.stage_tracker.toast_info_s and
+// toast_error_s. The bounds are shared with the settings modal's number
+// fields and the PUT validation so every path agrees on what is legal.
+const (
+	DefaultStageTrackerToastInfoS  = 15
+	DefaultStageTrackerToastErrorS = 30
+	MinStageTrackerToastS          = 3
+	MaxStageTrackerToastS          = 120
+)
+
+// stageTrackerToastSeconds applies the shared default/clamp rule for a
+// toast duration knob.
+func stageTrackerToastSeconds(configured, def int) int {
+	if configured == 0 {
+		return def
+	}
+	return min(max(configured, MinStageTrackerToastS), MaxStageTrackerToastS)
+}
+
+// StageTrackerToastInfo is the effective dashboard.stage_tracker.toast_info_s
+// as a duration.
+func (c *Config) StageTrackerToastInfo() time.Duration {
+	if c == nil {
+		return DefaultStageTrackerToastInfoS * time.Second
+	}
+	return time.Duration(stageTrackerToastSeconds(c.Dashboard.StageTracker.ToastInfoS, DefaultStageTrackerToastInfoS)) * time.Second
+}
+
+// StageTrackerToastError is the effective
+// dashboard.stage_tracker.toast_error_s as a duration.
+func (c *Config) StageTrackerToastError() time.Duration {
+	if c == nil {
+		return DefaultStageTrackerToastErrorS * time.Second
+	}
+	return time.Duration(stageTrackerToastSeconds(c.Dashboard.StageTracker.ToastErrorS, DefaultStageTrackerToastErrorS)) * time.Second
+}
+
+// defaultStageTrackerWaitingPushStale is the default
+// dashboard.stage_tracker.waiting_push_stale_h.
+const defaultStageTrackerWaitingPushStale = 4 * time.Hour
+
+// StageTrackerWaitingPushStale is the effective
+// dashboard.stage_tracker.waiting_push_stale_h as a duration; 0 means a
+// wait is never marked stale.
+func (c *Config) StageTrackerWaitingPushStale() time.Duration {
+	if c == nil || c.Dashboard.StageTracker.WaitingPushStaleH == 0 {
+		return defaultStageTrackerWaitingPushStale
+	}
+	if c.Dashboard.StageTracker.WaitingPushStaleH < 0 {
+		return 0
+	}
+	return time.Duration(c.Dashboard.StageTracker.WaitingPushStaleH) * time.Hour
 }

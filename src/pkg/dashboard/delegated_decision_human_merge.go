@@ -21,8 +21,8 @@ import (
 // then ignores, and the operator would learn that thirty minutes later
 // through the stalled-decision path. So the hive answers at once, in the
 // same no-effect shape the SPA already renders: why it cannot merge this
-// itself, and the buttons that do — Approve & merge as maintainer, Approve
-// — let hive merge — plus how to trust the author next time.
+// itself, and the buttons that do — Approve and let hive merge (lead),
+// Merge now as maintainer — plus how to trust the author next time.
 
 // delegatedHumanMergeRule is the rule slug on the answer; it resolves in
 // the glossary to the plain words the toast head shows.
@@ -41,17 +41,17 @@ func delegatedHumanMergeReason(in delegatedecision.Input, req delegatedDecisionR
 }
 
 // delegatedHumanMergeOptions are the answer's buttons: the two merge
-// actions (merger / owner only), then send back (hive-authored PRs only:
+// actions (merger / owner only; "Approve and let hive merge" leads), then send back (hive-authored PRs only:
 // a direction has no agent to carry it on a person's PR) and close.
 func delegatedHumanMergeOptions(in delegatedecision.Input, number int, mergerRole bool) []StageTrackerDecisionOption {
 	ref := "#" + strconv.Itoa(number)
-	mergeNow := decisionOption(decisionActionMergeNow, "Approve & merge as maintainer", mergerRole, decisionWhyMergerRole)
+	mergeNow := decisionOption(decisionActionMergeNow, decisionMergeNowLabel, mergerRole, decisionWhyMergerRole)
 	mergeNow.Consequence = "merges " + ref + " now via hive's identity, attributed to you"
-	queue := decisionOption(decisionActionQueueMerge, "Approve — let hive merge", mergerRole, decisionWhyMergerRole)
-	queue.Consequence = "records your approval; the hive's merge sweep merges " + ref + " on its next pass once CI is green and the head has soaked"
+	queue := decisionOption(decisionActionQueueMerge, decisionQueueMergeLabel, mergerRole, decisionWhyMergerRole)
+	queue.Consequence = "records your approval; the hive's merge sweep merges " + ref + " on its next tick once CI is green and the head has soaked"
 	direction := decisionOption(decisionActionDirection, "Send back for a new commit", in.HiveAuthored, "The hive did not open this PR, so it cannot carry a direction to its author; leave a changes-requested review on GitHub")
 	closeSup := decisionOption(decisionActionCloseSuperseded, "Close as superseded", true, "")
-	return []StageTrackerDecisionOption{mergeNow, queue, direction, closeSup}
+	return []StageTrackerDecisionOption{queue, mergeNow, direction, closeSup}
 }
 
 // decisionWhyMergerRole is the plain reason a merge button is greyed.
@@ -71,6 +71,9 @@ func (s *Server) delegatedHumanMergeOutcome(repoFull string, number int, itemTyp
 		code = delegatedHumanMergeRule
 	}
 	why := stageTrackerUntrustedAuthorWhy(base, in.Author)
+	if fix := stageTrackerUntrustedAuthorFix(base, in.Author); why != "" && fix != "" {
+		why += ". " + strings.TrimSuffix(fix, ".")
+	}
 	if why == "" {
 		why = decisionPlainReason(base)
 		if base == "" || why == base {
@@ -110,7 +113,7 @@ func (s *Server) delegatedHumanMergeOutcome(repoFull string, number int, itemTyp
 // "Let hive decide" on an untrusted author's 090 PR takes the decision
 // (hivecommons/hive#15173) instead of answering that it cannot merge: when
 // nothing is wrong with the PR the owner's delegate approves it — the same
-// path as "Approve — let hive merge", so the merge sweep merges the PR under
+// path as "Approve and let hive merge", so the merge sweep merges the PR under
 // its own number once the head has soaked — and only a red, conflicting or
 // unreviewed head falls back to adoption in supersede mode.
 const (
@@ -118,6 +121,7 @@ const (
 	delegatedHumanMergeAdoptCIRedRule  = "human-merge-adopt-ci-red"
 	delegatedHumanMergeAdoptRebaseRule = "human-merge-adopt-conflicting"
 	delegatedHumanMergeAdoptReviewRule = "human-merge-adopt-review"
+	delegatedHumanMergeAdoptDCORule    = "human-merge-adopt-dco"
 )
 
 // delegatedHumanMergeDecidedPath is the chosen path and its reason for a
@@ -133,6 +137,10 @@ func delegatedHumanMergeDecidedPath(rule string) string {
 		return "adopt · conflicting, needs rebase"
 	case delegatedHumanMergeAdoptReviewRule:
 		return "adopt · review not passed"
+	case delegatedHumanMergeAdoptDCORule:
+		return "adopt · DCO sign-off missing"
+	case delegatedecision.RuleReturnToAuthor:
+		return "return to author · a person pushed this PR; the hive asked them, not adopted it"
 	}
 	return ""
 }
@@ -174,6 +182,14 @@ func (s *Server) delegatedHumanMergeDecision(in delegatedecision.Input, req dele
 	}
 	ref := "#" + strconv.Itoa(in.Number)
 	adopt := func(rule, why string) (delegatedecision.Decision, []string, bool) {
+		if in.PersonAuthored() {
+			// A person pushed this PR: it is theirs to fix, never the
+			// hive's to adopt (hivecommons/hive#15202).
+			if d, ok := delegatedecision.ReturnToAuthor(in); ok {
+				return d, []string{"hive decided: return to author · " + why}, true
+			}
+			return delegatedecision.Decision{}, nil, false
+		}
 		if !s.stageAdoptionEnabled() {
 			return delegatedecision.Decision{}, nil, false
 		}
@@ -189,6 +205,8 @@ func (s *Server) delegatedHumanMergeDecision(in delegatedecision.Input, req dele
 	switch {
 	case in.Conflicting:
 		return adopt(delegatedHumanMergeAdoptRebaseRule, "the branch conflicts with the base and needs a rebase")
+	case in.DCOMissing:
+		return adopt(delegatedHumanMergeAdoptDCORule, "the DCO sign-off is missing from its commits")
 	case !in.CIGreen:
 		return adopt(delegatedHumanMergeAdoptCIRedRule, "CI is not green on its head")
 	case !s.delegatedHumanMergeReviewPassed(in):
@@ -208,7 +226,7 @@ func (s *Server) delegatedHumanMergeDecision(in delegatedecision.Input, req dele
 
 // admitDelegatedHumanMergeHead writes the delegating person's approval as
 // the trust override for the PR's current head before the approval lands —
-// what "Approve — let hive merge" writes (hivecommons/hive#15136) — so the
+// what "Approve and let hive merge" writes (hivecommons/hive#15136) — so the
 // adoption engine cannot take the PR over before the sweep merges it.
 func (s *Server) admitDelegatedHumanMergeHead(ctx context.Context, repoFull string, number int, user string) string {
 	state, err := s.deps.GHClient.GetPRState(ctx, repoFull, number)

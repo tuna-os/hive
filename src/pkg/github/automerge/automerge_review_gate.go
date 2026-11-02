@@ -312,43 +312,13 @@ func reviewGateRecordLane(lane string) string {
 }
 
 func (c *Engine) latestTrustedHumanApproval(ctx context.Context, owner, repo string, number int, head string) (string, bool) {
-	if c == nil || c.gh == nil {
+	rv, ok := c.latestTrustedHumanReview(ctx, owner, repo, number, head, "APPROVED")
+	if !ok {
 		return "", false
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	opts := &gh.ListOptions{PerPage: 100}
-	var seen []*gh.PullRequestReview
-	for {
-		reviews, resp, err := c.gh.PullRequests.ListReviews(ctx, owner, repo, number, opts)
-		if err != nil {
-			c.warn("automerge review gate could not read PR reviews for human approval", "owner", owner, "repo", repo, "pr", number, "error", err)
-			return "", false
-		}
-		seen = append(seen, reviews...)
-		for _, review := range reviews {
-			if !strings.EqualFold(review.GetState(), "APPROVED") || strings.TrimSpace(review.GetCommitID()) != head {
-				continue
-			}
-			login := strings.TrimSpace(hgithub.SafeGetLogin(review.GetUser()))
-			if login == "" || c.isHiveAppReviewAuthor(review) || strings.HasSuffix(strings.ToLower(login), "[bot]") {
-				continue
-			}
-			trusted, configured := c.isTrustedMerger(login)
-			if configured && trusted {
-				c.noteStageReviews(owner, repo, number, seen)
-				c.noteStageTrustedHumanApproval(owner, repo, number, head, login)
-				return login, true
-			}
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-	c.noteStageReviews(owner, repo, number, seen)
-	return "", false
+	login := strings.TrimSpace(hgithub.SafeGetLogin(rv.GetUser()))
+	c.noteStageTrustedHumanApproval(owner, repo, number, head, login)
+	return login, true
 }
 
 func (c *Engine) trustedHumanApprovalForRequiresHuman(ctx context.Context, owner, repo string, number int, head string, verdict ContributorLaneVerdict) (string, bool) {
@@ -358,20 +328,25 @@ func (c *Engine) trustedHumanApprovalForRequiresHuman(ctx context.Context, owner
 	if login, ok := c.latestTrustedHumanApproval(ctx, owner, repo, number, head); ok {
 		return login, true
 	}
-	return c.recordedHumanApprovalForHead(owner, repo, number, head)
+	// No live trusted approval on head: a persisted review-backed approval
+	// is revoked, so drop it before reading the recorded decision.
+	c.reconcileReviewBackedApproval(ctx, owner, repo, number, head)
+	return c.recordedHumanApprovalForHead(ctx, owner, repo, number, head)
 }
 
 // recordedHumanApprovalForHead is a bare `/hive decision approve` the un-park
 // sweep recorded against head (pr_unpark_decision.go): the owner answered the
 // swarm's question with "yes" in a comment rather than a GitHub review. It
 // releases requires_human the way an APPROVED review on the head does
-// (hivecommons/hive#14679).
-func (c *Engine) recordedHumanApprovalForHead(owner, repo string, number int, head string) (string, bool) {
+// (hivecommons/hive#14679). An approval recorded on the previous head
+// follows the PR when the hive's own base refresh is all that moved it
+// (hivecommons/hive#15649).
+func (c *Engine) recordedHumanApprovalForHead(ctx context.Context, owner, repo string, number int, head string) (string, bool) {
 	if c == nil || c.humanChangeRequests == nil || strings.TrimSpace(head) == "" {
 		return "", false
 	}
-	req, ok := c.humanChangeRequests.For(owner+"/"+repo, number, strings.TrimSpace(head))
-	if !ok || !req.IsApproval() || strings.TrimSpace(req.Actor) == "" {
+	req, ok := c.recordedDecisionFor(ctx, owner, repo, number, "", head)
+	if !ok || !req.IsApproval() {
 		return "", false
 	}
 	login := strings.ToLower(strings.TrimSpace(req.Actor))

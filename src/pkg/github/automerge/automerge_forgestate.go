@@ -265,6 +265,9 @@ func (c *Engine) openPullRequests(ctx context.Context, owner, repoName string, t
 	fullRepo := owner + "/" + repoName
 	if c.openPRs == nil {
 		prs, err := c.listOpenPullRequests(ctx, owner, repoName)
+		if err == nil {
+			c.rememberClaimants(fullRepo, prs)
+		}
 		if err != nil || targets == nil {
 			return prs, "", err
 		}
@@ -354,14 +357,14 @@ func (c *Engine) runEventDrivenSweep(ctx context.Context, maxMerges int, acmmAll
 	}
 	floor := time.NewTicker(c.floorInterval())
 	defer floor.Stop()
-	c.sweepClock.armFloor(c.now().Add(c.floorInterval()))
+	c.sweepClock.armFloorEvery(c.now(), c.floorInterval())
 	c.sweepPass(ctx, maxMerges, acmmAllowed, nil, "startup")
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-floor.C:
-			c.sweepClock.armFloor(c.now().Add(c.floorInterval()))
+			c.sweepClock.armFloorEvery(c.now(), c.floorInterval())
 			// The floor pass is low-priority work like the legacy tick: under
 			// rate-limit caution it yields to the queue (#13382); event passes
 			// are targeted and still run.

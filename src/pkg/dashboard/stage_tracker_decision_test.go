@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -250,11 +251,54 @@ func TestStageTrackerVerdictLookup(t *testing.T) {
 	}
 }
 
+// The lead merge-gate answer is "Approve and let hive merge" whenever it
+// can be clicked; "Merge now as maintainer" steps forward only when
+// queueing is greyed out, so the lead is never a button nobody can press.
+func TestStageTrackerDecisionHumanMergeLeadOptions(t *testing.T) {
+	since := time.Date(2026, 10, 28, 15, 0, 0, 0, time.UTC)
+	base := StageTrackerItem{Repo: "hivecommons/hotshot", Number: 317, Kind: "pr", Author: "Karibhou", AuthorKind: authorKindHuman, BaseRef: "main",
+		Stage: stagelabels.ReadyForHumanMerge.Number(), StageSince: &since, Reason: stageengineprstage.ContributorLaneReasonAuthorAssociation}
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*StageTrackerItem)
+		held     bool
+		wantLead string
+		leadOn   bool
+	}{
+		{name: "plain row leads with queue-merge", mutate: func(*StageTrackerItem) {}, wantLead: decisionActionQueueMerge, leadOn: true},
+		{name: "needs-rebase row still leads with queue-merge", mutate: func(it *StageTrackerItem) { it.Labels = []string{"needs-rebase"} }, wantLead: decisionActionQueueMerge, leadOn: true},
+		{name: "admitted head leads with merge-now", mutate: func(it *StageTrackerItem) { it.AdmittedBy = stagelabels.OperatorApprovalAdmission("octo") }, wantLead: decisionActionMergeNow, leadOn: true},
+		{name: "breaking change leads with merge-now", mutate: func(it *StageTrackerItem) { it.Reason = stageengineprstage.AutoMergeReasonHumanMergeRequired }, wantLead: decisionActionMergeNow, leadOn: true},
+		{name: "held row keeps queue-merge first, both greyed", mutate: func(*StageTrackerItem) {}, held: true, wantLead: decisionActionQueueMerge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			it := base
+			tc.mutate(&it)
+			d := decisionForHumanMerge(it, tc.held)
+			if len(d.Options) < 2 {
+				t.Fatalf("options = %+v", d.Options)
+			}
+			lead, second := d.Options[0], d.Options[1]
+			if lead.Action != tc.wantLead || lead.Enabled != tc.leadOn {
+				t.Fatalf("lead = %+v, want %s enabled=%v", lead, tc.wantLead, tc.leadOn)
+			}
+			merge := map[string]bool{decisionActionQueueMerge: true, decisionActionMergeNow: true}
+			if !merge[second.Action] || second.Action == lead.Action {
+				t.Fatalf("second = %+v, want the other merge action", second)
+			}
+			if lead.Action == decisionActionQueueMerge && lead.Label != "Approve and let hive merge" {
+				t.Fatalf("lead label = %q", lead.Label)
+			}
+		})
+	}
+}
+
 // TestStageTrackerDecisionForHumanMerge: a PR at 090 Ready for human merge
 // asks the person to merge, so the decision leads with the two ways to do
-// that — merge now as maintainer, or approve and let the hive's sweep merge
-// — each with its consequence, then direction / close / hold
-// (hivecommons/hive#15078: hotshot#317 had no such action).
+// that — "Approve and let hive merge" first (the maintainer's default last
+// word: the hive's sweep merges on its next tick once CI is green), then
+// "Merge now as maintainer" — each with its consequence, then direction /
+// close / hold (hivecommons/hive#15078: hotshot#317 had no such action).
 func TestStageTrackerDecisionForHumanMerge(t *testing.T) {
 	since := time.Date(2026, 10, 28, 15, 0, 0, 0, time.UTC)
 	it := StageTrackerItem{Repo: "hivecommons/hotshot", Number: 317, Kind: "pr", Author: "Karibhou", AuthorKind: authorKindHuman, BaseRef: "main",
@@ -263,20 +307,31 @@ func TestStageTrackerDecisionForHumanMerge(t *testing.T) {
 	if d == nil || d.AskedBy != decisionAskedByLane {
 		t.Fatalf("decision = %+v", d)
 	}
-	if got := []string{d.Options[0].Action, d.Options[1].Action}; got[0] != decisionActionMergeNow || got[1] != decisionActionQueueMerge {
-		t.Fatalf("lead options = %v, want merge-now then queue-merge", got)
+	if got := []string{d.Options[0].Action, d.Options[1].Action}; got[0] != decisionActionQueueMerge || got[1] != decisionActionMergeNow {
+		t.Fatalf("lead options = %v, want queue-merge then merge-now", got)
 	}
-	merge := d.Options[0]
-	if !merge.Enabled || merge.Label != "Approve & merge as maintainer" || merge.Consequence != "merges #317 into main now via hive's identity, attributed to you" {
-		t.Fatalf("merge-now = %+v", merge)
-	}
-	queue := d.Options[1]
-	if !queue.Enabled || queue.Label != "Approve — let hive merge" || !strings.Contains(queue.Consequence, "merge sweep merges #317") || !strings.Contains(queue.Consequence, "soaked") {
+	queue := d.Options[0]
+	if !queue.Enabled || queue.Label != "Approve and let hive merge" || queue.Consequence != "Hive merges #317 on its next tick once CI is green" {
 		t.Fatalf("queue-merge = %+v", queue)
 	}
-	for _, want := range []string{"untrusted author", "@Karibhou is not a collaborator", "👥 Contributors", "auto_merge.contributor_lane.require_tiers"} {
-		if !strings.Contains(d.Question, want) {
-			t.Errorf("question lacks %q: %q", want, d.Question)
+	merge := d.Options[1]
+	if !merge.Enabled || merge.Label != "Merge now as maintainer" || merge.Consequence != "Merges #317 into main now, credited to you" {
+		t.Fatalf("merge-now = %+v", merge)
+	}
+	// hivecommons/hive#15394: the first read is one plain sentence of
+	// state and one of why; the how-to-trust line sits behind Details.
+	if d.Question != "Ready to merge. Hive won't merge it alone — @Karibhou isn't a trusted author yet." {
+		t.Errorf("question = %q", d.Question)
+	}
+	if !strings.Contains(d.Detail, "To trust @Karibhou: give them the trusted tier under 👥 Contributors") || strings.Contains(d.Detail, "auto_merge.") {
+		t.Errorf("detail = %q", d.Detail)
+	}
+	if d.Blocker != "" {
+		t.Errorf("blocker should be empty on the first read: %q", d.Blocker)
+	}
+	for _, o := range d.Options {
+		if n := len(strings.Fields(o.Consequence)); n > 12 {
+			t.Errorf("%s consequence is %d words: %q", o.Action, n, o.Consequence)
 		}
 	}
 	dir := decisionOptionByAction(t, d, decisionActionDirection)
@@ -296,8 +351,8 @@ func TestStageTrackerDecisionForHumanMerge(t *testing.T) {
 		if d == nil || !decisionOptionByAction(t, d, decisionActionDirection).Enabled {
 			t.Fatalf("decision = %+v", d)
 		}
-		if d.Options[0].Action != decisionActionMergeNow {
-			t.Fatalf("merge-now must lead: %+v", d.Options)
+		if d.Options[0].Action != decisionActionQueueMerge || d.Options[1].Action != decisionActionMergeNow {
+			t.Fatalf("queue-merge must lead, merge-now second: %+v", d.Options)
 		}
 	})
 
@@ -321,11 +376,11 @@ func TestStageTrackerDecisionForHumanMerge(t *testing.T) {
 		agent := it
 		agent.Author, agent.AuthorKind, agent.DCOUnsigned, agent.DCOTotal = "hive[bot]", "hive", 2, 3
 		d := stageTrackerDecisionNeeded(agent, nil, "")
-		if !strings.Contains(d.Blocker, "2 of 3 commits have no Signed-off-by") || !strings.Contains(d.Blocker, "Re-author as hive PR is the separate choice") {
-			t.Fatalf("blocker lacks the DCO warning: %q", d.Blocker)
+		if !strings.Contains(d.Detail, "2 of 3 commits have no Signed-off-by") || !strings.Contains(d.Detail, "Re-author as hive PR is the separate choice") {
+			t.Fatalf("details lack the DCO warning: %q", d.Detail)
 		}
-		if got := []string{d.Options[0].Action, d.Options[1].Action, d.Options[2].Action}; got[2] != decisionActionReauthor || got[0] != decisionActionMergeNow || got[1] != decisionActionQueueMerge {
-			t.Fatalf("options = %v, want merge-now, queue-merge, re-author", got)
+		if got := []string{d.Options[0].Action, d.Options[1].Action, d.Options[2].Action}; got[2] != decisionActionReauthor || got[0] != decisionActionQueueMerge || got[1] != decisionActionMergeNow {
+			t.Fatalf("options = %v, want queue-merge, merge-now, re-author", got)
 		}
 		for _, a := range []string{decisionActionMergeNow, decisionActionQueueMerge} {
 			if o := decisionOptionByAction(t, d, a); !o.Enabled || !strings.Contains(o.Consequence, "no Signed-off-by") {
@@ -351,8 +406,8 @@ func TestStageTrackerDecisionForHumanMerge(t *testing.T) {
 		admitted := it
 		admitted.AdmittedBy = stagelabels.OperatorApprovalAdmission("octo")
 		d := stageTrackerDecisionNeeded(admitted, nil, "")
-		if !strings.Contains(d.Blocker, "Admitted by @octo (operator-approval:octo)") {
-			t.Fatalf("blocker = %q", d.Blocker)
+		if !strings.Contains(d.Detail, "Admitted by @octo (operator-approval:octo)") || !strings.HasPrefix(d.Question, "@octo approved it.") {
+			t.Fatalf("question = %q detail = %q", d.Question, d.Detail)
 		}
 		if o := decisionOptionByAction(t, d, decisionActionQueueMerge); o.Enabled || !strings.Contains(o.ReasonIfDisabled, "@octo already approved") {
 			t.Fatalf("queue-merge after admission = %+v", o)
@@ -451,3 +506,56 @@ func TestStageTrackerNeedsHumanStatesCarryAnAction(t *testing.T) {
 		})
 	}
 }
+
+// TestStageTrackerHumanMergeSaysItOnce (hivecommons/hive#15394): the 090
+// hover is built from the question, the folded details, the gate word's
+// tip and the next-move line. No sentence may appear twice across them,
+// the next-move line must not echo the reason text, and none of the
+// operator-visible strings may carry a config key or internal jargon.
+func TestStageTrackerHumanMergeSaysItOnce(t *testing.T) {
+	since := time.Date(2026, 10, 28, 15, 0, 0, 0, time.UTC)
+	for _, reason := range []string{
+		stageengineprstage.ContributorLaneReasonAuthorAssociation, "untrusted-author-role", "author-permission-missing", "fork-non-member",
+		stageengineprstage.ContributorLaneReasonClaimTier, stageengineprstage.ContributorLaneReasonClaimUnverified, stageengineprstage.ContributorLaneReasonNoClaim,
+		"contributor-lane:workflow-files", "contributor-lane:tests-removed", "repo-auto-merge-disabled", "something-brand-new",
+	} {
+		it := StageTrackerItem{Repo: "hivecommons/hive", Number: 15315, Kind: "pr", Author: "odttlnt", AuthorKind: authorKindHuman, BaseRef: "v5",
+			Stage: stagelabels.ReadyForHumanMerge.Number(), StageSince: &since, Reason: reason}
+		base, _ := stagelabels.HumanApprovedReason(reason)
+		if why := stageTrackerUntrustedAuthorWhy(base, it.Author); why != "" {
+			it.HumanMergeReasonText = "Hive won't merge it alone — " + why
+		}
+		it.HumanMergeReason, _, _ = stageTrackerHumanMergeReason(reason)
+		d := stageTrackerDecisionNeeded(it, nil, "")
+		actor := stageTrackerStageActor(it, nil, since)
+		if n := len(strings.Fields(d.Question)); n > 25 {
+			t.Errorf("%s: question is %d words: %q", reason, n, d.Question)
+		}
+		seen := map[string]string{}
+		for _, part := range []struct{ name, text string }{{"question", d.Question}, {"blocker", d.Blocker}, {"detail", d.Detail}, {"next-move", actor.Why}} {
+			for _, sent := range stageTrackerSentences(part.text) {
+				if prev, dup := seen[sent]; dup {
+					t.Errorf("%s: %q appears in both %s and %s", reason, sent, prev, part.name)
+				}
+				seen[sent] = part.name
+			}
+		}
+		if it.HumanMergeReasonText != "" && strings.Contains(actor.Why, it.HumanMergeReasonText) {
+			t.Errorf("%s: next-move echoes the reason text: %q", reason, actor.Why)
+		}
+		all := strings.Join([]string{d.Question, d.Blocker, d.Detail, actor.Why, it.HumanMergeReasonText}, " ")
+		if m := configKeyRE.FindString(all); m != "" {
+			t.Errorf("%s: config key %q in hover text: %q", reason, m, all)
+		}
+		for _, word := range []string{"sweep", "soak", "sentinel", "audit marker", "trust override", " lane", "requires_human", " 085", " 090"} {
+			if strings.Contains(strings.ToLower(all), word) {
+				t.Errorf("%s: jargon %q in hover text: %q", reason, word, all)
+			}
+		}
+	}
+	if got := stageTrackerSayOnce("Ready to merge. Hive won't merge it alone — @x isn't trusted.", "hive won't merge it alone — @x isn't trusted. To trust @x: do this.", "To trust @x: do this. Rails apply."); got != "To trust @x: do this. Rails apply." {
+		t.Errorf("stageTrackerSayOnce = %q", got)
+	}
+}
+
+var configKeyRE = regexp.MustCompile(`\b[a-z_]+\.[a-z_]+\.[a-z_]+\b`)

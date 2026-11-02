@@ -15,7 +15,10 @@ import (
 	"github.com/hivecommons/hive/pkg/github/automerge"
 	"github.com/hivecommons/hive/pkg/holdguard"
 	"github.com/hivecommons/hive/pkg/intent"
+	"github.com/hivecommons/hive/pkg/review"
+	"github.com/hivecommons/hive/pkg/stageengine/prstage"
 	"github.com/hivecommons/hive/pkg/stagelabels"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 var (
@@ -35,6 +38,43 @@ func getHoldGuardStore() *holdguard.Store {
 		holdGuardStore = holdguard.Load(holdGuardLedgerPath)
 	})
 	return holdGuardStore
+}
+
+// holdGuardHumanChangeRequests resolves the decision ledger the hold guard
+// reads operator approvals from; tests swap in a memory-only store.
+var holdGuardHumanChangeRequests = func() review.HumanChangeRequestStore {
+	return review.DefaultHumanChangeRequests()
+}
+
+// holdGuardOperatorApproval reports the trusted merger whose recorded
+// approval (dashboard Approve or `/hive decision approve`,
+// pr_decision_operator.go) stands against exactly headSHA on repo#number.
+// The record is head-scoped — a newer head supersedes it — so it is proof
+// the person reviewed the tree on the branch now, which the gate-lift
+// timeline cannot show when the hive removed the label for them. Fails
+// closed: no record, a change request, an unknown or untrusted actor, or an
+// empty head never cover the head. The one head change that does not
+// supersede the record is the hive's own base refresh — a merge of the base
+// branch by the App that leaves the PR's diff as the person saw it — which
+// carries the approval onto the new head first (hivecommons/hive#15649).
+func holdGuardOperatorApproval(ctx context.Context, cfg *config.Config, ghClient *github.Client, repo string, number int, headSHA string) (string, bool) {
+	headSHA = strings.TrimSpace(headSHA)
+	if cfg == nil || headSHA == "" {
+		return "", false
+	}
+	store := holdGuardHumanChangeRequests()
+	if store == nil {
+		return "", false
+	}
+	req, ok := ghClient.RecordedDecisionFor(ctx, store, repo, number, headSHA)
+	if !ok || !req.IsApproval() || !strings.EqualFold(strings.TrimSpace(req.HeadSHA), headSHA) {
+		return "", false
+	}
+	login := strings.TrimSpace(req.Actor)
+	if !trustedMergerFunc(cfg)(login) {
+		return "", false
+	}
+	return login, true
 }
 
 // enforceHoldGuard closes #5589: a hold-gated PR that accumulates commits —
@@ -160,6 +200,18 @@ func enforceHoldGuard(
 				continue
 			}
 		}
+		// A dashboard Approve (or `/hive decision approve`) is recorded
+		// against the exact head the person saw; the hive then removes the
+		// gate label on their behalf, so the timeline below shows a hive
+		// lift that can never cover the head. The head-keyed approval by a
+		// trusted merger is the review the guard asks for: accept it.
+		if login, ok := holdGuardOperatorApproval(ctx, cfg, ghClient, repo, pr.Number, pr.HeadSHA); ok {
+			store.Clear(repo, pr.Number)
+			logger.Info("hold guard: current head approved by a trusted merger through the hive's decision record; head accepted",
+				"repo", repo, "pr", pr.Number,
+				"recorded_head", rec.HeadSHA, "current_head", pr.HeadSHA, "approver", login)
+			continue
+		}
 		if ghClient != nil {
 			// A trusted human who removed the gate label AFTER the current
 			// head arrived reviewed the head that is on the branch now; an
@@ -208,8 +260,17 @@ func enforceHoldGuard(
 			// exclusion above still holds every tick; side effects wait.
 			continue
 		}
+		// Hold-gate upkeep is own-only (writeback.KindHoldGateNotice): the
+		// reReview exclusion above already blocks the merge internally; a
+		// drift comment and re-hold label on a human's PR the hive never
+		// opened is the torch-spyre spam. The gate records the suppression
+		// for the dashboard.
+		if d := ghClient.WritebackAllowed(repo, ghClient.WritebackItemForPR(pr), writeback.KindHoldGateNotice, holdguard.CommentBody(drift)); !d.Allowed {
+			logger.Info("hold guard: drift notice kept off GitHub by write-back gate", "repo", repo, "pr", pr.Number, "reason", d.Reason)
+			continue
+		}
 		if !rec.Commented {
-			if err := writer.CreateIssueComment(ctx, pr.Repo, pr.Number, holdguard.CommentBody(drift)); err != nil {
+			if err := writer.CreateIssueComment(ctx, pr.Repo, pr.Number, holdguard.CommentBody(drift)); err != nil { // writeback:gated
 				// Retry the whole episode next tick rather than re-holding
 				// with no explanation — the evidence reaching a human is the
 				// point, and the exclusion above already blocks the merge.
@@ -219,7 +280,7 @@ func enforceHoldGuard(
 			}
 			store.MarkCommented(repo, pr.Number)
 		}
-		if err := writer.AddLabels(ctx, pr.Repo, pr.Number, []string{holdguard.ReHoldLabel}); err != nil {
+		if err := writer.AddLabels(ctx, pr.Repo, pr.Number, []string{holdguard.ReHoldLabel}); err != nil { // writeback:gated
 			// Commented but not re-held: the snapshot stays on the OLD head,
 			// so next tick re-detects the drift (comment deduped) and retries
 			// the label. Never re-arm before the label sticks.
@@ -315,6 +376,12 @@ func maintainHeldPRMergeability(
 		if state != "behind" && state != "dirty" {
 			continue
 		}
+		// Own-only: upkeep of held PRs must pass the same write-back
+		// containment gate as its conflict notices.
+		if d := ghClient.WritebackAllowed(repo, ghClient.WritebackItemForPR(pr), writeback.KindHoldGateNotice, holdguard.ConflictCommentBody()); !d.Allowed {
+			logger.Debug("hold guard: held-PR mergeability upkeep kept off GitHub by write-back gate", "repo", repo, "pr", pr.Number, "reason", d.Reason)
+			continue
+		}
 		if hasLabel(pr.Labels, returned) {
 			continue
 		}
@@ -338,7 +405,7 @@ func maintainHeldPRMergeability(
 		// stacks its merge on commits the guard has not evaluated. The
 		// post-hoc IsHygieneMerge check below still covers a push landing
 		// after the 202 (hivecommons/hive#14537).
-		if err := ghClient.UpdateBranchExpectedHead(ctx, pr.Repo, pr.Number, head, base); err != nil {
+		if err := ghClient.UpdateBranchExpectedHead(ctx, pr.Repo, pr.Number, head, base); err != nil { // writeback:gated
 			if github.IsUpdateBranchStaleHead(err) {
 				// The head moved since enumeration: not a conflict, and not
 				// ours to merge onto. The next tick re-reads the head and the
@@ -433,6 +500,7 @@ func stopHeldPRUpdate(ctx context.Context, writer forge.IssueWriter, store *hold
 // once per head and reason, retrying a failed post on later passes. A
 // conflict keeps the conflict notice (dirty only, as before); GitHub calling
 // a "behind" branch current is a stale state, not something to act on.
+// maintainHeldPRMergeability checks KindHoldGateNotice before reaching here.
 func noteHeldPRUpdateStopped(ctx context.Context, writer forge.IssueWriter, store *holdguard.Store, repo string, pr github.PullRequest, reason string, logger *slog.Logger) {
 	if writer == nil {
 		return
@@ -448,7 +516,7 @@ func noteHeldPRUpdateStopped(ctx context.Context, writer forge.IssueWriter, stor
 		if rec.ConflictNoted || strings.ToLower(pr.MergeableState) != "dirty" {
 			return
 		}
-		if err := writer.CreateIssueComment(ctx, pr.Repo, pr.Number, holdguard.ConflictCommentBody()); err != nil {
+		if err := writer.CreateIssueComment(ctx, pr.Repo, pr.Number, holdguard.ConflictCommentBody()); err != nil { // writeback:gated
 			logger.Warn("hold guard: posting held-PR conflict notice failed; will retry next pass",
 				"repo", repo, "pr", pr.Number, "error", err)
 			return
@@ -459,7 +527,7 @@ func noteHeldPRUpdateStopped(ctx context.Context, writer forge.IssueWriter, stor
 	if rec.UpdateStopNoted(pr.HeadSHA, reason) {
 		return
 	}
-	if err := writer.CreateIssueComment(ctx, pr.Repo, pr.Number, holdguard.UpdateStoppedCommentBody(reason)); err != nil {
+	if err := writer.CreateIssueComment(ctx, pr.Repo, pr.Number, holdguard.UpdateStoppedCommentBody(reason)); err != nil { // writeback:gated
 		logger.Warn("hold guard: posting held-PR update notice failed; will retry next pass",
 			"repo", repo, "pr", pr.Number, "reason", reason, "error", err)
 		return
@@ -491,6 +559,16 @@ func humanMergePathsFor(cfg *config.Config, repo string) []string {
 		return nil
 	}
 	return cfg.AutoMerge.HumanMergePathsFor(repo)
+}
+
+// humanMergeRuleFor reads auto_merge.human_merge_title_prefixes /
+// human_merge_labels through cfg on every call so a reload applies
+// (hivecommons/hive#15442). A nil config means the defaults.
+func humanMergeRuleFor(cfg *config.Config) prstage.HumanMergeRule {
+	if cfg == nil {
+		return prstage.HumanMergeRule{}
+	}
+	return cfg.AutoMerge.HumanMergeRule()
 }
 
 // selfMergeIntentGate builds the intent-tier gate the App self-merge sweep

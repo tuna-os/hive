@@ -365,6 +365,11 @@ func (s *Server) applyPack(level int, forceGovernor bool) (*ApplyPackResult, err
 
 			// Respect user's enabled: false — don't override it.
 			if changed || stamped {
+				// Any backend move above must not leave a launch_cmd that
+				// launches the previous CLI behind.
+				if changed {
+					s.reconcileLaunchCmdForBackend(pa.Name, &existing)
+				}
 				s.deps.Config.Agents[pa.Name] = existing
 				_ = s.deps.AgentMgr.UpdateConfig(pa.Name, existing)
 				if agentsDir != "" {

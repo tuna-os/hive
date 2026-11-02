@@ -317,12 +317,12 @@ RUN timeout 120s npm install -g --ignore-scripts --no-fund --no-audit \
 # dashboard's codex model discovery (`codex app-server` model/list — pure
 # local stdio, no network, unaffected by the proxy CA) falls back to the
 # static list, and non-codex backends are unaffected.
-ARG CODEX_VERSION=0.165.0
+ARG CODEX_VERSION=0.166.0
 RUN npm install -g --ignore-scripts --no-fund --no-audit @openai/codex@${CODEX_VERSION} && npm cache clean --force || \
     echo "WARN: OpenAI Codex CLI install failed — skipping"
 
 # --- Layer 7: Claude Code (most frequent updates) ---
-ARG CLAUDE_CODE_VERSION=2.1.312
+ARG CLAUDE_CODE_VERSION=2.1.314
 # --ignore-scripts (kept, deliberately: no arbitrary postinstall runs during the
 # build) skips claude-code's install.cjs, which is what LINKS the platform
 # native binary into the package's bin/. The binary itself ships in the
@@ -343,9 +343,9 @@ RUN npm install -g --ignore-scripts --no-fund --no-audit @anthropic-ai/claude-co
 # Installs from the OFFICIAL aaif-goose/goose repo, pinned to a fixed release and
 # SHA-256-verified before extraction. Download failures are tolerated because
 # Goose is an optional backend; checksum mismatches must hard-fail the build.
-ARG GOOSE_VERSION=1.56.0
-ARG GOOSE_SHA256_AMD64=225a929b35b5130fb691eafdb50be236f2c0a150019b53973775938f8f19c281
-ARG GOOSE_SHA256_ARM64=26bcb7d3f55aac485a91d81cbdecd8d90e5af1acadeca6e580b4d58b64a888e4
+ARG GOOSE_VERSION=1.57.0
+ARG GOOSE_SHA256_AMD64=10eb96cb6a159b6e1d38eeedbef6ab64cd28168aad91948f1fa5c34eefdf98e3
+ARG GOOSE_SHA256_ARM64=c32605acfd560aeb2adbf17ec359cc0217e28022a7e647b35a6af5dcfca91749
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     case "$ARCH" in \
       amd64) GOOSE_ARCH=x86_64; GOOSE_SHA256="$GOOSE_SHA256_AMD64" ;; \
@@ -391,9 +391,9 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # --- Layer 8.27: OMP CLI (Oh My Pi — backend: omp) ---
 # Mirrored from Dockerfile.contributor so hub agents can launch backend: omp.
 # Downloads are optional like Goose/agy, but checksum mismatches are fatal.
-ARG OMP_VERSION=18.13.1
-ARG OMP_SHA256_AMD64=ee2961c7da02e514a2475ee958c2fd85dbabf4d0907949ba5022edb2951f84b5
-ARG OMP_SHA256_ARM64=803db725f9e5bd177ce5274f7718081481f367829f773d984a0a9611f4713244
+ARG OMP_VERSION=18.14.0
+ARG OMP_SHA256_AMD64=e7dd2b606c4ebe9d1a7bcfad1b8820db968cd6b05409fed1c6bc8db0b6a95a8f
+ARG OMP_SHA256_ARM64=dba8d170499709bc87359e02e677821aa76a6ef998ca0254578fe4ea07aff5bc
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
   && case "$ARCH" in \
        amd64|x86_64) OMP_ASSET=omp-linux-x64; OMP_SHA256="$OMP_SHA256_AMD64" ;; \

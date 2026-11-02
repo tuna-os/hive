@@ -271,6 +271,9 @@ func TestStageTrackerMotionDetector(t *testing.T) {
 		jsFunc(t, html, "stageTrackerItemKey"),
 		jsFunc(t, html, "stageTrackerPRKey"),
 		jsFunc(t, html, "stageTrackerLinkedDrawnHere"),
+		jsFunc(t, html, "stageTrackerLinkedSuperseder"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededGone"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededTip"),
 		jsFunc(t, html, "stageTrackerLinkedSorted"),
 		jsConstLine(t, html, "STAGE_TRACKER_ATTENTION_STAGES"),
 		jsConstLine(t, html, "STAGE_TRACKER_HUMAN_MODS"),
@@ -295,7 +298,7 @@ const col = (kind, stage) => stageTrackerColIndex({ kind, stage }, stages);
 // Column index follows the drawn anchor: shared columns and detours collapse.
 assert.strictEqual(col('issue', 0), 0); assert.strictEqual(col('issue', 10), 1); assert.strictEqual(col('issue', 15), 1);
 assert.strictEqual(col('issue', 20), 2); assert.strictEqual(col('pr', 30), 3); assert.strictEqual(col('pr', 40), 3);
-assert.strictEqual(col('pr', 50), 4); assert.strictEqual(col('pr', 60), 5); assert.strictEqual(col('pr', 70), 4); assert.strictEqual(col('pr', 71), 4);
+assert.strictEqual(col('pr', 50), 4); assert.strictEqual(col('pr', 60), 4, '060 reviewed is pre-admission: CI / Review, not the merge gate'); assert.strictEqual(col('pr', 70), 4); assert.strictEqual(col('pr', 71), 4);
 assert.strictEqual(col('pr', 80), 5); assert.strictEqual(col('pr', 85), 5); assert.strictEqual(col('pr', 90), 5); assert.strictEqual(col('pr', 95), 5); assert.strictEqual(col('pr', 100), 5);
 assert.strictEqual(col('issue', 45), 1, 'an issue parked on a person lights Actionable');
 assert.strictEqual(col('issue', 110), STAGE_TRACKER_CAP_COLUMN, 'merged is the cap column');
@@ -445,8 +448,10 @@ func TestStageTrackerMotionRowStamp(t *testing.T) {
 		jsFunc(t, html, "stageTrackerChipsHtml"),
 		jsFunc(t, html, "stageTrackerHeadColsHtml"),
 		jsFunc(t, html, "stageTrackerSinceHtml"),
+		jsConstBlock(t, html, "STAGE_TRACKER_ICONS"),
 		stageTrackerActedJS(t, html),
 		jsFunc(t, html, "stageTrackerSubRowHtml"),
+		jsFunc(t, html, "stageTrackerPRPillsHtml"),
 		jsFunc(t, html, "stageTrackerLinkedPRItem"),
 		jsFunc(t, html, "stageTrackerLinkedPROpen"),
 		jsFunc(t, html, "stageTrackerNestedOpenPRs"),
@@ -455,6 +460,9 @@ func TestStageTrackerMotionRowStamp(t *testing.T) {
 		jsFunc(t, html, "stageTrackerLinkedTip"),
 		jsConstLine(t, html, "STAGE_TRACKER_LINKED_GLYPH"),
 		jsFunc(t, html, "stageTrackerLinkedDrawnHere"),
+		jsFunc(t, html, "stageTrackerLinkedSuperseder"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededGone"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededTip"),
 		jsFunc(t, html, "stageTrackerLinkedSorted"),
 		jsFunc(t, html, "stageTrackerNeedsAttention"),
 		stageTrackerTierJS(t, html),
@@ -467,10 +475,13 @@ func TestStageTrackerMotionRowStamp(t *testing.T) {
 		jsFunc(t, html, "stageTrackerRowToolsHtml"),
 		jsFunc(t, html, "stageTrackerRowHtml"),
 		jsFunc(t, html, "stageTrackerPRIssueSlot"),
+		jsFunc(t, html, "stageTrackerClosedChipHtml"),
+		jsFunc(t, html, "stageTrackerSplitTitleTag"),
+		jsFunc(t, html, "stageTrackerTitleHtml"),
+		jsFunc(t, html, "stageTrackerItemURL"),
 	}, "\n") + `
 const now = Date.parse('2026-01-01T12:00:00Z');
 const stages = [{ number: 10, label: 'Actionable', short: 'Actionable' }, { number: 20, label: 'Claimed', short: 'Claimed' }, { number: 30, label: 'PR in progress', short: 'PR in progress' }, { number: 50, label: 'Review pending', short: 'CI / Review' }, { number: 80, label: 'Awaiting merge admission', short: 'Merge gate' }, { number: 110, label: 'Merged', short: 'Merged' }];
-const STAGE_TRACKER_ICONS = {};
 const prev = [{ kind: 'issue', repo: 'a/b', number: 1, stage: 10 }, { kind: 'issue', repo: 'a/b', number: 2, stage: 20, linked_prs: [{ number: 7, stage: 30 }, { number: 8, stage: 50 }] }, { kind: 'pr', repo: 'a/b', number: 3, stage: 50 }];
 const next = [{ kind: 'issue', repo: 'a/b', number: 1, stage: 20 }, { kind: 'issue', repo: 'a/b', number: 2, stage: 20, linked_prs: [{ number: 7, stage: 30 }, { number: 8, stage: 80 }] }, { kind: 'pr', repo: 'a/b', number: 3, stage: 50 }];
 const ctx = { nowMs: now, stages, moves: stageTrackerColMoves(stageTrackerColMap(prev, stages), stageTrackerColMap(next, stages)) };
@@ -572,6 +583,7 @@ func TestStageTrackerMotionPreviewSample(t *testing.T) {
 		jsFunc(t, html, "stageTrackerSinceHtml"),
 		stageTrackerActedJS(t, html),
 		jsFunc(t, html, "stageTrackerSubRowHtml"),
+		jsFunc(t, html, "stageTrackerPRPillsHtml"),
 		jsFunc(t, html, "stageTrackerLinkedPRItem"),
 		jsFunc(t, html, "stageTrackerLinkedPROpen"),
 		jsFunc(t, html, "stageTrackerNestedOpenPRs"),
@@ -580,9 +592,15 @@ func TestStageTrackerMotionPreviewSample(t *testing.T) {
 		jsFunc(t, html, "stageTrackerLinkedTip"),
 		jsConstLine(t, html, "STAGE_TRACKER_LINKED_GLYPH"),
 		jsFunc(t, html, "stageTrackerLinkedDrawnHere"),
+		jsFunc(t, html, "stageTrackerLinkedSuperseder"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededGone"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededTip"),
 		jsFunc(t, html, "stageTrackerLinkedSorted"),
 		jsFunc(t, html, "stageTrackerNeedsAttention"),
 		stageTrackerTierJS(t, html),
+		jsConstLine(t, html, "STAGE_TRACKER_COVERED_BY_PR"),
+		jsFunc(t, html, "stageTrackerLeadStage"),
+		jsFunc(t, html, "stageTrackerLead"),
 		jsFunc(t, html, "stageTrackerSortKey"),
 		jsFunc(t, html, "stageTrackerHeadline"),
 		jsFunc(t, html, "stageTrackerAnchor"),
@@ -595,6 +613,10 @@ func TestStageTrackerMotionPreviewSample(t *testing.T) {
 		jsFunc(t, html, "stageTrackerRowToolsHtml"),
 		jsFunc(t, html, "stageTrackerRowHtml"),
 		jsFunc(t, html, "stageTrackerPRIssueSlot"),
+		jsFunc(t, html, "stageTrackerClosedChipHtml"),
+		jsFunc(t, html, "stageTrackerSplitTitleTag"),
+		jsFunc(t, html, "stageTrackerTitleHtml"),
+		jsFunc(t, html, "stageTrackerItemURL"),
 		jsFunc(t, html, "stageTrackerItemKey"),
 		jsFunc(t, html, "stageTrackerMoveAttrs"),
 		jsFunc(t, html, "stageTrackerColIndex"),

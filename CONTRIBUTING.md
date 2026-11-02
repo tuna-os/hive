@@ -2,7 +2,7 @@
 
 Thank you for helping improve Hive. This guide is for contributing code and documentation to this repository. If you want to donate compute to a running hive, see [Contribute to a Hive](src/docs/what-is-hive.md#contribute-to-a-hive) instead.
 
-**New here?** Start with the [getting-started guide for first-time contributors](docs/getting-started-contributing.md) — it walks the end-to-end journey (finding an issue, local setup, testing without a cluster, key concepts, and what the review/CI process looks like) and links back into this guide for the mechanics. For live community help, [Join our Discord](https://hivecommons.dev/discord).
+**New here?** Start with the [getting-started guide for first-time contributors](docs/getting-started-contributing.md) — it walks the end-to-end journey (finding an issue, local setup, testing without a cluster, key concepts, and what the review/CI process looks like) and links back into this guide for the mechanics. For live community help, [Join our Discord](https://hivecommons.dev/discord). To see a hive at work, [watch the hive live on Twitch](https://www.twitch.tv/hivecommons).
 
 ## Where to work
 
@@ -258,6 +258,33 @@ rewritten; their failures are resolved by maintainer disposition, not by you.
   on failures. The waiver semantics — what each instrument accepts and its
   blast radius — are documented in
   [`src/docs/v5-sync-policy.md`](src/docs/v5-sync-policy.md#inherited-dco-failures-from-v4).
+
+  **Note on waivers:** Per-SHA waivers in `DCO_WAIVED_COMMITS` cover squash
+  commits whose author/sign-off mismatch the checkers cannot resolve on their
+  own — typically a noreply author paired with a real sign-off address that
+  has no same-person evidence in the protected branch's history yet (see the
+  next paragraph). The "Sign-off survives the squash" pre-merge check
+  (`.github/workflows/dco-squash-attribution.yml`, running
+  `src/scripts/check-squash-signoff-attribution.sh`) catches every other kind
+  of mismatch at PR time. If your PR fails that check, fix your sign-off by
+  re-signing your branch commits (`git commit --amend -s`), not by seeking a
+  waiver; waivers are a maintainer disposition for already-landed commits, not
+  a way around the pre-merge gate.
+
+  One identity shape the post-merge check resolves on its own: GitHub's squash
+  writes the pull-request author's GitHub identity on the landing commit, so a
+  contributor with a private email lands as
+  `<id>+<login>@users.noreply.github.com` while the `Signed-off-by:` carried
+  over from the branch is their real address — the one the pre-merge DCO check
+  already accepted. The checker treats that as the same person **only when the
+  protected branch's own history shows the link**: another commit authored or
+  committed under the sign-off address by the same name, or a commit on which
+  that address and `<login>`'s noreply appear together. It makes no GitHub API
+  call for this, and it reports each acceptance as an informational
+  `same-person-noreply … evidence=<kind>:<sha>` line rather than hiding it. A
+  first-time contributor's squash has no such evidence yet and still needs a
+  per-SHA waiver, which becomes `STALE-WAIVER` once their next commit under
+  that address lands ([#15401](https://github.com/hivecommons/hive/issues/15401)).
 
 All four reuse the same trailer validation (`src/scripts/check-dco-trailers.sh`
 for the range-scanning gates), and the sign-off *identity* rules — noreply

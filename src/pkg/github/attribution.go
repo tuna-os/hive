@@ -45,6 +45,10 @@ const (
 	// required "Gap vs existing" section. The detail names the match so the
 	// refusal is visible to operators, not just in the agent's bead store.
 	AuditActionAgentIssuePriorArtRefused = "agent_issue_prior_art_refused"
+	// AuditActionAgentIssueEmptyAdvisoryRefused: the relay refused an
+	// issue-create whose body is a dedupe checklist with nothing actionable
+	// in it (hivecommons/hive#15381).
+	AuditActionAgentIssueEmptyAdvisoryRefused = "agent_issue_empty_advisory_refused"
 	// AuditActionHiveIssueCreated is the audit action recorded when the hive
 	// itself creates an issue (advisory issue, ACMM-gap issue).
 	AuditActionHiveIssueCreated = "hive_issue_created"
@@ -147,7 +151,7 @@ const (
 	// counted as relay merges.
 	PRAuditPathForge = "forge"
 	// PRAuditPathDashboard marks a merge an operator asked for from the
-	// dashboard's activity monitor ("Approve & merge as maintainer" on a
+	// dashboard's activity monitor ("Merge now as maintainer" on a
 	// Ready-for-human-merge row, hivecommons/hive#15078): the hive's App
 	// performs it, the audit line names the person.
 	PRAuditPathDashboard = "dashboard"
