@@ -71,25 +71,26 @@ const (
 // has to carry a second copy of this vocabulary (the #6902 "one admission path"
 // rule applies to the WORDS as much as to the decisions).
 var withheldReasonLabels = map[string]string{
-	contributorAdmissionReasonOpenPRClaim:       "An open pull request already claims this issue",
-	contributorAdmissionReasonOpenPRLinked:      "An open pull request already links this issue (claim skipped)",
-	contributorAdmissionReasonIssueClaim:        "Someone has claimed this issue; the claim expires on its own",
-	contributorAdmissionReasonMergedClaimStale:  "Fixed by a merged pull request; the issue is still open — close it or say what remains",
-	contributorAdmissionReasonIssueChurn:        "Too many pull requests on one issue — needs maintainer triage",
-	contributorAdmissionReasonWorkflowBlocked:   "Workflow label: blocked",
-	contributorAdmissionReasonLabelSkipped:      "Contribute skip label",
-	contributorAdmissionReasonDependencyBlocked: "A dependency is still open",
-	contributorAdmissionReasonDependencyUnknown: "A dependency could not be resolved",
-	withheldReasonDisabledRepo:                  "Repository is disabled for contribution",
-	withheldReasonRepoUnmintable:                "Repository excluded after a GitHub App token mint failure",
-	withheldReasonTracker:                       "Tracker / umbrella issue",
-	withheldReasonCooldown:                      "Completion cooldown",
-	withheldReasonNoWorkNeeded:                  "Previous no_work_needed verdict",
-	completionVerdictNeedsDecision:              "Waiting on a maintainer decision",
-	withheldReasonFailureCooldown:               "Failure cooldown",
-	withheldReasonInFlight:                      "Already in flight",
-	withheldReasonContributorFilter:             "Rejected by a contributor filter",
-	withheldReasonAssignedToOther:               "Assigned to another contributor",
+	contributorAdmissionReasonOpenPRClaim:            "An open pull request already claims this issue",
+	contributorAdmissionReasonOpenPRLinked:           "An open pull request already links this issue (claim skipped)",
+	contributorAdmissionReasonOpenPRGuardRateLimited: "GitHub rate limit: the open-PR check is deferred until it resets",
+	contributorAdmissionReasonIssueClaim:             "Someone has claimed this issue; the claim expires on its own",
+	contributorAdmissionReasonMergedClaimStale:       "Fixed by a merged pull request; the issue is still open — close it or say what remains",
+	contributorAdmissionReasonIssueChurn:             "Too many pull requests on one issue — needs maintainer triage",
+	contributorAdmissionReasonWorkflowBlocked:        "Workflow label: blocked",
+	contributorAdmissionReasonLabelSkipped:           "Contribute skip label",
+	contributorAdmissionReasonDependencyBlocked:      "A dependency is still open",
+	contributorAdmissionReasonDependencyUnknown:      "A dependency could not be resolved",
+	withheldReasonDisabledRepo:                       "Repository is disabled for contribution",
+	withheldReasonRepoUnmintable:                     "Repository excluded after a GitHub App token mint failure",
+	withheldReasonTracker:                            "Tracker / umbrella issue",
+	withheldReasonCooldown:                           "Completion cooldown",
+	withheldReasonNoWorkNeeded:                       "Previous no_work_needed verdict",
+	completionVerdictNeedsDecision:                   "Waiting on a maintainer decision",
+	withheldReasonFailureCooldown:                    "Failure cooldown",
+	withheldReasonInFlight:                           "Already in flight",
+	withheldReasonContributorFilter:                  "Rejected by a contributor filter",
+	withheldReasonAssignedToOther:                    "Assigned to another contributor",
 }
 
 // withheldReasonLabel returns the operator-facing prose for a reason code,
@@ -112,6 +113,7 @@ func isConvergenceWithheldReason(reason string) bool {
 	switch reason {
 	case contributorAdmissionReasonOpenPRClaim,
 		contributorAdmissionReasonOpenPRLinked,
+		contributorAdmissionReasonOpenPRGuardRateLimited,
 		contributorAdmissionReasonIssueClaim,
 		contributorAdmissionReasonMergedClaimStale,
 		contributorAdmissionReasonIssueChurn,
@@ -340,6 +342,10 @@ func withheldFromAdmissionDecision(c withheldCandidate, d contributorAdmissionDe
 		if d.openPR.PRNumber > 0 {
 			item.Detail = fmt.Sprintf("Claim skipped: open pull request #%d already links this issue", d.openPR.PRNumber)
 		}
+		return item
+	case contributorAdmissionReasonOpenPRGuardRateLimited:
+		item := newWithheldItem(c, d.reason)
+		item.Detail = fmt.Sprintf("GitHub rate-limited the open-PR listing; dispatch deferred until %s", formatRunTime(d.openPR.RateLimitedUntil))
 		return item
 	case contributorAdmissionReasonMergedClaimStale:
 		item := newWithheldItem(c, d.reason)
