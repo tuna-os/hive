@@ -178,7 +178,8 @@ func (c *Client) issueClaimGate(ctx context.Context, repo string, number int) (i
 // using IssueClaimBlockReason: the agent whose own PR links the issue holds
 // its claim legitimately, and a guard that released it would un-stage the
 // very PR it exists to protect. Off with scanner.skip_issues_with_open_pr:
-// false; a failed listing fails open with a warning.
+// false; a failed listing fails open with a warning, except a rate-limited
+// one, which refuses with ClaimBlockReasonOpenPRRateLimited until the reset.
 func (c *Client) IssueDispatchBlockReason(ctx context.Context, repo string, number int) (string, error) {
 	gate, err := c.issueClaimGate(ctx, repo, number)
 	if err != nil || gate.reason != "" {

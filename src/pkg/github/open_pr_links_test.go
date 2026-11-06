@@ -1,12 +1,15 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +24,12 @@ type openPRGuardServer struct {
 	addedLabels []string
 	createdLbl  []string
 	failPulls   bool
+	// rateLimitReset, when set, answers the pulls listing as GitHub does
+	// once the installation's primary limit is spent (403, remaining 0).
+	rateLimitReset time.Time
+	// secondaryRetryAfter, when positive, answers it with a secondary
+	// rate limit carrying Retry-After in seconds.
+	secondaryRetryAfter int
 }
 
 func newOpenPRGuardServer(t *testing.T, prs []map[string]any, issueLabels []string) (*httptest.Server, *openPRGuardServer) {
@@ -35,9 +44,25 @@ func newOpenPRGuardServer(t *testing.T, prs []map[string]any, issueLabels []stri
 		obs.mu.Lock()
 		obs.pullsCalls++
 		fail := obs.failPulls
+		reset := obs.rateLimitReset
+		retryAfter := obs.secondaryRetryAfter
 		obs.mu.Unlock()
 		if fail {
 			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if !reset.IsZero() {
+			w.Header().Set("X-RateLimit-Limit", "6450")
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"message":"API rate limit of 6450 exceeded for installation ID 1."}`)
+			return
+		}
+		if retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"message":"You have exceeded a secondary rate limit.","documentation_url":"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits"}`)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(prs)
@@ -206,6 +231,133 @@ func TestOpenPRGuard_ListingFailureFailsOpen(t *testing.T) {
 	}
 	if _, ok, err := c.OpenPRLinkingIssue(context.Background(), "o/r", 42); ok || err == nil {
 		t.Fatalf("OpenPRLinkingIssue = ok=%v err=%v; want the listing error surfaced", ok, err)
+	}
+}
+
+func TestOpenPRGuard_ListingFailureIsNotRetriedWithinWindow(t *testing.T) {
+	srv, obs := newOpenPRGuardServer(t, nil, nil)
+	defer srv.Close()
+	obs.failPulls = true
+	c := newTestClient(t, srv, "o", []string{"r"})
+	if _, ok := c.OpenPRLinkGuard(context.Background(), "o/r", 42, nil); ok {
+		t.Fatal("guard refused; want fail-open")
+	}
+	calls := obs.pullsCalls
+	if calls == 0 {
+		t.Fatal("first claim did not attempt a listing")
+	}
+	for i := 0; i < 5; i++ {
+		if _, ok := c.OpenPRLinkGuard(context.Background(), "o/r", 42, nil); ok {
+			t.Fatal("guard refused; want fail-open")
+		}
+	}
+	if obs.pullsCalls != calls {
+		t.Fatalf("listing attempts = %d, want %d: failure must be replayed within the window", obs.pullsCalls, calls)
+	}
+}
+
+// rateLimitedGuardClient is a client whose pulls listing is rate-limited
+// until reset, on a fake clock starting at t0, with PR 14775 open and
+// closing #42 — the PR a rate-limited guard cannot see.
+func rateLimitedGuardClient(t *testing.T, t0, reset time.Time) (*Client, *openPRGuardServer, *time.Time) {
+	t.Helper()
+	srv, obs := newOpenPRGuardServer(t, []map[string]any{
+		openPRFixture(14775, "Fixes #42", "clubanderson", t0.Add(-time.Hour)),
+	}, nil)
+	t.Cleanup(srv.Close)
+	// The 403s below engage the process-wide pacer; keep it out of other tests.
+	ResetRateLimitPacingForTest()
+	t.Cleanup(ResetRateLimitPacingForTest)
+	obs.rateLimitReset = reset
+	c := newTestClient(t, srv, "o", []string{"r"})
+	clock := t0
+	c.openPRLinks().now = func() time.Time { return clock }
+	return c, obs, &clock
+}
+
+// Production: an exhausted installation limit made go-github fail every
+// listing locally, and each claim candidate re-listed and re-warned (47k
+// warnings an hour). The failure must be replayed until the reset — past
+// the one-minute failure TTL, across both repo spellings — and warned once.
+func TestOpenPRGuard_RateLimitedListingIsNotRetriedUntilReset(t *testing.T) {
+	t0 := time.Date(2026, 10, 27, 1, 0, 0, 0, time.UTC)
+	reset := t0.Add(30 * time.Minute)
+	c, obs, clock := rateLimitedGuardClient(t, t0, reset)
+	var logs bytes.Buffer
+	c.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	for i := range 20 {
+		*clock = t0.Add(time.Duration(i) * time.Minute)
+		repo := "o/r"
+		if i%2 == 1 {
+			repo = "r"
+		}
+		c.OpenPRLinkGuard(context.Background(), repo, 42, nil)
+	}
+	if obs.pullsCalls != 1 {
+		t.Fatalf("listing attempts = %d, want 1 until the rate limit resets", obs.pullsCalls)
+	}
+	if n := strings.Count(logs.String(), "open-PR guard"); n != 1 {
+		t.Fatalf("guard warnings = %d, want 1 per repo per window:\n%s", n, logs.String())
+	}
+}
+
+// While rate-limited the guard cannot see PR 14775, so it must refuse the
+// claim (fail closed) instead of admitting an already-linked issue — and
+// write no has-open-pr label, since no PR is known.
+func TestOpenPRGuard_RateLimitedListingRefusesClaim(t *testing.T) {
+	t0 := time.Date(2026, 10, 27, 1, 0, 0, 0, time.UTC)
+	reset := t0.Add(30 * time.Minute)
+	c, obs, _ := rateLimitedGuardClient(t, t0, reset)
+	got, err := c.IssueDispatchBlockReason(context.Background(), "o/r", 42)
+	if err != nil || got != ClaimBlockReasonOpenPRRateLimited {
+		t.Fatalf("reason = %q, %v; want %q while rate-limited", got, err, ClaimBlockReasonOpenPRRateLimited)
+	}
+	link, ok := c.OpenPRLinkGuard(context.Background(), "r", 42, nil)
+	if !ok || !link.RateLimited() || !link.RateLimitedUntil.Equal(reset) || link.PRNumber != 0 {
+		t.Fatalf("guard = %+v, %v; want a refusal deferred until %s", link, ok, reset)
+	}
+	if len(obs.addedLabels) != 0 || len(obs.createdLbl) != 0 {
+		t.Fatalf("labels added = %v created = %v; want none for a rate-limit deferral", obs.addedLabels, obs.createdLbl)
+	}
+}
+
+func TestOpenPRGuard_RateLimitedListingRetriesAfterReset(t *testing.T) {
+	t0 := time.Date(2026, 10, 27, 1, 0, 0, 0, time.UTC)
+	reset := t0.Add(30 * time.Minute)
+	c, obs, clock := rateLimitedGuardClient(t, t0, reset)
+	if link, ok := c.OpenPRLinkGuard(context.Background(), "o/r", 42, nil); !ok || !link.RateLimited() {
+		t.Fatalf("guard = %+v, %v; want deferred while rate-limited", link, ok)
+	}
+	*clock = reset.Add(-time.Second)
+	if link, ok := c.OpenPRLinkGuard(context.Background(), "o/r", 42, nil); !ok || !link.RateLimited() || obs.pullsCalls != 1 {
+		t.Fatalf("guard = %+v, %v after %d listings; want still deferred just before the reset", link, ok, obs.pullsCalls)
+	}
+	obs.mu.Lock()
+	obs.rateLimitReset = time.Time{}
+	obs.mu.Unlock()
+	ResetRateLimitPacingForTest() // the reset has passed for the pacer too
+	*clock = reset.Add(time.Second)
+	got, err := c.IssueDispatchBlockReason(context.Background(), "o/r", 42)
+	if want := ClaimBlockReasonOpenPRPrefix + "14775"; err != nil || got != want {
+		t.Fatalf("reason = %q, %v; want %q once the limit reset", got, err, want)
+	}
+	if obs.pullsCalls != 2 {
+		t.Fatalf("listing attempts = %d, want 2 (one relist after the reset)", obs.pullsCalls)
+	}
+}
+
+// A secondary limit backs off for its Retry-After, not the failure TTL.
+func TestOpenPRGuard_SecondaryRateLimitRefusesForRetryAfter(t *testing.T) {
+	t0 := time.Date(2026, 10, 27, 1, 0, 0, 0, time.UTC)
+	c, obs, clock := rateLimitedGuardClient(t, t0, time.Time{})
+	obs.secondaryRetryAfter = 120
+	link, ok := c.OpenPRLinkGuard(context.Background(), "o/r", 42, nil)
+	if want := t0.Add(2 * time.Minute); !ok || !link.RateLimitedUntil.Equal(want) {
+		t.Fatalf("guard = %+v, %v; want deferred until %s", link, ok, want)
+	}
+	*clock = t0.Add(90 * time.Second)
+	if _, ok := c.OpenPRLinkGuard(context.Background(), "o/r", 42, nil); !ok || obs.pullsCalls != 1 {
+		t.Fatalf("guard ok=%v after %d listings; want deferred without relisting inside Retry-After", ok, obs.pullsCalls)
 	}
 }
 
