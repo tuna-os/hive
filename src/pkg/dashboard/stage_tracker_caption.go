@@ -135,7 +135,7 @@ func stageTrackerClassifyModifiers(labels []string, hiveID string, rec stagelabe
 // caption clause naming what it waits on. Only the pre-claim stages
 // qualify: once a claim or PR exists the sequencing no longer gates it.
 func stageTrackerBlockedBy(it *StageTrackerItem, blockers []string) {
-	if it == nil || len(blockers) == 0 || it.Stage > trackerNumberPossiblyExists {
+	if it == nil || len(blockers) == 0 || it.Stage >= trackerNumberClaimed {
 		return
 	}
 	it.BlockedOn = append([]string(nil), blockers...)
@@ -171,12 +171,15 @@ const (
 // a merged or closed-unmerged blocker means for the row. It never adds the
 // `blocked` modifier: the label does that (finish), and an issue whose
 // label was lifted but whose body still carries the marker is not blocked.
+// When no PR marker or reason is at hand it falls through to
+// stageTrackerBlockedOnIssue for the `issue=` variant.
 func stageTrackerBlockedOnPR(it *StageTrackerItem, body, reason string, baseURL string, state func(repo string, number int) string) {
 	if it == nil || !slices.Contains(it.Modifiers, modBlocked) {
 		return
 	}
 	repo, number, ok := github.BlockedOnTarget(body, reason)
 	if !ok {
+		stageTrackerBlockedOnIssue(it, body, reason)
 		return
 	}
 	ref := &StageTrackerBlockedOnPR{Repo: repo, Number: number, URL: overviewItemURL("", repo, number, "pr", baseURL)}
@@ -197,6 +200,28 @@ func stageTrackerBlockedOnPR(it *StageTrackerItem, body, reason string, baseURL 
 	if it.Stage == 0 {
 		it.Caption = clause
 		it.Actor = "PR " + short
+		return
+	}
+	it.Caption = joinClause(it.Caption, clause)
+}
+
+// stageTrackerBlockedOnIssue is stageTrackerBlockedOnPR for an issue blocked
+// on another issue (the `issue=` marker): the blocker joins blocked_on and
+// the caption names it. Like the PR variant it never adds the modifier.
+func stageTrackerBlockedOnIssue(it *StageTrackerItem, body, reason string) {
+	repo, number, ok := github.BlockedOnIssueTarget(body, reason)
+	if !ok {
+		return
+	}
+	key := repo + "#" + strconv.Itoa(number)
+	if !slices.Contains(it.BlockedOn, key) {
+		it.BlockedOn = append(it.BlockedOn, key)
+	}
+	short := stageTrackerBlockerList(it.Repo, []string{key})
+	clause := "Blocked on issue " + short + " — lifts when it closes"
+	if it.Stage == 0 {
+		it.Caption = clause
+		it.Actor = "issue " + short
 		return
 	}
 	it.Caption = joinClause(it.Caption, clause)
@@ -306,6 +331,12 @@ func humanizeStageReason(reason string) string {
 	if r == "" {
 		return ""
 	}
+	if rest, ok := strings.CutPrefix(r, "ci-reporting-stalled:"); ok {
+		return "CI reporting stalled — " + rest
+	}
+	if rest, ok := strings.CutPrefix(r, "ci-reporting-unverified:"); ok {
+		return "CI reporting unverified — " + rest
+	}
 	if base, approver := stagelabels.HumanApprovedReason(r); approver != "" {
 		clause := humanizeStageReason(base)
 		if clause == "" {
@@ -314,12 +345,28 @@ func humanizeStageReason(reason string) string {
 		return clause + " — approved by @" + approver
 	}
 	lower := strings.ToLower(r)
+	if front, ok := strings.CutPrefix(r, "base-refresh:queued-behind#"); ok {
+		if front == "0" {
+			return "waiting for admission to final base preparation"
+		}
+		return "queued for base refresh behind PR #" + front
+	}
+	if r == "base-refresh:preparing" {
+		return "preparing the current base; current-head CI and review must complete"
+	}
 	switch lower {
 	case "actionable", "live agent claim", "live issue claim", "open pr covers it":
 		return ""
 	}
 	if stageengine.ReasonIsPartialCover(r) {
 		return "the PR references it without closing it (partial)"
+	}
+	// "blocked: App lacks workflows permission" (derive_issue.go, a
+	// structured blocker's short text): already prose. The generic replacer
+	// below would turn its ": " into ":  " (hivecommons/docs#612 read
+	// "owed — blocked:  App lacks…").
+	if rest, ok := strings.CutPrefix(r, "blocked: "); ok {
+		return "blocked: " + strings.TrimSpace(rest)
 	}
 	if clause, ok := humanizeCoverReason(r); ok {
 		return clause
@@ -332,6 +379,8 @@ func humanizeStageReason(reason string) string {
 		return "the hive's copies of this PR were closed without merging twice within an hour"
 	case stagelabels.LaneReasonAdoptionCopyFailed:
 		return "the hive's copy of this PR failed and this PR was reopened"
+	case stagelabels.LaneReasonAdoptionFixerReverts:
+		return "fixing CI would undo this PR's change: the hive's push removed most of what the PR changes"
 	case "held":
 		return "held by a hold label"
 	case "label:needs-rebase":
@@ -340,6 +389,8 @@ func humanizeStageReason(reason string) string {
 		return "author's role is not trusted for unattended merge"
 	case "contributor-lane:no-verdict":
 		return noVerdictClause
+	case stageengineprstage.ContributorLaneReasonReviewOff:
+		return "needs a reviewer verdict, but this hive's review swarm is off, so none will be requested"
 	case "contributor-lane:no-claim":
 		return "no verified claim links this PR to an issue"
 	case "contributor-lane:claim-tier-untrusted":
@@ -369,6 +420,9 @@ func humanizeStageReason(reason string) string {
 	}
 	if rest, ok := strings.CutPrefix(r, stageengineprstage.StageReasonUnauthorizedPrefix); ok {
 		return "the hive's GitHub App is not permitted to " + unauthorizedStepWords(rest) + "; a maintainer must"
+	}
+	if rest, ok := strings.CutPrefix(r, stageengineprstage.RequiredCheckNeverReportedPrefix); ok {
+		return "required check " + rest + " has never reported on this repository — fix auto_merge.required_checks (or the repo's required_checks override) or merge by hand"
 	}
 	if rest, ok := strings.CutPrefix(r, "fork-guard:"); ok {
 		return "check " + strings.ReplaceAll(rest, ",", ", ") + " refuses fork PRs — a maintainer must push this branch to the repository"
@@ -435,12 +489,16 @@ func unauthorizedStepWords(step string) string {
 	return strings.ReplaceAll(strings.TrimSpace(step), "-", " ")
 }
 
-// Tooltip for the unauthorized pill, per step; the generic form serves a
-// label whose stage reason does not (or no longer) names the step.
+// Tooltip for the hive-bot-lacks-permission pill, per step; the generic
+// form serves a label whose stage reason does not (or no longer) names the
+// step. Operator wording says "hive bot lacks permission", never
+// "unauthorized" (hivecommons/hive#16639): nobody did anything illegitimate,
+// the App installation is missing one permission. The label name
+// hive:unauthorized is a contract and stays.
 const (
-	stageTrackerUnauthorizedApproveRuns = "The hive's GitHub App lacks `actions: write`, so it cannot approve the workflow runs GitHub is holding for this head. A maintainer must click Approve and run on the PR's checks banner (or the Actions tab); see the hive:unauthorized comment for the run ids. Hive resumes, and clears the label, once the required checks report."
-	stageTrackerUnauthorizedGeneric     = "The hive's GitHub App lacks a permission for the next step, so only a person can take it; the hive:unauthorized comment on the PR names the permission and the step. Hive resumes, and clears the label, once the step is done."
-	stageTrackerUnauthorizedMergeWF     = "The hive's GitHub App lacks `workflows: write`, so it cannot merge this owner-approved PR that edits .github/workflows files. A maintainer must click Merge on GitHub (the approval already stands), or grant the App Workflows: Read and write so the hive can merge such PRs itself."
+	stageTrackerUnauthorizedApproveRuns = "The hive bot's GitHub App is missing the 'actions: write' permission needed to approve the workflow runs GitHub is holding for this head, so a person has to take that step: click Approve and run on the PR's checks banner (or the Actions tab); the `hive:unauthorized` comment on the PR lists the run ids. Hive resumes and clears the label once the required checks report."
+	stageTrackerUnauthorizedGeneric     = "The hive bot's GitHub App is missing a permission needed for the next step, so a person has to take that step. The `hive:unauthorized` comment on the PR names the permission and the action; hive resumes and clears the label once it's done."
+	stageTrackerUnauthorizedMergeWF     = "The hive bot's GitHub App is missing the 'workflows: write' permission needed to merge this owner-approved PR that edits .github/workflows files, so a person has to take that step: click Merge on GitHub (the approval already stands), or grant the App Workflows: Read and write so the hive can merge such PRs itself."
 )
 
 // stageTrackerUnauthorized derives the gate word and the tooltip for an
@@ -458,7 +516,7 @@ func stageTrackerUnauthorized(reason string) (step, tip string) {
 	if rest == stageengineprstage.UnauthorizedStepMergeWorkflowPath {
 		return step, stageTrackerUnauthorizedMergeWF
 	}
-	return step, "The hive's GitHub App lacks the permission to " + step + ", so only a person can take that step; the hive:unauthorized comment on the PR names the permission and the action. Hive resumes, and clears the label, once the step is done."
+	return step, "The hive bot's GitHub App is missing the permission needed to " + step + ", so a person has to take that step. The `hive:unauthorized` comment on the PR names the permission and the action; hive resumes and clears the label once it's done."
 }
 
 // stageTrackerManualMergeReason reports whether a bare stage reason is a
@@ -484,7 +542,7 @@ var stageTrackerHumanMergeReasonWords = map[string][2]string{
 	stageengineprstage.HumanMergeReasonMergeMethod:       {"merge method", "The repo does not allow the merge method this PR needs"},
 	stageengineprstage.HumanMergeReasonAutoMergeOff:      {"auto-merge off", "Auto-merge is off for this repo, so a person merges"},
 	stageengineprstage.HumanMergeReasonUntrustedAuthor:   {"untrusted author", "Hive won't merge it alone — the author isn't a trusted author yet"},
-	stageengineprstage.HumanMergeReasonUnauthorized:      {"unauthorized", "GitHub does not let hive merge here; a person merges"},
+	stageengineprstage.HumanMergeReasonUnauthorized:      {"hive bot lacks permission", "The hive bot's GitHub App is missing the permission to merge here; a person merges"},
 	stageengineprstage.HumanMergeReasonReviewerDeferred:  {"reviewer deferred", "A reviewer asked for a person to merge this one"},
 	stageengineprstage.HumanMergeReasonBreakingChange:    {"human merge", "Breaking change — owner merges; hive never merges a ⚠️-titled or needs-owner-merge PR"},
 }
@@ -739,6 +797,8 @@ func joinClause(head, clause string) string {
 	return head + " — " + clause
 }
 
+const stageTrackerRemediationNeededCaption = "CI failed or review changes requested; remediation needed"
+
 // stageTrackerCaption builds the human sentence and the actor for an item.
 func stageTrackerCaption(stage stagelabels.Stage, reason, author string, kind string, mirrored bool, rec stagelabels.Record, hasRec bool, linkedPR int, head string) (caption, actor string) {
 	clause := humanizeStageReason(reason)
@@ -769,6 +829,14 @@ func stageTrackerCaption(stage stagelabels.Stage, reason, author string, kind st
 		return stageTrackerTriageNeededCaption, "maintainer"
 	case stagelabels.PossiblyExisting:
 		return joinClause("Prior art found; the author must confirm the gap (`/hive decision proceed — <gap>`) or close it (`/hive decision exists`)", clause), strings.TrimPrefix(who, "@")
+	case stagelabels.OpenForDiscussion:
+		// The reason ("open for discussion: proposal") would repeat the
+		// chevron word; the caption names the label and the way in.
+		head := "Open for discussion; no agent work is queued — claim it to take it on"
+		if label := stageengine.ReasonDiscussionLabel(reason); label != "" {
+			head = "Open for discussion (" + label + "); no agent work is queued — claim it to take it on"
+		}
+		return head, "anyone"
 	case stagelabels.Claimed:
 		return joinClause("Claimed; work is about to start", clause), "claimant"
 	case stagelabels.PRInProgress:
@@ -783,7 +851,7 @@ func stageTrackerCaption(stage stagelabels.Stage, reason, author string, kind st
 	case stagelabels.Reviewed:
 		return joinClause("Review passed; waiting for merge admission", clause), "CI"
 	case stagelabels.Fixing:
-		return joinClause("Red or changes requested; a hive agent is fixing it", clause), "hive"
+		return joinClause(stageTrackerRemediationNeededCaption, clause), "hive"
 	case stagelabels.NeedsAuthor:
 		return joinClause("Needs "+who, clause) + " — " + who + " must act", strings.TrimPrefix(who, "@")
 	case stagelabels.ReturnedToContributor:
@@ -818,13 +886,18 @@ func stageTrackerCaption(stage stagelabels.Stage, reason, author string, kind st
 		case stageTrackerAdoptedResolving:
 			return "Rebase failed twice: the hive's copy #" + strconv.Itoa(rec.AdoptedBy) + " still conflicts with the base after two fixer attempts; a person decides", "maintainer"
 		}
+		if strings.TrimSpace(strings.ToLower(reason)) == stagelabels.LaneReasonBotAuthorFinding {
+			return joinClause("Reviewer finding on another bot's PR: the bot regenerates this branch, so the fix belongs on the base branch; a person decides", clause), "maintainer"
+		}
 		if strings.TrimSpace(strings.ToLower(reason)) == stagelabels.LaneReasonRebaseFailedTwice {
 			return "Rebase failed twice: the fixer could not resolve the conflicts with the base; a person decides", "maintainer"
 		}
 		if step, _ := stageTrackerUnauthorized(reason); step != "" {
 			// hivecommons/hive#14589: not a decision but a step only a
-			// person may take; the gate cell says the same.
-			return joinClause("Awaiting human: "+step, clause), "maintainer"
+			// person may take; the PR in progress chevron says the same
+			// (hive#16524: it is the person's move on the PR, not a
+			// merge-queue matter).
+			return joinClause("Waiting for a maintainer · "+step+" on GitHub", clause), "maintainer"
 		}
 		if c := stageTrackerMergeTrainCaption(reason); c != "" {
 			return c, "maintainer"
@@ -1042,4 +1115,36 @@ func stageTrackerStaleDecisionRecord(rec stagelabels.Record, labels []string) bo
 		}
 	}
 	return true
+}
+
+// stageTrackerTrackingActor is the actor word of a decomposed parent at 010:
+// nobody on the parent is due to move; its children carry the work.
+const stageTrackerTrackingActor = "its children"
+
+// stageTrackerTrackingWhy is the stage_actor.why of a decomposed parent at
+// 010 waiting on n open children.
+func stageTrackerTrackingWhy(n int) string {
+	return "waiting on " + strconv.Itoa(n) + " open child issue(s) — the scanner does not claim a decomposed parent; its children carry the work"
+}
+
+// stageTrackerApplyTracking rewrites a 010 issue row whose reason carries
+// the stage engine's "waiting on N open child issue(s)" suffix: the parent
+// is tracking its children, not waiting on the scanner, so the caption and
+// actor say so and OpenChildren lets the client draw "Tracking · 3/4"
+// instead of "Actionable" (hivecommons/hive#16481).
+func stageTrackerApplyTracking(it *StageTrackerItem, stage stagelabels.Stage) {
+	if it == nil || it.Kind != "issue" || stage != stagelabels.Actionable {
+		return
+	}
+	n := stageengine.ReasonOpenChildren(it.Reason)
+	if n <= 0 {
+		return
+	}
+	it.OpenChildren = n
+	head := "Tracking"
+	if c := it.Children; c != nil && c.Total > 0 {
+		head += " — " + strconv.Itoa(c.Completed) + " of " + strconv.Itoa(c.Total) + " children done"
+	}
+	it.Caption = head + "; waiting on " + strconv.Itoa(n) + " open child issue(s). The scanner leaves a decomposed parent to its children"
+	it.Actor = stageTrackerTrackingActor
 }

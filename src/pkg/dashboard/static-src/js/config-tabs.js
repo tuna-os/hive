@@ -35,7 +35,7 @@
         // agent's kick history over the selected time window.
         if (tabId === AGENT_PROMPTS_TAB) initAgentPromptHistory();
       } else {
-        body.innerHTML = renderGovernorTab(tabId);
+        body.innerHTML = renderGateRegressionBanner() + renderGovernorTab(tabId);
         settingsAnnotateRows(body);
         if (tabId === 'Hub') { fetchQueueCount(); fetchAutoUpdateStatus(); }
         // The escalation breaker lives at the top level of hive.yaml, so the
@@ -56,22 +56,39 @@
         if (tabId === 'Features') loadLinearAgentStatus();
         // The Features tab also hosts the advisor lane settings panel.
         if (tabId === 'Features') loadAdvisorSettings();
+        if (tabId === 'Inbox') loadInboxSettingsInline();
         // The same tab carries the upstream-watch editor and divergence view
         // (#9969, #11211); it loads from its own endpoint.
         if (tabId === 'Features') loadUpstreamWatch();
         if (tabId === 'Extensions') loadExtensionRelayStatus();
         if (tabId === 'Smart classifier') loadSmartClassifierStats();
+        if (tabId === 'Features') loadEventTriggers();
         // Review Gate → Reviewers: the eligibility summary and engine warning
         // are derived from the rendered rows and the fan-out/combined switches.
         if (tabId === 'Features') refreshReviewerAgentSummary();
         if (tabId === 'Appearance') loadThemeConfig();
         if (tabId === 'Knowledge') { renderPublicKnowledgeControls(); loadKnowledgeConnectors(); loadKnowledgePipeline(); }
         if (tabId === 'Compliance') loadComplianceStatus();
+        // The workflow editor's canvas needs real pointer listeners and a
+        // measured viewport once its SVG is in the DOM.
+        if (tabId === 'Workflows' && typeof wfEdAfterRender === 'function') wfEdAfterRender();
       }
       // Keep the Save button's enabled state in lockstep with the repos/default
       // invariant on every render (requirement #4). Cheap and idempotent — a
       // no-op on tabs/dialogs without a repos list.
       if (typeof syncRepoSaveGuard === 'function') syncRepoSaveGuard();
+    }
+
+    // Safety-gate regression banner (#16438): /api/status config.gate_regressions
+    // lists the gates (review.require_labels, project.paused_repos, …) a
+    // previous runtime overlay carried that this boot's config dropped or
+    // loosened. Shown at the top of every Settings tab until the operator
+    // restores the gate (or removes it on purpose) and the hive restarts.
+    function renderGateRegressionBanner() {
+      const regs = ((window._lastStatus || {}).config || {}).gate_regressions || [];
+      if (!regs.length) return '';
+      const items = regs.map(g => `<li><code>${esc(g.gate || '')}</code> was <code>${esc(g.previous || '')}</code>, now ${esc(g.effective || '')}${g.source ? ` <span class="text-muted">(from ${esc(g.source)})</span>` : ''}</li>`).join('');
+      return `<div class="cmp-banner" id="gate-regression-banner" role="alert"><strong>Safety gate dropped at boot.</strong> This hive booted without ${regs.length === 1 ? 'a gate' : regs.length + ' gates'} its previous runtime config enforced; agents may now act on items it used to leave alone. Restore the setting here and save, or set <code>config.refuse_gate_regression: true</code> to make this fatal.<ul class="cmp-banner-detail">${items}</ul></div>`;
     }
 
     function renderAgentImport() {
@@ -244,6 +261,7 @@
         case 'Thresholds': return renderGovThresholds(d) + renderGovSLATargets(d);
         case 'Labels': return renderGovLabels(d.labels || [], d.holdLabels || [], d.requireLabels || []);
         case 'Repos': return renderGovRepos(d.repos || []);
+        case 'Workflows': return renderGovWorkflows();
         case 'Budget': return renderGovBudget(d.budget || {}, d.health || {});
         case 'Notifications': return renderGovNotifications(d.notifications || {});
         case 'Channels': return renderGovChannels(d.channels);
@@ -255,6 +273,7 @@
         case 'Features': return renderGovFeatures(d.features || {}, d.auto_merge || {}, d.review || {});
         case 'Extensions': return renderGovExtensions(d.features || {});
         case 'Knowledge': return renderGovKnowledgeSharing();
+        case 'Inbox': return renderGovInbox();
         case 'Project Observability': return renderGovProjectObservability(d.project_observability || {});
         case 'Advisory': return renderGovAdvisory(d.advisory || {});
         case 'Smart classifier': return renderGovSmartClassifier(d.classifier || {});
@@ -280,7 +299,7 @@
     }
 
     // ---- Settings → Knowledge → Connectors (#11075) ----
-    const KB_CONNECTOR_TYPE_ORDER = ['confluence', 'context7', 'document', 'git', 'github-wiki', 'google-drive', 'notion', 'repo-wiki', 'sharepoint'];
+    const KB_CONNECTOR_TYPE_ORDER = ['confluence', 'context7', 'document', 'git', 'github-wiki', 'google-drive', 'notion', 'plaud', 'repo-wiki', 'sharepoint', 'wisprflow'];
     const KC_TYPE_INFO = {
       'confluence': { label: 'Confluence', description: 'Sync Confluence Cloud or Data Center pages into knowledge facts.' },
       'context7': { label: 'Context7', description: 'Sync documentation for default Context7 libraries. The API key is a reference to an environment variable or secret file; the value is never shown.' },
@@ -289,8 +308,10 @@
       'github-wiki': { label: 'GitHub Wiki', description: 'Clone and index one or more GitHub wiki repositories.' },
       'google-drive': { label: 'Google Drive', description: 'Sync Google Docs, Sheets, markdown, and text files from Drive folders or shared drives.' },
       'notion': { label: 'Notion', description: 'Sync Notion pages and database rows visible to an internal integration.' },
+      'plaud': { label: 'Plaud voice notes', description: 'Sync Plaud Note recordings (Plaud summary + transcript) through the free official Plaud MCP server. Sign-in is Plaud OAuth in your browser; hive never stores the token.' },
       'repo-wiki': { label: 'Repo wiki', description: 'Sync .hive/wiki (or another directory) from one or more GitHub repositories.' },
-      'sharepoint': { label: 'SharePoint / OneDrive', description: 'Sync markdown, text, and HTML files from SharePoint document libraries or OneDrive drives.' }
+      'sharepoint': { label: 'SharePoint / OneDrive', description: 'Sync markdown, text, and HTML files from SharePoint document libraries or OneDrive drives.' },
+      'wisprflow': { label: 'Wispr Flow dictation', description: 'Sync your Wispr Flow dictation history (what you spoke, when, into which app) from the desktop app\'s local flow.sqlite or an export folder. Read-only, no sign-in, $0 beyond your Wispr Flow plan.' }
     };
     const KC_TYPE_ICONS = {
       // Vendor marks: simple-icons (CC0 1.0) paths, 24x24 viewBox, rendered with currentColor.
@@ -304,6 +325,8 @@
       // Generic glyphs (no vendor): document sheet and open book, drawn in-house.
       'context7': 'M4 4h3v16H4zm5 0h3v16H9zm5.2.6 2.9-.8 3.8 15.5-2.9.8z',
       'document': 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm4 18H6V4h7v5h5zM8 12h8v1.6H8zm0 3.2h8v1.6H8zm0 3.2h5V20H8z',
+      'plaud': 'M12 2a3.5 3.5 0 0 0-3.5 3.5v6a3.5 3.5 0 0 0 7 0v-6A3.5 3.5 0 0 0 12 2zm-6 9.5h1.8a4.2 4.2 0 0 0 8.4 0H18a6 6 0 0 1-5.1 5.93V20h3v1.8H8.1V20h3v-2.57A6 6 0 0 1 6 11.5z',
+      'wisprflow': 'M3 10h2v4H3zm4-3h2v10H7zm4-5h2v20h-2zm4 5h2v10h-2zm4 3h2v4h-2z',
       'repo-wiki': 'M4 3h7.2c1.1 0 2 .55 2.8 1.3.8-.75 1.7-1.3 2.8-1.3H20v16h-3.2c-1 0-1.95.4-2.8 1.1V22h-4v-1.9c-.85-.7-1.8-1.1-2.8-1.1H4zm2 2v12h1.2c1.3 0 2.5.4 3.6 1.1V6.2C10.4 5.55 9.6 5 8.8 5zm12 0h-1.2c-.8 0-1.6.55-2 1.2v12.1c1.1-.7 2.3-1.1 3.6-1.1H18z'
     };
     function kbIntegrationIcon(type) {
@@ -319,8 +342,10 @@
       'github-wiki': [['repos', 'Repositories (comma-separated)', 'org/repo-a, org/repo-b'], ['branch', 'Branch', 'master']],
       'google-drive': [['folder_ids', 'Folder IDs', 'folder123, folder456'], ['shared_drive_ids', 'Shared drive IDs', 'drive123'], ['include_mime', 'Include MIME groups', 'docs,md,txt']],
       'notion': [['root_page_ids', 'Root page IDs', '1a2b3c4d5e6f47a8b9c0d1e2f3a4b5c6'], ['database_ids', 'Database IDs', '0f1e2d3c-4b5a-4968-8776-655443322110'], ['include_archived', 'Include archived', 'false'], ['max_pages', 'Max pages', '2000'], ['full_sync_every', 'Full sync every', '10']],
+      'plaud': [['command', 'MCP command', 'npx -y @plaud-ai/mcp@latest'], ['since_days', 'Days back on first sync', '30'], ['max_files', 'Max recordings per sync', '200'], ['include_audio', 'Include 24h audio link', 'false'], ['query', 'Name filter (optional)', 'standup'], ['tags', 'Extra tags (comma-separated)', 'voice, ideas'], ['home', 'Token store HOME (optional)', '/data/knowledge/connector-state/plaud/home']],
       'repo-wiki': [['repos', 'Repositories (comma-separated)', 'org/repo-a, org/repo-b'], ['branch', 'Branch', 'v5'], ['dir', 'Wiki directory', '.hive/wiki']],
-      'sharepoint': [['drive_ids', 'Drive IDs', 'b!drive-id'], ['site_ids', 'Site IDs', 'contoso.sharepoint.com,site-id,web-id'], ['folder_path', 'Folder path', '/Docs/Sub'], ['include_files', 'Include file extensions', '.md,.txt,.html']]
+      'sharepoint': [['drive_ids', 'Drive IDs', 'b!drive-id'], ['site_ids', 'Site IDs', 'contoso.sharepoint.com,site-id,web-id'], ['folder_path', 'Folder path', '/Docs/Sub'], ['include_files', 'Include file extensions', '.md,.txt,.html']],
+      'wisprflow': [['path', 'flow.sqlite or export folder (empty = app default)', '/Users/me/Library/Application Support/Wispr Flow/flow.sqlite'], ['since_days', 'Days back on first sync', '30'], ['max_items', 'Max dictations per sync', '500'], ['min_words', 'Skip dictations shorter than (words)', '3'], ['group', 'Fact per dictation or day', 'dictation'], ['apps', 'Only these apps (comma-separated, optional)', 'slack, obsidian, vscode'], ['include_raw', 'Include raw ASR text', 'false'], ['tags', 'Extra tags (comma-separated)', 'voice, ideas'], ['sqlite3', 'sqlite3 command (optional)', 'sqlite3']]
     };
     let _kcState = { loaded: false, error: '', connectors: [], rows: [], types: [], layers: ['personal', 'project', 'org', 'community'], runtime: false, publish: null };
 
@@ -1860,6 +1885,17 @@
             <input id="forge-gh-${key}" type="number" min="0" step="1" value="${st[key] ? esc(String(st[key])) : ''}" placeholder="${esc(String(placeholder))}" ${owner ? '' : 'disabled'}>
             <div class="config-help">${help}${restart ? ' Requires restart.' : ' Applies without a restart.'}</div>
           </div>`;
+      // agents.github_api_hourly_cap sits here beside the agent reserve floor
+      // but differs from the num() fields: blank means the default (the key
+      // is removed) and 0 is a real value, no cap.
+      const capKey = 'agent_github_api_hourly_cap';
+      const capDefault = d.agent_github_api_hourly_cap || 300;
+      const fleetCapField = `
+          <div class="config-field">
+            <label for="forge-gh-${capKey}">Agent GitHub API hourly cap ${yamlHint('agents.github_api_hourly_cap')} ${settingHelpMark('operator-reference/runtime-and-quota', 'github-api-quota', 'Agent GitHub API hourly cap', 'How many charged GitHub API responses each agent may receive through the API proxy in a sliding hour before the proxy answers 429. 0 removes the cap; blank uses the default. An agent with its own value on its General tab keeps it, and replicas and review heads use their base agent’s value. Every agent draws on the one hourly bucket of the App installation, so a higher cap lets agents spend more of it; the agent reserve floor still refuses agent reads when that bucket runs low.')}</label>
+            <input id="forge-gh-${capKey}" type="number" min="0" step="1" value="${st.agent_github_api_hourly_cap_set ? esc(String(st[capKey])) : ''}" placeholder="${esc(String(capDefault))}" ${owner ? '' : 'disabled'}>
+            <div class="config-help">Charged GitHub API calls each agent may make through the proxy per sliding hour. 0 = no cap; blank = default (${esc(String(capDefault))}). Applies without a restart.</div>
+          </div>`;
       const toggle = (key, label, path, help, restart, mark) => `
           <div class="config-toggle mt-3">
             <div id="forge-gh-${key}" class="config-toggle-switch ${st[key] ? 'on' : ''} ${owner ? '' : 'disabled'}" data-action="${owner ? 'forgeGitHubToggle' : ''}" data-arg-types="t" role="switch" aria-checked="${st[key] ? 'true' : 'false'}"></div>
@@ -1878,15 +1914,22 @@
         <div class="card-inset mt-5">
           <div class="settings-subsection-title">API quota, PR scans and authorship</div>
           <div class="config-field-row">
-            ${num('api_reserve', 'API reserve', 'github.api_reserve', 800, 'Remaining core REST quota below which Hive skips optional sweeps (conserve mode). 0 uses the default (800).', true, settingHelpMark('operator-reference', 'github-api-budget-governor', 'API reserve', 'Below this many remaining core REST calls the governor enters conserve mode: optional sweeps are skipped and the eval interval is multiplied. 0 restores the default (800).'))}
-            ${num('api_critical', 'API critical floor', 'github.api_critical', 250, 'Lower floor where Hive enters critical mode and stretches the eval interval further. Must be below the reserve. 0 uses the default (250).', true, settingHelpMark('operator-reference', 'github-api-budget-governor', 'API critical floor', 'Below this many remaining calls the governor also sheds unstick steps and stretches the eval interval 4x. Must stay below the reserve; 0 restores the default (250).'))}
-            ${num('agent_reserve_floor', 'Agent reserve floor', 'github.agent_reserve_floor', d.agent_reserve_floor || 400, 'Agent reads through the API proxy get a 429 once the shared core bucket drops below this, so daemon merge and scan work is never starved.', true, settingHelpMark('operator-reference', 'github-api-quota', 'Agent reserve floor', 'Protects the shared core bucket from agent traffic: once the latest rate-limit reading drops below the floor, agent reads through the API proxy are refused with a 429 until the bucket recovers. 0 uses the default.'))}
+            ${num('api_reserve', 'API reserve', 'github.api_reserve', 800, 'Remaining core REST quota below which Hive skips optional sweeps (conserve mode). 0 uses the default (800).', true, settingHelpMark('operator-reference/sweeps-and-operations', 'github-api-budget-governor', 'API reserve', 'Below this many remaining core REST calls the governor enters conserve mode: optional sweeps are skipped and the eval interval is multiplied. 0 restores the default (800).'))}
+            ${num('api_critical', 'API critical floor', 'github.api_critical', 250, 'Lower floor where Hive enters critical mode and stretches the eval interval further. Must be below the reserve. 0 uses the default (250).', true, settingHelpMark('operator-reference/sweeps-and-operations', 'github-api-budget-governor', 'API critical floor', 'Below this many remaining calls the governor also sheds unstick steps and stretches the eval interval 4x. Must stay below the reserve; 0 restores the default (250).'))}
+            ${num('agent_reserve_floor', 'Agent reserve floor', 'github.agent_reserve_floor', d.agent_reserve_floor || 400, 'Agent reads through the API proxy get a 429 once the shared core bucket drops below this, so daemon merge and scan work is never starved.', true, settingHelpMark('operator-reference/runtime-and-quota', 'github-api-quota', 'Agent reserve floor', 'Protects the shared core bucket from agent traffic: once the latest rate-limit reading drops below the floor, agent reads through the API proxy are refused with a 429 until the bucket recovers. 0 uses the default.'))}
           </div>
           <div class="config-field-row">
-            ${num('pr_detail_ttl_s', 'PR detail cache TTL (seconds)', 'github.pr_detail_ttl_s', d.pr_detail_ttl_s || 1800, 'Reuses a PR detail response while the PR list still reports the same head SHA and updated_at. 0 uses the default.', false, settingHelpMark('operator-reference', 'notable-fields', 'PR detail cache TTL', 'How long a GET /pulls/{number} detail response is reused while the cheap PR list still reports the same head SHA and updated_at and GitHub has resolved mergeable_state. 0 uses the default.'))}
-            ${num('graphql_pr_batch_page_size', 'GraphQL PR batch page size', 'github.graphql_pr_batch_page_size', d.graphql_pr_batch_page_size || 50, 'Page size for the batched pullRequests query, 1–100. 0 uses the default.', false, settingHelpMark('operator-reference', 'notable-fields', 'GraphQL PR batch page size', 'Page size for the GraphQL pullRequests(first:) batch query. Values above GitHub&#39;s maximum of 100 are rejected; 0 uses the default.'))}
+            ${fleetCapField}
           </div>
-          ${toggle('graphql_pr_batch', 'Batch open-PR scans with GraphQL', 'github.graphql_pr_batch', 'one paginated query per repo instead of per-PR detail and check-run reads.', false, settingHelpMark('operator-reference', 'notable-fields', 'Batch open-PR scans with GraphQL', 'On by default. One paginated GraphQL query per repository scan fills the PR detail and CI rollup caches, replacing most per-PR detail and check-run reads. Off returns to the REST-only scan path.'))}
+          <div class="config-field-row">
+            ${num('pr_detail_ttl_s', 'PR detail cache TTL (seconds)', 'github.pr_detail_ttl_s', d.pr_detail_ttl_s || 1800, 'Reuses a PR detail response while the PR list still reports the same head SHA and updated_at. 0 uses the default.', false, settingHelpMark('operator-reference/README', 'notable-fields', 'PR detail cache TTL', 'How long a GET /pulls/{number} detail response is reused while the cheap PR list still reports the same head SHA and updated_at and GitHub has resolved mergeable_state. 0 uses the default.'))}
+            ${num('graphql_pr_batch_page_size', 'GraphQL PR batch page size', 'github.graphql_pr_batch_page_size', d.graphql_pr_batch_page_size || 50, 'Page size for the batched pullRequests query, 1–100. 0 uses the default.', false, settingHelpMark('operator-reference/README', 'notable-fields', 'GraphQL PR batch page size', 'Page size for the GraphQL pullRequests(first:) batch query. Values above GitHub&#39;s maximum of 100 are rejected; 0 uses the default.'))}
+          </div>
+          <div class="config-field-row">
+            ${num('etag_cache_max_mb', 'ETag cache size (MB)', 'github.etag_cache_max_mb', d.etag_cache_max_mb || 128, 'Memory for remembered GitHub responses so repeat GETs can be answered by a free 304. Bodies are gzip-compressed (about 7× effective). A cache that fills within hours evicts bodies other pollers are about to revalidate and charged fetches climb; raise it. 0 uses the default (128); up to 2048.', false, settingHelpMark('operator-reference/README', 'notable-fields', 'ETag cache size (MB)', 'Upper bound on the gzip-compressed bodies the GitHub conditional-request cache keeps in memory. Each remembered body lets the next GET of the same resource be answered 304 Not Modified, which GitHub does not charge. Watch the fill level under Debug → GitHub API budget: at the cap, evictions turn free revalidations back into charged fetches. 0 restores the default (128 MB); the maximum is 2048. HIVE_GITHUB_ETAG_CACHE_MAX_MB overrides the file.'))}
+            ${num('etag_cache_max_entries', 'ETag cache entries', 'github.etag_cache_max_entries', d.etag_cache_max_entries || 8192, 'Maximum number of remembered responses regardless of size. 0 uses the default (8192).', false, settingHelpMark('operator-reference/README', 'notable-fields', 'ETag cache entries', 'How many GitHub responses the conditional-request cache holds at most, whatever their size. A multi-repo hive with many small list pages can hit this before the MB bound. 0 restores the default (8192). HIVE_GITHUB_ETAG_CACHE_MAX_ENTRIES overrides the file.'))}
+          </div>
+          ${toggle('graphql_pr_batch', 'Batch open-PR scans with GraphQL', 'github.graphql_pr_batch', 'one paginated query per repo instead of per-PR detail and check-run reads.', false, settingHelpMark('operator-reference/README', 'notable-fields', 'Batch open-PR scans with GraphQL', 'On by default. One paginated GraphQL query per repository scan fills the PR detail and CI rollup caches, replacing most per-PR detail and check-run reads. Off returns to the REST-only scan path.'))}
           ${toggle('app_authored_prs', 'Author agent PRs as the App bot', 'github.app_authored_prs', 'agents open PRs and commit as &lt;slug&gt;[bot] with the App installation token when project.ai_author is empty.', true, settingHelpMark('github-app-setup', '', 'Author agent PRs as the App bot', 'With a GitHub App installed, agents open PRs and commit as &lt;slug&gt;[bot] using the installation token whenever project.ai_author is empty, so PR authorship is the App rather than a personal account.'))}
           ${toggle('app_signed_commits', 'Re-author agent PRs as GitHub-signed commits', 'github.app_signed_commits', 'needed when a base branch requires signed commits; rewrites the agent branch before the PR opens.', false, settingHelpMark('github-app-setup', 'signed-commits-on-agent-prs-app_signed_commits', 'Re-author agent PRs as GitHub-signed commits', 'Opt-in; needs an installed App. Before a PR opens, the watcher squashes the agent branch into one commit created through the GraphQL createCommitOnBranch mutation, which GitHub signs and shows as Verified, so a required_signatures ruleset accepts it. Unsigned follow-up commits are reconciled the same way.'))}
           ${owner ? '<button class="hv-btn btn-primary mt-4" id="forge-gh-save-btn" data-action="saveForgeGitHubSettings">Save</button>' : '<div class="config-help mt-3">Owner role required to change these settings.</div>'}
@@ -1902,13 +1945,27 @@
     async function saveForgeGitHubSettings() {
       const st = _forgeGitHubSettings || {};
       const body = {};
-      for (const key of ['api_reserve', 'api_critical', 'agent_reserve_floor', 'pr_detail_ttl_s', 'graphql_pr_batch_page_size']) {
+      for (const key of ['api_reserve', 'api_critical', 'agent_reserve_floor', 'pr_detail_ttl_s', 'graphql_pr_batch_page_size', 'etag_cache_max_mb', 'etag_cache_max_entries']) {
         const el = document.getElementById('forge-gh-' + key);
         if (!el) continue;
         const raw = (el.value || '').trim();
         const v = raw === '' ? 0 : parseInt(raw, 10);
         if (isNaN(v) || v < 0) { showToast(key + ' must be a non-negative number', 'error'); return; }
         if (v !== (st[key] || 0)) body[key] = v;
+      }
+      // Blank removes agents.github_api_hourly_cap (null), so the default
+      // applies; a number sets it, 0 included (no cap).
+      const capEl = document.getElementById('forge-gh-agent_github_api_hourly_cap');
+      if (capEl) {
+        const raw = (capEl.value || '').trim();
+        const wasSet = st.agent_github_api_hourly_cap_set === true;
+        if (raw === '') {
+          if (wasSet) body.agent_github_api_hourly_cap = null;
+        } else {
+          const v = Number(raw);
+          if (!Number.isInteger(v) || v < 0) { showToast('Agent GitHub API hourly cap must be a whole number of at least 0, or blank for the default', 'error'); return; }
+          if (!wasSet || v !== st.agent_github_api_hourly_cap) body.agent_github_api_hourly_cap = v;
+        }
       }
       for (const key of ['graphql_pr_batch', 'app_authored_prs', 'app_signed_commits']) {
         const el = document.getElementById('forge-gh-' + key);
@@ -3178,4 +3235,3 @@
     function contribRepoMatchingDisabledEntries(repoFull, disabled) {
       return (disabled || []).filter(function(entry) { return contribRepoDisabledEntryMatches(repoFull, entry); });
     }
-

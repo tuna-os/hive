@@ -2,7 +2,10 @@ package github
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +32,18 @@ const baseRefreshMergeParents = 2
 // carry walks back through to reach the decided head (hivecommons/hive#15766).
 const baseRefreshMaxHops = 5
 
+// baseRefreshCompareFileCap is the most files GitHub lists for a compare,
+// however it is paginated; a compare that reaches it may be truncated.
+const baseRefreshCompareFileCap = 300
+
+// baseRefreshWebFlowLogin is the committer login GitHub puts on commits it
+// creates and signs itself, such as the update-branch merge.
+const baseRefreshWebFlowLogin = "web-flow"
+
+// ErrCompareFileCap reports a compare whose file list reached GitHub's
+// 300-file cap, so the diff cannot be verified file for file.
+var ErrCompareFileCap = errors.New("compare file list reached GitHub's 300-file cap")
+
 // BaseRefreshRepos is the slice of the repositories API the base-refresh
 // check reads: one commit lookup and two three-dot compares per new head.
 type BaseRefreshRepos interface {
@@ -46,9 +61,13 @@ type BaseRefreshChecker struct {
 }
 
 // HeadIsBaseRefreshOf reports whether newHead on owner/repo#number is a
-// merge commit authored by the App (appBotLogin) whose parents are oldHead
+// GitHub-verified merge commit created by the App (appBotLogin, see
+// CommitIsVerifiedAppMerge) whose parents are oldHead
 // and a commit on baseRef, and whose three-dot diff against baseRef is
-// file-for-file identical to oldHead's. That is exactly the head the
+// file-for-file identical to oldHead's (sameChangedFiles: hunks that only
+// moved to other line numbers in a file outside `.github/` still count as
+// identical; a compare at GitHub's 300-file cap cannot show any of that and
+// is false). That is exactly the head the
 // require_current_base gate produces when it merges the base into the
 // branch: the PR's content is unchanged, only its base moved. Any other
 // head change — a content commit (even one that also merged the base), a
@@ -93,8 +112,8 @@ func baseRefreshKey(owner, repo string, number int, oldHead, newHead string) str
 // chain for at most baseRefreshMaxHops hops. Each commit is fetched exactly
 // once and must itself be a hive base refresh of its first parent
 // (App-authored merge, base parent on the base branch, diff unchanged); the
-// walk succeeds when a hop's non-base parent is oldHead. The first hop keeps
-// the single-refresh tolerance of oldHead in either parent position.
+// walk succeeds when a hop's non-base parent is oldHead. Each hop allows
+// oldHead in either parent position (per-hop tolerance).
 func headIsBaseRefreshChainOf(ctx context.Context, api BaseRefreshRepos, owner, repo, baseRef, oldHead, newHead, appBotLogin string) bool {
 	ctx = WithRESTCaller(ctx, "hive:decision_base_refresh")
 	cur := newHead
@@ -127,7 +146,7 @@ func mergeIsBaseRefreshOf(ctx context.Context, api BaseRefreshRepos, owner, repo
 	if commit == nil || len(commit.Parents) != baseRefreshMergeParents {
 		return false
 	}
-	if !CommitByGitHubLogin(commit, appBotLogin) {
+	if !CommitIsVerifiedAppMerge(commit, appBotLogin) {
 		return false
 	}
 	first, second := strings.TrimSpace(commit.Parents[0].GetSHA()), strings.TrimSpace(commit.Parents[1].GetSHA())
@@ -158,7 +177,45 @@ func mergeIsBaseRefreshOf(ctx context.Context, api BaseRefreshRepos, owner, repo
 	return sameChangedFiles(oldFiles, newFiles)
 }
 
+// BaseMergeParent reports the PR-side parent of commit (the commit at
+// newHead) when it is a merge of baseRef into that parent which leaves the
+// PR's three-dot diff against baseRef unchanged, whoever made the merge:
+// the other parent is the merge-base with baseRef, and the changed files
+// match file for file. It is mergeIsBaseRefreshOf without the App-author
+// rule, for questions about content rather than about who pushed: GitHub
+// moves a person's approving review onto such a merge (projectbluefin/utah#1078:
+// a review submitted 2026-11-04 01:17Z is reported on a merge made
+// 2026-11-05 19:50Z). Lookup failures are false.
+func BaseMergeParent(ctx context.Context, api BaseRefreshRepos, owner, repo, baseRef string, commit *gh.RepositoryCommit, newHead string) (string, bool) {
+	baseRef, newHead = strings.TrimSpace(baseRef), strings.TrimSpace(newHead)
+	if api == nil || commit == nil || len(commit.Parents) != baseRefreshMergeParents || baseRef == "" || newHead == "" {
+		return "", false
+	}
+	first, second := strings.TrimSpace(commit.Parents[0].GetSHA()), strings.TrimSpace(commit.Parents[1].GetSHA())
+	newCmp, newFiles, err := compareAllFiles(ctx, api, owner, repo, baseRef, newHead)
+	if err != nil || newCmp == nil {
+		return "", false
+	}
+	prev := ""
+	switch strings.TrimSpace(newCmp.GetMergeBaseCommit().GetSHA()) {
+	case second:
+		prev = first
+	case first:
+		prev = second
+	}
+	if prev == "" || prev == newHead {
+		return "", false
+	}
+	_, oldFiles, err := compareAllFiles(ctx, api, owner, repo, baseRef, prev)
+	if err != nil || !sameChangedFiles(oldFiles, newFiles) {
+		return "", false
+	}
+	return prev, true
+}
+
 // compareAllFiles walks every page of the three-dot compare base...head.
+// A file list at GitHub's cap is ErrCompareFileCap: past it GitHub drops
+// files silently, so the two diffs could differ in what it left out.
 func compareAllFiles(ctx context.Context, api BaseRefreshRepos, owner, repo, base, head string) (*gh.CommitsComparison, []*gh.CommitFile, error) {
 	opts := &gh.ListOptions{PerPage: 100}
 	var first *gh.CommitsComparison
@@ -174,6 +231,9 @@ func compareAllFiles(ctx context.Context, api BaseRefreshRepos, owner, repo, bas
 		if cmp != nil {
 			files = append(files, cmp.Files...)
 		}
+		if len(files) >= baseRefreshCompareFileCap {
+			return nil, nil, fmt.Errorf("compare %s...%s: %w", base, head, ErrCompareFileCap)
+		}
 		if resp == nil || resp.NextPage == 0 {
 			return first, files, nil
 		}
@@ -184,6 +244,17 @@ func compareAllFiles(ctx context.Context, api BaseRefreshRepos, owner, repo, bas
 // sameChangedFiles reports whether two three-dot diffs touch the same files
 // the same way: name, status, rename source, resulting blob, line counts
 // and — when GitHub returned it for both — the patch text itself.
+//
+// One difference in the resulting blob is tolerated (sameHunksAtShiftedLines):
+// the base branch also edited a file the PR modifies, somewhere the PR's
+// hunks do not reach, so every hunk is byte-for-byte the same — context
+// lines, added and removed lines, hunk lengths — and only its line numbers
+// moved. That is still exactly the change the person approved
+// (projectbluefin/utah-packages#924: main edited a doc the PR also edits, 15
+// lines above the PR's hunks). A file under `.github/` never gets that
+// tolerance: a workflow or action file must read exactly as approved,
+// because a base edit elsewhere in it (its triggers, its permissions) can
+// change what the approved lines do.
 func sameChangedFiles(a, b []*gh.CommitFile) bool {
 	if len(a) != len(b) {
 		return false
@@ -207,8 +278,14 @@ func sameChangedFiles(a, b []*gh.CommitFile) bool {
 		if x.GetFilename() != y.GetFilename() || x.GetStatus() != y.GetStatus() || x.GetPreviousFilename() != y.GetPreviousFilename() {
 			return false
 		}
-		if x.GetSHA() != y.GetSHA() || x.GetAdditions() != y.GetAdditions() || x.GetDeletions() != y.GetDeletions() || x.GetChanges() != y.GetChanges() {
+		if x.GetAdditions() != y.GetAdditions() || x.GetDeletions() != y.GetDeletions() || x.GetChanges() != y.GetChanges() {
 			return false
+		}
+		if x.GetSHA() != y.GetSHA() {
+			if !sameHunksAtShiftedLines(x, y) {
+				return false
+			}
+			continue
 		}
 		if x.Patch != nil && y.Patch != nil && x.GetPatch() != y.GetPatch() {
 			return false
@@ -217,15 +294,98 @@ func sameChangedFiles(a, b []*gh.CommitFile) bool {
 	return true
 }
 
+// baseDriftHunkHeaderRE reads a unified-diff hunk header: the two start
+// lines, the two optional lengths, and the trailing section heading.
+var baseDriftHunkHeaderRE = regexp.MustCompile(`^@@ -\d+(,\d+)? \+\d+(,\d+)? @@(.*)$`)
+
+// sameHunksAtShiftedLines reports whether two entries for the same file,
+// whose resulting blobs differ, carry the same hunks moved to other line
+// numbers: both are plain modifications of a path outside any `.github/`
+// directory, GitHub returned a patch for both, and the patches are equal
+// once each hunk header's two start lines are dropped (hunk lengths and
+// section headings still have to match). Anything else — a missing or
+// empty patch, a header that does not parse, a rename, a `.github/` path —
+// is false.
+func sameHunksAtShiftedLines(x, y *gh.CommitFile) bool {
+	if !strings.EqualFold(x.GetStatus(), "modified") || !strings.EqualFold(y.GetStatus(), "modified") {
+		return false
+	}
+	for _, name := range []string{x.GetFilename(), x.GetPreviousFilename(), y.GetFilename(), y.GetPreviousFilename()} {
+		if underDotGitHub(name) {
+			return false
+		}
+	}
+	if x.Patch == nil || y.Patch == nil || x.GetPatch() == "" || y.GetPatch() == "" {
+		return false
+	}
+	px, okx := patchWithoutHunkStarts(x.GetPatch())
+	py, oky := patchWithoutHunkStarts(y.GetPatch())
+	return okx && oky && px == py
+}
+
+// underDotGitHub reports a path inside a `.github/` directory at any depth.
+func underDotGitHub(name string) bool {
+	name = strings.TrimSpace(name)
+	return strings.HasPrefix(name, ".github/") || strings.Contains(name, "/.github/")
+}
+
+// patchWithoutHunkStarts rewrites each hunk header of a unified-diff patch
+// to keep only its lengths and section heading ("@@ -,3 +,5 @@ heading"),
+// so two patches of the same hunks at different line numbers read the same.
+// false when a header does not parse or there is no hunk at all.
+func patchWithoutHunkStarts(patch string) (string, bool) {
+	lines := strings.Split(patch, "\n")
+	hunks := 0
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "@@") {
+			continue
+		}
+		m := baseDriftHunkHeaderRE.FindStringSubmatch(line)
+		if m == nil {
+			return "", false
+		}
+		oldLen, newLen := strings.TrimPrefix(m[1], ","), strings.TrimPrefix(m[2], ",")
+		if oldLen == "" {
+			oldLen = "1"
+		}
+		if newLen == "" {
+			newLen = "1"
+		}
+		lines[i] = "@@ -," + oldLen + " +," + newLen + " @@" + m[3]
+		hunks++
+	}
+	if hunks == 0 {
+		return "", false
+	}
+	return strings.Join(lines, "\n"), true
+}
+
 // CommitByGitHubLogin reports whether the commit's GitHub-attributed author
-// or committer is login ([bot] suffix tolerated, case-insensitive). Only the
-// server-resolved logins count, never the forgeable git name or email.
+// or committer is login ([bot] suffix tolerated, case-insensitive). GitHub
+// resolves those logins from the git author and committer emails, so on its
+// own this is attribution, not proof: anyone can author a commit as the
+// App's noreply address. Use CommitIsVerifiedAppMerge to trust a commit.
 func CommitByGitHubLogin(commit *gh.RepositoryCommit, login string) bool {
 	want := normalizeGitHubLogin(login)
 	if commit == nil || want == "" {
 		return false
 	}
 	return normalizeGitHubLogin(commit.GetAuthor().GetLogin()) == want || normalizeGitHubLogin(commit.GetCommitter().GetLogin()) == want
+}
+
+// CommitIsVerifiedAppMerge reports whether GitHub itself created the commit
+// for login, as it does for the App's update-branch merge: the signature is
+// one GitHub verified, the committer is web-flow (GitHub-created and
+// GitHub-signed, so GitHub set the author) or login itself, and the commit
+// is attributed to login. A signature binds the committer only, so a
+// verified commit committed by anyone else proves nothing about an author
+// login derived from a forgeable email (hivecommons/hive#16860).
+func CommitIsVerifiedAppMerge(commit *gh.RepositoryCommit, login string) bool {
+	if commit == nil || !commit.GetCommit().GetVerification().GetVerified() || !CommitByGitHubLogin(commit, login) {
+		return false
+	}
+	committer := normalizeGitHubLogin(commit.GetCommitter().GetLogin())
+	return committer == baseRefreshWebFlowLogin || committer == normalizeGitHubLogin(login)
 }
 
 func normalizeGitHubLogin(login string) string {

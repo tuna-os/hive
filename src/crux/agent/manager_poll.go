@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hivecommons/hive/crux/agent/panesignal"
 )
 
 // pollTmuxOutputForAgent is pollTmuxOutput using the agent's tmux socket.
@@ -94,9 +96,9 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 				if agent.shouldResetTokenRestartCap(paneHasCLIMarker(strings.Join(tail, "\n")), startedAt, time.Now()) {
 					// A future "token appeared, nudge it" restart is now a
 					// fresh theory rather than a repeat of one that already
-					// failed. Reset both halves of the cap together.
-					agent.tokenRestartAttempts = 0
-					agent.tokenRestartGaveUp = false
+					// failed. The latch survives while the rolling window is
+					// still full (#17483).
+					agent.rearmTokenRestartCap(time.Now())
 				}
 			}
 
@@ -253,6 +255,15 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 				}
 			}
 
+			// The CLI refused the configured model id (Claude Code: "There's
+			// an issue with the selected model (<id>)"). Not transient, not a
+			// login problem: surface it as the agent's error, back kicks off,
+			// and park the agent after repeated identical failures instead of
+			// letting it cycle kick → refusal → restart (model_rejection.go).
+			if m.observeModelRejection(agent, tail, time.Now()) {
+				return
+			}
+
 			if bobKeyRejected {
 				agent.LastError = startFailureReason(bobBackend, StartFailureCredentialRejected, "")
 				m.mu.Lock()
@@ -323,7 +334,9 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 			}
 
 			if !IsInferenceBackend(effectiveBackend(agent)) {
-				m.nudgeIfPollingCI(agent, output, m.captureVisiblePaneForAgent(agent))
+				visible := m.captureVisiblePaneForAgent(agent)
+				m.nudgeIfPollingCI(agent, output, visible)
+				m.adviseKnowledge(agent, output, visible)
 			}
 
 			// Detect copilot hung: if running long enough with no CLI prompt,
@@ -339,7 +352,13 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 			// the prompt out of the capture window for ~100s on a large kick,
 			// far longer than expiredTokenHangTimeoutSec has any reason to
 			// tolerate.
-			if agent.Config.Backend == "copilot" && !IsInferenceBackend(agent.BackendOverride) && agent.StartedAt != nil &&
+			//
+			// ctx.Err() gates it too: a tick still running when a restart
+			// cancelled this poller sees the relaunched, still-empty pane
+			// against the OLD StartedAt, so it reads as a session hung for
+			// hours. That session is the restart's, not this poller's (and
+			// runCopilotDiagnostic re-checks ctx under m.mu before touching it).
+			if ctx.Err() == nil && agent.Config.Backend == "copilot" && !IsInferenceBackend(agent.BackendOverride) && agent.StartedAt != nil &&
 				!agent.kickDelivering.Load() &&
 				time.Since(*agent.StartedAt).Seconds() >= expiredTokenHangTimeoutSec &&
 				!paneShowsCLIReady(filtered) {
@@ -396,18 +415,6 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 		}
 	}
 }
-
-// codexUpdatePromptLabel identifies the codex update menu in blockingPrompts.
-//
-// NOTE: answering "skip until next version" is deliberate, and updating in
-// place is NOT a viable alternative here. The prompt's own "1. Update now"
-// runs `npm install -g @openai/codex`, which needs write access to
-// /usr/local/lib/node_modules (root:root). Neither the agent UID nor the hub
-// process has it — attempting the install from the hub fails with the same
-// exit status 243. "Skip until next version" persists in each agent's
-// CODEX_HOME, so the prompt is answered once per agent and does not recur.
-// Updating the CLI belongs to the image build, not to a running agent.
-const codexUpdatePromptLabel = "codex update prompt"
 
 // watchForTrustPromptForAgent monitors a tmux session for startup-blocking
 // modal prompts using the agent's tmux socket, and answers each with the
@@ -466,6 +473,17 @@ func (m *Manager) watchForTrustPromptForAgent(agent *AgentProcess, ctx context.C
 				backend = "claude"
 			}
 			if key, label, ok := blockingPromptKey(backend, output); ok && time.Since(answeredAt[label]) > trustReanswerAfter {
+				if label == claudePermissionDialogLabel {
+					title, _ := claudePermissionDialog(output)
+					if !agentExpectsSkipPermissions(agent, backend) {
+						m.logger.Warn("Claude Code permission dialog on screen; launch_cmd does not declare --dangerously-skip-permissions, leaving it for the operator",
+							"agent", agent.Name, "dialog", title)
+						answeredAt[label] = time.Now()
+						continue
+					}
+					m.logger.Warn("Claude Code permission dialog on screen; the agent is meant to run with --dangerously-skip-permissions — answering option 1",
+						"agent", agent.Name, "dialog", title, "option", key)
+				}
 				answeredAt[label] = time.Now()
 				time.Sleep(paneCaptureSleep)
 				// An empty key means the affirmative option is already selected
@@ -614,18 +632,8 @@ func diffNewLines(prev, curr []string) []string {
 	return out
 }
 
-var spinnerReplacer = strings.NewReplacer(
-	"◐", "○", "◑", "○", "◒", "○", "◓", "○",
-	"◎", "○", "◉", "○", "●", "○",
-)
-
-var creditsRe = regexp.MustCompile(`AI Credits: [\d.]+`)
-
 func normalizeLine(s string) string {
-	s = strings.TrimRight(s, " \t")
-	s = spinnerReplacer.Replace(s)
-	s = creditsRe.ReplaceAllString(s, "AI Credits: _")
-	return s
+	return panesignal.NormalizeLine(s)
 }
 
 func findOverlap(prev, curr []string) int {

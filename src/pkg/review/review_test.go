@@ -64,12 +64,12 @@ func TestAggregateReportsMatrix(t *testing.T) {
 			r.DecisionQuestion = "@clubanderson should decide whether this workflow trigger change is acceptable."
 			return r
 		}()}, want: VerdictRequiresHuman, human: true},
-		{name: "unbacked decision request on a contributor PR is advisory", reps: []PerspectiveReport{func() PerspectiveReport {
+		{name: "unbacked decision request on a fully reviewed contributor PR is advisory", reps: withApprovingSiblings(func() PerspectiveReport {
 			r := baseReport(PerspectiveCorrectness, VerdictApprove)
 			r.DecisionRequested = true
 			r.DecisionQuestion = "@clubanderson should decide whether this groundwork lands before its consumer."
 			return r
-		}()}, want: VerdictApprove, merge: true},
+		}()), want: VerdictApprove, merge: true},
 		{name: "reject recommends close", reps: []PerspectiveReport{baseReport(PerspectiveCorrectness, VerdictReject)}, want: VerdictReject, close: true},
 		{name: "fix cap requires human", reps: []PerspectiveReport{baseReport(PerspectiveCorrectness, VerdictChangesRequested)}, opts: AggregateOptions{FixAttempts: DefaultFixCycleCap}, want: VerdictRequiresHuman, human: true},
 		{name: "missing perspectives is incomplete, not a human hold", reps: []PerspectiveReport{baseReport(PerspectiveCorrectness, VerdictApprove)}, want: VerdictIncomplete},
@@ -123,7 +123,9 @@ func TestAggregateReportsResolvesNonRiskHiveAuthoredDecisionQuestions(t *testing
 			r.DecisionRequested = true
 			r.DecisionQuestion = question
 
-			got := AggregateReports([]PerspectiveReport{r}, AggregateOptions{})
+			// Every perspective reported: the advisory approve needs full
+			// coverage (approve_needs_coverage_test.go).
+			got := AggregateReports(alongsideApprovals([]PerspectiveReport{r}), AggregateOptions{})
 
 			if got.Verdict != VerdictApprove || !got.MergeEligible || got.RequiresHuman || got.DecisionRequested {
 				t.Fatalf("aggregate = %+v, want resolved approve", got)
@@ -437,7 +439,7 @@ func TestAggregateReportsAdvisesSelfAuthoredNonRiskHumanWithoutRemediation(t *te
 	r.HiveAuthored = true
 	r.Summary = "This sequencing question is low stakes but worth noting for maintainers."
 
-	got := AggregateReports([]PerspectiveReport{r}, AggregateOptions{})
+	got := AggregateReports(alongsideApprovals([]PerspectiveReport{r}), AggregateOptions{})
 
 	if got.Verdict != VerdictApprove || !got.MergeEligible || got.RequiresHuman {
 		t.Fatalf("aggregate = %+v, want advisory approval", got)
@@ -739,7 +741,9 @@ func TestAggregateReportsContributorDecisionNeedsBacking(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := AggregateReports([]PerspectiveReport{tt.rep}, tt.opts)
+			// The siblings approve so the head is fully reviewed: a hands-
+			// free approve needs the same coverage as any approve.
+			got := AggregateReports(withApprovingSiblings(tt.rep), tt.opts)
 			if got.Verdict != tt.want {
 				t.Fatalf("aggregate = %+v, want %s", got, tt.want)
 			}
@@ -775,7 +779,7 @@ func TestAggregateReportsContributorDecisionNeedsBacking(t *testing.T) {
 func TestAggregateReportsContributorRequiresHumanNeedsSecurityFinding(t *testing.T) {
 	plain := baseReport(PerspectiveIntentAlignment, VerdictRequiresHuman)
 	plain.Summary = "Unclear whether the groundwork should land before its consumer."
-	got := AggregateReports([]PerspectiveReport{plain}, AggregateOptions{})
+	got := AggregateReports(withApprovingSiblings(plain), AggregateOptions{})
 	if got.Verdict != VerdictApprove || got.RequiresHuman || !got.MergeEligible {
 		t.Fatalf("aggregate = %+v, want advisory approve", got)
 	}
@@ -805,5 +809,66 @@ func TestAggregateReportsContributorUnbackedDecisionWithChangesRoutesToFixer(t *
 	got := AggregateReports([]PerspectiveReport{ask, changes}, AggregateOptions{})
 	if got.Verdict != VerdictChangesRequested || !got.FixCycle || got.DecisionRequested || got.RequiresHuman {
 		t.Fatalf("aggregate = %+v, want the sibling change request to route to the fixer, question advisory", got)
+	}
+}
+
+// projectbluefin/utah-packages#890: the security review withheld approval on
+// a new App credential while intent-alignment asked for a PR-body edit. The
+// security hold is the contributor rule's one early exit to a person
+// (hivecommons/hive#15640); the sibling change request folded it into the
+// fix cycle and the PR went back to its author at 072 instead of 085.
+func TestAggregateReportsContributorSecurityHoldSurvivesSiblingChangeRequest(t *testing.T) {
+	sec := baseReport(PerspectiveSecurity, VerdictRequiresHuman)
+	sec.Summary = "New App credential minted in a scheduled workflow; a maintainer must confirm the credential choice."
+	intent := baseReport(PerspectiveIntentAlignment, VerdictChangesRequested, outputschema.Finding{Title: "`Closes #874` contradicts the issue's own handoff", Severity: outputschema.SeverityMedium, ReviewScope: "in-scope"})
+	got := AggregateReports([]PerspectiveReport{sec, intent}, AggregateOptions{})
+	if got.Verdict != VerdictRequiresHuman || !got.RequiresHuman || got.FixCycle || got.MergeEligible {
+		t.Fatalf("aggregate = %+v, want the security hold kept for a person", got)
+	}
+	if !strings.Contains(got.DecisionFinding, "security review withheld approval") {
+		t.Fatalf("DecisionFinding = %q, want the security hold named", got.DecisionFinding)
+	}
+	if got.Perspectives[PerspectiveSecurity] != VerdictRequiresHuman {
+		t.Fatalf("perspectives = %v, want the security perspective left as requires_human", got.Perspectives)
+	}
+
+	// An unbacked requires_human beside a change request still goes to the fixer.
+	plain := baseReport(PerspectiveIntentAlignment, VerdictRequiresHuman)
+	plain.Summary = "Unclear whether the groundwork should land before its consumer."
+	changes := baseReport(PerspectiveCorrectness, VerdictChangesRequested, outputschema.Finding{Title: "nil deref", Severity: outputschema.SeverityMedium, ReviewScope: "in-scope"})
+	got = AggregateReports([]PerspectiveReport{plain, changes}, AggregateOptions{})
+	if got.Verdict != VerdictChangesRequested || !got.FixCycle || got.RequiresHuman {
+		t.Fatalf("unbacked aggregate = %+v, want the fixer lane", got)
+	}
+
+	// The hive's own PR is not under the contributor rule: its fix cycle runs first.
+	sec.HiveAuthored, intent.HiveAuthored = true, true
+	got = AggregateReports([]PerspectiveReport{sec, intent}, AggregateOptions{})
+	if got.Verdict != VerdictChangesRequested || !got.FixCycle || got.RequiresHuman {
+		t.Fatalf("hive-authored aggregate = %+v, want the fixer lane", got)
+	}
+}
+
+// The gate decides from ScopeEffectiveReports, so a security report whose raw
+// requires_human is downgraded because every finding is out-of-scope must not
+// back the contributor security hold for a sibling's requires_human
+// (hivecommons/hive#16865).
+func TestAggregateReportsContributorSecurityHoldIgnoresOutOfScopeOnlySecurityReport(t *testing.T) {
+	sec := baseReport(PerspectiveSecurity, VerdictRequiresHuman, outputschema.Finding{Title: "unrelated credential handling", Severity: outputschema.SeverityMedium, ReviewScope: "out-of-scope"})
+	sec.Summary = "A maintainer must confirm the credential choice."
+	plain := baseReport(PerspectiveIntentAlignment, VerdictRequiresHuman)
+	plain.Summary = "Unclear whether the groundwork should land before its consumer."
+	changes := baseReport(PerspectiveCorrectness, VerdictChangesRequested, outputschema.Finding{Title: "nil deref", Severity: outputschema.SeverityMedium, ReviewScope: "in-scope"})
+	got := AggregateReports([]PerspectiveReport{sec, plain, changes}, AggregateOptions{})
+	if got.Verdict != VerdictChangesRequested || !got.FixCycle || got.RequiresHuman {
+		t.Fatalf("change-request aggregate = %+v, want the fixer lane", got)
+	}
+	if strings.Contains(got.DecisionFinding, "security review withheld approval") {
+		t.Fatalf("DecisionFinding = %q, want no security hold from an out-of-scope-only report", got.DecisionFinding)
+	}
+
+	got = AggregateReports([]PerspectiveReport{sec, plain}, AggregateOptions{})
+	if strings.Contains(got.DecisionFinding, "security review withheld approval") {
+		t.Fatalf("bare aggregate DecisionFinding = %q, want no security hold from an out-of-scope-only report", got.DecisionFinding)
 	}
 }

@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/hivecommons/hive/pkg/stagelabels"
@@ -36,7 +37,7 @@ const (
 // CI / Review column — only 080 and later are the merge gate.
 func stageTrackerColumn(stage stagelabels.Stage) int {
 	switch stage {
-	case stagelabels.Actionable, stagelabels.TriageNeeded, stagelabels.PossiblyExisting, stagelabels.IssueNeedsDecision:
+	case stagelabels.Actionable, stagelabels.TriageNeeded, stagelabels.PossiblyExisting, stagelabels.OpenForDiscussion, stagelabels.IssueNeedsDecision:
 		return trackerColumnActionable
 	case stagelabels.Claimed:
 		return trackerColumnClaimed
@@ -77,6 +78,10 @@ func stageTrackerItemColumn(it *StageTrackerItem) int {
 		return trackerColumnReview
 	}
 	if it.Stage > trackerColumnPR {
+		if mg := it.MergeGate; mg != nil && mg.State == MergeGateStateMergeFailed && mg.MergeFailedKind == MergeRefusalChecksPending &&
+			(st == stagelabels.ReviewPending || st == stagelabels.Reviewed) {
+			return trackerColumnReview
+		}
 		if mg := it.MergeGate; mg != nil && (mg.State == MergeGateStateMerging || mg.State == MergeGateStateMergeFailed) {
 			return trackerColumnMergeGate
 		}
@@ -84,7 +89,81 @@ func stageTrackerItemColumn(it *StageTrackerItem) int {
 			return trackerColumnMergeGate
 		}
 	}
+	if stageTrackerPersonActsOnPR(it) {
+		return trackerColumnReview
+	}
 	return stageTrackerColumn(st)
+}
+
+// stageTrackerPersonActsOnPR: a PR parked at 085 because a person has to
+// act ON THE PR — rerun CI, approve workflow runs, resolve a permission
+// (reason `unauthorized:<step>`), or answer review findings / red or
+// running checks still open on its head — is not queued, merging or
+// merge-ready, so its chevron lights its REAL stage, CI / Review (the CI
+// track while checks run or are red / unknown, the Review track while the
+// verdict is pending), never Merge queue and never PR in progress: the
+// human gate is a pill on the real stage, not a stage of its own (owner
+// rule 2026-11-08, hivecommons/hive#17327; #17453 for the 085 park). The
+// Merge queue column is only for rows actually queued / merging / merged,
+// or a merge-ready PR (review approved, CI green) parked on a merge
+// decision. A bare 085 with no track evidence keeps the gate: the person
+// decides there (hive#14821). Hive's own #16524 read "Awaiting human:
+// rerun shared ci" under Merge queue with CI unknown and review findings
+// open; #17442 read "Needs human · decision" under PR in progress while
+// CI ran.
+func stageTrackerPersonActsOnPR(it *StageTrackerItem) bool {
+	if it == nil || it.Kind != "pr" || stageByNumber(it.Stage) != stagelabels.NeedsDecision {
+		return false
+	}
+	if mg := it.MergeGate; mg != nil && mg.State != "" {
+		return false
+	}
+	if mt := it.MergeTrain; mt != nil && mt.State != "" {
+		return false
+	}
+	if step, _ := stageTrackerUnauthorized(it.Reason); step != "" {
+		return !stageTrackerMergeReadyEvidence(it)
+	}
+	return stageTrackerNotMergeReadyEvidence(it)
+}
+
+// stageTrackerApplyPersonActsOnPRPill: once the head's tracks are known,
+// a 085 PR whose chevron is its real stage (stageTrackerPersonActsOnPR →
+// CI / Review) gets the `needs-decision` modifier back, so the pill strip
+// carries the ask — the human icon, the decision popover, the question in
+// the tooltip — where the chevron no longer says "Needs human decision"
+// (hivecommons/hive#17453). The modifier keeps its place in the pill
+// order (stageTrackerModifierOrder).
+func stageTrackerApplyPersonActsOnPRPill(it *StageTrackerItem) {
+	if it == nil || !stageTrackerPersonActsOnPR(it) || slices.Contains(it.Modifiers, modNeedsDecision) {
+		return
+	}
+	it.Modifiers = append(it.Modifiers, modNeedsDecision)
+	slices.SortStableFunc(it.Modifiers, func(a, b string) int {
+		return slices.Index(stageTrackerModifierOrder, a) - slices.Index(stageTrackerModifierOrder, b)
+	})
+}
+
+func stageTrackerActivityOnHead(it *StageTrackerItem, a *StageTrackerActivity) bool {
+	return a != nil && (a.Head == "" || it.Head == "" || strings.EqualFold(a.Head, it.Head))
+}
+
+// stageTrackerMergeReadyEvidence: review approved and CI green on the
+// row's current head — the only state in which a human-gated PR may sit
+// in the Merge queue column.
+func stageTrackerMergeReadyEvidence(it *StageTrackerItem) bool {
+	return stageTrackerActivityOnHead(it, it.ReviewActivity) && it.ReviewActivity.State == "approved" &&
+		stageTrackerActivityOnHead(it, it.CIActivity) && it.CIActivity.State == "passing"
+}
+
+// stageTrackerNotMergeReadyEvidence: a track on the current head says the
+// PR is short of merge-ready (review not approved, CI not green). CI that
+// is queued or running on the same head counts too: the head's real stage
+// is CI while checks run, so the row lights the CI track, not the gate
+// (hivecommons/hive#17453).
+func stageTrackerNotMergeReadyEvidence(it *StageTrackerItem) bool {
+	return (stageTrackerActivityOnHead(it, it.ReviewActivity) && it.ReviewActivity.State != "approved") ||
+		(stageTrackerActivityOnHead(it, it.CIActivity) && it.CIActivity.State != "passing")
 }
 
 // stageTrackerStagePhrase is the stage as a lowercase clause for the
@@ -98,6 +177,8 @@ func stageTrackerStagePhrase(stage stagelabels.Stage) string {
 		return "waiting for triage"
 	case stagelabels.PossiblyExisting:
 		return "waiting for the author to confirm the gap (prior art found)"
+	case stagelabels.OpenForDiscussion:
+		return "open for discussion"
 	case stagelabels.Claimed:
 		return "claimed"
 	case stagelabels.PRInProgress:
@@ -111,7 +192,7 @@ func stageTrackerStagePhrase(stage stagelabels.Stage) string {
 	case stagelabels.Reviewed:
 		return "review passed · waiting for merge admission"
 	case stagelabels.Fixing:
-		return "being fixed by hive"
+		return "being remediated by hive"
 	case stagelabels.NeedsAuthor:
 		return "waiting for its author"
 	case stagelabels.ReturnedToContributor:

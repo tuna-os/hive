@@ -29,7 +29,7 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 		selfHold = it.Hold
 	}
 
-	sentinel := it.SentinelAlert || lower == "sentinel" || lower == stageengineprstage.ContributorLaneReasonSentinelBlocked
+	sentinel := !it.SentinelNotice && (it.SentinelAlert || lower == "sentinel" || lower == stageengineprstage.ContributorLaneReasonSentinelBlocked)
 	changes := decisionChangesRequested(base)
 	laneRule := decisionLaneRule(base)
 	adoptionLane, adoptionStalled := strings.CutPrefix(base, stagelabels.LaneReasonAdoptionStalledPrefix)
@@ -38,6 +38,13 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 	// supersedes) after the fixer's two rebase-resolve attempts failed.
 	rebaseFailedTwice := lower == stagelabels.LaneReasonRebaseFailedTwice || (adoptionStalled && adoptionLane == stagelabels.LaneReasonRebaseFailedTwice)
 	reviewerDeferred := lower == stageengine.StageReasonVerdictRequiresHuman || lower == stageengine.StageReasonDecisionRequested
+	// hivecommons/hive#15744: the hive's own PR after its fixer spent the
+	// re-engagement cap; nobody is fixing it any more.
+	fixerAttempts, fixerExhausted := stagelabels.ParseFixerExhausted(base)
+	// Another bot's PR the reviewer asked to change: nobody pushes to the
+	// branch that bot regenerates, so the fix lands on the base branch.
+	botAuthorFinding := lower == stagelabels.LaneReasonBotAuthorFinding
+	hiveSupersederStop := stagelabels.HiveSupersederHardStopReason(base)
 
 	// WHAT it is waiting on: the question, most specific source first. A
 	// reviewer's own question is quoted verbatim — it is the text the
@@ -46,10 +53,16 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 	switch {
 	case it.UnauthorizedStep != "":
 		d.AskedBy = decisionAskedByApp
-		d.Question = "The hive's GitHub App may not " + unauthorizedStepWords(it.UnauthorizedStep) + " here. A maintainer has to do that step on GitHub."
+		d.Question = "The hive bot's GitHub App is missing the permission to " + unauthorizedStepWords(it.UnauthorizedStep) + " here. A maintainer has to do that step on GitHub."
 		d.Blocker = strings.TrimSpace(it.Unauthorized)
 		delegateOK, delegateWhy = false, decisionWhyNoPermission
 		approveOK, approveWhy = false, decisionWhyApproveNoGrant
+	case hiveSupersederStop != "":
+		// The owner's superseder rule (hive-authored superseding PRs
+		// auto-merge with no decision) was overridden by its one exception
+		// class; the caption names which stop, never "needs your decision".
+		d.AskedBy = decisionAskedByLane
+		d.Question = "The hive's superseding PR would auto-merge (owner rule), but " + stagelabels.HiveSupersederHardStopProse(hiveSupersederStop) + ". Clear that stop and the lane merges it on its next pass, or close it?"
 	case verdict != nil && strings.TrimSpace(verdict.DecisionQuestion) != "":
 		d.AskedBy = decisionAskedByReviewer
 		d.Question = strings.TrimSpace(verdict.DecisionQuestion)
@@ -69,12 +82,33 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 		// name the gate and the issue, and offer release / keep.
 		d.AskedBy = decisionAskedByLane
 		d.Question = "The hive held this PR itself for " + decisionHoldReason(selfHold) + ". Release the hold (the lane then merges it on its next pass once the other gates are clear), or keep it?"
+		if strings.EqualFold(selfHold.Source, stagelabels.HoldSourceHumanMergePath) {
+			// No lane merges a human-merge-path PR, held or not: the
+			// person's step is the merge (projectbluefin/utah#1097).
+			d.Question = "The hive held this PR because " + decisionHoldReason(selfHold) + ": the hive never merges it. Review it and merge it by hand, or close it?"
+		}
 		if selfHold.Since != nil {
 			t := *selfHold.Since
 			d.Since = &t
 		}
 		d.Blocker = "The hive set `hold` on its own: " + decisionHoldReason(selfHold) + ". It does nothing more until the hold is released."
 		d.BlockerReason = decisionBlockerHoldHive
+	case fixerExhausted:
+		d.AskedBy = decisionAskedByReviewer
+		d.Question = "The hive's fixer gave up on this PR after " + strconv.Itoa(fixerAttempts) + " attempts"
+		if finding := decisionFixerExhaustedFinding(it, verdict); finding != "" {
+			d.Question += ": " + finding
+		}
+		d.Question += ". Give direction, hand it to a person, or close it as not planned?"
+	case botAuthorFinding:
+		d.AskedBy = decisionAskedByReviewer
+		d.Question = "A reviewer asked for changes on a PR another bot opened and regenerates, so neither the hive nor the bot will change this branch"
+		if verdict != nil {
+			if s := decisionFirstNonEmpty(verdict.HumanSummaries); s != "" {
+				d.Question += ": " + s
+			}
+		}
+		d.Question += ". Fix it on the base branch, merge it as is, or close it?"
 	case verdict != nil && decisionFirstNonEmpty(verdict.HumanSummaries) != "":
 		d.AskedBy = decisionAskedByReviewer
 		d.Question = "A reviewer handed this to a person: " + decisionFirstNonEmpty(verdict.HumanSummaries)
@@ -96,6 +130,8 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 		d.Question = "The hive's copies of this PR were closed without merging twice within an hour, so the hive stopped opening copies. Reopen the last copy (#" + strconv.Itoa(it.AdoptedBy) + "), give direction, or close it?"
 	case rebaseFailedTwice:
 		d.Question = "The hive adopted this PR but its fixer could not resolve the conflicts with the base in two attempts. Adopt the commits into a fresh branch, give direction, or close it as superseded?"
+	case lower == stagelabels.LaneReasonAdoptionFixerReverts:
+		d.Question = "The hive adopted this PR, but the commit it pushed to fix CI undoes most of the PR's own change, so the hive will not merge it. Wait for what the PR depends on, revert the hive's commit, give direction, or close it?"
 	case lower == stagelabels.LaneReasonAdoptionCopyFailed:
 		d.Question = "The hive's copy of this PR (#" + strconv.Itoa(it.AdoptedBy) + ") failed, so this PR was reopened. Ask the hive to supersede it again, give direction, or close it?"
 	case adoptionStalled:
@@ -134,6 +170,12 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 		d.Blocker = "The hive never merges this by itself. After approval, a maintainer merges."
 	case forkGuarded:
 		d.Blocker = "Neither the author nor the hive can make CI run for this fork PR."
+	case botAuthorFinding:
+		d.Blocker = "A reviewer requested changes" + at + ". The bot that opened this PR rewrites its branch, so no fix is pushed here; the fix lands on the base branch, and the bot's next run brings it in."
+		approveOK, approveWhy = false, "Approving does not clear the reviewer's change request. Merge it yourself on GitHub to take it as is."
+	case fixerExhausted:
+		d.Blocker = "The fix dispatcher refuses another fix for this head (" + strconv.Itoa(fixerAttempts) + " attempts spent). No agent is on it until a person decides."
+		approveOK, approveWhy = false, "The head still carries the reviewer's unresolved findings; approving does not fix them."
 	case reviewerDeferred:
 		d.Blocker = "The hive will not merge until a person decides."
 		if verdict != nil && strings.TrimSpace(verdict.DecisionFinding) != "" {
@@ -169,6 +211,17 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 		// for merge-now (rebaseMergeFailureOptions).
 		d.Options = slices.Insert(d.Options, 0, decisionOption(decisionActionAdopt, rebasemerge.OptionAdoptFreshLabel, true, ""))
 	}
+	if fixerExhausted {
+		d.Options = decisionLeadFixerExhausted(d.Options, it)
+	}
+	if botAuthorFinding {
+		// Direction goes to a fixer, and no fixer pushes to this branch.
+		for i := range d.Options {
+			if d.Options[i].Action == decisionActionDirection {
+				d.Options[i] = decisionOption(decisionActionDirection, d.Options[i].Label, false, decisionWhyBotAuthorBranch)
+			}
+		}
+	}
 	if selfHold != nil {
 		// Release leads: it is the one action that answers the question.
 		d.Options = append([]StageTrackerDecisionOption{decisionHoldOption(true)}, d.Options[:len(d.Options)-1]...)
@@ -181,6 +234,52 @@ func decisionForPR(it StageTrackerItem, verdict *review.Aggregate, sentinelLabel
 		d.Options = decisionLeadWithCloseSuperseded(d.Options, verdict.RedundantOf)
 	}
 	return d
+}
+
+// decisionApproveSignOffConsequence is the inline Approve pill's hover on
+// a sign-off ask.
+const decisionApproveSignOffConsequence = "Posts /lgtm + /approve as you; the merge queue takes it from there. Nothing merges here."
+
+// stageTrackerLeadApproveForSignOff marks Approve the lead answer on a PR
+// parked for a policy sign-off: a reviewer or the security check asked a
+// person to accept something (a workflow change from a fork touching a
+// secret, hivecommons/hive#16572), the reviews are otherwise done
+// (human_decision / approved on this head), Approve is enabled and CI is
+// not failing. The row then reads "Approve ▸ · Let hive decide ▸" instead
+// of leading with delegate. Runs after CI and review activity are
+// derived, since decisionForPR sees neither. A lead the question already
+// chose (Re-author, Close as superseded) stands.
+func stageTrackerLeadApproveForSignOff(it *StageTrackerItem) {
+	if it == nil || it.Kind != "pr" || it.DecisionNeeded == nil {
+		return
+	}
+	d := it.DecisionNeeded
+	if d.AskedBy != decisionAskedByReviewer && d.AskedBy != decisionAskedBySentinel {
+		return
+	}
+	for _, o := range d.Options {
+		if o.Lead {
+			return
+		}
+	}
+	if it.CIActivity != nil && it.CIActivity.Head == it.Head && (it.CIActivity.State == "failing" || it.CIActivity.ChecksFailed > 0) {
+		return
+	}
+	if it.ReviewActivity == nil || it.ReviewActivity.Head != it.Head ||
+		(it.ReviewActivity.State != "human_decision" && it.ReviewActivity.State != "approved") {
+		return
+	}
+	for i := range d.Options {
+		o := &d.Options[i]
+		if o.Action != decisionActionApprove || !o.Enabled {
+			continue
+		}
+		o.Lead = true
+		if o.Consequence == "" {
+			o.Consequence = decisionApproveSignOffConsequence
+		}
+		return
+	}
 }
 
 // decisionLeadWithCloseSuperseded moves "Close as superseded" to the front
@@ -198,6 +297,53 @@ func decisionLeadWithCloseSuperseded(opts []StageTrackerDecisionOption, redundan
 		out = append(out, o)
 	}
 	return out
+}
+
+// decisionLeadFixerExhausted shapes the options for a fixer-exhausted PR.
+// The hive re-authors its own exhausted PR by itself (once per issue; see
+// automerge's reauthorExhaustedHivePR), so no "re-author" answer is
+// offered here: a person gives direction (the lead), hands it to someone,
+// or closes it as not planned. A contributor's PR may instead be adopted.
+func decisionLeadFixerExhausted(opts []StageTrackerDecisionOption, it StageTrackerItem) []StageTrackerDecisionOption {
+	lead := decisionOption(decisionActionDirection, "Give direction", true, "")
+	lead.Consequence = "Tell the hive what to change; its next attempt starts from your words instead of the reviewer's."
+	lead.Lead = true
+	out := make([]StageTrackerDecisionOption, 0, len(opts)+2)
+	out = append(out, lead)
+	if it.AuthorKind != authorKindHive && it.AuthorKind != authorKindHuman {
+		adopt := decisionOption(decisionActionAdopt, "Adopt as hive PR", true, "")
+		adopt.Consequence = "The hive opens a fresh PR for the same issue from the current base and closes this one as superseded."
+		out = append(out, adopt)
+	}
+	for _, o := range opts {
+		switch o.Action {
+		case decisionActionDirection, decisionActionAdopt:
+			continue
+		case decisionActionCloseWontfix:
+			o.Label = "Close as not planned"
+			o.Consequence = "Closes this PR as not planned; the issue stays open for someone else."
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+// decisionFixerExhaustedFinding is the reviewer's last finding in one line
+// for the fixer-exhausted question: the verdict's human summary or
+// question, else the caption's dash clause.
+func decisionFixerExhaustedFinding(it StageTrackerItem, verdict *review.Aggregate) string {
+	if verdict != nil {
+		if s := decisionFirstNonEmpty(verdict.HumanSummaries); s != "" {
+			return stageTrackerFirstLine(s)
+		}
+		if q := strings.TrimSpace(verdict.DecisionQuestion); q != "" {
+			return stageTrackerFirstLine(q)
+		}
+	}
+	if _, after, ok := strings.Cut(it.Caption, " — "); ok {
+		return strings.TrimSpace(after)
+	}
+	return ""
 }
 
 // decisionHoldReason is the hold's plain-words reason for the popover.

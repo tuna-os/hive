@@ -125,6 +125,13 @@
       return STAGE_TRACKER_NEEDS_HUMAN_AUTHOR_STAGES.indexOf(n) >= 0 && (item.author_kind || '') === 'human';
     }
 
+    // The phone tier of the Activity monitor: the same media query the
+    // sheet-vs-popover decision uses (STAGE_TRACKER_SHEET_QUERY in
+    // tracker-actions.js), so the two cannot drift.
+    function stageTrackerPhone() {
+      return stageTrackerIsPhoneSheet();
+    }
+
     // Chip order: every stage/NNN-* label first by NNN, then everything
     // else alphabetically, case-insensitive.
     function stageTrackerLabelCompare(a, b) {
@@ -148,6 +155,7 @@
       f.needsHuman = !!f.needsHuman;
       f.onHold = !!f.onHold;
       f.waitingOnYou = !!f.waitingOnYou;
+      f.attentionFirst = f.attentionFirst !== false;
       if (!(f.age in STAGE_TRACKER_AGE_MS) && f.age !== 'stale') f.age = 'any';
       if (['human', 'clanker', 'hive'].indexOf(f.author) < 0) f.author = 'any';
       f.attention = !!f.attention;
@@ -162,6 +170,14 @@
     // True when any narrowing filter (not sort / paging) is set.
     function stageTrackerFilterActive(f) {
       return f.kind !== 'all' || !!f.repo || !!f.q || f.labels.length > 0 || f.needsHuman || f.onHold || f.waitingOnYou || f.age !== 'any' || f.author !== 'any' || f.attention || f.acted !== 'any';
+    }
+
+    // How many narrowing filters the phone Filters sheet holds are set:
+    // everything stageTrackerFilterActive counts except the kind /
+    // attention / waiting-on-you chips, which sit on the compact bar.
+    function stageTrackerSheetFilterCount(f) {
+      f = stageTrackerNormalizeFilter(f);
+      return (f.repo ? 1 : 0) + (f.q ? 1 : 0) + (f.age !== 'any' ? 1 : 0) + (f.author !== 'any' ? 1 : 0) + (f.acted !== 'any' ? 1 : 0) + f.labels.length + (f.needsHuman ? 1 : 0) + (f.onHold ? 1 : 0);
     }
 
     // Does one item pass the narrowing filters? ctx.nowMs anchors the age
@@ -211,9 +227,10 @@
     // row (one muted "N review notes blocked on this PR" line), or, when the
     // PR is not drawn in this view, into the lowest-numbered note of its
     // group, so a PR with eight notes costs the count one row, not eight.
+    // A standing meta issue is never a row (stageTrackerIsStandingMeta).
     function stageTrackerVisible(items, filter, ctx) {
       const f = stageTrackerNormalizeFilter(filter || _stageTrackerFilter);
-      const rows = (items || []).filter(it => stageTrackerMatches(it, f, ctx));
+      const rows = (items || []).filter(it => !stageTrackerIsStandingMeta(it) && stageTrackerMatches(it, f, ctx));
       if (f.kind === 'pr') return rows;
       const issues = new Set(rows.filter(it => it.kind === 'issue').map(it => it.repo + '#' + it.number));
       const out = rows.filter(it => !(it.kind === 'pr' && it.nested_under && issues.has(it.repo + '#' + it.nested_under)));
@@ -234,6 +251,21 @@
     // Pure: an issue the tracker folds as a review note (see stageTrackerVisible).
     function stageTrackerIsReviewNote(it) {
       return !!(it && it.kind === 'issue' && Number(it.review_note_of) > 0);
+    }
+
+    // Pure: a standing meta issue — a bot Dependency Dashboard or the Hive
+    // Advisory Report, the enumeration's hive_advisory / dependency_dashboard
+    // buckets. It is a control panel, not pipeline work, so the monitor never
+    // draws it (hivecommons/hive#13257). It stays in the payload's items, so
+    // open_issues still equals the Overview tile, and the count line names
+    // the difference.
+    function stageTrackerIsStandingMeta(it) {
+      return !!(it && it.kind === 'issue' && (it.bucket === 'hive_advisory' || it.bucket === 'dependency_dashboard'));
+    }
+
+    // Pure: how many items are standing meta issues (not rows).
+    function stageTrackerStandingCount(items) {
+      return (items || []).filter(stageTrackerIsStandingMeta).length;
     }
 
     // Pure: the review notes folded into this row. On a PR row, its
@@ -272,6 +304,181 @@
       return rank(item && item.finisher);
     }
 
+    /* ---- Maintainer notes (JS) --------------------------------------------
+       Private per-item notes maintainers leave for each other on a row
+       (/api/notes, api_maintainer_notes.go). They never reach GitHub; every
+       signed-in maintainer of the hive sees them, and the scheduler types
+       them into the item's agent kicks. The row's 🗒 button opens an inline
+       expander (list + one-line composer, ⌘/Ctrl+Enter adds). Pure helpers
+       (…Html, hamNotesIndex) run under node in
+       stage_tracker_maintainer_notes_test.go; the handlers below fetch. */
+    const MAINTAINER_NOTES_MAX = 2000;
+    const MAINTAINER_NOTES_GLYPH = '🗒';
+    const MAINTAINER_NOTES_AVATAR_PX = 32;
+    const MAINTAINER_NOTES_PRIVACY = 'Private to this hive\u2019s maintainers \u2014 not posted to GitHub; included in agent kicks for the item.';
+    var _hamNotes = {};
+    var _hamNotesOpen = new Set();
+    var _hamNotesDraft = {};
+    var _hamNotesLoaded = false;
+    var _hamNotesBusy = new Set();
+
+    function hamNotesKey(repo, number) { return String(repo || '').toLowerCase() + '#' + (Number(number) || 0); }
+    function hamNotesPanelId(key) { return 'ham-notes-' + String(key || '').replace(/[^a-z0-9]+/gi, '-'); }
+    // Pure: a /api/notes list → { 'owner/repo#n': [notes, oldest first] }.
+    function hamNotesIndex(notes) {
+      const out = {};
+      for (const n of (Array.isArray(notes) ? notes : [])) {
+        if (!n || !n.repo || !(Number(n.number) > 0)) continue;
+        const k = hamNotesKey(n.repo, n.number);
+        (out[k] = out[k] || []).push(n);
+      }
+      for (const k of Object.keys(out)) out[k].sort((a, b) => (Date.parse(a.created_at || '') || 0) - (Date.parse(b.created_at || '') || 0));
+      return out;
+    }
+    function hamNotesFor(item) { return (item && _hamNotes[hamNotesKey(item.repo, item.number)]) || []; }
+    function hamNotesCount(item) { return hamNotesFor(item).length; }
+    // The identity the notes UI draws for: signed in, login, write on the
+    // repo (null = not known yet), verified owner (may delete any note).
+    function hamNotesCtx(item) {
+      const base = typeof stageTrackerActionCtx === 'function' && item ? (stageTrackerActionCtx(item.repo) || {}) : {};
+      const role = (typeof window !== 'undefined' && window._hiveRole) || 'read';
+      const owner = typeof dashboardRoleAtLeast === 'function' && dashboardRoleAtLeast(role, 'owner');
+      return { user: !!base.user, login: String(base.login || ''), canHold: base.canHold, owner: !!owner };
+    }
+    // Pure: the row's notes affordance — nothing for a signed-out visitor
+    // (the notes are the maintainers' own), a count badge once the item
+    // has any. Sits with the row's decision controls.
+    // The phone card tier (hivecommons/hive#17161) renders the badge
+    // only once an item has notes, so an unnoted row keeps its two-line
+    // head; the ⋯ menu's "Maintainer notes…" is the way in there.
+    function hamNotesPhoneTier() {
+      return typeof matchMedia === 'function' && matchMedia('(max-width: 640px), ((pointer: coarse) and (max-width: 820px))').matches;
+    }
+    function stageTrackerNotesButtonHtml(item, ctx) {
+      if (!item || !ctx || !ctx.user) return '';
+      const key = hamNotesKey(item.repo, item.number);
+      const n = hamNotesCount(item);
+      if (!n && hamNotesPhoneTier()) return '';
+      const open = _hamNotesOpen.has(key);
+      const ref = stageTrackerRefOf(item);
+      const tip = (n ? n + ' maintainer note' + (n === 1 ? '' : 's') + '. ' : 'Leave a note for other maintainers. ') + MAINTAINER_NOTES_PRIVACY;
+      return `<button type="button" class="ham-notes-btn${n ? ' ham-notes-has' : ''}" data-action="hamNotesToggle" data-arg-types="e,t" data-stop="1" data-prevent="1" data-ham-notes-key="${esc(key)}" aria-expanded="${open ? 'true' : 'false'}" aria-controls="${esc(hamNotesPanelId(key))}" aria-label="${esc('Maintainer notes for ' + ref + (n ? ' (' + n + ')' : ''))}" title="${esc(tip)}"><span class="ham-notes-glyph" aria-hidden="true">${MAINTAINER_NOTES_GLYPH}</span>${n ? `<span class="ham-notes-count">${n}</span>` : ''}</button>`;
+    }
+    // Pure: one note — avatar, login, relative time (ticked in place by
+    // stageTrackerCueAgeSync via .cue-event-age), Delete for its author
+    // or an owner, then the text (plain, pre-wrapped).
+    function stageTrackerNoteHtml(n, ctx) {
+      const login = String(n.author || '');
+      const ms = Date.parse(n.created_at || '') || 0;
+      const mine = !!(ctx && ctx.login) && login.toLowerCase() === String(ctx.login).toLowerCase();
+      const canDelete = mine || !!(ctx && ctx.owner);
+      return `<li class="ham-note" data-ham-note-id="${esc(n.id || '')}"><div class="ham-note-meta"><img class="ham-note-avatar" src="https://github.com/${encodeURIComponent(login)}.png?size=${MAINTAINER_NOTES_AVATAR_PX}" alt="" loading="lazy" width="${MAINTAINER_NOTES_AVATAR_PX}" height="${MAINTAINER_NOTES_AVATAR_PX}"><span class="ham-note-author">@${esc(login)}</span><time class="cue-event-age ham-note-when" data-at="${ms}" datetime="${esc(n.created_at || '')}" title="${esc(n.created_at || '')}"></time>${canDelete ? `<button type="button" class="ham-note-del" data-action="hamNoteDelete" data-arg-types="e,t" data-stop="1" data-prevent="1" aria-label="${esc('Delete note by @' + login)}">Delete</button>` : ''}</div><div class="ham-note-text">${esc(n.text || '')}</div></li>`;
+    }
+    // Pure: the open expander — the notes, then the composer (a signed-in
+    // user without write on the repo reads but cannot add). '' when the
+    // row's expander is closed.
+    function stageTrackerNotesPanelHtml(item, ctx) {
+      if (!item || !ctx || !ctx.user) return '';
+      const key = hamNotesKey(item.repo, item.number);
+      if (!_hamNotesOpen.has(key)) return '';
+      const notes = hamNotesFor(item);
+      const ref = stageTrackerRefOf(item);
+      const draft = _hamNotesDraft[key] || '';
+      const list = notes.length
+        ? `<ul class="ham-notes-list">${notes.map(n => stageTrackerNoteHtml(n, ctx)).join('')}</ul>`
+        : `<p class="ham-notes-empty">No maintainer notes on ${esc(ref)} yet.</p>`;
+      const add = ctx.canHold !== false
+        ? `<div class="ham-notes-add"><textarea class="ham-notes-input" rows="1" maxlength="${MAINTAINER_NOTES_MAX}" placeholder="Note for other maintainers\u2026" aria-label="${esc('New maintainer note for ' + ref)}" data-input-action="hamNotesDraft" data-keydown-action="hamNotesKeydown" data-keys="Enter" data-arg-types="e,t">${esc(draft)}</textarea><button type="button" class="hv-btn btn-secondary ham-notes-submit" data-action="hamNoteAdd" data-arg-types="e,t" data-stop="1" data-prevent="1" title="Add note (\u2318/Ctrl+Enter)">Add note</button></div>`
+        : `<p class="ham-notes-empty">${esc(STAGE_TRACKER_WHY_WRITE)} to add a note.</p>`;
+      return `<div class="ham-notes" id="${esc(hamNotesPanelId(key))}" data-ham-notes="${notes.length}" data-ham-notes-key="${esc(key)}" role="region" aria-label="${esc('Maintainer notes for ' + ref)}"><div class="ham-notes-head">${esc(MAINTAINER_NOTES_PRIVACY)}</div>${list}${add}</div>`;
+    }
+    function hamNotesKeyOf(el) { const p = el && el.closest ? el.closest('[data-ham-notes-key]') : null; return p ? p.getAttribute('data-ham-notes-key') || '' : ''; }
+    function hamNotesSplitKey(key) { const i = String(key).lastIndexOf('#'); return { repo: String(key).slice(0, i), number: Number(String(key).slice(i + 1)) || 0 }; }
+    // Loads every live note once a maintainer is signed in (the count
+    // badges), or one item's after its `maintainer-notes` SSE frame.
+    async function hamNotesLoad(key) {
+      const role = window._hiveRole || 'read';
+      if (!window._hiveUser && !(typeof dashboardRoleAtLeast === 'function' && dashboardRoleAtLeast(role, 'owner'))) return;
+      try {
+        const q = key ? hamNotesSplitKey(key) : null;
+        const r = await fetch(q ? '/api/notes?repo=' + encodeURIComponent(q.repo) + '&number=' + q.number : '/api/notes');
+        if (!r.ok) return;
+        const d = await r.json();
+        const idx = hamNotesIndex(d && d.notes);
+        if (q) { if (idx[key]) _hamNotes[key] = idx[key]; else delete _hamNotes[key]; }
+        else { _hamNotes = idx; _hamNotesLoaded = true; }
+        renderStageTracker();
+      } catch (e) { /* keep the previous notes; the next poll or frame retries */ }
+    }
+    // Pure: the row menu's entry — the count in its label once there are notes.
+    function stageTrackerNotesMenuItem(item) {
+      const n = hamNotesCount(item);
+      return { id: 'notes', label: 'Maintainer notes' + (n ? ' (' + n + ')' : '') + '\u2026', hint: 'private', enabled: true, why: '' };
+    }
+    function hamNotesOpenFor(item) {
+      const key = hamNotesKey(item.repo, item.number);
+      _hamNotesOpen.add(key);
+      renderStageTracker();
+      const p = document.getElementById(hamNotesPanelId(key));
+      const ta = p && p.querySelector('.ham-notes-input');
+      if (ta) ta.focus(); else if (p && p.focus) { p.setAttribute('tabindex', '-1'); p.focus(); }
+      if (!_hamNotesLoaded) hamNotesLoad();
+    }
+    function hamNotesToggle(e, btn) {
+      const key = btn && btn.getAttribute ? btn.getAttribute('data-ham-notes-key') : '';
+      if (!key) return;
+      if (_hamNotesOpen.has(key)) _hamNotesOpen.delete(key); else _hamNotesOpen.add(key);
+      renderStageTracker();
+      if (_hamNotesOpen.has(key)) {
+        const p = document.getElementById(hamNotesPanelId(key));
+        const ta = p && p.querySelector('.ham-notes-input');
+        if (ta) ta.focus();
+        if (!_hamNotesLoaded) hamNotesLoad();
+      }
+    }
+    function hamNotesDraft(e, ta) { const key = hamNotesKeyOf(ta); if (key && ta) _hamNotesDraft[key] = ta.value; }
+    function hamNotesKeydown(e, ta) { if (e && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); hamNoteAdd(e, ta); } }
+    async function hamNoteAdd(e, el) {
+      const key = hamNotesKeyOf(el);
+      if (!key || _hamNotesBusy.has(key)) return;
+      const p = document.getElementById(hamNotesPanelId(key));
+      const ta = p && p.querySelector('.ham-notes-input');
+      const text = String(ta ? ta.value : (_hamNotesDraft[key] || '')).trim();
+      if (!text) { if (ta) ta.focus(); return; }
+      if (text.length > MAINTAINER_NOTES_MAX) { showToast('A note is at most ' + MAINTAINER_NOTES_MAX + ' characters', 'error'); return; }
+      const q = hamNotesSplitKey(key);
+      _hamNotesBusy.add(key);
+      try {
+        const r = await fetch('/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo: q.repo, number: q.number, text }) });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { showToast('Could not add the note: ' + (d && d.error ? d.error : 'HTTP ' + r.status), 'error'); return; }
+        delete _hamNotesDraft[key];
+        if (d && d.note) { const cur = (_hamNotes[key] || []).filter(n => n.id !== d.note.id); cur.push(d.note); _hamNotes[key] = cur; }
+        renderStageTracker();
+        const p2 = document.getElementById(hamNotesPanelId(key));
+        const ta2 = p2 && p2.querySelector('.ham-notes-input');
+        if (ta2) ta2.focus();
+      } catch (err) {
+        showToast('Could not add the note: ' + (err && err.message ? err.message : 'network error'), 'error');
+      } finally { _hamNotesBusy.delete(key); }
+    }
+    async function hamNoteDelete(e, btn) {
+      const li = btn && btn.closest ? btn.closest('.ham-note[data-ham-note-id]') : null;
+      const id = li ? li.getAttribute('data-ham-note-id') : '';
+      const key = hamNotesKeyOf(btn);
+      if (!id || !key) return;
+      try {
+        const r = await fetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { showToast('Could not delete the note: ' + (d && d.error ? d.error : 'HTTP ' + r.status), 'error'); return; }
+        _hamNotes[key] = (_hamNotes[key] || []).filter(n => n.id !== id);
+        if (!_hamNotes[key].length) delete _hamNotes[key];
+        renderStageTracker();
+      } catch (err) {
+        showToast('Could not delete the note: ' + (err && err.message ? err.message : 'network error'), 'error');
+      }
+    }
+
     // The canonical tracker count (owner): rows of the default view — every
     // item on its own row except a PR drawn on a listed issue's row.
     function stageTrackerRowCount(items, ctx) {
@@ -286,8 +493,12 @@
     // attention-first within a column (stageTrackerAttentionTier); dir 'asc'
     // reverses the strip / age / repo / number keys but never the tier, and
     // reverses 'finisher' whole (rows that need a person first).
-    function stageTrackerSort(rows, stages, f) {
+    // On a phone (opts.phone) with f.attentionFirst the tier becomes the
+    // top-level group, ahead of the column, so rows parked on a person lead
+    // the list; desktop ordering never reads it.
+    function stageTrackerSort(rows, stages, f, opts) {
       f = stageTrackerNormalizeFilter(f);
+      const tierFirst = !!(opts && opts.phone) && f.attentionFirst && (f.sort === 'furthest' || f.sort === 'waiting');
       const byRepoNumber = (x, y) => ((x.repo || '').localeCompare(y.repo || '')) || ((x.number || 0) - (y.number || 0));
       const sign = f.dir === 'asc' ? -1 : 1;
       const byTier = (x, y) => stageTrackerAttentionTier(x) - stageTrackerAttentionTier(y);
@@ -306,6 +517,8 @@
           cmp = (x, y) => { const a = keyOf(x), b = keyOf(y); return sign * (b.anchor - a.anchor) || byTier(x, y) || sign * ((a.since - b.since) || byRepoNumber(x, y)); };
         }
       }
+      const ordered = cmp;
+      if (tierFirst) cmp = (x, y) => byTier(x, y) || ordered(x, y);
       return (rows || []).slice().sort(cmp);
     }
 
@@ -322,24 +535,26 @@
     }
 
     // label facet model begin
-    // Label chips: every label on any item, stage/NNN first by number then
-    // the rest alphabetically (stageTrackerLabelCompare). The row shows the
-    // first STAGE_TRACKER_LABEL_CHIP_LIMIT plus every selected label; `all`
-    // is the complete list the "+N more" dialog offers, so no label is ever
-    // out of reach. `needsHuman` and `onHold` are the synthetic facets:
-    // their counts are the items stageTrackerItemNeedsHuman /
-    // stageTrackerItemOnHold accept — the same predicates the filter uses.
+    // Label chips: every label on any item that can be a row (never a
+    // standing meta issue, stageTrackerIsStandingMeta), stage/NNN first by
+    // number then the rest alphabetically (stageTrackerLabelCompare). The
+    // row shows the first STAGE_TRACKER_LABEL_CHIP_LIMIT plus every selected
+    // label; `all` is the complete list the "+N more" dialog offers, so no
+    // label is ever out of reach. `needsHuman` and `onHold` are the
+    // synthetic facets: their counts are the items stageTrackerItemNeedsHuman
+    // / stageTrackerItemOnHold accept — the same predicates the filter uses.
     function stageTrackerLabelFacets(items, f, opts) {
       f = stageTrackerNormalizeFilter(f);
+      items = (items || []).filter(it => !stageTrackerIsStandingMeta(it));
       const counts = {};
-      (items || []).forEach(it => (Array.isArray(it.labels) ? it.labels : []).forEach(l => { const k = String(l).toLowerCase(); counts[k] = (counts[k] || 0) + 1; }));
+      items.forEach(it => (Array.isArray(it.labels) ? it.labels : []).forEach(l => { const k = String(l).toLowerCase(); counts[k] = (counts[k] || 0) + 1; }));
       const all = Object.keys(counts).sort(stageTrackerLabelCompare);
       const shown = all.slice(0, STAGE_TRACKER_LABEL_CHIP_LIMIT);
       f.labels.forEach(l => { if (counts[l] && shown.indexOf(l) < 0) shown.push(l); });
       shown.sort(stageTrackerLabelCompare);
       const chip = l => ({ label: l, count: counts[l], on: f.labels.indexOf(l) >= 0 });
-      const needsHuman = { count: (items || []).filter(stageTrackerItemNeedsHuman).length, on: f.needsHuman };
-      const onHold = { count: (items || []).filter(stageTrackerItemOnHold).length, on: f.onHold };
+      const needsHuman = { count: items.filter(stageTrackerItemNeedsHuman).length, on: f.needsHuman };
+      const onHold = { count: items.filter(stageTrackerItemOnHold).length, on: f.onHold };
       return { chips: shown.map(chip), all: all.map(chip), hidden: Math.max(0, all.length - shown.length), needsHuman, onHold };
     }
 
@@ -368,17 +583,18 @@
     // spells out how the row count is made ("33 issues + 4 PRs on their
     // own row") in the header and the pill tooltip, so the two pills read
     // as different views of one population rather than a disagreement.
-    function stageTrackerCountsText(page, allCount, attention, open, attentionAll, folded) {
+    function stageTrackerCountsText(page, allCount, attention, open, attentionAll, folded, standing) {
       const filteredOut = Math.max(0, allCount - page.total);
       const showing = page.total ? `showing ${page.from}–${page.to} of ${page.total}` : 'showing 0 of 0';
       const attnText = n => n ? n + ' need' + (n === 1 ? 's' : '') + ' attention' : 'nothing needs attention';
       const attn = attnText(attention);
       const attnAll = attnText(Number.isFinite(Number(attentionAll)) ? Number(attentionAll) : attention);
       const rowsWord = n => n === 1 ? 'row' : 'rows';
-      const parts = stageTrackerRowBreakdown(allCount, open, folded);
+      const parts = stageTrackerRowBreakdown(allCount, open, folded, standing);
       const noteBits = [];
       if (parts.shared) noteBits.push(`${parts.shared} ${parts.shared === 1 ? 'PR' : 'PRs'} shown on ${parts.shared === 1 ? 'its' : 'their'} issue's row`);
       if (parts.folded) noteBits.push(`${parts.folded} review ${parts.folded === 1 ? 'note' : 'notes'} folded under ${parts.folded === 1 ? 'its' : 'their'} PR`);
+      if (parts.standing) noteBits.push(`${parts.standing} bot ${parts.standing === 1 ? 'dashboard' : 'dashboards'} or advisory ${parts.standing === 1 ? 'report' : 'reports'} not listed`);
       const note = noteBits.join(' · ');
       const breakdown = parts.known ? `${parts.issues} ${parts.issues === 1 ? 'issue' : 'issues'} + ${parts.standalonePRs} ${parts.standalonePRs === 1 ? 'PR' : 'PRs'} on ${parts.standalonePRs === 1 ? 'its' : 'their'} own row` : '';
       return {
@@ -393,18 +609,20 @@
 
     // Pure: how the default view's row count decomposes against the open
     // item totals. Every open issue is a row except a review note folded
-    // under its PR (`folded`, see stageTrackerVisible); a PR is a row only
-    // when it is not drawn under a listed issue, so standalonePRs = rows −
-    // (issues − folded) and shared = (issues − folded + PRs) − rows. `known`
-    // is false without totals. `issues` stays the open-issue total so the
+    // under its PR (`folded`, see stageTrackerVisible) and a standing meta
+    // issue (`standing`); a PR is a row only when it is not drawn under a
+    // listed issue, so standalonePRs = rows − (issues − folded − standing)
+    // and shared = (issues − folded − standing + PRs) − rows. `known` is
+    // false without totals. `issues` stays the open-issue total so the
     // breakdown still adds up to the Overview tile.
-    function stageTrackerRowBreakdown(rowCount, open, folded) {
+    function stageTrackerRowBreakdown(rowCount, open, folded, standing) {
       const rows = Math.max(0, Number(rowCount) || 0);
-      if (!open || !Number.isFinite(Number(open.issues)) || !Number.isFinite(Number(open.prs))) return { known: false, rows, issues: 0, prs: 0, standalonePRs: 0, shared: 0, folded: 0 };
+      if (!open || !Number.isFinite(Number(open.issues)) || !Number.isFinite(Number(open.prs))) return { known: false, rows, issues: 0, prs: 0, standalonePRs: 0, shared: 0, folded: 0, standing: 0 };
       const issues = Math.max(0, Number(open.issues)), prs = Math.max(0, Number(open.prs));
       const fold = Math.min(issues, Math.max(0, Number(folded) || 0));
-      const standalonePRs = Math.min(prs, Math.max(0, rows - (issues - fold)));
-      return { known: true, rows, issues, prs, standalonePRs, shared: Math.max(0, issues - fold + prs - rows), folded: fold };
+      const meta = Math.min(issues - fold, Math.max(0, Number(standing) || 0));
+      const standalonePRs = Math.min(prs, Math.max(0, rows - (issues - fold - meta)));
+      return { known: true, rows, issues, prs, standalonePRs, shared: Math.max(0, issues - fold - meta + prs - rows), folded: fold, standing: meta };
     }
 
     // Pure: how many issues of the default view are folded review notes

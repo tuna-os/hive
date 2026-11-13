@@ -1,0 +1,624 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  ACTIONS_APP_ID, DCO_APP_ID, POLICY_CHECKS, BUILD_CHECKS,
+  PendingEvidence, membersForGroup, assertEligible, evidenceForHead, closedNoop, evaluate,
+  isTransientAPIError, isCosmeticLabelFlip, replayLastVerdict,
+  ProviderUnavailable, FORWARD_MERGE, PROW,
+  DCO_ENUMERATION_SUMMARY_PREFIX,
+  DCO_ENUMERATION_SUMMARY_FALLBACK,
+  DCO_PROVIDER_UNAVAILABLE_TEXT,
+  DCO_PROVIDER_RUNBOOK,
+} = require('./native-queue-policy.cjs');
+
+const sha = n => n.toString(16).padStart(40, '0');
+// App 1861 check run 125732155592 on #16378, head 1989d20aa8d0d92cce761786ac05825aef1d9d3a.
+const unavailableSummary = DCO_ENUMERATION_SUMMARY_PREFIX + '\n\n' +
+  'GitHub returned 250 commits from the REST API, so the app attempted to retrieve the full list through GraphQL before evaluating the pull request. ' +
+  DCO_ENUMERATION_SUMMARY_FALLBACK + '\n\nHTTP status: unknown\nGitHub request ID: unavailable';
+const group = {
+  base_sha: sha(1), head_sha: sha(4), base_ref: 'refs/heads/v5',
+  head_ref: 'refs/heads/gh-readonly-queue/v5/pr-2-example',
+};
+const entries = [
+  { id: 'one', position: 1, baseCommit: { oid: sha(1) }, headCommit: { oid: sha(3) },
+    pullRequest: { number: 1, headRefOid: sha(11), baseRefName: 'v5' } },
+  { id: 'two', position: 2, baseCommit: { oid: sha(3) }, headCommit: { oid: sha(4) },
+    pullRequest: { number: 2, headRefOid: sha(12), baseRefName: 'v5' } },
+];
+const clone = x => structuredClone(x);
+const eligible = n => ({
+  number: n, state: 'open', draft: false, head: { sha: sha(10 + n) },
+  base: { ref: 'v5' }, labels: [],
+});
+
+function checks(head, definitions = { ...POLICY_CHECKS, ...BUILD_CHECKS }) {
+  return Object.entries(definitions).map(([name, source], index) => ({
+    id: 100 + index, name, head_sha: head, status: 'completed', conclusion: 'success',
+    app: { id: source ? ACTIONS_APP_ID : DCO_APP_ID },
+    check_suite: { id: 10000 + index },
+    details_url: `https://github.com/acme/widget/actions/runs/${1000 + index}/job/1`,
+  }));
+}
+
+function fixture(eventName = 'merge_group') {
+  const state = {
+    queue: clone(entries), prs: [eligible(1), eligible(2)], seen: [], reviews: [],
+    runs: new Map([1, 2].map(n => [sha(10 + n), checks(sha(10 + n))])),
+    ancestry: 'ahead', ref: group.head_sha, queueReads: 0, prReads: 0, reviewReads: 0,
+  };
+  const github = {
+    rest: {
+      checks: { listForRef: 'checks' }, pulls: {
+        get: async ({ pull_number: n }) => {
+          state.prReads++;
+          if (state.prReads === state.holdOnPRRead) state.prs[n - 1].labels = [{ name: 'hold' }];
+          return { data: clone(state.prs[n - 1]) };
+        },
+        listReviews: 'reviews',
+      },
+      actions: {
+        listJobsForWorkflowRun: 'jobs',
+        getWorkflowRun: async ({ run_id: id }) => {
+          const definition = [...Object.entries(POLICY_CHECKS), ...Object.entries(BUILD_CHECKS)][id - 1000];
+          const source = definition[1];
+          return { data: {
+            id, check_suite_id: id + 9000,
+            path: state.badWorkflow || `.github/workflows/${source[0]}`,
+            event: source[1][0], head_sha: state.workflowHead,
+          } };
+        },
+      },
+      repos: { compareCommitsWithBasehead: async ({ basehead }) => {
+        state.seen.push(basehead);
+        return { data: { status: state.ancestry, merge_base_commit: { sha: basehead.split('...')[0] } } };
+      } },
+      git: { getRef: async () => ({ data: { object: { sha: state.ref } } }) },
+    },
+    paginate: async (method, args) => {
+      if (method === 'jobs') {
+        const index = args.run_id - 1000;
+        const [name] = [...Object.entries(POLICY_CHECKS), ...Object.entries(BUILD_CHECKS)][index];
+        return [{
+          id: 100000 + index, run_id: args.run_id, name, head_sha: state.workflowHead,
+          check_run_url: `https://api.github.com/repos/acme/widget/check-runs/${100 + index}`,
+          status: 'completed', conclusion: 'success',
+        }];
+      }
+      if (method === 'checks') {
+        state.workflowHead = args.ref;
+        return clone(state.runs.get(args.ref));
+      }
+      state.reviewReads++;
+      if (state.reviewReads === state.dismissOnReviewRead) {
+        state.reviews = [{ id: 2, user: { login: 'reviewer' }, state: 'DISMISSED', commit_id: sha(11) }];
+      }
+      return clone(state.reviews);
+    },
+    graphql: async (_query, args) => {
+      state.queueReads++;
+      if (state.mutateOnReread && state.queueReads === 2) state.queue[0].pullRequest.headRefOid = sha(99);
+      const start = Number(args.cursor || 0);
+      const end = state.pageSize ? start + state.pageSize : state.queue.length;
+      return { repository: { mergeQueue: { entries: {
+        nodes: clone(state.queue.slice(start, end)),
+        pageInfo: { hasNextPage: end < state.queue.length, endCursor: String(end) },
+      } } } };
+    },
+  };
+  const context = {
+    repo: { owner: 'acme', repo: 'widget' }, eventName,
+    payload: eventName === 'merge_group' ? { action: 'checks_requested', merge_group: clone(group) } :
+      { pull_request: clone(state.prs[0]) },
+  };
+  return { github, context, state };
+}
+
+test('all members, not merely the PR encoded in the group ref', () => {
+  assert.deepEqual(membersForGroup(entries, group).map(e => e.pullRequest.number), [1, 2]);
+});
+
+test('missing, duplicate, reordered and changed-base membership fail closed', () => {
+  for (const mutate of [
+    es => es.shift(),
+    es => { es[0].pullRequest.number = 2; },
+    es => { es[1].baseCommit.oid = sha(99); },
+    es => { es[0].pullRequest.baseRefName = 'v6'; },
+    es => { es[1].headCommit = null; },
+    es => { es[0].pullRequest.headRefOid = ''; },
+  ]) {
+    const es = clone(entries);
+    mutate(es);
+    assert.throws(() => membersForGroup(es, group));
+  }
+});
+
+test('malformed group identity is rejected', () => {
+  for (const change of [{ head_sha: '' }, { base_sha: '' }, { head_ref: 'refs/heads/v5' }, { base_ref: 'v5' }]) {
+    assert.throws(() => membersForGroup(entries, { ...group, ...change }));
+  }
+});
+
+test('every one of the eleven protections needs exact-head evidence', () => {
+  const definitions = { ...POLICY_CHECKS, ...BUILD_CHECKS };
+  assert.equal(Object.keys(definitions).length, 11);
+  const runs = checks(sha(11));
+  assert.equal(evidenceForHead(runs, sha(11), definitions).length, 11);
+  for (const run of runs) {
+    assert.throws(() => evidenceForHead(runs.filter(r => r.id !== run.id), sha(11), definitions), PendingEvidence);
+    for (const change of [
+      { status: 'in_progress' }, { conclusion: 'failure' }, { conclusion: 'neutral' },
+      { app: { id: 999 } }, { head_sha: sha(99) },
+    ]) {
+      assert.throws(() => evidenceForHead(runs.map(r => r.id === run.id ? { ...r, ...change } : r), sha(11), definitions));
+    }
+  }
+});
+
+test('no Actions-generated DCO, stale success, or skipped policy proof', () => {
+  const runs = checks(sha(11));
+  const dco = runs.find(r => r.name === 'DCO');
+  for (const change of [{ app: { id: ACTIONS_APP_ID } }, { conclusion: 'skipped' }, { status: 'queued' }]) {
+    assert.throws(() => evidenceForHead([...runs, { ...dco, id: 999, ...change }], sha(11), POLICY_CHECKS));
+  }
+  const technical = runs.map(r => Object.hasOwn(BUILD_CHECKS, r.name) ? { ...r, conclusion: 'skipped' } : r);
+  assert.equal(evidenceForHead(technical, sha(11), BUILD_CHECKS).length, 6);
+});
+
+test('provider enumeration UNKNOWN blocks both admission paths without retry or substituted proof', async () => {
+  for (const eventName of ['pull_request_target', 'merge_group']) {
+    const f = fixture(eventName);
+    const runs = f.state.runs.get(sha(11));
+    const dco = runs.find(r => r.name === 'DCO');
+    Object.assign(dco, { conclusion: 'failure', output: { summary: unavailableSummary } });
+    // Neither an older authoritative success nor a lowercase status-like
+    // check can replace the latest failed authoritative run.
+    runs.push({ ...dco, id: 1, conclusion: 'success' },
+      { ...dco, id: 999, name: 'dco', conclusion: 'success', app: { id: 999 } });
+    await assert.rejects(evaluate(f), error => {
+      assert.ok(error instanceof ProviderUnavailable);
+      assert.ok(!(error instanceof PendingEvidence));
+      assert.match(error.message, /verdict UNKNOWN.*App 1861/);
+      assert.ok(error.message.startsWith(DCO_PROVIDER_UNAVAILABLE_TEXT));
+      assert.ok(error.message.includes(DCO_PROVIDER_RUNBOOK));
+      assert.match(error.message, /Admission remains blocked/);
+      assert.match(error.message, /No PR source change is requested/);
+      return true;
+    });
+    dco.conclusion = 'success';
+    assert.match(await evaluate(f), /policy providers succeeded|validated all/);
+  }
+});
+
+test('UNKNOWN reporting requires trusted exact-head completed DCO and the specific enumeration diagnostic', () => {
+  const dco = checks(sha(11), { DCO: null })[0];
+  const unknown = { ...dco, conclusion: 'failure', output: { summary: unavailableSummary } };
+  for (const change of [
+    { app: { id: ACTIONS_APP_ID } }, { head_sha: sha(99) }, { status: 'in_progress' },
+    { output: undefined }, { output: { summary: 'The sign-off is missing.' } },
+    { output: { summary: 'DCO verdict is unknown.' } }, { conclusion: 'action_required' },
+  ]) {
+    assert.throws(() => evidenceForHead([{ ...unknown, ...change }], sha(11), { DCO: null }),
+      error => !(error instanceof ProviderUnavailable));
+  }
+  assert.throws(() => evidenceForHead([{ ...dco, conclusion: 'failure' }], sha(11), { DCO: null }),
+    error => !(error instanceof ProviderUnavailable) && error.message === 'DCO: failure');
+});
+
+// #17030: v6-topup.yml's PR whose probot DCO rejects a commit already on v5.
+function forwardMergeFixture() {
+  const f = fixture('pull_request_target');
+  Object.assign(f.state.prs[0], {
+    head: { sha: sha(11), ref: 'sync/v5-to-v6', repo: { full_name: 'acme/widget' } },
+    base: { ref: 'v6' }, user: { ...FORWARD_MERGE.author },
+  });
+  f.context.payload.pull_request = clone(f.state.prs[0]);
+  f.state.runs.get(sha(11)).find(r => r.name === 'DCO').conclusion = 'action_required';
+  // sha(201) is the v5 commit probot rejects; sha(11) is the top-up merge of
+  // v5 (sha(201)) onto v6 (sha(300)).
+  f.state.commits = [
+    { sha: sha(201), parents: [{ sha: sha(200) }] },
+    { sha: sha(11), parents: [{ sha: sha(300) }, { sha: sha(201) }] },
+  ];
+  f.state.reachable = new Set([`v5...${sha(201)}`, `v6...${sha(300)}`]);
+  f.state.statuses = [
+    { id: 1, context: 'dco', state: 'success', creator: { login: PROW.login, id: PROW.id } },
+  ];
+  f.github.rest.pulls.listCommits = 'commits';
+  f.github.rest.repos.listCommitStatusesForRef = 'statuses';
+  f.github.rest.repos.compareCommitsWithBasehead = async ({ basehead }) => {
+    f.state.seen.push(basehead);
+    return { data: { status: f.state.reachable.has(basehead) ? 'behind' : 'diverged' } };
+  };
+  const basePaginate = f.github.paginate;
+  f.github.paginate = async (method, args) => {
+    if (method === 'commits') return clone(f.state.commits);
+    if (method === 'statuses') return clone(f.state.statuses);
+    return basePaginate(method, args);
+  };
+  return f;
+}
+
+test('v5-reachable sync/v5-to-v6 forward-merge passes on prow dco without probot DCO', async () => {
+  const f = forwardMergeFixture();
+  assert.match(await evaluate(f),
+    /five existing policy providers succeeded.*DCO path: prow dco for v5-reachable sync\/v5-to-v6 forward-merge/);
+  assert.deepEqual(f.state.seen, [`v5...${sha(201)}`, `v6...${sha(300)}`, `v5...${sha(201)}`]);
+});
+
+test('one commit unreachable from v5 keeps the forward-merge on probot DCO', async () => {
+  const unreachable = forwardMergeFixture();
+  unreachable.state.reachable.delete(`v5...${sha(201)}`);
+  await assert.rejects(evaluate(unreachable), /DCO: action_required.*probot DCO.*not reachable from v5/);
+  const extra = forwardMergeFixture();
+  extra.state.commits.splice(1, 0, { sha: sha(202), parents: [{ sha: sha(201) }] });
+  await assert.rejects(evaluate(extra), new RegExp(`DCO: action_required.*${sha(202)} is not reachable from v5`));
+  for (const parents of [[{ sha: sha(201) }], [{ sha: sha(301) }, { sha: sha(201) }], [{ sha: sha(300) }, { sha: sha(202) }]]) {
+    const notMerge = forwardMergeFixture();
+    notMerge.state.commits[1].parents = parents;
+    await assert.rejects(evaluate(notMerge), /DCO: action_required.*is not a merge of v5 into v6/);
+  }
+  const truncated = forwardMergeFixture();
+  truncated.state.commits = Array.from({ length: 250 }, (_, i) => ({ sha: sha(1000 + i), parents: [] }));
+  await assert.rejects(evaluate(truncated), /DCO: action_required.*commit list unverifiable/);
+  // Probot DCO succeeding still admits through the unchanged path.
+  unreachable.state.runs.get(sha(11)).find(r => r.name === 'DCO').conclusion = 'success';
+  assert.match(await evaluate(unreachable), /DCO path: probot DCO \(App 1861\); sync\/v5-to-v6 fallback/);
+});
+
+test('another head branch, base, fork or author keeps requiring probot DCO', async () => {
+  for (const change of [
+    pr => { pr.head.ref = 'sync/v5-to-v6-extra'; },
+    pr => { pr.head.repo.full_name = 'fork/widget'; },
+    pr => { pr.user = { login: 'clubanderson', id: 1, type: 'User' }; },
+    pr => { pr.user.id = 1; },
+    pr => { pr.user.login = 'hivecommons-hive[bot]'; },
+  ]) {
+    const f = forwardMergeFixture();
+    change(f.state.prs[0]);
+    await assert.rejects(evaluate(f), error => error.message === 'DCO: action_required');
+    assert.equal(f.state.seen.length, 0);
+  }
+  const v5 = forwardMergeFixture();
+  v5.state.prs[0].base.ref = 'v5';
+  v5.context.payload.pull_request.base.ref = 'v5';
+  await assert.rejects(evaluate(v5), error => error.message === 'DCO: action_required');
+});
+
+test('forward-merge path fails without a successful prow-created dco status', async () => {
+  const failed = forwardMergeFixture();
+  failed.state.statuses.push({ id: 2, context: 'dco', state: 'failure', creator: { login: PROW.login, id: PROW.id } });
+  await assert.rejects(evaluate(failed), /prow dco: failure.*DCO path: prow dco/);
+  // Any workflow token can post a `dco` status; it never stands in for prow.
+  const forged = forwardMergeFixture();
+  forged.state.statuses = [{ id: 3, context: 'dco', state: 'success', creator: { login: 'github-actions[bot]', id: 41898282 } }];
+  await assert.rejects(evaluate(forged), error => error instanceof PendingEvidence && /Missing prow dco/.test(error.message));
+  const pending = forwardMergeFixture();
+  pending.state.statuses[0].state = 'pending';
+  await assert.rejects(evaluate(pending), error => error instanceof PendingEvidence);
+});
+
+test('draft, closed, held and moved-head/base PRs cannot pass', () => {
+  for (const change of [
+    { draft: true }, { state: 'closed' }, { head: { sha: sha(99) } }, { base: { ref: 'v6' } },
+    ...['hold', 'needs-human', 'do-not-merge', 'do-not-merge/security', 'release-in-progress'].map(name => ({ labels: [{ name }] })),
+  ]) assert.throws(() => assertEligible({ ...eligible(1), ...change }, sha(11), 'v5'));
+});
+
+test('group evaluation checks each member head, all evidence, and live synthetic ref', async () => {
+  const f = fixture();
+  assert.match(await evaluate(f), /all 2 member heads/);
+  assert.deepEqual(f.state.seen, [`${sha(11)}...${sha(4)}`, `${sha(12)}...${sha(4)}`]);
+  assert.equal(f.state.queueReads, 2);
+});
+
+test('membership lookup consumes every page up to this group, not pending successors', async () => {
+  const f = fixture();
+  f.state.pageSize = 1;
+  f.state.queue.push({ id: 'later', position: 3, headCommit: null, pullRequest: null });
+  assert.match(await evaluate(f), /all 2 member heads/);
+  assert.equal(f.state.queueReads, 4);
+});
+
+test('PR-target admission consumes policy providers without group APIs', async () => {
+  const f = fixture('pull_request_target');
+  assert.match(await evaluate(f), /five existing policy providers/);
+  assert.equal(f.state.queueReads, 0);
+  assert.equal(f.state.seen.length, 0);
+});
+
+test('closed PR on pull_request_target passes as a no-op and skips evidence lookup', async () => {
+  const f = fixture('pull_request_target');
+  f.state.prs[0].state = 'closed';
+  let lookups = 0;
+  const paginate = f.github.paginate;
+  f.github.paginate = async (...args) => { lookups++; return paginate(...args); };
+  assert.match(await evaluate(f), new RegExp(closedNoop(f.state.prs[0])));
+  assert.equal(lookups, 0);
+});
+
+test('PR closed during evidence wait passes as a no-op', async () => {
+  const f = fixture('pull_request_target');
+  const get = f.github.rest.pulls.get;
+  let reads = 0;
+  f.github.rest.pulls.get = async args => {
+    const res = await get(args);
+    if (++reads === 2) res.data.state = 'closed';
+    return res;
+  };
+  assert.match(await evaluate(f), new RegExp(closedNoop(f.state.prs[0])));
+});
+
+test('a 5xx from the API is retried as pending evidence, never read as a verdict', async () => {
+  const apiError = status => Object.assign(new Error(`GET /check-runs - ${status}`), { status });
+  for (const eventName of ['pull_request_target', 'merge_group']) {
+    const f = fixture(eventName);
+    const paginate = f.github.paginate;
+    let calls = 0;
+    f.github.paginate = async (method, args) => {
+      if (method === 'checks' && ++calls === 1) throw apiError(500);
+      return paginate(method, args);
+    };
+    await assert.rejects(evaluate(f), error =>
+      error instanceof PendingEvidence && /GitHub API 500/.test(error.message) && error.cause?.status === 500);
+    // The retry is the workflow loop's job: the next evaluate succeeds on its own.
+    assert.match(await evaluate(f), /policy providers succeeded|validated all/);
+  }
+  // Only the server side is transient: a 4xx or a non-HTTP failure stays a hard failure.
+  for (const failure of [apiError(404), apiError(403), new Error('socket hang up')]) {
+    const f = fixture('pull_request_target');
+    f.github.paginate = async () => { throw failure; };
+    await assert.rejects(evaluate(f), error => !(error instanceof PendingEvidence) && error === failure);
+  }
+  assert.equal(isTransientAPIError({ status: 502 }), true);
+  assert.equal(isTransientAPIError({ status: '503' }), true);
+  assert.equal(isTransientAPIError({ status: 429 }), false);
+  assert.equal(isTransientAPIError({ status: 600 }), false);
+  assert.equal(isTransientAPIError(undefined), false);
+});
+
+test('open PR with moved head still fails closed on pull_request_target', async () => {
+  const f = fixture('pull_request_target');
+  f.state.prs[0].head.sha = sha(99);
+  await assert.rejects(evaluate(f), /head\/base moved/);
+});
+
+test('untrusted events and workflow provenance are rejected', async () => {
+  const f = fixture('pull_request');
+  await assert.rejects(evaluate(f), /Unsupported/);
+  const g = fixture();
+  g.state.badWorkflow = '.github/workflows/untrusted.yml';
+  await assert.rejects(evaluate(g), /Unexpected workflow/);
+});
+
+test('copied expected-run URL/name cannot substitute a foreign check suite or check identity', async () => {
+  for (const change of [
+    { id: 999, check_suite: { id: 99999 } },
+    { id: 999 }, // Even a claimed matching suite cannot replace actual job membership.
+    { check_suite: null },
+  ]) {
+    const f = fixture('pull_request_target');
+    const gate = f.state.runs.get(sha(11)).find(r => r.name === 'gate');
+    Object.assign(gate, change);
+    await assert.rejects(evaluate(f), /suite\/job identity mismatch/);
+  }
+});
+
+test('expected workflow suite alone does not accept a wrong job head, name or conclusion', async () => {
+  for (const change of [
+    { head_sha: sha(99) }, { name: 'another job' }, { conclusion: 'failure' },
+    { run_id: 99999 }, { status: 'in_progress' },
+  ]) {
+    const f = fixture('pull_request_target');
+    const paginate = f.github.paginate;
+    f.github.paginate = async (method, args) => {
+      const results = await paginate(method, args);
+      return method === 'jobs' ? results.map(job => ({ ...job, ...change })) : results;
+    };
+    await assert.rejects(evaluate(f), /suite\/job identity mismatch/);
+  }
+});
+
+test('Dependabot PR-target events require an actual successful verifier, never a skipped proof', async () => {
+  for (const conclusion of ['success', 'skipped', 'failure']) {
+    const f = fixture('pull_request_target');
+    f.context.actor = 'dependabot[bot]';
+    f.context.payload.sender = { login: 'dependabot[bot]', type: 'Bot' };
+    f.context.payload.pull_request.user = clone(f.context.payload.sender);
+    f.state.prs[0].user = clone(f.context.payload.sender);
+    f.state.runs.get(sha(11)).find(r => r.name === 'verify PR contents').conclusion = conclusion;
+    if (conclusion === 'success') {
+      assert.match(await evaluate(f), /five existing policy providers/);
+    } else {
+      await assert.rejects(evaluate(f), /verify PR contents/);
+    }
+  }
+});
+
+test('earlier member failure blocks the whole group', async () => {
+  const f = fixture();
+  f.state.runs.get(sha(11)).find(r => r.name === 'DCO').conclusion = 'failure';
+  await assert.rejects(evaluate(f), /DCO: failure/);
+});
+
+test('changed membership, missing ancestry and moved ref fail closed', async () => {
+  for (const change of [
+    { mutateOnReread: true }, { ancestry: 'diverged' }, { ref: sha(99) },
+  ]) {
+    const f = fixture();
+    Object.assign(f.state, change);
+    await assert.rejects(evaluate(f));
+  }
+});
+
+test('changes requested, withdrawn and stale approvals block group validation', async () => {
+  for (const review of [
+    { state: 'CHANGES_REQUESTED', commit_id: sha(11) },
+    { state: 'DISMISSED', commit_id: sha(11) },
+    { state: 'APPROVED', commit_id: sha(99) },
+  ]) {
+    const f = fixture();
+    f.state.reviews = [{ id: 1, user: { login: 'reviewer' }, ...review }];
+    await assert.rejects(evaluate(f), /approval|changes requested/);
+  }
+});
+
+test('late hold or approval withdrawal is caught by the final re-read', async () => {
+  for (const change of [{ holdOnPRRead: 3 }, { dismissOnReviewRead: 3 }]) {
+    const f = fixture();
+    Object.assign(f.state, change);
+    await assert.rejects(evaluate(f), /held|approval/);
+  }
+  const pr = fixture('pull_request_target');
+  pr.state.holdOnPRRead = 2;
+  await assert.rejects(evaluate(pr), /held/);
+});
+
+test('API failure is never interpreted as an empty successful member list', async () => {
+  const f = fixture();
+  f.github.graphql = async () => { throw new Error('403 queue read forbidden'); };
+  await assert.rejects(evaluate(f), /403/);
+});
+
+test('isCosmeticLabelFlip is true only for unread labels on label events', () => {
+  const ctx = (eventName, action, label) => ({ eventName, payload: { action, ...(label && { label: { name: label } }) } });
+  assert.equal(isCosmeticLabelFlip(ctx('pull_request_target', 'labeled', 'size/L')), true);
+  assert.equal(isCosmeticLabelFlip(ctx('pull_request_target', 'unlabeled', 'size/L')), true);
+  assert.equal(isCosmeticLabelFlip(ctx('pull_request_target', 'labeled', 'hold')), false);
+  assert.equal(isCosmeticLabelFlip(ctx('pull_request_target', 'labeled', 'do-not-merge/foo')), false);
+  assert.equal(isCosmeticLabelFlip(ctx('pull_request_target', 'synchronize', 'size/L')), false);
+  assert.equal(isCosmeticLabelFlip(ctx('merge_group', 'checks_requested')), false);
+  assert.equal(isCosmeticLabelFlip(ctx('pull_request_target', 'labeled')), false);
+});
+
+function replayFixture(priorRuns, labels = [], workflowOverride = {}) {
+  const f = fixture('pull_request_target');
+  f.state.prs[0].labels = labels;
+  const head = sha(11);
+  f.state.listed = [];
+  const runs = clone(priorRuns).map(r => ({
+    name: 'native-queue-policy', head_sha: head, app: { id: ACTIONS_APP_ID },
+    check_suite: { id: 5000 + r.id },
+    details_url: `https://github.com/acme/widget/actions/runs/${3000 + r.id}/job/1`, ...r,
+  }));
+  const baseGetWorkflowRun = f.github.rest.actions.getWorkflowRun;
+  const basePaginate = f.github.paginate;
+  f.github.rest.actions.getWorkflowRun = async ({ run_id: id }) => (id < 3000 ? baseGetWorkflowRun({ run_id: id }) : { data: {
+    id, check_suite_id: id + 2000, path: '.github/workflows/native-queue-policy.yml',
+    event: 'pull_request_target', head_sha: head, ...workflowOverride,
+  } });
+  f.github.paginate = async (method, args) => {
+    // Policy provider evidence comes from the base fixture (all green).
+    if (method === 'jobs' && args.run_id < 3000) return basePaginate(method, args);
+    if (method === 'checks' && !args.check_name) return basePaginate(method, args);
+    if (method === 'jobs') {
+      const run = runs.find(r => 3000 + r.id === args.run_id);
+      if (!run) return [];
+      return [{
+        id: 200000 + run.id, run_id: args.run_id, name: run.name, head_sha: head,
+        check_run_url: `https://api.github.com/repos/acme/widget/check-runs/${run.id}`,
+        status: 'completed', conclusion: run.conclusion,
+      }];
+    }
+    assert.equal(method, 'checks');
+    f.state.listed.push(args);
+    return clone(runs);
+  };
+  return f;
+}
+
+test('cosmetic flip replays the latest completed success on the same head', async () => {
+  const f = replayFixture([
+    { id: 5, status: 'completed', conclusion: 'failure' },
+    { id: 7, status: 'completed', conclusion: 'success' },
+    { id: 9, status: 'in_progress', conclusion: null },
+  ]);
+  assert.match(await replayLastVerdict(f), /run 7 \(success\)/);
+  assert.equal(f.state.listed[0].ref, sha(11));
+});
+
+test('cosmetic flip does not replay a success when a policy provider re-ran red on the head', async () => {
+  for (const name of Object.keys(POLICY_CHECKS)) {
+    const f = replayFixture([{ id: 7, status: 'completed', conclusion: 'success' }]);
+    f.state.runs.get(sha(11)).find(r => r.name === name).conclusion = 'failure';
+    await assert.rejects(replayLastVerdict(f), new RegExp(`${name}: failure`));
+  }
+});
+
+test('cosmetic flip falls through to the full wait while a policy provider is re-running or missing', async () => {
+  // PendingEvidence is not a verdict: returning null sends the caller to the
+  // polling wait instead of failing the check with no retry.
+  for (const name of Object.keys(POLICY_CHECKS)) {
+    for (const change of [{ status: 'queued', conclusion: null }, { status: 'in_progress', conclusion: null }]) {
+      const f = replayFixture([{ id: 7, status: 'completed', conclusion: 'success' }]);
+      Object.assign(f.state.runs.get(sha(11)).find(r => r.name === name), change);
+      assert.equal(await replayLastVerdict(f), null);
+    }
+    const f = replayFixture([{ id: 7, status: 'completed', conclusion: 'success' }]);
+    const runs = f.state.runs.get(sha(11));
+    runs.splice(runs.findIndex(r => r.name === name), 1);
+    assert.equal(await replayLastVerdict(f), null);
+  }
+});
+
+test('cosmetic flip falls through to the full wait when the DCO provider reports UNKNOWN', async () => {
+  // The full wait re-raises ProviderUnavailable once and renders the runbook
+  // job summary; failing here would skip that operator-facing surface.
+  const f = replayFixture([{ id: 7, status: 'completed', conclusion: 'success' }]);
+  Object.assign(f.state.runs.get(sha(11)).find(r => r.name === 'DCO'),
+    { conclusion: 'failure', output: { summary: unavailableSummary } });
+  assert.equal(await replayLastVerdict(f), null);
+});
+
+test('cosmetic flip has nothing to replay without a prior success and falls through', async () => {
+  // A failed, cancelled (timed-out) or absent prior run must not be pinned
+  // onto every later stage-label flip: null sends the caller to the full wait.
+  assert.equal(await replayLastVerdict(replayFixture([
+    { id: 5, status: 'completed', conclusion: 'success' },
+    { id: 7, status: 'completed', conclusion: 'failure' },
+  ])), null);
+  assert.equal(await replayLastVerdict(replayFixture([
+    { id: 5, status: 'completed', conclusion: 'success' },
+    { id: 7, status: 'completed', conclusion: 'cancelled' },
+  ])), null);
+  assert.equal(await replayLastVerdict(replayFixture([
+    { id: 9, status: 'in_progress', conclusion: null },
+  ])), null);
+  assert.equal(await replayLastVerdict(replayFixture([])), null);
+  const own = replayFixture([{ id: 8, status: 'completed', conclusion: 'success' }]);
+  assert.equal(await replayLastVerdict({ ...own, currentCheckRunId: 8 }), null);
+});
+
+test('cosmetic flip still honours a live hold even after a prior success', async () => {
+  const f = replayFixture([{ id: 7, status: 'completed', conclusion: 'success' }], [{ name: 'hold' }]);
+  await assert.rejects(replayLastVerdict(f), /held/);
+});
+
+test('replay ignores runs with a different name, head_sha or app id', async () => {
+  for (const change of [
+    { name: 'other-check' }, { head_sha: sha(99) }, { app: { id: DCO_APP_ID } }, { app: undefined },
+  ]) {
+    assert.equal(
+      await replayLastVerdict(replayFixture([{ id: 7, status: 'completed', conclusion: 'success', ...change }])),
+      null);
+  }
+});
+
+test('replay rejects a same-named success run from another workflow', async () => {
+  const run = { id: 7, status: 'completed', conclusion: 'success' };
+  for (const override of [
+    { path: '.github/workflows/forged.yml' },
+    { event: 'pull_request' },
+    { head_sha: sha(99) },
+    { check_suite_id: 1 },
+  ]) {
+    await assert.rejects(replayLastVerdict(replayFixture([run], [], override)), /Unexpected workflow|identity mismatch/);
+  }
+  await assert.rejects(replayLastVerdict(replayFixture([
+    { ...run, details_url: 'https://example.com/acme/widget/actions/runs/3007/job/1' },
+  ])), /Invalid Actions provenance/);
+  await assert.rejects(replayLastVerdict(replayFixture([
+    { ...run, details_url: 'https://github.com/acme/widget/actions/runs/3008/job/1' },
+  ])), /Unexpected workflow|identity mismatch/);
+});

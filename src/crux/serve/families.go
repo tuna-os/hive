@@ -148,13 +148,7 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if !s.readOptionalJSON(w, r, &req) {
 		return
 	}
-	var err error
-	if req.Bootstrap != "" {
-		err = s.Runtime.RestartWithBootstrap(s.LaunchContext, name, req.Bootstrap)
-	} else {
-		err = s.Runtime.Restart(s.LaunchContext, name)
-	}
-	if err != nil {
+	if err := s.restartFor(name, req); err != nil {
 		s.writeRuntimeError(w, name, "restart", err)
 		return
 	}
@@ -988,9 +982,7 @@ func (s *Server) installHostObservers() func() {
 	if !ok {
 		return func() {}
 	}
-	host.SetKickOutcomeObserver(func(agent string, o crux.KickOutcome) {
-		s.publishData(api.EventKickOutcome, agent, api.KickOutcome{Kind: o.Kind, Reason: o.Reason, At: o.At, KickAt: o.KickAt})
-	})
+	host.SetKickOutcomeObserver(s.recordKickOutcome)
 	host.SetPauseTransitionObserver(func(ev crux.PauseTransitionEvent) {
 		s.publishData(api.EventPauseTransition, ev.Agent, api.PauseTransition{
 			Paused: ev.Paused, Trigger: ev.Trigger, Reason: ev.Reason, By: ev.By, At: ev.At,

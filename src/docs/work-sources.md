@@ -108,6 +108,17 @@ GitHub repository. See [Forges: GitLab, Gitea and
 Forgejo](integrations/forges.md) for the operation list and what runs through
 the adapters today, and [Forge setup](forge-app-setup.md) for the reasons.
 
+## Spek-published RFCs and children
+
+Spek (hivecommons/spektacular) can publish a finished spec as an RFC plus
+child issues into any of the sources above. Nothing source-specific is needed:
+the children are read like any other item, provided they pass the source's own
+filters (`require_labels`, `hold_labels`, `teams[].repo` / `states`,
+`project_keys` / `jql`). The hidden `<!-- spek:publish … -->` marker in each
+body keeps a child on the direct-fix path, skips the clarity score, carries the
+RFC link into the kick and marks the RFC itself as an umbrella Hive never
+claims; see [spektacular.md → Publish hand-off](spektacular.md#publish-hand-off).
+
 ## Run stages (`run_stages: true`)
 
 <details>
@@ -595,7 +606,7 @@ Review findings below the blocking line (`review.severity.block_at`), and cited 
 | `linear` | `linear` | An issue on the team mapped to the PR's repo (`teams[].repo`), in `linear_state` when set. Labels that already exist on the team are applied. |
 | `jira` | `jira` | A Task in the first `project_keys` project, moved to `jira_status` when set. Labels have their whitespace replaced with `-`. |
 
-If the destination's work source is not active, or cannot be built (for example a missing `api_key`), the hive files a GitHub issue with the `agent/reviewer` label and logs why. Items are de-duplicated per repo by finding fingerprint. When another PR raises the same finding, the hive comments on the existing item instead of filing a new one. At most `max_per_pr_per_day` items are filed or updated per PR per day. See [review-swarm.md](review-swarm.md#backlog-routing) for the fingerprint, item body and audit entries.
+If the destination's work source is not active, or cannot be built (for example a missing `api_key`), the hive files a GitHub issue with the `agent/reviewer` label and logs why. Items are de-duplicated per repo by finding fingerprint. When another PR raises the same finding, the hive comments on the existing item instead of filing a new one. Findings below `review.backlog.min_severity` (default `P2`) are held in one Follow-ups comment on the PR instead of filed; new findings sharing a perspective are filed as one checklist item; and at most `max_per_pr` items (default 3) are filed per PR over its lifetime. See [review-swarm.md](review-swarm.md#backlog-routing) for the fingerprint, item body and audit entries.
 
 ## Open questions
 

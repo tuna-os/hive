@@ -72,8 +72,16 @@
       // Guarded: the test harnesses load helpers by name.
       if (typeof stageTrackerAdoptionQueued === 'function' && stageTrackerAdoptionQueued(item)) return STAGE_TRACKER_ADOPTION_QUEUED_CHIP;
       if (stageTrackerAdoptOffered(item)) return 'adopt?';
-      if (a.blocked_by) return 'not adopted';
+      if (a.blocked_by) {
+        switch (a.blocked_by) {
+          case 'author-is-person': return 'author-owned';
+          case 'author-is-maintainer': return 'maintainer-owned';
+          case 'operator-admission': return 'contributor-managed';
+          default: return 'adoption blocked';
+        }
+      }
       // Guarded: the test harnesses load helpers by name.
+      if (typeof stageTrackerHiveReviewerChipText === 'function' && stageTrackerHiveReviewerChipText(item)) return stageTrackerHiveReviewerChipText(item);
       const text = 'waiting on ' + (a.author ? '@' + a.author : 'author');
       return typeof stageTrackerReworkSuffix === 'function' ? stageTrackerReworkSuffix(text, item) : text;
     }
@@ -104,8 +112,11 @@
     function stageTrackerPresenceOf(item) {
       const p = item && item.presence;
       if (!p || typeof p !== 'object' || !p.login) return null;
-      const state = STAGE_TRACKER_PRESENCE_STATES.indexOf(p.state) >= 0 ? p.state : 'unknown';
-      return { login: String(p.login), state, kind: p.kind === 'clanker' ? 'clanker' : 'human', since: p.since || '', last_seen: p.last_seen || '', next: p.next === 'adopt' ? 'adopt' : 'wait', adopt_at: p.adopt_at || '' };
+      const humanAuthor = (item.author_kind === 'human' || item.adoption && item.adoption.blocked_by === 'author-is-person')
+        && String(item.author || '').toLowerCase() === String(p.login).toLowerCase();
+      const kind = !humanAuthor && p.kind === 'clanker' ? 'clanker' : 'human';
+      const state = kind === 'human' ? 'unknown' : STAGE_TRACKER_PRESENCE_STATES.indexOf(p.state) >= 0 ? p.state : 'unknown';
+      return { login: String(p.login), state, kind, since: p.since || '', last_seen: kind === 'clanker' ? p.last_seen || '' : '', next: kind === 'clanker' && p.next === 'adopt' ? 'adopt' : 'wait', adopt_at: kind === 'clanker' ? p.adopt_at || '' : '' };
     }
     // "26h" / "40m" / "3d": how long the clanker has been gone, counted from
     // its last heartbeat or the start of the wait, whichever is later.
@@ -147,7 +158,7 @@
         next = p.next === 'adopt' && adopt ? 'hive will adopt ' + adopt : 'hive is waiting for them';
       } else if (p.kind === 'human') {
         head = 'Waiting on @' + p.login + ' (human)';
-        next = 'waiting for a human reply' + (adopt ? '; adoption ' + adopt : '');
+        next = 'human availability is unknown; waiting for a human reply';
       } else {
         head = hive + 'not registered here)';
         next = p.next === 'adopt' && adopt ? 'hive will adopt ' + adopt : 'hive is waiting for them';
@@ -192,8 +203,10 @@
     // Pill text with the indicator placed just before the @login (or
     // leading, when the text names nobody): "waiting on [robot ●] @hanthor".
     function stageTrackerPresenceInPillHtml(item, text) {
-      const dot = stageTrackerPresenceDotHtml(item, Date.now());
       const t = String(text || '');
+      // The hive's own turn: no author presence glyph on the pill.
+      if (typeof stageTrackerReReviewOwedByHive === 'function' && stageTrackerReReviewOwedByHive(item)) return esc(t);
+      const dot = stageTrackerPresenceDotHtml(item, Date.now());
       if (!dot) return esc(t);
       const i = t.indexOf('@');
       if (i < 0) return dot + esc(t);
@@ -207,6 +220,8 @@
     function stageTrackerPresenceChipText(item) {
       const p = stageTrackerPresenceOf(item);
       if (!p) return '';
+      // Guarded: the test harnesses load helpers by name.
+      if (typeof stageTrackerHiveReviewerChipText === 'function' && stageTrackerHiveReviewerChipText(item)) return stageTrackerHiveReviewerChipText(item);
       const ownPR = item && item.kind === 'pr' && item.author_kind === 'human' && p.kind === 'human' && String(item.author || '').toLowerCase() === String(p.login).toLowerCase();
       const text = 'waiting on @' + p.login + (ownPR ? ' to push' : '');
       // Guarded: the test harnesses load helpers by name.
@@ -238,14 +253,14 @@
     //             the hive.
     const STAGE_TRACKER_PUSH_NEXT = { ci: 'CI running', 're-review': 're-review queued' };
     function stageTrackerPushOf(item) {
-      const p = item && item.kind === 'pr' ? item.push : null;
-      if (!p || (p.state !== 'waiting' && p.state !== 'pushed')) return null;
+      const p = item && (item.kind === 'pr' || item.via_pr) ? item.push : null;
+      if (!p || (p.state !== 'waiting' && p.state !== 'pushed' && p.state !== 'checking')) return null;
       return p;
     }
-    // Pure: whether the author's push has landed — the row is the hive's again.
+    // Whether the row is the hive's again: a push, or observed same-head CI.
     function stageTrackerPushedBack(item) {
       const p = stageTrackerPushOf(item);
-      return !!(p && p.state === 'pushed');
+      return !!(p && (p.state === 'pushed' || p.state === 'checking'));
     }
     // Pure: the short age of the state ("38m", "2h"); '' without a time.
     function stageTrackerPushAge(p, nowMs) {
@@ -267,10 +282,11 @@
     // Pure: "@zoe pushed abc1234 · 2m"; '' unless the push landed.
     function stageTrackerPushChipText(item, nowMs) {
       const p = stageTrackerPushOf(item);
+      if (p && p.state === 'checking') return 'checks pending · no new push requested';
       if (!p || p.state !== 'pushed') return '';
       const sha = stageTrackerPushSha(p);
       const age = stageTrackerPushAge(p, nowMs);
-      return (p.login ? '@' + p.login + ' ' : '') + 'pushed' + (sha ? ' ' + sha : '') + (age ? ' · ' + age : '');
+      return (p.login ? '@' + p.login + ' ' : '') + 'pushed' + (sha ? ' ' + sha : '') + (p.next === 're-review' ? ' · re-review pending' : '') + (age ? ' · ' + age : '');
     }
     // Pure: whether the row's lineage chip (adopted / rebased copy) carries
     // the push instead of a pill of its own.
@@ -290,6 +306,7 @@
     function stageTrackerPushTip(item, nowMs) {
       const p = stageTrackerPushOf(item);
       if (!p) return '';
+      if (p.state === 'checking') return 'checks pending again on the current head — no new push requested';
       const at = Date.parse(p.since || '');
       const when = at > 0 ? stageTrackerAgoText(at, nowMs) + ' (' + agentNowClockTime(at, nowMs) + ')' : '';
       const who = p.login ? '@' + p.login : 'the author';
@@ -326,7 +343,39 @@
       const r = stageTrackerReworkOf(item);
       if (!r) return '';
       if (r.state === 'requested' && r.evidence === 'queued') return 'queued';
+      // A DCO ask on the pushed head queues no re-review (hivecommons/hive#17789).
+      if (r.state === 'pushed' && /^(dco-missing|hive-signoff-attribution)$/.test(String(item.reason || '').trim())) return 'sign-off owed';
       return STAGE_TRACKER_REWORK_WORDS[r.state];
+    }
+    // "re-review pending" means the HIVE's reviewer owes a pass on the new
+    // head, not the author (hivecommons/hive#16615: "are we waiting on the
+    // clanker or are we in CI?"). The backend says so with
+    // `rework.owed_by: "hive-reviewer"` once the pushed head carries
+    // nothing the author must fix (red CI, findings, a conflict nobody
+    // rebases) and "author" while it does; older payloads without the
+    // field are read the same way from the activities.
+    const STAGE_TRACKER_REWORK_OWED_BY_HIVE = 'hive-reviewer';
+    function stageTrackerReReviewOwedByHive(item) {
+      const r = stageTrackerReworkOf(item);
+      if (!r || r.state !== 'pushed') return false;
+      if (r.owed_by) return r.owed_by === STAGE_TRACKER_REWORK_OWED_BY_HIVE;
+      const on = k => { const a = item[k + '_activity']; return a && (!a.head || !item.head || a.head === item.head) ? a.state || 'unknown' : 'unknown'; };
+      if (on('ci') === 'failing' || on('review') === 'changes_requested') return false;
+      if (/conflict/i.test(String(item.reason || '')) && !item.rebase) return false;
+      if (/^(dco-missing|hive-signoff-attribution)$/.test(String(item.reason || '').trim())) return false;
+      return true;
+    }
+    // "re-review of d88928e" — the owed pass, named by head.
+    function stageTrackerReReviewWord(item) {
+      const r = stageTrackerReworkOf(item);
+      const sha = String((r && r.head) || item.head || '').slice(0, 7);
+      return 're-review' + (sha ? ' of ' + sha : ' pending');
+    }
+    // "waiting on 🐝 hive reviewer · re-review of d88928e"; '' when the
+    // author still owes the next move.
+    function stageTrackerHiveReviewerChipText(item) {
+      if (!stageTrackerReReviewOwedByHive(item)) return '';
+      return 'waiting on 🐝 hive reviewer · ' + stageTrackerReReviewWord(item);
     }
     // "waiting on @x · acknowledged" — the pill text with the pickup word.
     function stageTrackerReworkSuffix(text, item) {
@@ -346,7 +395,7 @@
       const since = when(r.since);
       switch (r.state) {
         case 'pushed':
-          return who + ' pushed a new head' + (since ? ' ' + since : '') + ' · re-review pending';
+          return who + ' pushed a new head' + (since ? ' ' + since : '') + (stageTrackerReReviewOwedByHive(item) ? ' · hive reviewer owes the ' + stageTrackerReReviewWord(item) : ' · re-review pending');
         case 'in_progress':
           return who + "'s clanker picked up the rework" + (since ? ' ' + since : '') + (r.mode ? ' (' + r.mode + ')' : '');
         case 'acknowledged':
@@ -434,20 +483,37 @@
       if (!item || !item.sentinel_alert) return '';
       const head = String(item.head || '').slice(0, STAGE_TRACKER_SHORT_SHA);
       const reason = String(item.sentinel_reason || '').trim();
-      return STAGE_TRACKER_SENTINEL_TIP + (head ? ' at ' + head : '') + ': ' + (reason || STAGE_TRACKER_SENTINEL_TIP_FALLBACK);
+      const lead = item.sentinel_notice ? 'Informational security notice (not a merge gate)' : STAGE_TRACKER_SENTINEL_TIP;
+      const fallback = item.sentinel_notice ? 'informational findings; no blocking sentinel label' : STAGE_TRACKER_SENTINEL_TIP_FALLBACK;
+      return lead + (head ? ' at ' + head : '') + ': ' + (reason || fallback);
     }
-    // Whether the item's lit chevron word carries the alert itself (a PR
-    // parked at 085, or an issue riding one): the chip then adds nothing.
-    function stageTrackerSentinelInLane(item) {
-      return !!(item && item.sentinel_alert) && (Number(item.stage) || 0) === STAGE_TRACKER_NEEDS_DECISION && (item.kind === 'pr' || !!item.via_pr);
+    // Pure: one line per sentinel finding naming its rule and the files it
+    // fired on — "sensitive_path: .github/workflows/ci.yml, OWNERS (+3
+    // more)" — from the row's sentinel_details (hivecommons/hive: "knowing
+    // what the sensitive path(s) (and files) are in this alert dialog would
+    // really help me make a decision"). The server bounds the paths per
+    // finding and reports the rest as more_paths. [] without details.
+    function stageTrackerSentinelPathLines(item) {
+      const details = item && Array.isArray(item.sentinel_details) ? item.sentinel_details : [];
+      return details.map(d => {
+        const rule = String((d && d.rule) || '').trim();
+        const summary = String((d && d.summary) || '').trim();
+        const paths = (d && Array.isArray(d.paths) ? d.paths : []).map(p => String(p || '').trim()).filter(Boolean);
+        const more = Number(d && d.more_paths) || 0;
+        const label = rule || summary;
+        if (!label) return '';
+        if (!paths.length) return rule && summary ? rule + ' (' + summary + ')' : label;
+        return label + ': ' + paths.join(', ') + (more > 0 ? ' (+' + more + ' more)' : '');
+      }).filter(Boolean);
     }
-    // A returned PR (071/072) keeps its routing word — the human already
-    // acted, nothing is owed by the maintainer — and carries the alert as
-    // a " · sentinel" suffix instead (hivecommons/hive#15159); the chip
-    // then adds nothing.
-    function stageTrackerSentinelAsSuffix(item) {
-      const st = Number(item && item.stage) || 0;
-      return !!(item && item.sentinel_alert) && (st === 71 || st === 72) && (item.kind === 'pr' || !!item.via_pr);
+    // Pure: the sentinel tip followed by its path lines, one per line and
+    // indented, for the decision dialogs and result toasts; the tip alone
+    // when the row carries no details.
+    function stageTrackerSentinelTipWithPaths(item) {
+      const tip = stageTrackerSentinelTip(item);
+      if (!tip) return '';
+      const lines = stageTrackerSentinelPathLines(item);
+      return lines.length ? tip + lines.map(l => '\n   · ' + l).join('') : tip;
     }
     // Pure: whose PR a 071/072 row waits on — the row's own author, or, for
     // an issue row drawn through its one covering PR (via_pr), that PR's
@@ -483,6 +549,5 @@
       if (sup) text = 'Superseded by #' + sup + ' · decide';
       else if (who.author && st === 71) text = 'Needs @' + who.author;
       else if (who.author && st === 72) text = 'Returned to @' + who.author + stageTrackerToolingSuffix(who.kind);
-      return text + (stageTrackerSentinelAsSuffix(item) ? ' · ' + STAGE_TRACKER_SENTINEL_CHIP : '');
+      return text;
     }
-

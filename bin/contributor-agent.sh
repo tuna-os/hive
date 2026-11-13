@@ -27,11 +27,27 @@ TMUX_SESSION="contributor"
 
 # Save env vars passed via docker -e (before config file overrides them)
 _DOCKER_BACKEND="${AGENT_BACKEND:-}"
+_DOCKER_MAX_PARALLEL_FIXES="${HIVE_MAX_PARALLEL_FIXES:-}"
+_DOCKER_FIX_PR_TIMEOUT_MS="${HIVE_FIX_PR_TIMEOUT_MS:-}"
+_DOCKER_QUOTA_POOL_DIR="${HIVE_CONTRIBUTOR_QUOTA_POOL_DIR:-}"
 
 # Load contributor config
 if [[ -f "$CONFIG_FILE" ]]; then
   # shellcheck source=/dev/null
   source "$CONFIG_FILE"
+fi
+
+# `just contribute-hive` mounts the host's quota pool directory into the
+# container and passes the mount point with -e. A contributor.env line names
+# the HOST path, which does not exist in here, so the -e value must win or
+# the relay and `just contribute-quota` on the host never meet.
+if [[ -n "$_DOCKER_QUOTA_POOL_DIR" ]]; then
+  export HIVE_CONTRIBUTOR_QUOTA_POOL_DIR="$_DOCKER_QUOTA_POOL_DIR"
+fi
+unset _DOCKER_QUOTA_POOL_DIR
+if [[ "${HIVE_CONTRIBUTOR_AGENT_TEST_QUOTA_POOL_DIR:-}" == "1" ]]; then
+  echo "HIVE_CONTRIBUTOR_QUOTA_POOL_DIR=${HIVE_CONTRIBUTOR_QUOTA_POOL_DIR:-}"
+  exit 0
 fi
 
 # Docker -e takes precedence over config file
@@ -66,6 +82,10 @@ export HIVE_REGISTRATION_TOKEN="${HIVE_REGISTRATION_TOKEN:?Not registered — ru
 export HIVE_HUB_DISABLED="${HIVE_HUB_DISABLED:-}"
 [[ -n "${HIVE_COMMONS_STRATEGY:-}" ]] && export HIVE_COMMONS_STRATEGY || true
 [[ -n "${HIVE_CONTRIBUTOR_STRATEGY:-}" ]] && export HIVE_CONTRIBUTOR_STRATEGY || true
+HIVE_MAX_PARALLEL_FIXES="${_DOCKER_MAX_PARALLEL_FIXES:-${HIVE_MAX_PARALLEL_FIXES:-}}"
+HIVE_FIX_PR_TIMEOUT_MS="${_DOCKER_FIX_PR_TIMEOUT_MS:-${HIVE_FIX_PR_TIMEOUT_MS:-}}"
+[[ -n "$HIVE_MAX_PARALLEL_FIXES" ]] && export HIVE_MAX_PARALLEL_FIXES || true
+[[ -n "$HIVE_FIX_PR_TIMEOUT_MS" ]] && export HIVE_FIX_PR_TIMEOUT_MS || true
 export AGENT_BACKEND="${_DOCKER_BACKEND:-${AGENT_BACKEND:-claude}}"
 export HIVE_AGENT_SESSION="$TMUX_SESSION"
 export HIVE_AGENT_ID="contributor"
@@ -81,6 +101,7 @@ source "${SCRIPT_DIR}/lib/knowledge-export.sh"
 # TTY — suitable for an unattended / future Kubernetes contributor (#2549).
 # Only the two literals are accepted; anything else falls back to interactive.
 CONTRIBUTOR_MODE="${CONTRIBUTOR_MODE:-interactive}"
+if [[ "${AGENT_BACKEND:-}" == "cline" ]]; then CONTRIBUTOR_MODE="headless"; fi
 if [[ "$CONTRIBUTOR_MODE" != "headless" ]]; then
   CONTRIBUTOR_MODE="interactive"
 fi
@@ -193,12 +214,76 @@ if [[ "${HIVE_CONTRIBUTOR_AGENT_TEST_KNOWLEDGE_FETCH:-}" == "1" ]]; then
   exit 1
 fi
 
+# The directory the interactive CLI is launched from. The comment above the
+# tmux launch further down says why it is neither $HOME nor the workspace.
+contributor_agent_cwd() {
+  printf '%s\n' "${XDG_STATE_HOME:-${HOME}/.local/state}/hive/agent-cwd"
+}
+
+# Context filenames link_backend_knowledge can place in a directory. Used only
+# to retire the container's old $HOME links (below); never a user's own file.
+CONTAINER_KNOWLEDGE_LINK_NAMES=(CLAUDE.md AGENTS.md .goosehints .goose-instructions.md copilot-instructions.md COPILOT.md)
+
+# link_container_knowledge BACKEND AGENT_MD AGENT_CWD
+#
+# Places the knowledge export where the container's CLI actually reads it.
+#
+# Interactive mode launches the CLI in AGENT_CWD (an empty, non-git
+# directory under $HOME), so the context links go there, the same as
+# `just contribute-hive local` does (Justfile). They used to go into $HOME.
+# Claude still found ~/CLAUDE.md because it reads CLAUDE.md from every parent
+# directory, but Codex reads AGENTS.md only from the git root down to its cwd
+# (plus $CODEX_HOME/AGENTS.md, the user's own file, which Hive never writes),
+# so a Codex contributor ran every task with none of the hive's knowledge.
+# The backend's global files (~/.bob/AGENTS.md, the goose config seed,
+# ~/.copilot) still go into $HOME.
+#
+# The old $HOME links are removed once the new ones exist, but only symlinks
+# that point at this export: a CLI that walks parent directories (Claude, Pi)
+# would otherwise load the same export twice, once from AGENT_CWD and once
+# from $HOME.
+#
+# Headless mode is unchanged: the relay spawns that CLI in the workspace, not
+# in AGENT_CWD, so its links stay in $HOME.
+link_container_knowledge() {
+  local backend="$1"
+  local agent_md="$2"
+  local agent_cwd="$3"
+  local name link target
+
+  if [[ "${CONTRIBUTOR_MODE:-interactive}" == "headless" || "$agent_cwd" == "$HOME" ]]; then
+    link_backend_knowledge "$backend" "$agent_md" "$HOME"
+    return
+  fi
+
+  mkdir -p "$agent_cwd"
+  link_backend_knowledge "$backend" "$agent_md" "$agent_cwd" "$HOME"
+
+  for name in "${CONTAINER_KNOWLEDGE_LINK_NAMES[@]}"; do
+    link="${HOME}/${name}"
+    [[ -L "$link" ]] || continue
+    target="$(readlink "$link")"
+    if [[ "$target" == "$agent_md" || "$target" == "${HOME}/agent.pi-context.md" ]]; then
+      rm -f "$link"
+    fi
+  done
+}
+
 if [[ "${HIVE_CONTRIBUTOR_AGENT_TEST_LINK_KNOWLEDGE:-}" == "1" ]]; then
-  link_backend_knowledge "$AGENT_BACKEND" "${HIVE_CONTRIBUTOR_AGENT_TEST_KNOWLEDGE_DEST:-${HOME}/agent.md}" "${HIVE_CONTRIBUTOR_AGENT_TEST_KNOWLEDGE_LINK_DIR:-$HOME}"
+  # With KNOWLEDGE_LINK_DIR set, call link_backend_knowledge directly, as
+  # `just contribute-hive local` does. Without it, run the container path.
+  if [[ -n "${HIVE_CONTRIBUTOR_AGENT_TEST_KNOWLEDGE_LINK_DIR:-}" ]]; then
+    link_backend_knowledge "$AGENT_BACKEND" "${HIVE_CONTRIBUTOR_AGENT_TEST_KNOWLEDGE_DEST:-${HOME}/agent.md}" "$HIVE_CONTRIBUTOR_AGENT_TEST_KNOWLEDGE_LINK_DIR"
+  else
+    link_container_knowledge "$AGENT_BACKEND" "${HIVE_CONTRIBUTOR_AGENT_TEST_KNOWLEDGE_DEST:-${HOME}/agent.md}" "$(contributor_agent_cwd)"
+  fi
   exit 0
 fi
 
 validate_pi_selection() {
+  if [[ "${AGENT_MODEL:-}" == mlx/* ]]; then
+    node "${SCRIPT_DIR}/mlx-backend.js" check "${AGENT_MODEL}" --endpoint-only >&2 || return
+  fi
   node "${SCRIPT_DIR}/pi-backend.js" "${AGENT_MODEL:-}"
 }
 
@@ -265,6 +350,13 @@ detect_cli() {
   fi
 
   case "$backend" in
+    cline)
+      if "${HIVE_CLINE_RUNNER:-crux}" cline-turn --model "${AGENT_MODEL:-}" --check >/dev/null 2>&1; then
+        echo "UNVERIFIED"
+      else
+        echo "NOT_AUTHED"
+      fi
+      ;;
     claude)
       if claude --version &>/dev/null; then echo "OK"; else echo "NOT_AUTHED"; fi
       ;;
@@ -450,6 +542,16 @@ if [[ "$AGENT_BACKEND" == "pi" ]]; then
 fi
 
 # Check CLI readiness
+if [[ "$AGENT_BACKEND" == "cline" ]]; then
+  if [[ -n "${HIVE_CLINE_PROVIDERS_B64:-}" ]]; then
+    CLINE_SETTINGS="${HOME}/.cline/data/settings"
+    mkdir -p "$CLINE_SETTINGS"
+    (umask 077; printf '%s' "$HIVE_CLINE_PROVIDERS_B64" | base64 -d > "$CLINE_SETTINGS/providers.json") || exit 1
+    chmod 600 "$CLINE_SETTINGS/providers.json"
+    unset HIVE_CLINE_PROVIDERS_B64 CLINE_SETTINGS
+  fi
+  "${HIVE_CLINE_RUNNER:-crux}" cline-turn --model "${AGENT_MODEL:-}" --check || exit 1
+fi
 STATUS=$(detect_cli "$AGENT_BACKEND")
 case "$STATUS" in
   NOT_INSTALLED)
@@ -498,7 +600,7 @@ case "$STATUS" in
     exit 1
     ;;
   UNVERIFIED)
-    echo "$AGENT_BACKEND CLI is installed; authentication will be checked in its interactive pane."
+    echo "$AGENT_BACKEND CLI is installed; authentication remains unverified until its first request."
     ;;
   OK)
     if [[ "$AGENT_BACKEND" == "pi" ]]; then
@@ -567,8 +669,14 @@ fi
 AGENT_MD="${HOME}/agent.md"
 knowledge_export_sync_start "$AGENT_MD"
 
-# Make agent.md visible to the selected CLI backend.
-link_backend_knowledge "$AGENT_BACKEND" "$AGENT_MD"
+# Make agent.md visible to the selected CLI backend, in the directory the CLI
+# is launched from (HIVE_AGENT_CWD, exported here so the links and the launch
+# below agree on it; see the comment at the launch for why it is this
+# directory).
+HIVE_AGENT_CWD="$(contributor_agent_cwd)"
+export HIVE_AGENT_CWD
+mkdir -p "$HIVE_AGENT_CWD"
+link_container_knowledge "$AGENT_BACKEND" "$AGENT_MD" "$HIVE_AGENT_CWD"
 
 # Prepare a concrete workspace directory for the agent (kubestellar/hive#2545).
 # Previously the tmux session inherited the bare $HOME (/home/dev in the stock
@@ -624,8 +732,9 @@ fi
 # cwd grants nothing, the process runs as the user either way — but an empty
 # dedicated directory costs nothing and is not a git repo, which is what keeps
 # the agent from adopting its cwd as a checkout (#4168).
-export HIVE_AGENT_CWD="${XDG_STATE_HOME:-${HOME}/.local/state}/hive/agent-cwd"
-mkdir -p "$HIVE_AGENT_CWD"
+#
+# HIVE_AGENT_CWD itself is exported above, before the knowledge export is
+# linked into it, because that is where the CLI reads its context files.
 
 # Start the contributor's own quota reading publisher (hivecommons/hive#10299).
 #
@@ -676,6 +785,9 @@ if [[ -n "${AGENT_MODEL:-}" ]]; then
     goose|bob) ;;
     *) MODEL_FLAG="--model $AGENT_MODEL" ;;
   esac
+fi
+if [[ "$AGENT_BACKEND" == "pi" && "${AGENT_MODEL:-}" == mlx/* ]]; then
+  MODEL_FLAG+=" --extension $(printf %q "${SCRIPT_DIR}/mlx-pi-extension.js")"
 fi
 REASONING_FLAG=""
 if [[ "$AGENT_BACKEND" == "codex" && -n "${AGENT_REASONING_EFFORT:-}" ]]; then
@@ -790,6 +902,12 @@ echo ""
 cleanup() {
   echo "Shutting down..."
   kill "$RELAY_PID" 2>/dev/null || true
+  # Wait for the relay before ending the container. This script is PID 1, so
+  # its exit SIGKILLs everything left, and a relay stopped just after an
+  # agent's verdict is still writing that task's task_complete. The relay bounds
+  # that wait itself, inside the runtime's stop timeout. tmux goes after it,
+  # because the relay's own shutdown still stops the agent in that session.
+  wait "$RELAY_PID" 2>/dev/null || true
   # The publisher starts and stops with the contributor (#10299): a survivor
   # would keep refreshing this pool's presence marker and tell the next relay a
   # reading is coming that nothing will write.

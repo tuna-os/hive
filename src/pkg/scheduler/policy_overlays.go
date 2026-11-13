@@ -95,10 +95,18 @@ func (s *Scheduler) isHoldGatedPRAgent(agentName string) bool {
 // not to fix it. ci-maintainer-holdgated.md meanwhile promised
 // ".github/workflows/*.yml changes" it could never land.
 //
+// Step 3 names the lane's token as the limit: Danathar/goodreads-mcp#440 said
+// "the hive's token cannot change workflow files" while the App held
+// `workflows: write`, and the delegated decider took it for a missing App
+// permission.
+//
 // Injected at the same post-resolution seam as the held-PR preflight and for
 // the same reason (kubestellar/hive#4744): a customized or remotely sourced
 // policy must not be able to omit it.
 func (s *Scheduler) addWorkflowPushCeiling(agentName, message string) string {
+	if message != "" && s.cfg.AgentPushesWorkflows(agentName) {
+		return insertAfterKickHeader(message, workflowPushReach)
+	}
 	if message == "" || s.agentEffectiveMode(agentName) != "ISSUES_AND_PRS" {
 		return message
 	}
@@ -124,7 +132,11 @@ When a fix belongs in a workflow file:
 2. File the issue with the exact replacement text, so applying it is mechanical.
 3. Say plainly in the issue that the change needs a human or an
    ISSUES_PRS_MERGE agent to land, and why — otherwise "issue, no PR" reads as
-   a judgement call you did not make. Park it in the same request with
+   a judgement call you did not make. Name the limit as this lane's token
+   ("this lane's token cannot push workflow files"), never the hive's or the
+   App's: the installation can grant ` + "`workflows: write`" + ` to other lanes, and a
+   reader takes the broader claim for a permission the owner must grant. Park
+   it in the same request with
    ` + "`hive-open-issue comment --repo <owner/repo> <number> --body-file <file> --needs-decision`" + `
    (or ` + "`--needs-decision`" + ` on the create), since you cannot add the park label yourself.
 4. If part of the fix lives outside ` + "`.github/workflows/`" + `, PR that part and say
@@ -133,7 +145,57 @@ When a fix belongs in a workflow file:
 Everything else is pushable as normal, including composite actions under
 ` + "`.github/actions/`" + ` — GitHub's restriction covers the workflows directory only.
 `
+	// A kick spans the agent's repositories and the lane is chosen per
+	// repository (WorkflowsCapableLane), so the text names an example lane
+	// and says the hand-off happens only where one serves the repo.
+	if lane := s.cfg.WorkflowsLaneFor(agentName, ""); lane != "" {
+		section += `
+This hive runs lanes whose token can push workflow files (for example ` + "`" + lane + "`" + `). A
+park from step 3 whose only remaining change is under ` + "`.github/workflows/`" + ` (and
+that offers the owner no lettered options) is not parked in a repository such
+a lane serves: the hive hands the issue to it (label ` + "`" + github.WorkflowsLaneLabel + "`" + `), and
+your exact replacement is its spec. Write it for that lane to apply, not as a
+step for the owner, and do not pick the issue up again. Where no such lane
+serves the repository, the park stands and the owner applies it.
+`
+	}
 	return insertAfterKickHeader(message, section)
+}
+
+// workflowPushReach is the other side of the ceiling: a trusted/merger-tier
+// token asks for the Workflows permission, so the lane can push
+// .github/workflows/** itself. projectbluefin/testsuite#1059: scanner, at
+// ISSUES_PRS_MERGE, parked "the hive app cannot push .github/workflows/" the
+// same day the App pushed e2e.yml; nothing in its kick said otherwise. The
+// relay refuses such a park when the installation grants the permission.
+const workflowPushReach = `## Workflow files are in reach at this mode
+
+This agent's token is minted at the trusted/merger tier, which asks for the
+Workflows permission, so it can push changes under ` + "`.github/workflows/**`" + `.
+Push a workflow fix like any other; do not park it as "the App cannot push
+workflow files". Only if GitHub rejects the push for the ` + "`workflows`" + `
+permission, park it and quote the rejection.
+`
+
+// routeWorkflowsLane sends an issue the relay handed off for a workflow-only
+// change (github.WorkflowsLaneLabel) to the lane that can push workflow files.
+// Without it the issue keeps its `[lane]` title / `agent/<lane>` routing and
+// goes back to the lane that could not land it — Danathar/exult#374: the
+// owner approved the direction, ci-maintainer was kicked again and re-parked
+// it as an owner step, while scanner was merging workflow fixes in the same
+// hive. With no capable lane configured the issue keeps its classification.
+func (s *Scheduler) routeWorkflowsLane(issues []github.Issue) []github.Issue {
+	for i := range issues {
+		for _, l := range issues[i].Labels {
+			if strings.EqualFold(strings.TrimSpace(l), github.WorkflowsLaneLabel) {
+				if lane := s.cfg.WorkflowsCapableLane(issues[i].Repo); lane != "" {
+					issues[i].Lane = lane
+				}
+				break
+			}
+		}
+	}
+	return issues
 }
 
 // agentEffectiveMode returns the agent's configured mode, preferring the
@@ -142,23 +204,7 @@ Everything else is pushable as normal, including composite actions under
 // both did inline; it is one place now so a new caller cannot get it subtly
 // different.
 func (s *Scheduler) agentEffectiveMode(agentName string) string {
-	if s.cfg == nil {
-		return ""
-	}
-	agentCfg, ok := s.cfg.Agents[agentName]
-	if !ok {
-		agentCfg, ok = s.cfg.Agents[s.cfg.BaseAgentName(agentName)]
-	}
-	if !ok {
-		return ""
-	}
-	mode := agentCfg.Mode
-	if agentCfg.Tools != nil {
-		if effective := agentCfg.Tools.EffectiveMode(); effective != "" {
-			mode = effective
-		}
-	}
-	return mode
+	return s.cfg.AgentEffectiveMode(agentName)
 }
 
 // isPRCapableAgent reports whether the agent's effective mode lets it push
@@ -235,6 +281,16 @@ func (s *Scheduler) CIFailureKickMessage(agentName string, sig github.CIFailureS
 	}
 	header := fmt.Sprintf("CI failed on %s#%d (%s) — repair it now. Detection was out-of-band (webhook); do not watch or poll CI yourself.\n",
 		sig.Repo, sig.Number, sig.Check)
+	if context := sig.Integration; context != nil && context.CandidateID != "" {
+		header = fmt.Sprintf("Integration CI failed on candidate %s, tested commit %s tree %s, base %s, workflow policy %s, producer %s, attempt %d. Ordered PR:head members: %s. Existing ownership routes %s#%d at exact head %s to you first; this is NOT attribution of blame. Inspect the failed job %s (%s), coordinate shared prerequisite repair once, and retain every normal CI/review/trust/hold/current-base gate. Do not copy green statuses, cancel shared jobs, poll CI, or modify other members without their owner.\n",
+			context.CandidateID, context.TestedSHA, context.TestedTree, context.BaseSHA, context.Policy, context.Producer, context.Attempt,
+			strings.Join(context.Members, ", "), sig.Repo, sig.Number, sig.HeadSHA, sig.Check, sig.DetailsURL)
+		if context.RunID > 0 && context.SuiteID > 0 {
+			header += fmt.Sprintf("Evidence source %s; workflow run %d, suite %d.\n", context.Source, context.RunID, context.SuiteID)
+		} else {
+			header += "Workflow run/suite binding unavailable; membership observation is not passing policy proof.\n"
+		}
+	}
 	return header + section
 }
 

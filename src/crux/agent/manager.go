@@ -217,11 +217,15 @@ type AgentProcess struct {
 	// delivery or restart and is surfaced so operators can distinguish "due
 	// now" from "due but still busy".
 	KicksUndeliverable int
+	// ConsecutiveKickFailures survives restarts and resets only on delivery.
+	ConsecutiveKickFailures int
+	LastKickError           string
 	// BusySince is the first undeliverable-kick time in the current busy run.
 	BusySince time.Time
 	// LastTranscriptActivity is the newest events.jsonl mtime seen under this
 	// agent's own Copilot session-state tree.
 	LastTranscriptActivity time.Time
+	CodeWork               *crux.CodeWork
 	BusyCondition          string
 	BusyConditionMessage   string
 	Paused                 bool
@@ -316,6 +320,11 @@ type AgentProcess struct {
 	// alongside LastError on every (re)launch so a corrected model re-arms
 	// detection.
 	copilotModelFallbackRequested string
+	// inferenceDefaultModelWarned gates the "agent has no model; using the
+	// inference default" WARN to once per agent per distinct fallback, so a
+	// fleet whose agents[].model are all "" logs it per agent, not per
+	// relaunch.
+	inferenceDefaultModelWarned string
 	// copilotModelFallbackWarned is the "requested\x00running" tuple already
 	// logged at Warn; unlike the field above it survives relaunches.
 	copilotModelFallbackWarned string
@@ -331,7 +340,9 @@ type AgentProcess struct {
 	// lastTokenRestart beside it.
 	tokenRestartAttempts int
 	// tokenRestartGaveUp latches once the cap is hit so the diagnosis is logged
-	// a single time rather than every poll (~3s). Cleared alongside the counter.
+	// a single time rather than every poll (~3s). Cleared by a fresh fire in
+	// decideTokenRestart, by clearTokenRestartCap, and by the per-boot re-arm
+	// (rearmTokenRestartCap) only once the rolling window has drained (#17483).
 	tokenRestartGaveUp bool
 	// tokenRestartFiredAt is the rolling ledger of token-triggered restart
 	// times inside tokenRestartWindow. Unlike tokenRestartAttempts it is NOT
@@ -429,13 +440,18 @@ type AgentProcess struct {
 	// this as "Waiting on CI" instead of "Working" so a stalled-on-CI agent
 	// no longer looks indistinguishable from one making progress.
 	AwaitingCI                  bool
-	TransientNudges             int // total transient-API-error nudges sent (surfaced to the dashboard)
-	launchGen                   int // increments per launch; stale deliverStartupKick goroutines check it and drop
-	lastInferKickMarks          int // no-action watchdog: tool-marker count in pane+scrollback just after kick delivery
+	TransientNudges             int       // total transient-API-error nudges sent (surfaced to the dashboard)
+	launchGen                   int       // increments per launch; stale deliverStartupKick goroutines check it and drop
+	lastCLILaunchAt             time.Time // when the CLI was last typed into the pane; dates watchdog boot grace on relaunch (#17320)
+	lastInferKickMarks          int       // no-action watchdog: tool-marker count in pane+scrollback just after kick delivery
 	ProviderErrorClass          string
 	ProviderErrorLine           string
 	ProviderErrorBackoffUntil   time.Time
 	providerErrorBackoffAttempt int
+	// modelRejection counts identical "the CLI rejected the configured model"
+	// failures (see model_rejection.go). It survives restarts on purpose: a
+	// restart relaunches with the same --model and cannot fix the rejection.
+	modelRejection modelRejectionState
 	// BackendAuth is the per-agent backend-auth canary (#6558), derived from
 	// provider-auth failures observed in the CLI pane.
 	BackendAuth BackendAuthState
@@ -555,6 +571,8 @@ type Manager struct {
 	// own mutex: the pane pollers that consult it must not take m.mu.
 	rateLimitRelaunchMu   sync.Mutex
 	lastRateLimitRelaunch time.Time
+	cliMemory             cliMemoryState         // shared-store warning and drain hook, see cli_memory_drain.go
+	strayGitIdentity      strayGitIdentityWarned // warn-once state, see git_identity_warn_dedupe.go
 
 	// thrashMu guards thrash — its own mutex, NEVER m.mu: the breaker runs on
 	// the output-capture goroutines, and taking m.mu there risks startup
@@ -595,12 +613,16 @@ type Manager struct {
 	// precedence for whatever fresh token the operator supplied.
 	copilotAuthTokenRejected bool
 	claudeAuthToken          string
-	uidMap                   *UIDMap
-	sharedPool               SharedSessionPool
-	uidMapPath               string
-	appAuth                  AppTokenMinter
-	appNotInstalledWarned    sync.Map        // agent name -> struct{}: not-installed mint failure already logged
-	agentMint                AgentMintIssuer // optional, opt-in mint credential (nil ⇒ off)
+	claudeOperatorToken      string // HIVE_CLAUDE_OAUTH_TOKEN, read once at construction; a dashboard sign-in never replaces it
+	// claudeOperatorModeLogOnce guards the one-time "re-bridge and watchdog
+	// suspended" log for operator-token mode (claude_operator_token_mode.go).
+	claudeOperatorModeLogOnce sync.Once
+	uidMap                    *UIDMap
+	sharedPool                SharedSessionPool
+	uidMapPath                string
+	appAuth                   AppTokenMinter
+	appNotInstalledWarned     sync.Map        // agent name -> struct{}: not-installed mint failure already logged
+	agentMint                 AgentMintIssuer // optional, opt-in mint credential (nil ⇒ off)
 
 	// sharedPoolRenewInterval overrides the lease watcher tick (zero means
 	// defaultSharedPoolRenewInterval). Set before any watcher starts; it is
@@ -748,13 +770,13 @@ type Manager struct {
 	breakerPaused  map[string]bool
 
 	// recordPromptCallback, when set, persists the fully-expanded prompt text
-	// delivered to an agent so owners can review it later.
-	//
-	// Held as an atomic.Pointer rather than behind m.mu because the kick path
+	// delivered to an agent so owners can review it later. Held as an
+	// atomic.Pointer rather than behind m.mu because the kick path
 	// (deliverKickLocked) already holds m.mu when it fires this. m.mu is a
 	// non-reentrant RWMutex, so reading the callback under a second Lock there
 	// would deadlock the kick path.
 	recordPromptCallback atomic.Pointer[func(agent, trigger, prompt string)]
+	knowledgeAdvisor     atomic.Pointer[knowledgeAdvisor] // mid-task knowledge advisor (#17052); nil = off
 	// spanStarter, when set, opens the trace spans the runtime emits
 	// (SendKick's agent.send_kick). Same atomic.Pointer discipline as
 	// recordPromptCallback: read on paths that hold m.mu. Nil falls back to
@@ -785,7 +807,13 @@ type Manager struct {
 	// agent on sandbox.runtime: job (#6311). Nil means the real in-cluster
 	// launcher; tests inject a fake through setSandboxJobLauncherFactoryForTest.
 	sandboxJobLauncherFactory func(config.SandboxJobConfig) sandbox.Launcher
-	sandboxRunner             sandboxCommandRunner
+	// sandboxOpenShellLauncherFactory is the same seam for
+	// sandbox.runtime: openshell (ADR-0026).
+	sandboxOpenShellLauncherFactory func(config.SandboxOpenShellConfig) sandbox.Launcher
+	// sandboxSubstrateLauncherFactory is the same seam for
+	// sandbox.runtime: substrate (ADR-0026 phase 2).
+	sandboxSubstrateLauncherFactory func(config.SandboxSubstrateConfig) sandbox.Launcher
+	sandboxRunner                   sandboxCommandRunner
 	// sandboxRunPersister overrides persistSandboxRun in tests.
 	sandboxRunPersister  func(workDir string, entry SandboxRunHistoryEntry) error
 	sandboxPushMinter    pushbroker.TokenMinter
@@ -901,6 +929,7 @@ func NewManagerWithOptions(agents map[string]config.AgentConfig, logger *slog.Lo
 		copilotAuthTokenAuthoritative: copilotTokenAuthoritative,
 		copilotAuthTokenSource:        copilotTokenSource,
 		claudeAuthToken:               claudeToken,
+		claudeOperatorToken:           claude.OperatorToken(),
 		uidMap:                        uidMap,
 		sharedPool:                    opts.sharedPool,
 		uidMapPath:                    selectedUIDMapPath,
@@ -1252,6 +1281,15 @@ func (m *Manager) waitForInputPromptForAgentReason(agent *AgentProcess, abort fu
 	ticker := time.NewTicker(inputPromptPollInterval)
 	defer ticker.Stop()
 	menuEscapes := 0
+	dialogAnswers := 0
+	// lastWorking records whether the most recent poll saw the agent mid-turn.
+	lastWorking := false
+	// Inference-routed agents run Claude Code too, so a permission dialog in
+	// their pane is answered on the same terms as a plain claude agent's.
+	dialogBackend := backend
+	if m.routableBackend(backend) {
+		dialogBackend = "claude"
+	}
 
 	for {
 		if abort != nil && abort() {
@@ -1259,20 +1297,37 @@ func (m *Manager) waitForInputPromptForAgentReason(agent *AgentProcess, abort fu
 		}
 		select {
 		case <-deadline:
+			// An agent still mid-turn at the deadline is busy, not stuck: the
+			// kick paths already report it as busy and leave a genuinely stalled
+			// turn to the busy-no-activity watchdog (#12268). Dumping the pane at
+			// WARN here fed the agent_pane_timeout self-report every time a
+			// re-kick outwaited a long turn (#17993).
+			if lastWorking {
+				m.logger.Info("prompt wait ended: agent still mid-turn",
+					"agent", agent.Name,
+					"session", agent.tmuxSession,
+					"waited", inputPromptTimeout)
+				return false, kickPromptNotReadyReason
+			}
 			m.logger.Warn("prompt timeout — dumping pane",
 				"agent", agent.Name,
 				"session", agent.tmuxSession)
 			output := m.captureTmuxPaneForAgent(agent)
+			dialogTitle, hasDialog := claudePermissionDialog(output)
 			m.logger.Warn("pane content at timeout",
 				"agent", agent.Name,
 				"len", len(output),
 				"has_goose_ready", strings.Contains(output, "goose is ready"),
 				"has_enter", strings.Contains(output, "> Enter to send"),
 				"has_arrow", strings.Contains(output, "❯"),
-				"has_question_form", paneShowsCopilotQuestionForm(output),
+				"has_question_form", paneShowsQuestionForm(output),
+				"permission_dialog", dialogTitle,
 				"has_bob_placeholder", strings.Contains(output, bobInputPlaceholder),
 				"has_codex_ready", strings.Contains(output, codexInputPromptMarker),
 				"head_500", truncateHead(output, 500), "tail_500", truncateTail(output, 500))
+			if hasDialog {
+				return false, claudePermissionDialogNotReadyReason(dialogTitle)
+			}
 			return false, kickPromptNotReadyReason
 		case <-ticker.C:
 			// A consent/selection screen also contains "❯" but is NOT a
@@ -1280,8 +1335,15 @@ func (m *Manager) waitForInputPromptForAgentReason(agent *AgentProcess, abort fu
 			// Check the visible pane only: a dismissed consent screen
 			// lingers in the scrollback that captureTmuxPaneForAgent sees.
 			visible := m.captureVisiblePaneForAgent(agent)
+			lastWorking = false
 			if paneShowsCopilotQuestionForm(visible) {
 				m.dismissCopilotQuestionFormForKick(agent)
+				continue
+			}
+			if title, ok := claudePermissionDialog(visible); ok {
+				if reason := m.handleClaudePermissionDialogForKick(agent, dialogBackend, title, &dialogAnswers); reason != "" {
+					return false, reason
+				}
 				continue
 			}
 			// A Codex menu keeps a "›" selection caret that passes
@@ -1306,6 +1368,7 @@ func (m *Manager) waitForInputPromptForAgentReason(agent *AgentProcess, abort fu
 			// Use the visible pane only for the same reason as above: a
 			// finished task's working marker lingers in scrollback.
 			if paneShowsAgentWorking(visible) {
+				lastWorking = true
 				continue
 			}
 			if paneShowsInputPrompt(visible) {
@@ -1536,102 +1599,6 @@ func (m *Manager) RemoveAgent(name string) {
 	))
 }
 
-// AuthorizeReviewRequest enforces the policy for the review-request watcher.
-// It mirrors AuthorizePROpen's forge-resistance, but grants on capability as
-// well as mode (hivecommons/hive#7485).
-//
-// The review-request watcher is the SANCTIONED path: its doc comment tells an
-// agent to write a request file "INSTEAD of running `gh pr review` from its
-// own shell", because the file relay is App-authored and lands on the audit
-// trail. But it was gated with AuthorizePROpen, which requires CanPush() —
-// while the proxy, which is what a direct `gh pr review` goes through, grants
-// the same write on Converse alone:
-//
-//	MinMode: agent.ModeIssuesAndPRs, Capability: agent.AgentCapabilities.CanConverse
-//	                                            — pkg/proxy/rules.go:152
-//
-// So an ADVISORY+converse agent could post a review by going AROUND the relay
-// but not THROUGH it: the audited path was strictly stricter than the
-// unaudited one, which is exactly backwards — it pressures agents off the
-// trail. This aligns the relay with the proxy so the sanctioned route is never
-// the more restricted one. Converse stays conversation-only: it does not grant
-// pushing, opening PRs, or merging, which all remain on the mode ladder.
-//
-// A nil manager or unknown agent is denied.
-func (m *Manager) AuthorizeReviewRequest(agentName string, fileUID int) error {
-	if strings.TrimSpace(agentName) == "" {
-		return fmt.Errorf("no agent named in the request")
-	}
-	// Forge check: when we have a UID map and a real owning UID, the file owner
-	// must BE this agent.
-	if m.uidMap != nil && fileUID > 0 {
-		owner := m.uidMap.LookupByUID(fileUID)
-		if owner == "" {
-			return fmt.Errorf("request file owned by unknown uid %d (not a registered agent)", fileUID)
-		}
-		if owner != agentName {
-			return fmt.Errorf("request claims agent %q but file is owned by agent %q (uid %d)", agentName, owner, fileUID)
-		}
-	}
-	m.mu.RLock()
-	agent := m.agents[agentName]
-	m.mu.RUnlock()
-	if agent == nil {
-		return fmt.Errorf("unknown agent %q", agentName)
-	}
-	if m.agentCapabilities(agent).CanConverse() {
-		return nil
-	}
-	if !m.agentMode(agent).CanPush() {
-		return fmt.Errorf("agent %q may not review PRs at this ACMM level (mode %s) and does not have the `converse` capability",
-			agentName, m.agentMode(agent).String())
-	}
-	return nil
-}
-
-// GetBufferOutput returns output from the ring buffer directly, bypassing
-// the tmux pane capture. The ring buffer accumulates all output over time
-// (up to 500 lines) while the pane capture only has visible lines.
-func (m *Manager) GetBufferOutput(name string, lines int) ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	agent, ok := m.agents[name]
-	if !ok {
-		return nil, fmt.Errorf("agent %s not found", name)
-	}
-
-	if agent.OutputBuffer != nil && agent.OutputBuffer.Count() > 0 {
-		return agent.OutputBuffer.Last(lines), nil
-	}
-
-	if pane := agent.FilteredPaneLines(lines); len(pane) > 0 {
-		return pane, nil
-	}
-
-	return nil, nil
-}
-
-func (m *Manager) GetOutput(name string, lines int) ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	agent, ok := m.agents[name]
-	if !ok {
-		return nil, fmt.Errorf("agent %s not found", name)
-	}
-
-	if pane := agent.FilteredPaneLines(lines); len(pane) > 0 {
-		return pane, nil
-	}
-
-	if agent.OutputBuffer != nil {
-		return agent.OutputBuffer.Last(lines), nil
-	}
-
-	return nil, nil
-}
-
 func (m *Manager) bobPreflightUnlocked(agent *AgentProcess) {
 	if agent == nil {
 		return
@@ -1649,5 +1616,5 @@ func (m *Manager) bobPreflightUnlocked(agent *AgentProcess) {
 	// across the agent fleet.
 	m.ensureBobAuthSettings(agent.Name, bobSharedHome)
 	m.verifyBobKeyReadable(agent.Name, m.bobKeyFilePath(), agent.UID)
-	_ = m.verifyBobStateDirsWritable(agent.Name, bobSharedHome, m.workDir+"/"+agent.Name, agent.UID)
+	_ = m.verifyBobStateDirsWritable(agent.Name, bobStateHome(agent.Name, agent.UID, backend), m.workDir+"/"+agent.Name, agent.UID)
 }

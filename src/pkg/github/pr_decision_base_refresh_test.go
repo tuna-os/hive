@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -43,7 +44,8 @@ func (f *fakeBaseRefreshRepos) CompareCommits(_ context.Context, _, _, base, hea
 }
 
 func refreshCommit(sha, login string, parents ...string) *gh.RepositoryCommit {
-	c := &gh.RepositoryCommit{SHA: gh.Ptr(sha), Author: &gh.User{Login: gh.Ptr(login)}, Committer: &gh.User{Login: gh.Ptr("web-flow")}}
+	c := &gh.RepositoryCommit{SHA: gh.Ptr(sha), Author: &gh.User{Login: gh.Ptr(login)}, Committer: &gh.User{Login: gh.Ptr("web-flow")},
+		Commit: &gh.Commit{Verification: &gh.SignatureVerification{Verified: gh.Ptr(true)}}}
 	for _, p := range parents {
 		c.Parents = append(c.Parents, &gh.Commit{SHA: gh.Ptr(p)})
 	}
@@ -323,5 +325,125 @@ func TestSameChangedFilesIgnoresOrderButNotContent(t *testing.T) {
 	}
 	if !CommitByGitHubLogin(refreshCommit("x", "Kubestellar-Hive"), "kubestellar-hive[bot]") || CommitByGitHubLogin(refreshCommit("x", "mendezr"), "kubestellar-hive[bot]") {
 		t.Fatal("App attribution must match the login case-insensitively, [bot] suffix aside, and nobody else")
+	}
+}
+
+// BaseMergeParent accepts a diff-preserving base merge whoever made it
+// (projectbluefin/utah#1078's 9d8ceab was a web merge by the owner), and
+// refuses one that changes the PR's diff or is not a base merge.
+func TestBaseMergeParentAnyAuthor(t *testing.T) {
+	files := []*gh.CommitFile{refreshFile("ci.yml", "blobA", "@@")}
+	api := &fakeBaseRefreshRepos{
+		commits: map[string]*gh.RepositoryCommit{
+			"merge":   refreshCommit("merge", "Danathar", "head", "base2"),
+			"changed": refreshCommit("changed", "Danathar", "head", "base2"),
+			"single":  refreshCommit("single", "Danathar", "head"),
+		},
+		compares: map[string]*gh.CommitsComparison{
+			"main...head":    refreshCompare("base1", files...),
+			"main...merge":   refreshCompare("base2", files...),
+			"main...changed": refreshCompare("base2", refreshFile("ci.yml", "blobB", "@@ changed")),
+			"main...single":  refreshCompare("base1", files...),
+		},
+	}
+	ctx := context.Background()
+	if prev, ok := BaseMergeParent(ctx, api, "o", "r", "main", api.commits["merge"], "merge"); !ok || prev != "head" {
+		t.Fatalf("diff-preserving merge by a person: prev=%q ok=%v", prev, ok)
+	}
+	if _, ok := BaseMergeParent(ctx, api, "o", "r", "main", api.commits["changed"], "changed"); ok {
+		t.Fatal("a merge that changes the PR's diff must not count")
+	}
+	if _, ok := BaseMergeParent(ctx, api, "o", "r", "main", api.commits["single"], "single"); ok {
+		t.Fatal("a single-parent commit is not a base merge")
+	}
+}
+
+// hivecommons/hive#16860: GitHub derives a commit's author login from the
+// author email, so a merge authored as the App's noreply address resolves to
+// the App. Only a commit GitHub created and signed itself counts.
+func TestHeadIsBaseRefreshOfRequiresVerifiedGitHubCommit(t *testing.T) {
+	const oldHead, newHead, baseTip, app = "aaaa", "bbbb", "b45e", "kubestellar-hive[bot]"
+	same := []*gh.CommitFile{refreshFile("a.go", "blob1", "@@")}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*gh.RepositoryCommit)
+		want   bool
+	}{
+		{name: "verified update-branch merge", mutate: func(*gh.RepositoryCommit) {}, want: true},
+		{name: "unverified", mutate: func(c *gh.RepositoryCommit) { c.Commit.Verification.Verified = gh.Ptr(false) }},
+		{name: "no verification", mutate: func(c *gh.RepositoryCommit) { c.Commit = nil }},
+		{name: "verified but committed by someone else", mutate: func(c *gh.RepositoryCommit) { c.Committer = &gh.User{Login: gh.Ptr("mallory")} }},
+		{name: "verified, committed by the App", mutate: func(c *gh.RepositoryCommit) { c.Committer = &gh.User{Login: gh.Ptr(app)} }, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			commit := refreshCommit(newHead, app, oldHead, baseTip)
+			tc.mutate(commit)
+			api := &fakeBaseRefreshRepos{
+				commits:  map[string]*gh.RepositoryCommit{newHead: commit},
+				compares: map[string]*gh.CommitsComparison{"v5..." + oldHead: refreshCompare("0ld", same...), "v5..." + newHead: refreshCompare(baseTip, same...)},
+			}
+			if got := (&BaseRefreshChecker{}).HeadIsBaseRefreshOf(context.Background(), api, "hivecommons", "hive", 1, "v5", oldHead, newHead, app); got != tc.want {
+				t.Fatalf("HeadIsBaseRefreshOf = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// hivecommons/hive#16860: GitHub lists at most 300 files for a compare, so
+// two diffs at the cap may differ in files it left out; that fails closed.
+func TestHeadIsBaseRefreshOfFailsClosedAtCompareFileCap(t *testing.T) {
+	const oldHead, newHead, baseTip, app = "aaaa", "bbbb", "b45e", "kubestellar-hive[bot]"
+	for _, n := range []int{baseRefreshCompareFileCap - 1, baseRefreshCompareFileCap} {
+		files := make([]*gh.CommitFile, 0, n)
+		for i := 0; i < n; i++ {
+			files = append(files, refreshFile("f"+strconv.Itoa(i)+".go", "blob"+strconv.Itoa(i), "@@"))
+		}
+		api := &fakeBaseRefreshRepos{
+			commits:  map[string]*gh.RepositoryCommit{newHead: refreshCommit(newHead, app, oldHead, baseTip)},
+			compares: map[string]*gh.CommitsComparison{"v5..." + oldHead: refreshCompare("0ld", files...), "v5..." + newHead: refreshCompare(baseTip, files...)},
+		}
+		want := n < baseRefreshCompareFileCap
+		if got := (&BaseRefreshChecker{}).HeadIsBaseRefreshOf(context.Background(), api, "hivecommons", "hive", 1, "v5", oldHead, newHead, app); got != want {
+			t.Fatalf("%d files: HeadIsBaseRefreshOf = %v, want %v", n, got, want)
+		}
+		if _, _, err := compareAllFiles(context.Background(), api, "hivecommons", "hive", "v5", newHead); want != (err == nil) || (!want && !errors.Is(err, ErrCompareFileCap)) {
+			t.Fatalf("%d files: compareAllFiles err = %v", n, err)
+		}
+	}
+}
+
+// A base merge that also edited a file the PR modifies, away from the PR's
+// hunks, leaves every hunk byte-for-byte the same at other line numbers: the
+// blob differs but the change is still the one approved
+// (projectbluefin/utah-packages#924). Anything more — a changed context
+// line or hunk length, a missing patch, a rename, any `.github/` file — is
+// still a different diff.
+func TestSameChangedFilesToleratesShiftedHunksOutsideDotGitHub(t *testing.T) {
+	const approved = "@@ -145,32 +145,82 @@ Verify a fix with `rebuild-rpms.yml`\n ctx\n-old\n+new\n ctx\n@@ -207,7 +257,7 @@ way as libcdio.\n ctx\n-a\n+b"
+	const shifted = "@@ -160,32 +160,82 @@ Verify a fix with `rebuild-rpms.yml`\n ctx\n-old\n+new\n ctx\n@@ -239,7 +289,7 @@ way as libcdio.\n ctx\n-a\n+b"
+	file := func(name, status, blob, patch string) []*gh.CommitFile {
+		f := refreshFile(name, blob, patch)
+		f.Status = gh.Ptr(status)
+		return []*gh.CommitFile{f}
+	}
+	const doc = "docs/skills/upstream-version-bumps.md"
+	if !sameChangedFiles(file(doc, "modified", "3604514", approved), file(doc, "modified", "4da6d8a", shifted)) {
+		t.Fatal("the same hunks at shifted line numbers must compare equal outside .github/")
+	}
+	noPatch := file(doc, "modified", "4da6d8a", "")
+	noPatch[0].Patch = nil
+	for name, tc := range map[string][2][]*gh.CommitFile{
+		"a context line changed":  {file(doc, "modified", "3604514", approved), file(doc, "modified", "4da6d8a", strings.Replace(shifted, " ctx\n@@", " main's line\n@@", 1))},
+		"a hunk length changed":   {file(doc, "modified", "3604514", approved), file(doc, "modified", "4da6d8a", strings.Replace(shifted, "+160,82", "+160,83", 1))},
+		"a section heading moved": {file(doc, "modified", "3604514", approved), file(doc, "modified", "4da6d8a", strings.Replace(shifted, "way as libcdio.", "way as libcue.", 1))},
+		"the patch was omitted":   {file(doc, "modified", "3604514", approved), noPatch},
+		"the file was renamed":    {file(doc, "renamed", "3604514", approved), file(doc, "renamed", "4da6d8a", shifted)},
+		"a workflow file":         {file(".github/workflows/bump.yml", "modified", "a0bbe66", approved), file(".github/workflows/bump.yml", "modified", "39b9f1e", shifted)},
+		"a nested action file":    {file("tools/.github/actions/x/action.yml", "modified", "a0bbe66", approved), file("tools/.github/actions/x/action.yml", "modified", "39b9f1e", shifted)},
+		"identical patch text":    {file(".github/workflows/bump.yml", "modified", "a0bbe66", approved), file(".github/workflows/bump.yml", "modified", "39b9f1e", approved)},
+	} {
+		if sameChangedFiles(tc[0], tc[1]) {
+			t.Errorf("%s: a different blob must not compare equal here", name)
+		}
 	}
 }

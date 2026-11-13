@@ -37,6 +37,11 @@ func readGitHubProxySource(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("glob github_proxy*.go: %v", err)
 	}
+	chain, err := filepath.Glob(filepath.Join(filepath.Dir(file), "upstream_chain.go"))
+	if err != nil {
+		t.Fatalf("glob upstream_chain.go: %v", err)
+	}
+	paths = append(paths, chain...)
 	var sb strings.Builder
 	for _, path := range paths {
 		if strings.HasSuffix(path, "_test.go") {
@@ -63,9 +68,18 @@ func TestAllTLSUpstreamDialsAreBound(t *testing.T) {
 	if strings.Contains(text, "tls.DialWithDialer(markDialer(0)") {
 		t.Fatal("TLS upstream dials must not use an unbounded zero-timeout dialer")
 	}
+	// Every TLS upstream dial funnels through dialUpstreamTLS, whose direct
+	// leg is the single bounded tls.DialWithDialer(markDialer(timeout)) and
+	// whose chained leg is bounded by a context carrying the same timeout.
+	if got := strings.Count(text, "tls.DialWithDialer("); got != 1 {
+		t.Fatalf("tls.DialWithDialer sites = %d, want 1 (dialUpstreamTLS)", got)
+	}
+	if !strings.Contains(text, "tls.DialWithDialer(markDialer(timeout)") {
+		t.Fatal("dialUpstreamTLS direct leg must use the bounded markDialer(timeout)")
+	}
 	const wantBoundTLSUpstreamDials = 3
-	if got := strings.Count(text, "tls.DialWithDialer(markDialer(upstreamDialTimeout)"); got != wantBoundTLSUpstreamDials {
-		t.Fatalf("bounded TLS upstream dials = %d, want %d", got, wantBoundTLSUpstreamDials)
+	if got := strings.Count(text, "upstreamDialTimeout)"); got < wantBoundTLSUpstreamDials {
+		t.Fatalf("dialUpstreamTLS callers passing upstreamDialTimeout = %d, want >= %d", got, wantBoundTLSUpstreamDials)
 	}
 	for _, want := range []string{
 		`p.logger.Error("transparent proxy upstream dial failed"`,
@@ -220,5 +234,26 @@ func TestLogTimeoutWarnWindowReArmsPerMessage(t *testing.T) {
 	p.logTimeout(readMsg, err, "agent", "a")
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Fatalf("repeat right after re-arm must be DEBUG:\n%s", buf.String())
+	}
+}
+
+func TestLogConnectDialFailedLevels(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"no such host", &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", Name: "prom.example.com", IsNotFound: true}}, "level=DEBUG"},
+		{"refused", errors.New("connection refused"), "level=WARN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			p := &GitHubProxy{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+			p.logConnectDialFailed("prom.example.com:9090", tc.err)
+			if !strings.Contains(buf.String(), tc.want) {
+				t.Errorf("want %s, got %q", tc.want, buf.String())
+			}
+		})
 	}
 }

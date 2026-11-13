@@ -18,12 +18,15 @@ const (
 	CauseHumanMergeRequired   = "breaking change — owner merges"
 	CauseIntentUnauthorized   = "the merge intent could not be authorized"
 	CauseApprovalDeskWithheld = "the approval desk withheld this merge"
+	// CauseReviewOff: the contributor lane wants a reviewer verdict the hive
+	// will never ask for (contributor-lane:review-off).
+	CauseReviewOff = "the contributor lane needs a reviewer verdict (`auto_merge.contributor_lane.require_reviewer_verdict`), but this hive does not dispatch the review swarm (`review.require_approval` and `review.fan_out` must both be on), so no verdict will come for this head; a person merges it, or the owner turns the review swarm on or the verdict requirement off"
 	// CauseWorkflowPathManual is the workflow-path fence read as a rule a
 	// person merges around.
 	CauseWorkflowPathManual = "the PR edits CI workflow / action files, which the lane never merges unattended"
 	// CauseWorkflowPathAwaitingApproval is the same fence awaiting the
 	// owner's explicit approval (hivecommons/hive#14664).
-	CauseWorkflowPathAwaitingApproval = "the PR edits CI workflow / action files: awaiting owner approval — a hive owner / trusted merger's GitHub **Approve** review on the current head (or a dashboard `/hive decision approve`) releases the fence and the hive merges it; approval on an earlier head does not count, so re-approve after a push"
+	CauseWorkflowPathAwaitingApproval = "the PR edits CI workflow / action files: awaiting owner approval — a hive owner / trusted merger's GitHub **Approve** review on the current head (or a `/hive decision approve` reply, typed on the PR or from the dashboard) releases the fence and the hive merges it; approval on an earlier head does not count unless the hive's own merge of the base branch is all that moved the head, so re-approve after a push"
 )
 
 // CauseWorkflowApprovalUntrusted is the cause when the repository's

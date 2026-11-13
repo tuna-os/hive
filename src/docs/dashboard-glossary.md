@@ -26,7 +26,9 @@ For a plain-language explanation of every dashboard section — what it shows, h
 | Verdict / dwell / soak | A verdict is a review result. Dwell is time at a stage before it is considered stalled. Soak is an admitted PR's waiting period before merge. |
 | Swarm | Several reviewers working on the same review. Their results still pass through the merge policy. |
 | Re-home | Continue work in a replacement PR owned by the appropriate author; do not silently rewrite the original author's commits. |
+| Code scanning issue | An issue the hive filed from GitHub code scanning alerts (label `hive/code-scanning`). Its body starts with a hidden `<!-- hive:code-scanning tool=… rule=… paths=… alerts=… -->` marker listing every alert number it tracks; the sweep updates the alert table, and closes the issue when every alert is fixed or dismissed. See [Code scanning issues](code-scanning.md). |
 | Issue band / PR band | A display group in Projects, not a scheduler or merge permission. See the exact groups below. |
+| Board pressure (BP) | The open issues and PRs the configured repos put on this Hive's board: total open issues / total open PRs, before any of them is sorted into actionable, held, blocked or outside. The Overview sidebar pill reads `BP = 19/4`. |
 
 For exact stage labels, repair ownership and hold rules, see [Labels and control signals](labels-and-control-signals.md). For commands that inspect beads, see [`hivectl bead`](hivectl.md#bead--work-items).
 
@@ -43,7 +45,7 @@ The ADR-0018 information-architecture/naming pass is implemented. The table belo
 | Fleet | The set of agents or contributor agents under observation in an operational context. | Use for aggregate operational controls and live monitoring. |
 | Issue band | A display-only group in a repository card's issue column, named for the operator's action: Unclaimed, Claimed, Needs triage (agent-filed and not yet acknowledged by a human), Parked, or Confirm & close. | Use for Projects card grouping; do not imply scheduler eligibility changed. Hover a band header, Overview slice, or legend row for its rule. |
 | Pill legend | The collapsible Projects-section key explaining pill colours, borders, glyphs, and badges as a colour key plus captioned issue, pull-request, review, link, and action pills, including the red sentinel pill for PRs that carry the configured sentinel alert label. The aligned repository-card rows keep the left chip for the issue band or PR review class and align actions in fixed slots. | Use for the compact legend above project cards. |
-| PR band | A display-only group in a repository card's pull-request column: Gated, Merge-eligible, Blocked, In review, Open, or Draft. | Use for Projects card grouping; do not imply merge queue, hold, or review eligibility changed. |
+| PR band | A display-only group in a repository card's pull-request column: Gated, Merge-eligible, Blocked, In review, Open, or Draft. Drafts are counted from the sidelined draft list, since the enumeration keeps them out of the open-PR list. | Use for Projects card grouping; do not imply merge queue, hold, or review eligibility changed. |
 | Stale issue | An actionable repository-card issue whose `updated_at` activity is older than the configured `dashboard.issue_bands.stale_days` threshold. | Use for the `N no activity > Nd` counter and `🕒` badge. |
 | Stale PR | A repository-card PR whose `updated_at` activity is older than the configured `dashboard.issue_bands.stale_days` threshold. | Use for the PR `🕒` badge. |
 

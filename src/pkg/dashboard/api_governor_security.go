@@ -1,8 +1,11 @@
 package dashboard
 
 import (
+	"errors"
 	"net/http"
 	"os"
+	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/hivecommons/hive/pkg/config"
@@ -39,27 +42,28 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 		IntentAlignmentModel             *string `json:"intentAlignmentModel"`
 		// Intent classifier lists. An empty list restores the built-in
 		// defaults (nil), matching how the intent package treats them.
-		IntentTestPathPatterns      *[]string `json:"intentTestPathPatterns"`
-		IntentDocsPathPatterns      *[]string `json:"intentDocsPathPatterns"`
-		IntentGuardrailPathPatterns *[]string `json:"intentGuardrailPathPatterns"`
-		IntentFeatureSignals        *[]string `json:"intentFeatureSignals"`
-		ReviewRequire               *bool     `json:"reviewRequireApproval"`
-		ReviewFanOut                *bool     `json:"reviewFanOut"`
-		ReviewMaxParallel           *int      `json:"reviewMaxParallelReviews"`
-		ReviewReviewerAgents        *[]string `json:"reviewReviewerAgents"`
-		ReviewFixerAgent            *string   `json:"reviewFixerAgent"`
-		AgentSandboxEnabled         *bool     `json:"agentSandboxEnabled"`
-		SandboxImage                *string   `json:"agentSandboxImage"`
-		SandboxEnvAllowlist         *[]string `json:"agentSandboxEnvAllowlist"`
-		SandboxNetworkMode          *string   `json:"agentSandboxNetworkMode"`
-		SandboxTimeoutS             *int      `json:"agentSandboxTimeoutS"`
-		SandboxWorkspaceDir         *string   `json:"agentSandboxWorkspaceDir"`
-		SandboxRuntime              *string   `json:"agentSandboxRuntime"`
-		SandboxJobServiceAccount    *string   `json:"agentSandboxJobServiceAccount"`
-		SandboxJobSchedulerName     *string   `json:"agentSandboxJobSchedulerName"`
-		SandboxJobTTLSeconds        *int      `json:"agentSandboxJobTtlSeconds"`
-		SandboxJobWorkspaceClaim    *string   `json:"agentSandboxJobWorkspaceClaim"`
-		SandboxJobClaimMount        *string   `json:"agentSandboxJobWorkspaceClaimMount"`
+		IntentTestPathPatterns      *[]string                      `json:"intentTestPathPatterns"`
+		IntentDocsPathPatterns      *[]string                      `json:"intentDocsPathPatterns"`
+		IntentGuardrailPathPatterns *[]string                      `json:"intentGuardrailPathPatterns"`
+		IntentFeatureSignals        *[]string                      `json:"intentFeatureSignals"`
+		ReviewRequire               *bool                          `json:"reviewRequireApproval"`
+		ReviewFanOut                *bool                          `json:"reviewFanOut"`
+		ReviewMaxParallel           *int                           `json:"reviewMaxParallelReviews"`
+		ReviewReviewerAgents        *[]string                      `json:"reviewReviewerAgents"`
+		ReviewFixerAgent            *string                        `json:"reviewFixerAgent"`
+		AgentSandboxEnabled         *bool                          `json:"agentSandboxEnabled"`
+		SandboxImage                *string                        `json:"agentSandboxImage"`
+		SandboxEnvAllowlist         *[]string                      `json:"agentSandboxEnvAllowlist"`
+		SandboxNetworkMode          *string                        `json:"agentSandboxNetworkMode"`
+		SandboxTimeoutS             *int                           `json:"agentSandboxTimeoutS"`
+		SandboxWorkspaceDir         *string                        `json:"agentSandboxWorkspaceDir"`
+		SandboxRuntime              *string                        `json:"agentSandboxRuntime"`
+		SandboxJobServiceAccount    *string                        `json:"agentSandboxJobServiceAccount"`
+		SandboxJobSchedulerName     *string                        `json:"agentSandboxJobSchedulerName"`
+		SandboxJobTTLSeconds        *int                           `json:"agentSandboxJobTtlSeconds"`
+		SandboxJobWorkspaceClaim    *string                        `json:"agentSandboxJobWorkspaceClaim"`
+		SandboxJobClaimMount        *string                        `json:"agentSandboxJobWorkspaceClaimMount"`
+		SandboxSubstrate            *config.SandboxSubstrateConfig `json:"agentSandboxSubstrate"`
 		// Sentinel (suspicious-activity alerts) is pointer-typed per field
 		// so an absent key means "unchanged" — a save that only toggled a
 		// behavior must not wipe the sensitive-path list.
@@ -72,6 +76,13 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 			TrustedAuthorsBlock *bool     `json:"trustedAuthorsBlock"`
 			Repos               *[]string `json:"repos"`
 			MaxActions          *int      `json:"maxActions"`
+			// RepoSensitivePaths sets or clears single repositories'
+			// project.repo_policies[].sentinel_sensitive_paths: a list
+			// replaces that repository's own list ([] flags nothing by
+			// path there), null clears it so the repository reads
+			// sensitivePaths again. Repositories it does not name keep their
+			// list; the hive-wide list is never changed here.
+			RepoSensitivePaths map[string]*[]string `json:"repoSensitivePaths"`
 		} `json:"sentinel"`
 	}
 	if err := decodeBody(r, &body); err != nil {
@@ -79,6 +90,7 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var nextSentinel *config.SentinelConfig
+	var repoSensitivePaths map[string]*[]string
 	if body.Sentinel != nil {
 		sc := s.deps.Config.Sentinel
 		if body.Sentinel.Enabled != nil {
@@ -121,6 +133,14 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		nextSentinel = &sc
+		if body.Sentinel.RepoSensitivePaths != nil {
+			paths, msg := s.repoOverrideSensitivePaths(body.Sentinel.RepoSensitivePaths)
+			if msg != "" {
+				jsonError(w, msg, http.StatusBadRequest)
+				return
+			}
+			repoSensitivePaths = paths
+		}
 	}
 	if body.IoscanFailMode != nil && !validIoscanFailMode(*body.IoscanFailMode) {
 		jsonError(w, "ioscan fail_mode must be open or closed", http.StatusBadRequest)
@@ -163,6 +183,18 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 	}
 
 	cfg := s.deps.Config
+	// Per-repository Sentinel lists go first: they are the only write here
+	// that can still be refused, and a refusal must leave every setting as
+	// it was.
+	var repoSensitivePathChanges []string
+	if repoSensitivePaths != nil {
+		changes, err := cfg.SetRepoSentinelSensitivePaths(repoSensitivePaths)
+		if err != nil {
+			jsonError(w, "sentinel.repoSensitivePaths: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		repoSensitivePathChanges = changes
+	}
 	if body.IoscanEnabled != nil {
 		v := *body.IoscanEnabled
 		cfg.Ioscan.Enabled = &v
@@ -171,6 +203,9 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 	// ACMM level", which is closed at L5-L6, so storing open as empty made
 	// the dashboard unable to choose open on those levels.
 	if body.IoscanFailMode != nil {
+		// "open" is stored as given: an empty fail_mode follows the ACMM
+		// pack, which is closed at L5+, so the operator's choice would be
+		// silently lost there (#16973).
 		cfg.Ioscan.FailMode = strings.ToLower(strings.TrimSpace(*body.IoscanFailMode))
 	}
 	if body.IoscanClassifierFailMode != nil {
@@ -293,6 +328,14 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 			job.TTLSeconds = *body.SandboxJobTTLSeconds
 		}
 	}
+	if body.SandboxSubstrate != nil {
+		sub, err := sanitizeSubstrateConfig(*body.SandboxSubstrate)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cfg.AgentSandbox.Substrate = sub
+	}
 	if nextSentinel != nil {
 		cfg.Sentinel = *nextSentinel
 	}
@@ -300,9 +343,53 @@ func (s *Server) handleGovernorSecurity(w http.ResponseWriter, r *http.Request) 
 	if err := s.saveConfig(); err != nil {
 		s.logger.Error("failed to persist config after security update", "error", err)
 	}
-	s.auditFromRequest(r, "config_governor_security", auditDetail("section", "security"), "")
+	ioscanChanged := body.IoscanEnabled != nil || body.IoscanFailMode != nil || body.IoscanClassifierBackend != nil ||
+		body.IoscanClassifierCLIBudgetPerEval != nil || body.IoscanClassifierCLIDailyQuota != nil
+	if ioscanChanged && s.deps.IoscanConfigApplied != nil {
+		s.deps.IoscanConfigApplied()
+	}
+	auditKV := []string{"section", "security"}
+	if len(repoSensitivePathChanges) > 0 {
+		auditKV = append(auditKV, "sentinel_repo_sensitive_paths", strings.Join(repoSensitivePathChanges, "; "))
+	}
+	s.auditFromRequest(r, "config_governor_security", auditDetail(auditKV...), "")
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated"})
+}
+
+// repoOverrideSensitivePaths validates sentinel.repoSensitivePaths: every key
+// a repository in project.repos (stored as owner/repo, named once), every
+// value null (clear) or a list of non-blank, well-formed globs. A non-empty
+// msg is the 400 to return.
+func (s *Server) repoOverrideSensitivePaths(in map[string]*[]string) (map[string]*[]string, string) {
+	const key = "sentinel.repoSensitivePaths"
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]*[]string, len(in))
+	seen := map[string]bool{}
+	for _, k := range keys {
+		full, msg := s.autoMergeWatchedRepo(key, strings.TrimSpace(k))
+		if msg != "" {
+			return nil, msg
+		}
+		if seen[strings.ToLower(full)] {
+			return nil, key + ": " + full + " is named twice"
+		}
+		seen[strings.ToLower(full)] = true
+		v := in[k]
+		if v != nil {
+			paths, err := config.NormalizeRepoSentinelSensitivePaths(key+": "+full, *v)
+			if err != nil {
+				return nil, err.Error()
+			}
+			v = &paths
+		}
+		out[full] = v
+	}
+	return out, ""
 }
 
 // validIoscanFailMode accepts open, closed, or empty (follow the default).
@@ -412,17 +499,25 @@ func securitySectionResponse(cfg *config.Config) map[string]interface{} {
 		"agentSandboxJobTtlSeconds":          sandboxJobOrEmpty(cfg).TTLSeconds,
 		"agentSandboxJobWorkspaceClaim":      sandboxJobOrEmpty(cfg).WorkspaceClaim,
 		"agentSandboxJobWorkspaceClaimMount": sandboxJobOrEmpty(cfg).WorkspaceClaimMount,
+		"agentSandboxSubstrate":              substrateOrEmpty(cfg.AgentSandbox.Substrate),
 		"sandboxedAgents":                    sandboxed,
 		"totalAgents":                        len(cfg.Agents),
 		"sandboxWarnings":                    sandboxWarnings,
-		"sentinel":                           sentinelSectionResponse(cfg.Sentinel),
+		"sentinel":                           sentinelSectionResponse(cfg.Sentinel, cfg.SentinelSensitivePathsRepoOverrides()),
 	}
 }
 
 // sentinelSectionResponse renders the suspicious-activity block. It sends
 // the EFFECTIVE sensitive-path list plus whether that list is the shipped
 // default, so the UI can show the defaults pre-filled and offer a reset.
-func sentinelSectionResponse(sc config.SentinelConfig) map[string]interface{} {
+// repoSensitivePaths lists the repositories whose repo_policies override
+// replaces that list; the hive-wide list (and a change to it) does not apply
+// to them.
+func sentinelSectionResponse(sc config.SentinelConfig, overrides []config.RepoSensitivePathsOverride) map[string]interface{} {
+	repoPaths := make([]map[string]interface{}, 0, len(overrides))
+	for _, o := range overrides {
+		repoPaths = append(repoPaths, map[string]interface{}{"repo": o.Repo, "sensitivePaths": nonNilStrings(o.Paths)})
+	}
 	rules := config.SentinelBehaviors()
 	behaviors := make([]map[string]interface{}, 0, len(rules))
 	disabled := map[string]bool{}
@@ -442,11 +537,16 @@ func sentinelSectionResponse(sc config.SentinelConfig) map[string]interface{} {
 		"sensitivePaths":        sc.EffectiveSensitivePaths(),
 		"sensitivePathsDefault": sc.SensitivePaths == nil,
 		"defaultSensitivePaths": config.DefaultSentinelSensitivePaths(),
+		"repoSensitivePaths":    repoPaths,
 		"behaviors":             behaviors,
 		"exemptLogins":          nonNilStrings(sc.ExemptLogins),
 		"trustedAuthorsBlock":   sc.TrustedAuthorsBlock,
 		"repos":                 nonNilStrings(sc.Repos),
 		"maxActions":            sc.MaxActionsOrDefault(),
+
+		// This build takes sentinel.repoSensitivePaths on PUT; the admin MCP
+		// refuses to send it to a hive that does not say so.
+		"repoSensitivePathsSettable": true,
 	}
 }
 
@@ -508,4 +608,51 @@ func sandboxJobOrEmpty(cfg *config.Config) config.SandboxJobConfig {
 		return config.SandboxJobConfig{}
 	}
 	return *cfg.AgentSandbox.Job
+}
+
+func substrateOrEmpty(sub *config.SandboxSubstrateConfig) config.SandboxSubstrateConfig {
+	if sub == nil {
+		return config.SandboxSubstrateConfig{}
+	}
+	return *sub
+}
+
+// sanitizeSubstrateConfig trims and validates a Substrate block from the
+// Settings dialog. An all-empty block returns nil so the YAML key is dropped.
+func sanitizeSubstrateConfig(in config.SandboxSubstrateConfig) (*config.SandboxSubstrateConfig, error) {
+	if in.TimeoutS < 0 || in.BridgePort < 0 || in.CPUMillicores < 0 || in.MemoryBytes < 0 {
+		return nil, errors.New("substrate numeric settings must be >= 0")
+	}
+	clean := func(s string) string { return sanitizeString(strings.TrimSpace(s)) }
+	out := config.SandboxSubstrateConfig{
+		Endpoint:           clean(in.Endpoint),
+		Atespace:           clean(in.Atespace),
+		TokenEnv:           clean(in.TokenEnv),
+		TokenFile:          clean(in.TokenFile),
+		CAFile:             clean(in.CAFile),
+		InsecureTLS:        in.InsecureTLS,
+		TimeoutS:           in.TimeoutS,
+		RouterURL:          clean(in.RouterURL),
+		RouterClientBundle: clean(in.RouterClientBundle),
+		RouterCAFile:       clean(in.RouterCAFile),
+		BridgePort:         in.BridgePort,
+		Image:              clean(in.Image),
+		BridgeCommand:      sanitizeStringSlice(in.BridgeCommand),
+		CPUMillicores:      in.CPUMillicores,
+		MemoryBytes:        in.MemoryBytes,
+		WorkerSelector:     sanitizedHeaderMap(in.WorkerSelector),
+		SnapshotOnIdle:     in.SnapshotOnIdle,
+		AllowHosts:         sanitizeStringSlice(in.AllowHosts),
+		PolicyProfile:      clean(in.PolicyProfile),
+	}
+	if len(out.BridgeCommand) == 0 {
+		out.BridgeCommand = nil
+	}
+	if len(out.AllowHosts) == 0 {
+		out.AllowHosts = nil
+	}
+	if reflect.DeepEqual(out, config.SandboxSubstrateConfig{}) {
+		return nil, nil
+	}
+	return &out, nil
 }

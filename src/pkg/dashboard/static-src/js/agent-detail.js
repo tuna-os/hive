@@ -134,6 +134,7 @@
       document.querySelectorAll('.oc-nav-item').forEach(i => i.classList.remove('active'));
       const active = document.querySelector(`.oc-nav-item[data-agent-nav="${(window.CSS && CSS.escape) ? CSS.escape(name) : String(name).replace(/["\\]/g, '\\$&')}"]`);
       if (active) active.classList.add('active');
+      if (typeof dashboardProgressiveWake === 'function') dashboardProgressiveWake();
       navPeekRestore('agents-section', { instant: true });
       const expanded = navPeekExpand('agents-section');
       if (!expanded && isSectionCollapsed('agents-section')) toggleSection('agents-section', { collapsed: false, persist: false, navPeek: true });
@@ -552,7 +553,7 @@
       const by = a.pausedBy || '';
       const at = a.pausedAt ? formatDashboardDateTime(a.pausedAt) : 'unknown';
       const ago = a.pausedAt ? pillAge(a.pausedAt) : '';
-      return `<span class="pause-info" title="${esc(pauseProvenanceLine(a))}">ℹ️<span class="pause-tooltip">${esc(pauseProvenanceLine(a))}<br>Reason: ${esc(reason)}<br>Trigger: ${esc(trigger)}${by ? '<br>By: ' + esc(by) : ''}<br>Since: ${esc(at)}${ago ? ' (' + esc(ago) + ')' : ''}</span></span>`;
+      return `<span class="config-info pause-info" tabindex="0" data-stop="1" aria-label="Pause details">ℹ️<span class="config-tooltip pause-tooltip" role="tooltip">${esc(pauseProvenanceLine(a))}<br>Reason: ${esc(reason)}<br>Trigger: ${esc(trigger)}${by ? '<br>By: ' + esc(by) : ''}<br>Since: ${esc(at)}${ago ? ' (' + esc(ago) + ')' : ''}<br><br>To lift the pause, an owner can select ▶ resume or ▶ start &amp; resume on the agent card. If the agent is disabled, enable it first.</span></span>`;
     }
 
     function subAgentModelsHtml(a) {
@@ -592,11 +593,11 @@
             const claudeIcon = '<span class="cli-icon claude-icon"></span>';
             const copilotIcon = '<span class="cli-icon copilot-icon"></span>';
             if (_needsLogin) {
-              if (isClaude) return '<button class="hv-btn btn-primary btn-sm cli-login-btn claude" data-action="loginAgent" data-arg0="' + esc(a.name) + '" data-arg1="claude" data-stop="1" title="Authenticate Claude Code CLI">' + claudeIcon + ' Login</button>';
+              if (isClaude) return claudeLoginButtonHtml(a, true, claudeIcon);
               if (isCopilot) return '<button class="hv-btn btn-primary btn-sm cli-login-btn copilot" data-action="loginAgent" data-arg0="' + esc(a.name) + '" data-arg1="copilot" data-stop="1" title="Authenticate GitHub Copilot CLI">' + copilotIcon + ' Login</button>';
               return '<button class="hv-btn btn-secondary btn-sm cli-login-btn disabled" disabled title="This backend requires manual /login in the terminal">Login</button>';
             }
-            if (isClaude) return '<button class="hv-btn btn-secondary btn-sm cli-login-btn logged-in" data-action="loginAgent" data-arg0="' + esc(a.name) + '" data-arg1="claude" data-stop="1" title="Re-authenticate Claude Code CLI">' + claudeIcon + ' ✓ logged in</button>';
+            if (isClaude) return claudeLoginButtonHtml(a, false, claudeIcon);
             if (isCopilot) return '<button class="hv-btn btn-secondary btn-sm cli-login-btn logged-in" data-action="loginAgent" data-arg0="' + esc(a.name) + '" data-arg1="copilot" data-stop="1" title="Re-authenticate GitHub Copilot CLI">' + copilotIcon + ' ✓ logged in</button>';
             return '<button class="hv-btn btn-secondary btn-sm cli-login-btn disabled" disabled title="This backend requires manual /login in the terminal">✓ logged in</button>';
           })()}</div></div>
@@ -656,7 +657,7 @@
       /* 'disabled' outranks 'down': both reach here with state!=='running',
          but a switched-off agent is not a fault, and labelling it "down" sent
          operators looking for a crash that never happened. */
-      const stateLabel = agentSessionUnavailable(a) ? 'disabled' : needsLoginDown ? 'needs login' : isStopped ? (agentSandboxDownLabel(a) || (a.operatorStopped ? 'stopped by operator' : 'down')) : isOnDemand ? 'on demand' : isPaused ? 'paused' : isOff ? agentCadenceOffLabel() : isRunning ? (a.awaitingCI ? 'Waiting on CI' : 'working') : 'idle';
+      const stateLabel = agentSessionUnavailable(a) ? 'disabled' : needsLoginDown ? (a.credentialBridgeBroken === true ? CREDENTIAL_BRIDGE_BROKEN_LABEL : 'needs login') : isStopped ? (agentSandboxDownLabel(a) || (a.operatorStopped ? 'stopped by operator' : 'down')) : isOnDemand ? 'on demand' : isPaused ? 'paused' : isOff ? agentCadenceOffLabel() : isRunning ? (a.awaitingCI ? 'Waiting on CI' : 'working') : 'idle';
 
       const kickId = `oc-kick-${a.name}`;
       const prevInput = document.getElementById(kickId);
@@ -766,6 +767,7 @@
           ${fleetRunStripHtml()}
           <div class="gov-metric" title="${esc((window._lastStatus?.hold?.items || []).map(h => (h.type === 'pr' ? 'PR' : 'Issue') + ' ' + h.repo + '#' + h.number + (h.review_class ? ' [' + h.review_class + ']' : '') + ': ' + h.title).join('\n') || 'No items on hold')}"><span class="gm-label">on hold</span><span class="gm-val">${window._lastStatus?.hold?.total || 0}</span></div>
           ${standbyPauseFactsHtml(gov)}
+          ${contributorFirstFactsHtml(gov)}
           ${(() => {
             const plan = window._lastStatus?.planning || {};
             // Planning only runs at ACMM >= 5 (architect scheduled); hide the tile
@@ -830,7 +832,7 @@
       detail.innerHTML = `
         <div class="oc-agent-detail-header">
           <span class="status-dot ${dotState}" data-status="${statusAttr(dotState)}"${dotTitle ? ` title="${esc(dotTitle)}"` : ''}></span>
-          <span class="agent-name-big">${esc(a.displayName || a.name)}</span>${a.sandboxed ? ' ' + statusBadgeHTML('ready', 'sandboxed', 'Sandboxed runner active', 'done') : ''}${needsLoginDown ? '<span title="CLI needs login" style="margin-left:var(--sp-3)">\uD83D\uDD11</span>' : ''}
+          <span class="agent-name-big">${esc(a.displayName || a.name)}</span>${a.sandboxed ? ' ' + statusBadgeHTML('ready', 'sandboxed', 'Sandboxed runner active', 'done') : ''}${needsLoginDown ? '<span title="' + esc(needsLoginBadgeTitle(a)) + '" style="margin-left:var(--sp-3)">\uD83D\uDD11</span>' : ''}
           ${agentRunLineHtml(a)}
           <span style="font-size:0.78rem;color:var(--muted);margin-left:auto">${stateLabel}${pauseInfoIcon(a)}</span>
         </div>
@@ -866,7 +868,7 @@
         </div>
         ${agentNowHtml(a)}
         <div class="oc-detail-blockers">${agentBlockerLineHtml(a)}${neverScheduledChipHtml(a, a.name)}${repeatFailureLineHtml(a)}</div>
-        ${terminalCopyHintHtml(needsLoginDown, agentSessionUnavailable(a), a.name, a.loginURL, a.backendAuthStatus, a.backendAuthLastError, a.statusEvidence, a.inferenceLastError)}
+        ${credentialBridgeHintHtml(a)}${terminalCopyHintHtml(needsLoginDown, agentSessionUnavailable(a), a.name, a.loginURL, a.backendAuthStatus, a.backendAuthLastError, a.statusEvidence, a.inferenceLastError)}
         ${ocDetailFieldsHtml(a, isPaused, isOff, isOnDemand)}
         ${subAgentModelsHtml(a)}
         <div class="oc-detail-indicators">${agentIndicators(a.name)}</div>
@@ -938,4 +940,3 @@
     // Agent descriptions now come from the JSON status payload (agent.description field).
     // This empty map serves as a fallback for agents without a description in config.
     const AGENT_DESCRIPTIONS = {};
-

@@ -99,7 +99,7 @@ text**, by two independent mechanisms:
 **The readiness gate before the next kick.**
 `waitForInputPromptForAgent` (`src/crux/agent/manager_tmux.go:496`) polls
 `captureTmuxPaneForAgent` and returns once `paneShowsInputPrompt`
-(`src/crux/agent/manager_pane_signals.go:413`) matches a per-backend marker string. `SendKick`
+(`src/crux/agent/panesignal/panesignal.go:193`) matches a per-backend marker string. `SendKick`
 calls it at `src/crux/agent/manager_kick.go:203`. This gate is the only thing that
 stops hive typing a new prompt on top of an in-flight response.
 
@@ -139,9 +139,9 @@ Kick *timing* lives in `pkg/governor`; kick *text* is built in `pkg/scheduler`.
   `deps.newTicker(initialEvalInterval)` at `src/cmd/hive/main.go:5772`, loop at
   `src/cmd/hive/main.go:6112`, evaluation via `deps.runEval` at
   `src/cmd/hive/main.go:5956` (`runEvalCycle`, `src/cmd/hive/main_eval_cycle.go:471`),
-  message assembly via `sched.BuildKickMessagesWithSkips` at `src/cmd/hive/main_eval_cycle.go:964`
+  message assembly via `sched.BuildKickMessagesWithSkips` at `src/cmd/hive/main_eval_cycle.go:1107`
   (`src/pkg/scheduler/kickmessage.go:261`), and delivery via
-  `agentMgr.SendKick` wired into `dispatchAgentKicks` at `src/cmd/hive/main_eval_cycle.go:1127`.
+  `agentMgr.SendKick` wired into `dispatchAgentKicks` at `src/cmd/hive/main_eval_cycle.go:1593`.
 
 This matters for the RFC: the scheduler is already **stateless with respect to
 turns**. It does not hold a continuation, does not await turn *N* before
@@ -158,7 +158,7 @@ CLI subprocess.
 
 | State | Where | Citation |
 |---|---|---|
-| Pause flag (one bool per agent) | `/data/hive.yaml` via `AgentConfig.Paused` | `src/crux/config/agent_config.go:219`; writer `SetAgentPausedAndSave` `src/pkg/config/save.go:64` |
+| Pause flag (one bool per agent) | `/data/hive.yaml` via `AgentConfig.Paused` | `src/crux/config/agent_config.go:219`; writer `SetAgentPausedAndSave` `src/pkg/config/save.go:72`, which also mirrors the bool into the agent's overlay file when it has one |
 | Pause provenance (`PausedAt`, `PausedReason`, `PausedTrigger`, `PausedBy`), CLI/model pins, model/backend overrides, restart count, `LastKick`, truncated kick history | `/data/hive-state.json` via `snapshot.AgentState` | `src/pkg/snapshot/state.go:82-117`; path `src/cmd/hive/spokewire.go:3` |
 | Watchdog failure count, crash-loop latch, backoff deadline, healthy-since, conditions | same file, `snapshot.PersistedState.Watchdog` | `src/pkg/snapshot/state.go:48`; `watchdog.PersistedAgent` `src/crux/watchdog/reconciler.go:216` |
 | Fleet-breaker engagement + held set | same file, `BreakerState` | `src/pkg/snapshot/state.go:56` |

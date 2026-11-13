@@ -25,6 +25,10 @@ type RowActionResult struct {
 	Next      string          `json:"next"`
 	Rule      string          `json:"rule,omitempty"`
 	AppliedAt *time.Time      `json:"applied_at,omitempty"`
+	// Verdict is the delegate's verdict slug when the hive decided
+	// (owner-only, recommend-only, …), so the row caption can tell a
+	// recorded recommendation from an ask handed back to the person.
+	Verdict string `json:"verdict,omitempty"`
 	// Why is the glossary slug for why a recorded decision has not taken
 	// effect (Action no-effect); Options are the concrete next actions in
 	// the popover's shape (hivecommons/hive#14822). Both additive.
@@ -104,7 +108,7 @@ func delegatedRowActionResult(in delegatedecision.Input, d delegatedecision.Deci
 	if in.Kind == delegatedecision.KindPR {
 		kind = rowActionTargetPR
 	}
-	out := RowActionResult{Target: rowActionTarget(in.Repo, kind, in.Number), Rule: d.Rule}
+	out := RowActionResult{Target: rowActionTarget(in.Repo, kind, in.Number), Rule: d.Rule, Verdict: string(d.Verdict)}
 	ruleTag := ""
 	if d.Rule != "" {
 		ruleTag = " (" + delegatedecision.RulePlain(d.Rule) + ")"
@@ -203,10 +207,17 @@ func delegatedRowActionResult(in delegatedecision.Input, d delegatedecision.Deci
 		case note("queued for auto-merge"):
 			out.Next = "Queued: the auto-merge engine merges per repository settings."
 		case note("/lgtm"):
-			out.Next = "Hive's merge sweep merges it on its next pass once CI is green and the head has soaked."
+			out.Next = "Hive merges it on its next merge pass once CI is green and the head has soaked."
 			out.Posted = append(out.Posted, "`/lgtm` posted", "`/approve` posted")
 		default:
-			out.Next = "Hive's merge sweep merges it on its next pass once CI is green and the head has soaked."
+			out.Next = "Hive merges it on its next merge pass once CI is green and the head has soaked."
+		}
+	}
+	if in.Kind == delegatedecision.KindPR && d.Verdict == delegatedecision.VerdictApprove && note("native approval durably recorded") {
+		out.Outcome = "Native approval recorded for head `" + shortHead(in.HeadSHA) + "`" + ruleTag + "."
+		out.Next = "Current CI, review, hold, sentinel and queue requirements still apply; approval is not merge readiness."
+		if note("incomplete") {
+			out.Next = "GitHub/Prow reporting is incomplete and audited. Native approval stands; current merge gates still apply, without another model decision."
 		}
 	}
 	return out

@@ -341,7 +341,13 @@ type RegistryEntry struct {
 	// from cache. The hive is online, but health/agent-derived truth must be
 	// rendered as stale/unknown unless the beat explicitly carried a fresh
 	// in-memory agent overlay.
-	StatsStale       bool      `json:"statsStale,omitempty"`
+	StatsStale bool `json:"statsStale,omitempty"`
+	// ForgeUnreachable is the spoke-reported flag that the GitHub host in
+	// GitHubHost cannot be reached from the pod (forge probe timed out or
+	// failed at the transport layer). The pod is healthy; the break is egress,
+	// so the hub labels the row by host and exempts it from health/advisory
+	// penalties. Old spokes omit it (false = today's behaviour).
+	ForgeUnreachable bool      `json:"forgeUnreachable,omitempty"`
 	Upgrading        bool      `json:"upgrading,omitempty"`
 	UpgradeTarget    string    `json:"upgradeTarget,omitempty"`
 	UpgradeStartedAt time.Time `json:"upgradeStartedAt,omitempty"`
@@ -1009,6 +1015,8 @@ type HubServer struct {
 	registry             Registry
 	mu                   sync.RWMutex
 	logger               *slog.Logger
+	activity             activityStore       // per-hive activity digests, memory only (#15951); leaf lock
+	publicActivity       publicActivityCache // short-TTL anonymous activity body (#16111)
 	saveCh               chan struct{}
 	githubActivityFeed   *GitHubActivityFeed
 	githubActivityMu     sync.Mutex
@@ -1212,6 +1220,12 @@ type HubServer struct {
 	// Same rationale and same guarding mutex as lastNetAdminReconcile above:
 	// both are poller-loop-only state.
 	lastPerHiveEnvReconcile time.Time
+	// lastHostAliasesReconcile throttles the per-cluster host_aliases
+	// reconcile (cluster_host_aliases.go). Same mutex, same rationale.
+	lastHostAliasesReconcile time.Time
+	// lastStartupProbeReconcile throttles the template startupProbe / init
+	// image reconcile (startup_probe_reconcile.go). Same mutex, same rationale.
+	lastStartupProbeReconcile time.Time
 	// lastContributeIngressReconcile throttles the hive-contribute Ingress
 	// auth-url reconcile (contribute_ingress_reconcile.go), which puts the
 	// #7457 annotations onto spokes provisioned before that fix (#7517).
@@ -1312,6 +1326,14 @@ type HubServer struct {
 	// a-ks-wec2 n0sv loop: 18 ReplicaSets in 8 minutes, none Ready). A
 	// different tag, or a cleared switch, resets the clock.
 	heartbeatSwitchSent map[string]switchSend
+	// heartbeatChannelPinSent records, per hive, the target last sent as
+	// UpgradeTo to a release-channel follower. A follower whose channel lagged
+	// that target pins its Deployment to the target's SHA tag; the tracked-
+	// channel re-arm leaves that pin alone instead of rolling the pod a second
+	// time just to restore the channel tag, and the next upgrade returns it to
+	// the channel (#17978). In memory only: after a hub restart the re-arm
+	// behaves as before.
+	heartbeatChannelPinSent map[string]string
 
 	// pendingWebhooks stores GitHub App installation webhooks that arrived
 	// before the matching spoke heartbeat.  Key: lowercase org name.
@@ -1446,6 +1468,12 @@ type HubServer struct {
 	// field to point at a fake GitHub API before that first call.
 	dibsPublicOnce sync.Once
 	dibsPublic     *dibsPublicChecker
+
+	// Workflow marketplace catalogue (#17620 phase 7, marketplace*.go).
+	// Created lazily by marketplace(); tests pre-set the store/refresher.
+	marketplaceOnce      sync.Once
+	marketplaceStore     *marketplaceStore
+	marketplaceRefresher *marketplaceRefresher
 }
 
 // HubBannerEntry stores an admin banner targeted at a specific hive.
@@ -1723,6 +1751,9 @@ func NewHubServer(port int, logger *slog.Logger, gitHash, gitBranch string) *Hub
 	// same credential as /api/task-status. The only read path is the admin-gated
 	// GET registered in registerSaaSRoutes.
 	s.mux.HandleFunc("POST "+npsIngestPath, s.handleNPSIngest)
+	// Fleet benchmark records from spokes (hivecommons/hive#17694).
+	s.mux.HandleFunc("POST "+benchmarksIngestPath, s.handleBenchmarksIngest)
+	s.mux.HandleFunc("GET "+benchmarksStatusPath, s.handleBenchmarksStatus)
 	s.mux.HandleFunc("POST "+feedbackIngestPath, s.handleFeedbackIngest)
 	s.mux.HandleFunc("POST "+selfReportIngestPath, s.handleSelfReportIngest)
 	s.mux.HandleFunc("GET "+feedbackIssuesPath, s.handleFeedbackIssues)
@@ -1732,6 +1763,9 @@ func NewHubServer(port int, logger *slog.Logger, gitHash, gitBranch string) *Hub
 	s.mux.HandleFunc("GET /api/fleet-stats", s.handleFleetStats)
 	s.mux.HandleFunc("GET "+complianceRollupPath, s.requireAdmin(s.handleComplianceRollup))
 	s.mux.HandleFunc("GET "+evidencePath, s.requireAdmin(s.handleEvidence))
+	// Hub-wide activity (#15951): any signed-in user, scoped per hive inside
+	// the handler; read-only.
+	s.mux.HandleFunc("GET "+activityPath, s.requireAuth(s.handleHubActivity))
 	s.mux.HandleFunc("GET "+evidenceReportPath, s.requireAdmin(s.handleEvidenceReport))
 	s.mux.HandleFunc("GET /api/gh-rate-limits", s.requireAdmin(s.handleGHRateLimits))
 	s.mux.HandleFunc("GET /api/hub/version", s.handleHubVersion)
@@ -1796,6 +1830,11 @@ func NewHubServer(port int, logger *slog.Logger, gitHash, gitBranch string) *Hub
 	s.registerOAuth()
 	s.registerSaaSRoutes()
 	s.registerOpenRouterRoutes()
+	// Fleet activity page (#16063): signed-in, read-only board over
+	// GET /api/hub/activity.
+	s.registerActivityPageRoutes()
+	// Workflow marketplace catalogue (#17620 phase 7).
+	s.registerMarketplaceRoutes()
 	go s.saveLoop()
 	go s.refreshActiveMyHivesSnapshotsLoop()
 
@@ -2127,6 +2166,7 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}(),
 		Online:            true,
 		StatsStale:        payload.StatsStale,
+		ForgeUnreachable:  payload.ForgeUnreachable,
 		GitHubAppRequired: payload.GitHubAppRequired,
 		// GitHubAppPermIssue is a full sentence the drift hover renders
 		// verbatim ("The GitHub App is configured but has no installation.
@@ -2743,6 +2783,11 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.registry.Hives = append(s.registry.Hives, entry)
 	}
 	s.registry.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	// Activity digest (#15951): stored only once the beat is authenticated and
+	// accepted into the registry. Recorded while still holding s.mu so a
+	// concurrent delete (which forgets under s.mu) cannot leave a stale digest
+	// behind (#16010). activityStore.mu is a leaf lock, so taking it here is safe.
+	activityAck := s.activity.record(payload.HiveID, payload.Activity, time.Now().UTC())
 	s.mu.Unlock()
 
 	// Timeline: record whatever changed on this beat. Nothing is written when
@@ -2832,6 +2877,8 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		LatestSHA:  latestSHA,
 	}
 	resp.SelfExperimentFlag = s.selfExperimentFlagForHeartbeat(payload.HiveID, payload.SelfExperimentsOptIn)
+	resp.ActivityETag = activityAck
+	resp.ActivityEventsAck = s.activity.eventsAck(payload.HiveID)
 
 	if entry.IsPublic != payload.IsPublic {
 		resp.IsPublic = &entry.IsPublic
@@ -3004,8 +3051,18 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 			"pinned_digest", saasHive.DigestPin.Digest, "pinned_by", saasHive.DigestPin.By,
 			"reported_image", payload.ImageRef)
 	}
+	// A follower on the SHA tag it was just sent as UpgradeTo pinned there
+	// because its channel lagged the target (#10719). Switching it back now
+	// rolls the pod a second time onto a channel that may still be behind;
+	// the next upgrade returns it to the channel tag in the same roll (#17978).
+	pinnedToSentTarget := saasHive != nil && isReleaseChannel(saasHive.TrackedChannel) &&
+		s.channelPinSentMatches(payload.HiveID, saasHive.TrackedChannel, imageTagOf(sanitizeImageRef(payload.ImageRef)))
+	if pinnedToSentTarget && switchTag == "" && !payload.Upgrading {
+		s.logger.Debug("heartbeat: tracked-channel re-arm skipped - follower is pinned to the upgrade target it was sent",
+			"hive_id", payload.HiveID, "channel", saasHive.TrackedChannel, "reported_image", payload.ImageRef)
+	}
 	if !spokeUpgradesPausedNow && !digestPinnedNow && switchTag == "" && saasHive != nil && isReleaseChannel(saasHive.TrackedChannel) &&
-		!payload.Upgrading && payload.ImageRef != "" &&
+		!payload.Upgrading && payload.ImageRef != "" && !pinnedToSentTarget &&
 		imageTagOf(sanitizeImageRef(payload.ImageRef)) != saasHive.TrackedChannel {
 		switchTag = saasHive.TrackedChannel
 		s.mu.Lock()
@@ -3104,6 +3161,7 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Without this a :stable spoke armed at the v4 tip re-pulls :stable, comes
 	// back on the same commit, and is re-told to upgrade on every beat:
 	// "Upgrading" forever, ✓ on the SHA (12 spokes on 2026-09-09).
+	var hbReach upgradeReachability
 	if hbTarget != "" && payload.GitHash != "" {
 		trackedChannel := ""
 		if saasHive != nil {
@@ -3111,6 +3169,7 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		if channel := spokeReleaseChannel(payload.ImageRef, trackedChannel); channel != "" {
 			reach := s.reachableUpgradeTarget(branch, payload.ImageRef, trackedChannel)
+			hbReach = reach
 			switch {
 			case !reach.Resolved || reach.SHA == "":
 				// Unknown reachable set: do not deliver a target we cannot vouch for.
@@ -3211,6 +3270,7 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// the armed kubectl-fallback target below, exactly as it did when this was
 	// a single inline condition.
 	spokeManagedTarget, spokeManagedChannel := "", ""
+	var spokeManagedReach upgradeReachability
 	if spokeManaged && !spokeUpgradesPausedNow && !digestPinnedNow && payload.GitHash != "" {
 		trackedChannel := ""
 		if saasHive != nil {
@@ -3233,6 +3293,7 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 				"current", payload.GitHash, "channel_sha", reach.SHA)
 		default:
 			spokeManagedTarget, spokeManagedChannel = reach.SHA, reach.Channel
+			spokeManagedReach = reach
 		}
 	}
 
@@ -3259,21 +3320,25 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		if req, ok := s.upgradeInterrupts.pending(payload.HiveID, time.Now()); ok && req.appliesTo(spokeManagedTarget) {
 			resp.UpgradeInterrupt = true
 		}
+		resp.UpgradeChannelTag = s.noteChannelUpgradeSent(payload.HiveID, spokeManagedReach, spokeManagedTarget)
 		s.logger.Info("heartbeat: instructing spoke-managed hive to upgrade",
 			"hive_id", payload.HiveID,
 			"from", payload.GitHash,
 			"to", spokeManagedTarget,
 			"channel", spokeManagedChannel,
+			"channel_tag_carries_target", resp.UpgradeChannelTag != "",
 		)
 	} else if hbTarget != "" && !sameCommit(payload.GitHash, hbTarget) {
 		resp.UpgradeTo = hbTarget
 		if req, ok := s.upgradeInterrupts.pending(payload.HiveID, time.Now()); ok && req.appliesTo(hbTarget) {
 			resp.UpgradeInterrupt = true
 		}
+		resp.UpgradeChannelTag = s.noteChannelUpgradeSent(payload.HiveID, hbReach, hbTarget)
 		s.logger.Info("heartbeat: instructing hub-managed hive to upgrade (kubectl fallback)",
 			"hive_id", payload.HiveID,
 			"from", payload.GitHash,
 			"to", hbTarget,
+			"channel_tag_carries_target", resp.UpgradeChannelTag != "",
 		)
 	}
 
@@ -3287,6 +3352,17 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		resp.RestartSpoke = true
 		s.logger.Info("heartbeat: delivering spoke restart", "hive_id", payload.HiveID, "reporter", payload.Reporter)
 	}
+	// Intent before the kill (#15788): a hub-managed hive learns here that
+	// its pod is being rolled, so its dashboard shows the upgrade animation
+	// with the target instead of a bare "reconnecting" once the pod dies.
+	resp.UpgradeAnnounce = heartbeatUpgradeAnnounce(heartbeatUpgradeAnnounceInput{
+		HubManaged:             saasHive != nil && !spokeManaged,
+		LatchOpen:              entry.Upgrading,
+		Target:                 entry.UpgradeTarget,
+		Current:                payload.GitHash,
+		SpokeReportedUpgrading: payload.Upgrading,
+		Restart:                resp.RestartSpoke,
+	})
 
 	if ghCfg := s.pendingAppIdentityForHeartbeat(&payload); ghCfg != nil {
 		resp.GitHubAppConfig = ghCfg
@@ -3324,6 +3400,21 @@ func (s *HubServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 			resp.GitHubAppConfig = &HeartbeatGitHubAppConfig{}
 		}
 		resp.GitHubAppConfig.SecondaryKey = secCfg
+	}
+
+	// Per-hive webhook relay key (#17911), attached the same independent way as
+	// the secondary key: it rides whatever config the branches above produced,
+	// or an otherwise-empty one, and only until the spoke reports holding it.
+	if relayKey := s.webhookRelayKeyForHeartbeat(&payload); relayKey != "" {
+		if resp.GitHubAppConfig == nil {
+			resp.GitHubAppConfig = &HeartbeatGitHubAppConfig{}
+		}
+		resp.GitHubAppConfig.WebhookRelayKey = relayKey
+		s.logger.Info("heartbeat: delivering webhook relay key to spoke",
+			"hive_id", payload.HiveID,
+			"fingerprint", webhookRelayKeyFingerprint(relayKey),
+			"spoke_fingerprint", payload.WebhookRelayKeyFingerprint,
+		)
 	}
 
 	// SECURITY (C1/N3, CWE-200/639): the fleet-wide additional-key broadcast that
@@ -4290,6 +4381,10 @@ func (s *HubServer) removeRegistryEntry(id, by string) {
 			break
 		}
 	}
+	// Memory-only activity digests must not outlive the hive (#16002). Forgotten
+	// under s.mu so a heartbeat (which records under s.mu too) cannot slip a
+	// digest in between the removal and the purge (#16010).
+	s.activity.forget(id)
 	s.mu.Unlock()
 	if !removed {
 		return
@@ -4354,6 +4449,10 @@ func (s *HubServer) handleRegistryDelete(w http.ResponseWriter, r *http.Request)
 			break
 		}
 	}
+	// Memory-only activity digests must not outlive the hive (#16002). Forgotten
+	// under s.mu so a heartbeat (which records under s.mu too) cannot slip a
+	// digest in between the removal and the purge (#16010).
+	s.activity.forget(id)
 	s.mu.Unlock()
 	if removed {
 		// Synchronous flush for the same durability reason as removeRegistryEntry.
@@ -4506,6 +4605,7 @@ func (s *HubServer) mergeLeaderboards() []LeaderboardEntry {
 				existing.TasksCompleted += lb.TasksCompleted
 				existing.TasksFailed += lb.TasksFailed
 				existing.StagesCompleted = addStageCount(existing.StagesCompleted, lb.StagesCompleted)
+				existing.Abandoned += lb.Abandoned
 				if lb.Active {
 					existing.Active = true
 					existing.CurrentTask = lb.CurrentTask
@@ -4524,7 +4624,7 @@ func (s *HubServer) mergeLeaderboards() []LeaderboardEntry {
 		if v.StagesCompleted != nil {
 			stages = *v.StagesCompleted
 		}
-		if v.TasksCompleted == 0 && v.TasksFailed == 0 && stages == 0 && !v.Active {
+		if v.TasksCompleted == 0 && v.TasksFailed == 0 && stages == 0 && v.Abandoned == 0 && !v.Active {
 			continue
 		}
 		v.StageCredit = stageCreditFor(v.StagesCompleted)
@@ -4882,6 +4982,23 @@ func (s *HubServer) handleContributeLanding(w http.ResponseWriter, r *http.Reque
     <section aria-labelledby="hive-list-title">
       <h2 id="hive-list-title" style="margin:34px 0 0">Public hives accepting contributions</h2>
       %[2]s
+    </section>
+    <section class="card" id="apple-mlx" aria-labelledby="apple-mlx-title" style="margin-top:28px">
+      <h2 id="apple-mlx-title">Apple MLX: local ClankeR inference</h2>
+      <p>Apple Silicon only: macOS 14+, native arm64 Python 3.10+ and Node 22.19+. Intel Macs and Rosetta are unsupported. MLX-LM runs on your Mac; Pi 1.4.0+ supplies the coding tools in the contributor container. This is optional local inference, not Apple sign-in, a hosted Hive backend or an Apple endorsement.</p>
+      <p>Choose a hive above and select <strong>Apple MLX</strong> on its contributor page for OS-aware installation and copyable commands. Install just, gh, Pi and MLX-LM in a native Python virtualenv as described in the setup guide. Docker Desktop 4.34+ requires you to enable host networking. Podman machine and Kubernetes cannot use this loopback-only Mac route.</p>
+      <pre style="overflow-x:auto"><code># From your Hive source checkout, with HIVE_MLX_PYTHON pointing to your virtualenv:
+# Terminal 1: explicitly load your already-downloaded, tool-capable model:
+just contribute-mlx-serve /Users/YOU/models/tool-coder
+# Terminal 2: explicitly request two bounded tool-call verification turns:
+just contribute-mlx-setup /Users/YOU/models/tool-coder --verify-tools
+export AGENT_MODEL=mlx//Users/YOU/models/tool-coder
+export HIVE_HUB=https://YOUR-CHOSEN-HIVE
+just contribute-check pi
+just contribute-setup pi
+just contribute-mlx</code></pre>
+      <p>Download model weights yourself within your shared-RAM budget; the relay container limit does not cap host inference memory. No automatic weight downloads, public listener, cloud fallback or memory-setting changes. Not every model supports tools; the protocol probe is not a coding-quality benchmark. Live Mac inference is not certified by mock CI.</p>
+      <a href="%[1]s#apple-mlx-local-inference">Complete installation, model requirements and troubleshooting</a>
     </section>
   </main>
 </body>

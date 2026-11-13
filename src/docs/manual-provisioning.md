@@ -1393,14 +1393,14 @@ spec:
       # ── init containers — REQUIRED. The ConfigMap is mounted read-only at
       # /etc/hive-seed and copied into a WRITABLE emptyDir at /etc/hive. The hive
       # process must WRITE /etc/hive/hive.yaml at runtime (on first boot the entrypoint
-      # seeds it, then merges the PVC overlay over it; later boots restore it from
+      # seeds it, then merges the PVC overlay over it; later boots link it to
       # /data/hive.yaml.runtime; the dashboard's Save writes it). Mounting the ConfigMap DIRECTLY at /etc/hive makes it read-only and
       # every config save fails with "open /etc/hive/hive.yaml: read-only file
       # system" — and dashboard-installed GitHub App auth / ACMM changes are lost.
       initContainers:
       - name: copy-config
         image: ${IMAGE}
-        command: ["sh","-c","if [ -s /data/hive.yaml.runtime ]; then echo runtime-config-exists-for-recovery; elif [ -s /data/hive.yaml.bak ]; then echo legacy-runtime-config-exists-for-recovery; else cp /etc/hive-seed/hive.yaml /etc/hive/hive.yaml && echo configmap-copied-first-boot; fi"]
+        command: ["sh","-c","if [ -s /data/hive.yaml.runtime ]; then echo runtime-config-exists-for-recovery; ln -sf /data/hive.yaml.runtime /etc/hive/hive.yaml && echo config-path-linked-to-runtime || echo config-path-link-failed; elif [ -s /data/hive.yaml.bak ]; then echo legacy-runtime-config-exists-for-recovery; else cp /etc/hive-seed/hive.yaml /etc/hive/hive.yaml && echo configmap-copied-first-boot; fi"]
         volumeMounts:
         - { name: config,          mountPath: /etc/hive-seed, readOnly: true }
         - { name: config-writable, mountPath: /etc/hive }
@@ -1627,8 +1627,9 @@ entrypoint:
 2. merges the PVC dashboard overlay `/data/hive.yaml.dashboard` **over** it, and
 3. writes `/data/hive.yaml.runtime`.
 
-On **every later boot** it copies `/data/hive.yaml.runtime` over
-`/etc/hive/hive.yaml` and boots from that; the seed is not used and the overlay
+On **every later boot** the init container symlinks `/etc/hive/hive.yaml` to
+`/data/hive.yaml.runtime` (a spoke with only the legacy `.bak` is not linked, and
+the entrypoint copies it over instead) and the hive boots from that; the seed is not used and the overlay
 merge does not run. With neither file and no seed, it exits 1.
 
 The dashboard's `Config.Save()` writes the effective source, the dashboard
@@ -1688,6 +1689,22 @@ provision. Two pools, one per method type:
   provisioned manually (Path B) and left running at **`replicas: 1`**.
 - **Hub-reachable-cluster** placeholders serve **public** methods — provisioned
   via the API (Path A) and left running at **`replicas: 1`**.
+
+**Auto-pick on approve.** When an admin approves a provision request without
+choosing a specific placeholder, the hub picks one from the pool matching the
+request's `auth_method`: `private` → the heartbeat-only/GPU pool, anything else
+→ the default hub-reachable pool (`hive-oke`). The **public preference is
+soft**: if the default pool has no `available` placeholder, Auto-pick falls back
+to any *other* cluster registered in `clusters.json` that has one — most
+available first, ties broken by cluster ID — and logs one line
+(`approve: pool hive-oke empty, falling back to lke648397`). Two pins stay
+**hard** and never fall back: a `private` request only ever draws from the GPU
+pool, and the GPU pool is never used to satisfy a public request. Clusters with
+placeholders on disk but no `clusters.json` entry are skipped. The admin's
+explicit pick in the approve modal is strict — if that placeholder is not
+available the approve returns `409`, regardless of capacity elsewhere.
+Only when every eligible pool is empty does Auto-pick return
+`409 no available placeholder hive in pool "hive-oke" or any other registered pool`.
 
 > **Gotcha — placeholder IDs are date + random suffix, NOT sequential integers.**
 > The live pool uses `hosted-available-<cluster>-<YYMMDD>-<suffix>`, where
@@ -1832,17 +1849,17 @@ never changes:
 
 | Key | Kind | Holds |
 |---|---|---|
-| `hive.kubestellar.io/hive-name` | label | The hive's display name (`ProjectName`), **sanitized** to a valid RFC-1123 label value. |
-| `hive.kubestellar.io/org` | label | The hive's forge org, sanitized the same way. |
-| `hive.kubestellar.io/hive-id` | label | The hive's internal `hive_id`, sanitized the same way. |
-| `hive.kubestellar.io/display-name` | annotation | The **exact, unsanitized** hive name — the recoverable source of truth when the sanitized label value has been lossily transformed. |
+| `hive.hivecommons.dev/hive-name` | label | The hive's display name (`ProjectName`), **sanitized** to a valid RFC-1123 label value. |
+| `hive.hivecommons.dev/org` | label | The hive's forge org, sanitized the same way. |
+| `hive.hivecommons.dev/hive-id` | label | The hive's internal `hive_id`, sanitized the same way. |
+| `hive.hivecommons.dev/display-name` | annotation | The **exact, unsanitized** hive name — the recoverable source of truth when the sanitized label value has been lossily transformed. |
 
 **Sanitization**: label values are lower-cased, restricted to `[a-z0-9.-]`
 (everything else — spaces, underscores, unicode, punctuation — is dropped
 outright rather than transliterated), trimmed of leading/trailing separators,
 and capped at 63 characters (the RFC-1123 label-value limit). So a hive named
 `"TradingAsBuddies"` gets the label value `tradingasbuddies`, while the
-`hive.kubestellar.io/display-name` annotation preserves the original
+`hive.hivecommons.dev/display-name` annotation preserves the original
 `TradingAsBuddies` exactly. A field that sanitizes to empty (or wasn't set
 yet — e.g. a fresh placeholder with no real name/org) is **omitted** from the
 labels rather than written as an empty/invalid label.
@@ -1851,14 +1868,14 @@ Given a hive name, find its namespace:
 
 ```bash
 kubectl --context <hub-reachable-cluster> get ns \
-  -l hive.kubestellar.io/hive-name=tradingasbuddies
+  -l hive.hivecommons.dev/hive-name=tradingasbuddies
 ```
 
 Given a namespace, find the hive that owns it:
 
 ```bash
 kubectl --context <hub-reachable-cluster> get ns hive-hosted-hosted-available-<cluster>-01-placeholder-bb95 \
-  -o jsonpath='{.metadata.annotations.hive\.kubestellar\.io/display-name}'
+  -o jsonpath='{.metadata.annotations.hive\.hivecommons\.dev/display-name}'
 # -> TradingAsBuddies
 ```
 
@@ -1868,7 +1885,7 @@ known or changes, so the namespace never goes stale:
 
 1. **Automatic provisioning** (`provisionHive`, Path A above) — stamps
    whatever is known at namespace-creation time. For a freshly-created pool
-   placeholder this is often just `hive.kubestellar.io/hive-id`, since
+   placeholder this is often just `hive.hivecommons.dev/hive-id`, since
    `org`/`name` are still placeholder values at this point.
 2. **Claim** (`handleApproveProvision`) — the real name/org become known here
    for the first time, so the labels/annotation are (re)written.

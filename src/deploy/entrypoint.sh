@@ -64,7 +64,9 @@ EXIT_NET_ADMIN_REQUIRED=77
 # file is the only copy of the live config, and mutating it at boot risks
 # losing owner customisations with no warning. The old name is picked up
 # read-only until the first save writes the new one, after which both
-# exist and the new one wins.
+# exist and the new one wins. Once the new name is the boot source, every
+# clean boot refreshes the old name from it (#17862) so the fallback is
+# never months stale; see hive_refresh_legacy_fallback.
 HIVE_CONFIG_PATH="${HIVE_CONFIG:-/etc/hive/hive.yaml}"
 HIVE_CONFIG_RUNTIME="/data/hive.yaml.runtime"
 HIVE_CONFIG_RUNTIME_LEGACY="/data/hive.yaml.bak"
@@ -124,6 +126,8 @@ hive_run_uid_isolation_migration() {
     if [ "${HIVE_HOME_MODE_REPAIR_NEEDED:-false}" = "true" ]; then
       chmod -R g+rwX /data/home 2>/dev/null \
         || echo "[entrypoint] WARN: chmod -R g+rwX /data/home failed — is CAP_FOWNER in the pod's capabilities.add? Continuing; agents may hit EACCES under /data/home"
+      # The shared Claude settings.json stays hive-owned and not group-writable (#17059).
+      [ -L /data/home/.claude/settings.json ] || chmod go-w /data/home/.claude/settings.json 2>/dev/null || true
       find /data/home -type d -exec chmod g+s {} + 2>/dev/null \
         || echo "[entrypoint] WARN: chmod g+s on /data/home dirs failed — is CAP_FOWNER/CAP_FSETID in the pod's capabilities.add? Continuing"
     fi
@@ -148,7 +152,9 @@ hive_run_uid_isolation_migration() {
     else
       echo "[entrypoint] UID isolation: repairing ${_agent_name} (uid ${_agent_uid}) in background"
       hive_reown_agent_paths_if_needed "$_agent_name" "$_agent_uid"
-      chmod g+rwX "$_agent_dir" 2>/dev/null || true
+      if [ -d "$_agent_dir" ] && ! [ -L "$_agent_dir" ]; then
+        chmod g+rwX "$_agent_dir" 2>/dev/null || true
+      fi
       hive_publish_uid_isolation_marker "$_agent_marker" "$_agent_expected" || true
       echo "[entrypoint] UID isolation: ${_agent_name} pass complete"
     fi
@@ -415,7 +421,14 @@ hive_ensure_agent_user() {
 # hive_collect_agent_names <config> prints, one per line and sorted, every agent
 # name that needs a per-agent user, private token group and token cache file:
 # the config's agents (map keys or list items), the copies its `replicas:`
-# settings create, and, when HIVE_LEVEL is set, the ACMM pack agents.
+# settings create, and, when an ACMM level is in force, the ACMM pack agents.
+#
+# ACMM packs (#16803): the runtime applies a pack at boot from the config's
+# acmm_level, the level persisted in /data/hive-state.json, or HIVE_LEVEL
+# (planACMMBoot), and the pack apply creates agents such as strategist that
+# need not be in the config yet. Keying the pack lookup on HIVE_LEVEL alone
+# left those agents without a pre-created token cache whenever the level came
+# from the config or persisted state, so their scoped token was unreadable.
 #
 # Replicas (#13166): config.ExpandAgentReplicas derives <agent>-2 ..
 # <agent>-N in memory and MarshalYAML strips them on save, so they never
@@ -434,13 +447,16 @@ hive_ensure_agent_user() {
 #
 # Reviewer autoscale (#14685): review.reviewers.autoscale grows the lane's
 # base agent up to `max` replicas at runtime, so those names are pre-created
-# here too. autoscale_lane mirrors config.ReviewerAutoscaleAgent (the
-# configured agent, else the first name-sorted enabled role:reviewer agent,
-# else review.reviewer_agents[0]) and the default/ceiling mirror
-# DefaultReviewerAutoscaleMax / MaxAgentReplicas.
+# here too. The lane (config.ReviewerAutoscaleLane) is the named agent, else
+# the first review.reviewer_agents entry the swarm dispatches to, else the
+# first agent its "review" keyword rule admits, and the dashboard can move it
+# to another reviewer without a restart. autoscale_lanes therefore lists
+# every agent that rule can resolve to, so the new lane's replicas can read
+# their tokens too. The default/ceiling mirror DefaultReviewerAutoscaleMax /
+# MaxAgentReplicas.
 hive_collect_agent_names() {
   HIVE_COLLECT_CONFIG="$1" python3 - <<'PY'
-import glob, os, yaml
+import glob, json, os, yaml
 
 MAX_REPLICAS = 5  # config.MaxAgentReplicas
 AUTOSCALE_DEFAULT_MAX = 4  # config.DefaultReviewerAutoscaleMax
@@ -457,28 +473,29 @@ def replica_names(name, spec, floor=0):
         return []
     return ['%s-%d' % (name, i) for i in range(2, n + 1)]
 
-def autoscale_lane(cfg, agent_specs):
+def review_keyword(name, spec):  # config.reviewerAdmitted with no reviewer list
+    fields = [name, spec.get('role')]
+    for key in ('aliases', 'lane_keywords', 'detect_keywords'):
+        fields += spec.get(key) if isinstance(spec.get(key), list) else []
+    return any('review' in str(f or '').lower() for f in fields)
+
+def autoscale_lanes(cfg, agent_specs):
     review = cfg.get('review') if isinstance(cfg.get('review'), dict) else {}
     reviewers = review.get('reviewers') if isinstance(review.get('reviewers'), dict) else {}
     auto = reviewers.get('autoscale') if isinstance(reviewers.get('autoscale'), dict) else {}
     if not auto.get('enabled'):
-        return None, 0
+        return set(), 0
     try:
         mx = int(auto.get('max') or 0) or AUTOSCALE_DEFAULT_MAX
     except (TypeError, ValueError):
         mx = AUTOSCALE_DEFAULT_MAX
     mx = min(mx, MAX_REPLICAS)
-    lane = str(auto.get('agent') or '').strip()
-    if lane:
-        return (lane if lane in agent_specs else None), mx
-    for name in sorted(agent_specs):
-        spec = agent_specs[name]
-        if isinstance(spec, dict) and spec.get('enabled', True) is not False and str(spec.get('role') or '').strip().lower() == 'reviewer':
-            return name, mx
-    for name in review.get('reviewer_agents') or []:
-        if name in agent_specs:
-            return name, mx
-    return None, 0
+    listed = review.get('reviewer_agents') if isinstance(review.get('reviewer_agents'), list) else []
+    lanes = {str(n).strip() for n in listed} | {str(auto.get('agent') or '').strip()}
+    if not listed:
+        lanes |= {n for n, spec in agent_specs.items()
+                  if isinstance(spec, dict) and spec.get('enabled', True) is not False and review_keyword(n, spec)}
+    return {n for n in lanes if n in agent_specs}, mx
 
 def head_slug(s):
     out, dash = [], False
@@ -521,6 +538,18 @@ def head_names(name, spec):
         out += ['%s-%s-%d' % (name, alias, i) for i in range(1, n + 1)]
     return out
 
+# Mirrors planACMMBoot: any of HIVE_LEVEL, the config's acmm_level or the
+# persisted level makes the runtime apply a pack at boot.
+def acmm_level_set(cfg):
+    if os.environ.get('HIVE_LEVEL', '') or cfg.get('acmm_level'):
+        return True
+    try:
+        with open(os.environ.get('HIVE_STATE_FILE', '/data/hive-state.json')) as sf:
+            state = json.load(sf)
+        return isinstance(state, dict) and bool(state.get('acmm_level'))
+    except Exception:
+        return False
+
 names = set()
 with open(os.environ['HIVE_COLLECT_CONFIG']) as f:
     cfg = yaml.safe_load(f) or {}
@@ -530,14 +559,16 @@ if isinstance(agents, dict):
     agent_specs = dict(agents)
 elif isinstance(agents, list):
     agent_specs = {a['name']: a for a in agents if isinstance(a, dict) and 'name' in a}
-lane, lane_max = autoscale_lane(cfg, agent_specs)
+lanes, lane_max = autoscale_lanes(cfg, agent_specs)
 for name, spec in agent_specs.items():
     names.add(name)
-    names.update(replica_names(name, spec, lane_max if name == lane else 0))
+    names.update(replica_names(name, spec, lane_max if name in lanes else 0))
     names.update(head_names(name, spec))
-# Also check pack YAML if HIVE_LEVEL is set
-if os.environ.get('HIVE_LEVEL', ''):
-    for p in glob.glob('/opt/hive/packs/level-*.yaml') + glob.glob('/data/packs/level-*.yaml'):
+
+# Also check pack YAML when an ACMM level is in force
+if acmm_level_set(cfg):
+    pack_dirs = os.environ.get('HIVE_PACK_DIRS', '/opt/hive/packs /data/packs').split()
+    for p in [f for d in pack_dirs for f in glob.glob(os.path.join(d, 'level-*.yaml'))]:
         try:
             with open(p) as pf:
                 pack = yaml.safe_load(pf) or {}
@@ -662,6 +693,9 @@ hive_sweep_root_phase_paths() {
   _sweep_failed=""
   for _p in $HIVE_DATA_ROOT_PHASE_PATHS; do
     [ -e "$_p" ] || continue
+    # Never through a link: chown without -h acts on what the link names, and
+    # /data/home is writable by every agent uid.
+    [ -L "$_p" ] && continue
     # Already owned by the runtime user — the steady state on almost every
     # boot. Skip the syscall entirely so the common path costs one stat.
     [ "$(stat -c '%u' "$_p" 2>/dev/null || echo)" = "1001" ] && continue
@@ -743,16 +777,87 @@ for _cfg in "$HIVE_CONFIG_RUNTIME" "$HIVE_CONFIG_RUNTIME_LEGACY" /data/hive.yaml
 done
 unset _cfg
 
+# hive_file_mtime echoes a file's mtime as epoch seconds (0 when unreadable).
+# Both stat dialects are tried because the image is Debian but the helper
+# must also behave on the BusyBox/macOS shells the tests run under.
+hive_file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
 # hive_runtime_config_read echoes the path to read the persisted runtime
 # config from: the new name when it is present and non-empty, else the
 # legacy name when that is, else empty. Read-only — it never creates,
 # renames or removes anything on the PVC.
+#
+# #17862: falling back to the legacy name is never routine any more. Every
+# clean boot refreshes it from the runtime config (hive_refresh_legacy_fallback),
+# so reaching it means the runtime config was lost or truncated since the
+# last boot. Say so LOUDLY on stderr with both files' ages: a hive that
+# silently booted a 3-month-old hive.yaml.bak (level 3 instead of 6) is the
+# incident this guards against. When the legacy copy is OLDER than the
+# runtime file it is replacing — i.e. the runtime file was written after
+# the last refresh and then damaged — the WARN says the fallback is stale
+# and names the overlay/audit paths an operator can reconstruct from.
 hive_runtime_config_read() {
   if [ -f "$HIVE_CONFIG_RUNTIME" ] && [ -s "$HIVE_CONFIG_RUNTIME" ]; then
     echo "$HIVE_CONFIG_RUNTIME"
   elif [ -f "$HIVE_CONFIG_RUNTIME_LEGACY" ] && [ -s "$HIVE_CONFIG_RUNTIME_LEGACY" ]; then
+    _rt_state="missing"
+    _rt_mtime=0
+    if [ -f "$HIVE_CONFIG_RUNTIME" ]; then
+      _rt_state="present but EMPTY (0 bytes — likely truncated by a kill mid-save)"
+      _rt_mtime="$(hive_file_mtime "$HIVE_CONFIG_RUNTIME")"
+    fi
+    _lg_mtime="$(hive_file_mtime "$HIVE_CONFIG_RUNTIME_LEGACY")"
+    _now="$(date +%s)"
+    _lg_age_h=$(( (_now - _lg_mtime) / 3600 ))
+    echo "[entrypoint] WARN: runtime config $HIVE_CONFIG_RUNTIME is $_rt_state; FALLING BACK to legacy $HIVE_CONFIG_RUNTIME_LEGACY (last refreshed ${_lg_age_h}h ago)." >&2
+    if [ "$_rt_mtime" -gt "$_lg_mtime" ] 2>/dev/null; then
+      echo "[entrypoint] WARN: the legacy fallback is OLDER than the damaged runtime config ($(( (_rt_mtime - _lg_mtime) / 3600 ))h behind). Settings saved since then (acmm_level, agent roster, pauses, models) are NOT in this file — check /data/hive.yaml.dashboard and /data/audit.jsonl before trusting the booted config. See hivecommons/hive#17862." >&2
+    fi
+    unset _rt_state _rt_mtime _lg_mtime _now _lg_age_h
     echo "$HIVE_CONFIG_RUNTIME_LEGACY"
   fi
+}
+
+# hive_refresh_legacy_fallback copies a GOOD runtime config over the legacy
+# fallback name so the fallback is at most one boot stale (#17862). Before
+# this, hive.yaml.bak was frozen at the rename (Aug 2026) on every hive, and
+# a truncated runtime file booted a months-old config.
+#
+# Only runs when THIS boot is reading from the new name (so the legacy file
+# is strictly older, never the only copy — the Docker/LXC worry behind the
+# original never-write rule) and the runtime file parses as YAML with a
+# project section (so a half-written file is never promoted to fallback).
+# Copies to a temp name and renames so the fallback is never itself
+# truncated by a kill. Best-effort: a failure here only means the fallback
+# stays at its previous age.
+hive_refresh_legacy_fallback() {
+  [ "$1" = "$HIVE_CONFIG_RUNTIME" ] || return 0
+  [ -s "$HIVE_CONFIG_RUNTIME" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import sys, yaml
+with open(sys.argv[1]) as f:
+    d = yaml.safe_load(f)
+sys.exit(0 if isinstance(d, dict) and isinstance(d.get("project"), dict) else 1)
+' "$HIVE_CONFIG_RUNTIME" 2>/dev/null || {
+      echo "[entrypoint] WARN: $HIVE_CONFIG_RUNTIME does not parse as a hive config; legacy fallback $HIVE_CONFIG_RUNTIME_LEGACY left untouched" >&2
+      return 0
+    }
+  fi
+  if cmp -s "$HIVE_CONFIG_RUNTIME" "$HIVE_CONFIG_RUNTIME_LEGACY" 2>/dev/null; then
+    return 0
+  fi
+  _lg_tmp="${HIVE_CONFIG_RUNTIME_LEGACY}.tmp.$$"
+  if cp "$HIVE_CONFIG_RUNTIME" "$_lg_tmp" 2>/dev/null && mv -f "$_lg_tmp" "$HIVE_CONFIG_RUNTIME_LEGACY" 2>/dev/null; then
+    hive_harden_runtime_config "$HIVE_CONFIG_RUNTIME_LEGACY"
+    echo "[entrypoint] Legacy fallback $HIVE_CONFIG_RUNTIME_LEGACY refreshed from $HIVE_CONFIG_RUNTIME"
+  else
+    rm -f "$_lg_tmp" 2>/dev/null
+    echo "[entrypoint] WARN: could not refresh legacy fallback $HIVE_CONFIG_RUNTIME_LEGACY from $HIVE_CONFIG_RUNTIME" >&2
+  fi
+  unset _lg_tmp
 }
 
 # hive_ghe_git_host echoes this hive's configured GitHub host when it is NOT
@@ -990,11 +1095,18 @@ if [ "$IS_KUBERNETES" = "true" ]; then
   # result equal to its own input on every boot.
   HIVE_CONFIG_BOOT="$(hive_runtime_config_read)"
   if [ -n "$HIVE_CONFIG_BOOT" ]; then
+    hive_refresh_legacy_fallback "$HIVE_CONFIG_BOOT"
     # Steady state: boot from what this hive last had. The ConfigMap seed is
     # deliberately NOT merged — it is frozen at provision and every field it
     # could contribute is either already here or re-asserted by the hub on
     # the next heartbeat (~30s), including hub.is_public.
-    if cp "$HIVE_CONFIG_BOOT" "$HIVE_CONFIG_PATH" 2>/dev/null; then
+    #
+    # #17468: on hosted spokes the copy-config init container links the
+    # config path to the runtime config, so the two are one file. cp would
+    # refuse ("are the same file") and land in the read-only branch below.
+    if [ "$HIVE_CONFIG_PATH" -ef "$HIVE_CONFIG_BOOT" ]; then
+      echo "[entrypoint] K8s mode — booting from runtime config $HIVE_CONFIG_BOOT ($HIVE_CONFIG_PATH links to it; ConfigMap is a seed, not merged)"
+    elif cp "$HIVE_CONFIG_BOOT" "$HIVE_CONFIG_PATH" 2>/dev/null; then
       echo "[entrypoint] K8s mode — booting from runtime config $HIVE_CONFIG_BOOT (ConfigMap is a seed, not merged)"
     else
       export HIVE_CONFIG="$HIVE_CONFIG_BOOT"
@@ -1143,6 +1255,14 @@ PYEOF
     fi
     # Write the (merged) config as the disaster-recovery snapshot. Always
     # under the new name; the legacy file is left untouched on the PVC.
+    #
+    # Reaching this branch on a hive that USED to have a runtime config means
+    # the safety gates it carried (review.require_labels, paused_repos, …)
+    # are now whatever the seed says — usually nothing (#16438). The Go
+    # binary compares the loaded config against hive.yaml.runtime.bak and
+    # hive.yaml.dashboard at boot and WARNs per dropped gate (fatal with
+    # config.refuse_gate_regression); an operator moving the runtime config
+    # aside should name the copy hive.yaml.runtime.bak so it is found.
     cp "$HIVE_CONFIG_PATH" "$HIVE_CONFIG_RUNTIME" 2>/dev/null || true
     hive_harden_runtime_config "$HIVE_CONFIG_RUNTIME"
     echo "[entrypoint] K8s mode — ConfigMap is the seed, runtime config written to $HIVE_CONFIG_RUNTIME"
@@ -1165,6 +1285,7 @@ else
   # first boot on new code seeds hive.yaml.runtime from the legacy content
   # without touching the legacy file itself.
   HIVE_CONFIG_SOURCE="$(hive_runtime_config_read)"
+  hive_refresh_legacy_fallback "$HIVE_CONFIG_SOURCE"
   if [ -f "$HIVE_CONFIG_PATH" ] && [ -s "$HIVE_CONFIG_PATH" ] && [ -z "$HIVE_CONFIG_SOURCE" ]; then
     # First boot: config exists but no PVC runtime config yet — seed it
     cp "$HIVE_CONFIG_PATH" "$HIVE_CONFIG_RUNTIME"
@@ -1384,6 +1505,9 @@ if [ "$(id -u)" = "0" ]; then
     fi
     for _seeded_dir in /data/agents/*/; do
       [ -d "$_seeded_dir" ] || continue
+      # The trailing-slash glob also matches a link to a directory; a
+      # recursive chown/chmod must never start from one.
+      [ -L "${_seeded_dir%/}" ] && continue
       if [ "$(stat -c '%u' "$_seeded_dir" 2>/dev/null || echo 0)" = "0" ]; then
         chown -R dev:node "$_seeded_dir" 2>/dev/null || true
         chmod -R g+rwX "$_seeded_dir" 2>/dev/null || true
@@ -1452,6 +1576,27 @@ if [ "$(id -u)" = "0" ]; then
   chown dev:node /data/home/.copilot 2>/dev/null || true
   chmod 2775 /data/home/.claude /data/home/.claude/session-env 2>/dev/null || true
   chown dev:node /data/home/.claude /data/home/.claude/session-env 2>/dev/null || true
+  # hive_shared_dir_sticky DIR... — add the sticky bit to the shared CLI
+  # directories whose files the root-run perm guard and the in-process Go
+  # writers rename over: in a group-writable directory only the sticky bit
+  # keeps a dev-owned entry from being removed or replaced by another uid.
+  # Under the per-agent home layout every CLI rewrites its own copy inside
+  # /data/home/agents/<name>, so nothing legitimate renames over a dev-owned
+  # file here. The legacy whole-directory layout (HIVE_SHARED_AGENT_HOME=1)
+  # does — each agent uid refreshes the shared file in place — so the bit is
+  # left off there. Group bits are untouched; the existing 2770/2775 stays.
+  # Only directories that are real directories get it: a chmod through a
+  # symlink would land on whatever the link names.
+  hive_shared_dir_sticky() {
+    [ "${HIVE_SHARED_AGENT_HOME:-0}" = "1" ] && return 0
+    for _d; do
+      if [ -d "$_d" ] && ! [ -L "$_d" ]; then
+        chmod +t "$_d" 2>/dev/null || true
+      fi
+    done
+    return 0
+  }
+  hive_shared_dir_sticky /data/home /data/home/.claude /data/home/.copilot
   # Codex (newer method) writes a local sqlite state db under $HOME/.codex —
   # pre-create it group-writable + setgid so every agent UID (node group) can
   # init it, matching .claude/.copilot. Without this, switching an agent to the
@@ -1499,6 +1644,9 @@ if [ "$(id -u)" = "0" ]; then
   # process touches .bob first. 2770: no world access, these hold auth settings.
   chmod 2770 /data/home/.bob /data/home/.bob/settings 2>/dev/null || true
   chown dev:node /data/home/.bob /data/home/.bob/settings 2>/dev/null || true
+  # Not antigravity-cli/ or its cache/: those are bridged into each agent home
+  # as directories, so agy renames its token there under the agent's own uid.
+  hive_shared_dir_sticky /data/home/.gemini /data/home/.bob
   ln -sfn /data/config/github-copilot /home/dev/.config/github-copilot
   ln -sfn /data/config/github-copilot /data/home/.config/github-copilot
   ln -sfn /data/home/.copilot /home/dev/.copilot
@@ -1588,18 +1736,52 @@ if [ "$(id -u)" = "0" ]; then
   # this is an OAuth token. The chown restores dev ownership as well, because
   # that is the invariant the in-process Go permissions watcher depends on — it
   # runs as dev after the privilege drop and can only chmod what dev owns.
+  #
+  # Both single-file repairs go through hive_fix_shared_file, which acts only
+  # on a regular file inside a regular directory: chmod and chown (without -h)
+  # act on whatever a path resolves to, and these directories are writable by
+  # every agent uid. The invariant is that a root-run repair never changes the
+  # mode or owner of anything an agent uid could have pointed the path at.
   hive_fix_shared_credential() {
-    [ -f "$1" ] || return 0
-    chmod g+r "$1" 2>/dev/null || true
-    chown dev:node "$1" 2>/dev/null || true
+    hive_fix_shared_file "$1" g+r
     return 0
   }
 
   # hive_fix_copilot_config — copilot rewrites config.json 0600 on refresh.
   hive_fix_copilot_config() {
-    [ -f /data/home/.copilot/config.json ] || return 0
-    chmod 660 /data/home/.copilot/config.json 2>/dev/null || true
-    chown dev:node /data/home/.copilot/config.json 2>/dev/null || true
+    hive_fix_shared_file /data/home/.copilot/config.json 660
+    return 0
+  }
+
+  # hive_fix_shared_file PATH MODE — chmod MODE and chown dev:node the regular
+  # file at PATH. Nothing is done when PATH is absent. When PATH or its
+  # directory is anything other than a regular file in a regular directory,
+  # nothing is done either, and a WARN is logged once per path per guard
+  # process (HIVE_PERM_GUARD_REFUSED is that process's memory of it).
+  #
+  # The `[ -L ]` tests are the decision; the find runs the chmod and chown
+  # from the same enumeration (`-type f` never matches a link) and `chown -h`
+  # never follows, so the time between the check and each action is as short
+  # as the shell can make it. The sticky bit set on the shared dot-dirs at
+  # boot is what keeps a dev-owned entry from being swapped out from under it.
+  hive_fix_shared_file() {
+    _p="$1"; _m="$2"
+    _dir="${_p%/*}"; _base="${_p##*/}"
+    if [ -d "$_dir" ] && ! [ -L "$_dir" ] && [ -f "$_p" ] && ! [ -L "$_p" ]; then
+      find "$_dir" -maxdepth 1 -name "$_base" -type f ! -type l -exec chmod "$_m" {} + -exec chown -h dev:node {} + 2>/dev/null || true
+      return 0
+    fi
+    # Absent (and not a dangling link): nothing to repair, nothing to say.
+    if ! [ -e "$_p" ] && ! [ -L "$_p" ]; then
+      return 0
+    fi
+    case " ${HIVE_PERM_GUARD_REFUSED:-} " in
+      *" $_p "*) ;;
+      *)
+        HIVE_PERM_GUARD_REFUSED="${HIVE_PERM_GUARD_REFUSED:-} $_p"
+        echo "[entrypoint] WARN: perm guard: $_p is not a regular file in a regular directory; left untouched" >&2
+        ;;
+    esac
     return 0
   }
 
@@ -1658,12 +1840,16 @@ if [ "$(id -u)" = "0" ]; then
   # no-follow guarantee -- chmod has no no-follow form, so an entry an agent
   # swaps for a link between enumeration and the chmod is still followed (the
   # same window `chmod -R` has). `chown -h` never follows.
+  #
+  # The shared Claude settings.json is excluded: it carries hooks and
+  # apiKeyHelper, so it is hive-owned and never group-writable (#17059). The
+  # manager verifies and tightens it before every claude launch.
   hive_fix_walk() {
     [ -d "$1" ] || return 0
     _walk_root="$1"; shift
     _regroup_sh="$(hive_fix_regroup_sh)"
     _reown_sh="$(hive_fix_reown_sh)"
-    find "$_walk_root" ! -type l "$@" \( -type d -uid 0 -exec sh -c "$_reown_sh" sh g+rwxs {} + -o -type d -exec sh -c "$_regroup_sh" sh g+rwxs {} + -o -uid 0 -exec sh -c "$_reown_sh" sh g+rwX {} + -o -exec sh -c "$_regroup_sh" sh g+rwX {} + \) 2>/dev/null || true
+    find "$_walk_root" ! -type l ! -path /data/home/.claude/settings.json "$@" \( -type d -uid 0 -exec sh -c "$_reown_sh" sh g+rwxs {} + -o -type d -exec sh -c "$_regroup_sh" sh g+rwxs {} + -o -uid 0 -exec sh -c "$_reown_sh" sh g+rwX {} + -o -exec sh -c "$_regroup_sh" sh g+rwX {} + \) 2>/dev/null || true
     return 0
   }
 
@@ -1706,7 +1892,9 @@ if [ "$(id -u)" = "0" ]; then
   # sweep still happens, on the 5-minute cycle.
   hive_fix_claude_instant() {
     hive_fix_shared_credential /data/home/.claude/.credentials.json
-    chmod g+rwx /data/home/.claude 2>/dev/null || true
+    if [ -d /data/home/.claude ] && ! [ -L /data/home/.claude ]; then
+      chmod g+rwx /data/home/.claude 2>/dev/null || true
+    fi
     return 0
   }
 
@@ -1724,7 +1912,11 @@ if [ "$(id -u)" = "0" ]; then
   hive_fix_gemini_instant() {
     hive_fix_shared_credential /data/home/.gemini/antigravity-cli/antigravity-oauth-token
     hive_fix_shared_credential /data/home/.gemini/antigravity-cli/cache/onboarding.json
-    chmod g+rwx /data/home/.gemini /data/home/.gemini/antigravity-cli /data/home/.gemini/antigravity-cli/cache 2>/dev/null || true
+    for _d in /data/home/.gemini /data/home/.gemini/antigravity-cli /data/home/.gemini/antigravity-cli/cache; do
+      if [ -d "$_d" ] && ! [ -L "$_d" ]; then
+        chmod g+rwx "$_d" 2>/dev/null || true
+      fi
+    done
     return 0
   }
 
@@ -1857,6 +2049,11 @@ if [ "$(id -u)" = "0" ]; then
   # launch. Falling back to the proxy CA alone if the combined bundle isn't there
   # yet keeps proxied HTTPS working; the combined bundle is strictly safer because
   # it also trusts real public roots for any non-proxied endpoint (advisory mode).
+  # Root writes this file into a directory every agent uid can write to, so
+  # it is only ever written when the path is absent or already a regular file.
+  if [ -L /data/home/.bashrc ]; then
+    echo "[entrypoint] WARN: /data/home/.bashrc is not a regular file; left untouched"
+  else
   cat > /data/home/.bashrc <<'BASHRC' 2>/dev/null || true
 # Hive agent shell environment
 if [ -f /data/proxy-ca-bundle.pem ]; then
@@ -1873,15 +2070,16 @@ BASHRC
   # Written by root via `cat >` above, so it is created root:root. Hand it to
   # dev at the point of creation (#5369): the recursive /data chown is guarded
   # off on every normal boot and cannot be relied on to fix it later.
-  chown dev:node /data/home/.bashrc 2>/dev/null || true
+  chown -h dev:node /data/home/.bashrc 2>/dev/null || true
+  fi
   # Login shells (tmux default-command) read ~/.profile, not ~/.bashrc — chain
   # them so both shell flavors get the same environment.
-  if [ ! -f /data/home/.profile ]; then
+  if [ ! -f /data/home/.profile ] && ! [ -L /data/home/.profile ]; then
     # shellcheck disable=SC2016
     printf '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n' > /data/home/.profile 2>/dev/null || true
     chmod 644 /data/home/.profile 2>/dev/null || true
     # Same as .bashrc above — created by root, so hand it over here (#5369).
-    chown dev:node /data/home/.profile 2>/dev/null || true
+    chown -h dev:node /data/home/.profile 2>/dev/null || true
   fi
 
   # ── #5369: targeted post-phase ownership sweep ────────────────────────
@@ -1942,6 +2140,32 @@ if spek.get('enabled') and hub.get('enabled') is not False:
     SPEK_EXECUTOR_PROVISION=true
   fi
 
+  # The one-shot reviewer turns (Let hive decide, grounded chat) run through
+  # the Claude CLI when the hive has no reviewer endpoint
+  # (governor.reviewer_backend: auto or claude-cli). That CLI runs as its own
+  # UID (hive-<identity>), never as dev, the same way and for the same reason
+  # as the Spektacular hub executor above, and like it gets no workspace or
+  # token group. The identity is fixed (dashboard.ReviewerTurnIdentity).
+  # Skipped when governor.reviewer_backend is http, which never runs it, and
+  # on a hive with no agents, which has no UID isolation to join (the CLI then
+  # runs as dev, as every agent CLI there does).
+  REVIEWER_TURN_IDENTITY="hive-turn"
+  REVIEWER_TURN_PROVISION=false
+  _reviewer_backend=""
+  if [ -f "$HIVE_CONFIG" ]; then
+    _reviewer_backend=$(HIVE_CONFIG="$HIVE_CONFIG" python3 -c "
+import os, yaml
+with open(os.environ['HIVE_CONFIG']) as f:
+    cfg = yaml.safe_load(f) or {}
+print(str((cfg.get('governor') or {}).get('reviewer_backend') or '').strip().lower())
+" 2>/dev/null) || _reviewer_backend=""
+  fi
+  if [ -n "$AGENT_NAMES" ] && [ "$_reviewer_backend" != "http" ] \
+     && ! printf '%s\n' "$AGENT_NAMES" | grep -qxF "$REVIEWER_TURN_IDENTITY"; then
+    AGENT_NAMES=$(printf '%s\n%s\n' "$AGENT_NAMES" "$REVIEWER_TURN_IDENTITY" | sed '/^$/d')
+    REVIEWER_TURN_PROVISION=true
+  fi
+
   # Pre-cleanup: remove stale workspace artifacts from agent dirs.
   # Runs in BACKGROUND to avoid blocking startup — on slow CephFS with many
   # dirs, sequential rm -rf can exceed the startup probe timeout (10 min),
@@ -1994,6 +2218,14 @@ if spek.get('enabled') and hub.get('enabled') is not False:
         echo "[entrypoint] Spektacular hub executor user: hive-${SPEK_EXECUTOR_IDENTITY} (UID ${SPEK_EXECUTOR_UID})"
       fi
     fi
+    if [ "$REVIEWER_TURN_PROVISION" = "true" ]; then
+      REVIEWER_TURN_UID=$(printf '%s\n' "$AGENT_UID_LINES" | awk -F '\t' -v n="$REVIEWER_TURN_IDENTITY" '$1 == n { print $2 }')
+      AGENT_UID_LINES=$(printf '%s\n' "$AGENT_UID_LINES" | awk -F '\t' -v n="$REVIEWER_TURN_IDENTITY" '$1 != n')
+      if [ -n "$REVIEWER_TURN_UID" ]; then
+        hive_ensure_agent_user "$REVIEWER_TURN_IDENTITY" "$REVIEWER_TURN_UID"
+        echo "[entrypoint] Reviewer turn CLI user: hive-${REVIEWER_TURN_IDENTITY} (UID ${REVIEWER_TURN_UID})"
+      fi
+    fi
     export AGENT_UID_LINES
     printf '%s\n' "$AGENT_UID_LINES" | while IFS="$(printf '\t')" read -r agent_name AGENT_UID; do
       [ -z "$agent_name" ] && continue
@@ -2013,8 +2245,10 @@ if spek.get('enabled') and hub.get('enabled') is not False:
       fi
       # Ensure agent dirs are group-writable so the dev user (same node group)
       # can clean up stale workspaces at runtime without root privileges.
-      chmod g+rwX "/data/agents/${agent_name}" 2>/dev/null || true
-      if [ -d "/data/beads/${agent_name}" ]; then
+      if [ -d "/data/agents/${agent_name}" ] && ! [ -L "/data/agents/${agent_name}" ]; then
+        chmod g+rwX "/data/agents/${agent_name}" 2>/dev/null || true
+      fi
+      if [ -d "/data/beads/${agent_name}" ] && ! [ -L "/data/beads/${agent_name}" ]; then
         BEAD_DIR_OWNER=$(stat -c '%u' "/data/beads/${agent_name}" 2>/dev/null || echo "0")
         if [ "$BEAD_DIR_OWNER" != "$AGENT_UID" ]; then
           chown -R "hive-${agent_name}:node" "/data/beads/${agent_name}" 2>/dev/null || true

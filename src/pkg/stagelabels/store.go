@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +60,12 @@ type Record struct {
 	// read as a fresh note (hivecommons/hive#15729). Zero on records
 	// written before it existed; NoteChangedAt falls back to EnteredAt.
 	ReasonChangedAt time.Time `json:"reason_changed_at,omitempty"`
+	// UnblockedAt is when the blocked sweep last lifted the item's block
+	// (hivecommons/hive#15779). A blocked issue has no stage, so the lift
+	// leaves a stage-less record carrying only this time until the next
+	// stage-label pass stages the issue; the dashboard ages the row from
+	// StageSinceAt so "since" restarts at the lift, not at issue creation.
+	UnblockedAt time.Time `json:"unblocked_at,omitempty"`
 	// Author is the item's author login, lower-cased, as the lane saw it
 	// (hivecommons/hive#12502). It lets the dashboard answer "which of this
 	// contributor's PRs are returned to them" from the store alone, with no
@@ -75,13 +83,47 @@ type Record struct {
 	// NudgeOnline records whether the author's relay was online at the first
 	// nudge for NudgeHead (selects the online vs offline grace).
 	NudgeOnline bool `json:"nudge_online,omitempty"`
+	// NudgeReason, NudgeReasonCount and NudgeReasonAt are the per-reason
+	// nudge ledger (hivecommons/hive#17067): the reason class the one
+	// nudge comment on the PR currently explains, how many nudges that
+	// class has had (cap 2, counted across heads) and when the last one
+	// went out. A new head red for the same class rewrites the comment
+	// without counting; a new class restarts the count.
+	NudgeReason      string    `json:"nudge_reason,omitempty"`
+	NudgeReasonCount int       `json:"nudge_reason_count,omitempty"`
+	NudgeReasonAt    time.Time `json:"nudge_reason_at,omitempty"`
+	// NudgeCIChecks, NudgeCIHead, NudgeCIAt, NudgeCIAttempts and NudgeMode
+	// are the CI-failure nudge ledger (hivecommons/hive#17328): the sorted
+	// failing check names the one nudge comment currently lists, the head
+	// they were last seen on, when that set was last counted as a nudge
+	// (the ci_failure_cooldown clock), how many red heads the set has been
+	// seen on since, and the relay delivery mode of the last dispatch
+	// (reused by a same-head rewrite that does not re-dispatch).
+	NudgeCIChecks   []string  `json:"nudge_ci_checks,omitempty"`
+	NudgeCIHead     string    `json:"nudge_ci_head,omitempty"`
+	NudgeCIAt       time.Time `json:"nudge_ci_at,omitempty"`
+	NudgeCIAttempts int       `json:"nudge_ci_attempts,omitempty"`
+	NudgeMode       string    `json:"nudge_mode,omitempty"`
 	// AdoptedHead / AdoptedBy / AdoptedAt record the stage-074 adoption: the
 	// contributor head the hive adopted, the superseding App PR's number
 	// (0 while the attempt is recorded but no PR exists) and when. One
 	// attempt per head.
-	AdoptedHead string    `json:"adopted_head,omitempty"`
-	AdoptedBy   int       `json:"adopted_by,omitempty"`
-	AdoptedAt   time.Time `json:"adopted_at,omitempty"`
+	AdoptedHead string `json:"adopted_head,omitempty"`
+	// AdoptedIntentHead is the contributor's head an in-place adoption
+	// started from. Every hive push is judged against the PR's diff at this
+	// head, never against the previous hive head, so a refused push cannot
+	// become the baseline for the next one and a chain of small cuts cannot
+	// erode the change (IntentBaseHead).
+	AdoptedIntentHead string `json:"adopted_intent_head,omitempty"`
+	// AdoptedForReview says an in-place adoption took the PR over for the
+	// review swarm's requested changes, with CI not red. Such a fix may
+	// rightly drop part of the PR's change (the review asked for it), so a
+	// hive push the intent check refuses is released once the reviewer
+	// approves that exact head (hivecommons/hive#16816 follow-up,
+	// projectbluefin/utah-packages#943). An adoption for red CI never sets it.
+	AdoptedForReview bool      `json:"adopted_for_review,omitempty"`
+	AdoptedBy        int       `json:"adopted_by,omitempty"`
+	AdoptedAt        time.Time `json:"adopted_at,omitempty"`
 	// AdoptCheckedAt is the last time the superseding PR's state was polled.
 	AdoptCheckedAt time.Time `json:"adopt_checked_at,omitempty"`
 	// SupersededBy / SupersededAt record that the superseding App PR merged
@@ -93,6 +135,20 @@ type Record struct {
 	SupersededBy   int       `json:"superseded_by,omitempty"`
 	SupersededAt   time.Time `json:"superseded_at,omitempty"`
 	SupersededOpen bool      `json:"superseded_open,omitempty"`
+	// ReauthorIssue / ReauthorHead / ReauthorAttempts / ReauthoredAt record
+	// that the hive re-authored this PR itself after its fixer gave up on
+	// ReauthorHead (hivecommons/hive: "we should not need a re-author pill
+	// on a hive agent's PR"): the PR was closed as superseded and a fresh
+	// hive PR for ReauthorIssue is opened from the current base. One
+	// record per issue — the dashboard reads the fresh PR's lineage from
+	// it and the engine refuses a second automatic re-author.
+	ReauthorIssue    int       `json:"reauthor_issue,omitempty"`
+	ReauthorHead     string    `json:"reauthor_head,omitempty"`
+	ReauthorAttempts int       `json:"reauthor_attempts,omitempty"`
+	ReauthoredAt     time.Time `json:"reauthored_at,omitempty"`
+	// ReauthorNoted is true once the close note was posted on the
+	// re-authored PR; the close itself may be retried, the note never.
+	ReauthorNoted bool `json:"reauthor_noted,omitempty"`
 	// SupersededClosedFirst is true while the original was closed at
 	// adoption time, before its copy merged (close-first supersession,
 	// hivecommons/hive#15135). The reconciler keeps polling the copy
@@ -118,6 +174,20 @@ type Record struct {
 	// "superseder merged but this PR has moved on" note was posted, so a
 	// diverged original is told once per head rather than every poll.
 	SupersederMergedNotedHead string `json:"superseder_merged_noted_head,omitempty"`
+	// MentionCause is the cause (ReasonClass) the author was last
+	// @-mentioned for in the hive status comment. In quiet notification
+	// mode a person is mentioned once per distinct cause, not once per
+	// head: a mention is an email, and the same cause on a new head is the
+	// same ask.
+	MentionCause string `json:"mention_cause,omitempty"`
+	// ForkGuardChecks are the checks last seen refusing this PR only
+	// because it is from a fork (hgithub.PullRequest.ForkGuardChecks,
+	// hivecommons/hive#14273). They outlive the head: the policy answers
+	// only for the head the last CI-enriched enumeration saw, and a fork
+	// guard refuses every head of the PR, so the stage pass reads a later
+	// head red on nothing else as the same guard instead of handing it back
+	// to its author (projectbluefin/utah-packages#862, #869).
+	ForkGuardChecks []string `json:"fork_guard_checks,omitempty"`
 	// DCOHead, DCOTotal and DCOUnsigned cache the commit check for one head
 	// (hivecommons/hive#12542): how many non-merge commits the PR carried
 	// and how many lacked a Signed-off-by trailer. DCOUnsignedHive /
@@ -132,6 +202,10 @@ type Record struct {
 	DCOUnsignedOther     int    `json:"dco_unsigned_other,omitempty"`
 	DCOSquashUnsafeHive  int    `json:"dco_squash_unsafe_hive,omitempty"`
 	DCOSquashUnsafeKnown bool   `json:"dco_squash_unsafe_known,omitempty"`
+	// DCOSplitHiveIdentity marks a split computed with the hive's own
+	// identities (project.ai_author) counted as the hive's; records cached
+	// before that (hivecommons/hive#16701) lack it and are read again once.
+	DCOSplitHiveIdentity bool `json:"dco_split_hive_identity,omitempty"`
 	// EntryCommented records that the stage's entry comment (085 "needs a
 	// decision", 090 "ready for a human merge") was posted for the current
 	// stage visit; reset on every stage change so each transition explains
@@ -359,12 +433,37 @@ type Record struct {
 	// them too.
 	LastPushAt  time.Time `json:"last_push_at,omitempty"`
 	LastPushSha string    `json:"last_push_sha,omitempty"`
+	// ReworkAskedAt / ReworkPushedHead / ReworkPushedAt remember the
+	// author's answer to a 071 / 072 ask across the re-ask on the head
+	// they pushed (hivecommons/hive#16021): when the hive first asked them
+	// to push in this run of asks, and the latest head seen after it with
+	// when it landed. A new head red again re-enters 071 within one sweep,
+	// which restarts the waiting-on-push state and re-nudges for the new
+	// head — the two fields the dashboard's rework chip read — so the
+	// row said "no response" to an author who had just pushed. Cleared
+	// when the pushed head settles in the CI / Review column without a
+	// re-ask, and when the item leaves the column.
+	ReworkAskedAt    time.Time `json:"rework_asked_at,omitempty"`
+	ReworkPushedHead string    `json:"rework_pushed_head,omitempty"`
+	ReworkPushedAt   time.Time `json:"rework_pushed_at,omitempty"`
 	// LabelsSuppressed is set when the write-back gate kept the stage
 	// labels off the item on GitHub (a contributor PR without the opt-in
 	// label): the stage lives in this record only, so a label-less item
 	// is not evidence that a park lifted (hivecommons/hive#15541 rows read
 	// "PR in progress" while the record said 085).
 	LabelsSuppressed bool `json:"labels_suppressed,omitempty"`
+	// LabelsSuppressedReason is the write-back gate's reason for the last
+	// refusal ("needs-opt-in-label — #N carries none of …"), "" otherwise.
+	LabelsSuppressedReason string `json:"labels_suppressed_reason,omitempty"`
+	// TrainEjectedWhy / TrainEjectedHead / TrainEjectedAt record the merge
+	// train's last ejection of this PR (hivecommons/hive#15825): the head
+	// it was ejected at, why (head-moved, ci-pending, ci-red,
+	// verdict-owed, conflicting, …) and when. The tracker's gray pill
+	// carries the lineage ("left merge train · pushed 3m ago") while the
+	// row sits back in the CI / Review column; re-admission clears it.
+	TrainEjectedWhy  string    `json:"train_ejected_why,omitempty"`
+	TrainEjectedHead string    `json:"train_ejected_head,omitempty"`
+	TrainEjectedAt   time.Time `json:"train_ejected_at,omitempty"`
 }
 
 // Activity is what the reconciler observed this cycle that a person (or
@@ -518,7 +617,22 @@ type Transition struct {
 	// Recovered is true when a prior regression cleared because the stage
 	// reached or passed the point it fell from.
 	Recovered bool
+	// Suppressed is true when the transition dampener refused this stage change.
+	Suppressed bool
 }
+
+// dampenerMove tracks one stage transition for dampening flaps per (key, head).
+type dampenerMove struct {
+	from Stage
+	to   Stage
+	at   time.Time
+}
+
+// transitionDampenerWindow is how long stage transitions are remembered by the dampener.
+const transitionDampenerWindow = 30 * time.Minute
+
+// transitionDampenerMaxFlaps is the maximum number of transitions allowed between two stages within transitionDampenerWindow.
+const transitionDampenerMaxFlaps = 3
 
 // Store is the persisted per-item stage memory. One Store is shared
 // process-wide (Shared) because the automerge sweep builds a fresh engine
@@ -533,6 +647,13 @@ type Store struct {
 	// from) the file; ObserveProgress dirties the store for a LastSeen-only
 	// move once the saved value is LastSeenPersistEvery old.
 	seenSaved map[string]time.Time
+
+	// dampener tracks recent stage transitions per (key, head) (#16974).
+	// The history is deliberately in-memory only and is not persisted with
+	// the Record: the window is a short 30 minutes, so a restart merely
+	// resets suppression and at worst allows a few extra flaps (#16978).
+	dampenerHead map[string]string
+	dampener     map[string][]dampenerMove
 }
 
 // NewStore returns an empty in-memory store that persists to path ("" =
@@ -541,7 +662,14 @@ func NewStore(path string, now func() time.Time) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{path: path, now: now, items: map[string]Record{}, seenSaved: map[string]time.Time{}}
+	return &Store{
+		path:         path,
+		now:          now,
+		items:        map[string]Record{},
+		seenSaved:    map[string]time.Time{},
+		dampenerHead: map[string]string{},
+		dampener:     map[string][]dampenerMove{},
+	}
 }
 
 // markSeenSaved notes the LastSeen the file now holds for every record.
@@ -653,7 +781,12 @@ func (s *Store) Get(key string) (Record, bool) {
 // transition. A None stage is terminal: the record is dropped and the
 // transition carries Prev so the caller can clear labels.
 func (s *Store) Observe(key string, stage Stage, reason string) Transition {
-	return s.ObserveProgress(key, stage, reason, false)
+	return s.ObserveProgressHead(key, "", stage, reason, false)
+}
+
+// ObserveHead is Observe with key's head SHA.
+func (s *Store) ObserveHead(key, head string, stage Stage, reason string) Transition {
+	return s.ObserveProgressHead(key, head, stage, reason, false)
 }
 
 // ObserveProgress is Observe with the caller's knowledge of WHY the stage
@@ -663,6 +796,13 @@ func (s *Store) Observe(key string, stage Stage, reason string) Transition {
 // is progress books no regression and resolves one already open: the work
 // landed, so nothing was lost.
 func (s *Store) ObserveProgress(key string, stage Stage, reason string, progress bool) Transition {
+	return s.ObserveProgressHead(key, "", stage, reason, progress)
+}
+
+// ObserveProgressHead is ObserveProgress with key's head SHA. The dampener
+// history it consults is in-memory only (see Store.dampener): a process
+// restart forgets it, which is acceptable given the 30-minute window.
+func (s *Store) ObserveProgressHead(key, head string, stage Stage, reason string, progress bool) Transition {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
@@ -670,11 +810,34 @@ func (s *Store) ObserveProgress(key string, stage Stage, reason string, progress
 	tr := Transition{Prev: prev.Stage, Next: stage}
 	if stage == None {
 		if had {
-			delete(s.items, key)
-			s.dirty = true
+			s.forgetStageLocked(key, prev)
 			tr.Changed = prev.Stage != None
 		}
 		return tr
+	}
+	head = strings.TrimSpace(head)
+	if head == "" && had {
+		head = strings.TrimSpace(prev.ActivityHead)
+	}
+	// Per-(repo, number, head) transition dampener (#16974): refuse to move
+	// between two stages more than 3 times within 30 minutes without a new
+	// head SHA or a human event, log the suppressed transition, and keep the
+	// current label. Moves into a repair stage (070/071/072) are never
+	// refused: suppressing "CI went red, back to fixing" would leave the
+	// record at a stage the merge train reads as ready.
+	if had && prev.Stage != None && prev.Stage != stage && head != "" && !AuthorBlocked(stage) {
+		if s.isDampenedLocked(key, head, prev.Stage, stage, now) {
+			slog.Warn("stage transition suppressed by dampener",
+				slog.String("key", key),
+				slog.String("head", head),
+				slog.String("from", prev.Stage.String()),
+				slog.String("to", stage.String()),
+				slog.String("reason", reason))
+			tr.Next = prev.Stage
+			tr.Changed = false
+			tr.Suppressed = true
+			return tr
+		}
 	}
 	next := prev
 	next.Stage = stage
@@ -687,6 +850,9 @@ func (s *Store) ObserveProgress(key string, stage Stage, reason string, progress
 		next.EntryCommented = false
 		tr.Changed = true
 		next.notePushStageChange(now)
+		if had && prev.Stage != None && head != "" {
+			s.recordDampenerTransitionLocked(key, head, prev.Stage, stage, now)
+		}
 	} else if ReasonClass(prev.Reason) != ReasonClass(reason) {
 		next.ReasonChangedAt = now
 	}
@@ -767,6 +933,33 @@ func (r Record) NoteChangedAt() time.Time {
 	return r.EnteredAt
 }
 
+// StageSinceAt is when the row's since-time starts: stage entry, or the
+// later block lift when the sweep unblocked the item after it entered the
+// stage (or before any stage was recorded).
+func (r Record) StageSinceAt() time.Time {
+	if r.UnblockedAt.After(r.EnteredAt) {
+		return r.UnblockedAt
+	}
+	return r.EnteredAt
+}
+
+// NoteUnblocked records that the blocked sweep lifted key's block at now.
+// A blocked issue carries no stage record (its stage is None), so a
+// stage-less record is created to hold the time; the next ObserveProgress
+// keeps UnblockedAt while it stages the issue, and a None observation
+// drops the record as usual.
+func (s *Store) NoteUnblocked(key string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.items[key]
+	r.UnblockedAt = now
+	if r.LastSeen.IsZero() {
+		r.LastSeen = now
+	}
+	s.items[key] = r
+	s.dirty = true
+}
+
 // NoteActivity folds this cycle's activity inputs into key's record and
 // reports whether anything a person could have done changed since the last
 // observation. The first observation of a record seeds LastActivityAt
@@ -796,20 +989,33 @@ func (s *Store) NoteActivity(key string, a Activity) (changed bool) {
 	case a.Digest != r.ActivityDigest:
 		changed = true
 	}
+	if (a.Comments >= 0 && a.Comments > r.ActivityComments) ||
+		(a.Reviews >= 0 && a.Reviews > r.ActivityReviews) ||
+		(a.Head != "" && r.ActivityHead != "" && a.Head != r.ActivityHead) {
+		s.resetDampenerLocked(key)
+	}
 	if changed && at.After(r.LastActivityAt) {
 		r.LastActivityAt = at
 	}
 	if a.Head != "" && r.ActivityHead != "" && a.Head != r.ActivityHead {
 		// The enumerate fallback for a push no webhook announced
 		// (hivecommons/hive#15784). A head the sweep evaluated and still
-		// routed back to the author starts a fresh waiting-on-push state.
+		// routed back to the author starts a fresh waiting-on-push state
+		// — but it is still the author's answer to the standing ask
+		// (hivecommons/hive#16021).
 		switch {
 		case r.Stage.WaitsOnPush():
+			r.noteReworkPush(a.Head, at)
 			r.WaitingPushSince = at
 			r.LastPushAt, r.LastPushSha = time.Time{}, ""
 		case a.Head != r.LastPushSha:
 			r.LastPushAt, r.LastPushSha = at, a.Head
 		}
+	}
+	if a.Head != "" && !a.WaitingOnHive && r.Stage.TracksPush() && !r.Stage.WaitsOnPush() && r.Stage != Fixing && r.Stage != AdoptedByHive && strings.EqualFold(a.Head, r.ReworkPushedHead) {
+		// The hive evaluated the author's answer and is not waiting on
+		// itself any more: the exchange is over, a later ask is a new one.
+		r.clearRework()
 	}
 	if changed {
 		r.HiveHeldWarned = false
@@ -840,6 +1046,13 @@ func (s *Store) NoteActivity(key string, a Activity) (changed bool) {
 func (r *Record) notePushStageChange(now time.Time) {
 	switch {
 	case r.Stage.WaitsOnPush():
+		if r.ReworkAskedAt.IsZero() {
+			r.ReworkAskedAt = now
+		} else if r.LastPushSha != "" && !r.LastPushAt.Before(r.ReworkAskedAt) {
+			// Back to the author on the head they pushed for the standing
+			// ask: the push is the answer, keep it (hivecommons/hive#16021).
+			r.noteReworkPush(r.LastPushSha, r.LastPushAt)
+		}
 		r.WaitingPushSince = now
 		r.LastPushAt, r.LastPushSha = time.Time{}, ""
 	case r.Stage.TracksPush():
@@ -847,7 +1060,36 @@ func (r *Record) notePushStageChange(now time.Time) {
 	default:
 		r.WaitingPushSince = time.Time{}
 		r.LastPushAt, r.LastPushSha = time.Time{}, ""
+		r.clearRework()
 	}
+}
+
+// noteReworkPush books head as the author's latest answer to the standing
+// 071 / 072 ask (hivecommons/hive#16021). The same head twice keeps the
+// first instant; no standing ask, nothing to answer.
+func (r *Record) noteReworkPush(head string, at time.Time) {
+	head = strings.TrimSpace(head)
+	if head == "" || r.ReworkAskedAt.IsZero() || strings.EqualFold(head, r.ReworkPushedHead) {
+		return
+	}
+	if at.IsZero() || at.Before(r.ReworkAskedAt) {
+		at = r.ReworkAskedAt
+	}
+	r.ReworkPushedHead, r.ReworkPushedAt = head, at
+}
+
+// clearRework forgets the standing ask and the author's answer to it.
+func (r *Record) clearRework() {
+	r.ReworkAskedAt, r.ReworkPushedHead, r.ReworkPushedAt = time.Time{}, "", time.Time{}
+}
+
+// ReworkPushed reports the author's head pushed after the standing ask,
+// with when it landed; ok is false when none is on record.
+func (r Record) ReworkPushed() (head string, at time.Time, ok bool) {
+	if r.ReworkPushedHead == "" || r.ReworkAskedAt.IsZero() {
+		return "", time.Time{}, false
+	}
+	return r.ReworkPushedHead, r.ReworkPushedAt, true
 }
 
 // NotePush records that key's head moved to sha at the given instant, as a
@@ -881,8 +1123,58 @@ func (s *Store) NotePush(key, sha string, at time.Time) bool {
 	}
 	r.LastPushAt, r.LastPushSha = at, sha
 	s.items[key] = r
+	s.resetDampenerLocked(key)
 	s.dirty = true
 	return true
+}
+
+// NoteTrainEjected records that the merge train ejected an existing
+// record's PR at head for why (hivecommons/hive#15825). A zero or future
+// instant reads as now.
+func (s *Store) NoteTrainEjected(key, head, why string, now time.Time) {
+	why = strings.TrimSpace(why)
+	if why == "" {
+		s.ClearTrainEjected(key)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok {
+		return
+	}
+	at := now
+	if clock := s.now(); at.IsZero() || at.After(clock) {
+		at = clock
+	}
+	if r.TrainEjectedWhy == why && r.TrainEjectedHead == head {
+		return
+	}
+	r.TrainEjectedWhy, r.TrainEjectedHead, r.TrainEjectedAt = why, strings.TrimSpace(head), at
+	s.items[key] = r
+	s.dirty = true
+}
+
+// ClearTrainEjected forgets a record's merge-train ejection: the PR rides
+// a train again, or merged.
+func (s *Store) ClearTrainEjected(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok || (r.TrainEjectedWhy == "" && r.TrainEjectedHead == "" && r.TrainEjectedAt.IsZero()) {
+		return
+	}
+	r.TrainEjectedWhy, r.TrainEjectedHead, r.TrainEjectedAt = "", "", time.Time{}
+	s.items[key] = r
+	s.dirty = true
+}
+
+// TrainEjected reports the recorded merge-train ejection.
+func (r Record) TrainEjected() (why, head string, at time.Time, ok bool) {
+	if r.TrainEjectedWhy == "" {
+		return "", "", time.Time{}, false
+	}
+	return r.TrainEjectedWhy, r.TrainEjectedHead, r.TrainEjectedAt, true
 }
 
 // PushedSinceWaiting reports whether a push landed after the current
@@ -970,9 +1262,10 @@ func IsRegression(from, to Stage) bool {
 			return false
 		}
 		return to != ReviewPending && to != Reviewed
-	case ReadyForHumanMerge, NeedsDecision, IssueNeedsDecision, PossiblyExisting:
+	case ReadyForHumanMerge, NeedsDecision, IssueNeedsDecision, PossiblyExisting, OpenForDiscussion:
 		// Leaving a parking bay (017 included: the author confirmed the
-		// gap) is never a step back.
+		// gap; 018 too: the proposal / design label came off) is never a
+		// step back.
 		return false
 	case TriageNeeded:
 		// 015 → 010 is a maintainer triaging the issue (triage/accepted,
@@ -1051,10 +1344,17 @@ func (s *Store) MarkEntryCommentedCause(key, head, cause string) {
 
 // EntryCause digests an entry comment's reasons (the bullet list, not the
 // evidence summary whose soak clock ticks) so two comments that would tell
-// the maintainer the same thing compare equal.
+// the maintainer the same thing compare equal. The lane-rule consequence
+// bullet is presentation, not cause: RouteHuman adds it only when the
+// observing lane handed off at 085, so a PR two lanes observe alternately
+// would otherwise digest the same decision twice on one head
+// (hivecommons/hive#16405). It still counts when it is the only bullet.
 func EntryCause(reasons []string) string {
 	if len(reasons) == 0 {
 		return ""
+	}
+	if kept := slices.DeleteFunc(slices.Clone(reasons), func(r string) bool { return r == decisionConsequenceReason }); len(kept) > 0 {
+		reasons = kept
 	}
 	sum := sha256.Sum256([]byte(strings.Join(reasons, "\n")))
 	return hex.EncodeToString(sum[:8])
@@ -1095,6 +1395,41 @@ func (r Record) EntryCommentExplains(head, cause string) bool {
 	return len(r.EntryCommentedCauses) == 0 || cause == "" || slices.Contains(r.EntryCommentedCauses, cause)
 }
 
+// MentionDue reports whether the author should be @-mentioned for cause:
+// never for an empty cause, otherwise only when it differs from the cause
+// of the last mention.
+func (r Record) MentionDue(cause string) bool {
+	cause = MentionCauseClass(cause)
+	return cause != "" && !strings.EqualFold(r.MentionCause, cause)
+}
+
+// MentionCauseClass collapses a stage reason to what the author would be
+// asked to do about it: "check-failing:unit" and "check-failing:lint" are
+// both "CI is red, fix it", so a second red check on a later head is the
+// same cause and earns no second @-mention; a conflict after a red check is
+// a new one. The class is the reason's kind (ReasonClass, then the part
+// before the first ':'), with the "required-" qualifier dropped.
+func MentionCauseClass(reason string) string {
+	class := ReasonClass(reason)
+	if i := strings.IndexByte(class, ':'); i >= 0 {
+		class = class[:i]
+	}
+	return strings.TrimPrefix(strings.TrimSpace(class), "required-")
+}
+
+// MarkMentioned records that the author was @-mentioned for cause.
+func (s *Store) MarkMentioned(key, cause string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok {
+		return
+	}
+	r.MentionCause = MentionCauseClass(cause)
+	s.items[key] = r
+	s.dirty = true
+}
+
 // MarkStallCommented records that the stall note for this stage visit was posted.
 func (s *Store) MarkStallCommented(key string) {
 	s.mu.Lock()
@@ -1118,7 +1453,19 @@ func (s *Store) MarkNudged(key, head string, n int, online bool, now time.Time) 
 	if !ok {
 		return
 	}
+	if r.ReworkAskedAt.IsZero() {
+		// Records written before the field existed: the first nudge on
+		// record is the ask.
+		if r.ReworkAskedAt = r.NudgeStart(); r.ReworkAskedAt.IsZero() {
+			r.ReworkAskedAt = now
+		}
+	}
 	if r.NudgeHead != head {
+		if r.NudgeHead != "" {
+			// A nudge for another head: the author pushed since the last
+			// one (hivecommons/hive#16021).
+			r.noteReworkPush(head, now)
+		}
 		r.NudgeCount = 0
 		r.FirstNudgeAt = now
 		r.NudgeOnline = online
@@ -1134,6 +1481,111 @@ func (s *Store) MarkNudged(key, head string, n int, online bool, now time.Time) 
 		r.NudgeCount++
 	}
 	r.LastNudgeAt = now
+	s.items[key] = r
+	s.dirty = true
+}
+
+// WithdrawNudge forgets the stage-072 nudges recorded for head: the hand-back
+// they announced was withdrawn because the red turned out to be a shared CI
+// incident or the base branch's, not the head's (hivecommons/hive#17003). A
+// later return to 072 on the same head then posts a fresh first nudge, and
+// the stall and adoption graces count from it rather than from the
+// withdrawn one. A record whose nudges were for another head is unchanged.
+func (s *Store) WithdrawNudge(key, head string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok || head == "" || r.NudgeHead != head {
+		return
+	}
+	r.NudgeHead, r.NudgeCount, r.NudgeOnline = "", 0, false
+	r.LastNudgeAt, r.FirstNudgeAt = time.Time{}, time.Time{}
+	// The reason class goes too, so a head still red once the incident
+	// closes is owed a fresh first nudge rather than a capped repeat.
+	r.NudgeReason, r.NudgeReasonCount, r.NudgeReasonAt = "", 0, time.Time{}
+	s.items[key] = r
+	s.dirty = true
+}
+
+// MarkNudgedReason records that nudge number n for reason class reason was
+// posted (or the one nudge comment rewritten) at now. A different class
+// restarts the count at n; the same class keeps the larger of n and the
+// recorded count so a head-only rewrite (n == 0) never resets it.
+func (s *Store) MarkNudgedReason(key, reason string, n int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok {
+		return
+	}
+	reason = NudgeReasonSlug(reason)
+	if r.NudgeReason != reason {
+		r.NudgeReason = reason
+		r.NudgeReasonCount = 0
+	}
+	if n > r.NudgeReasonCount {
+		r.NudgeReasonCount = n
+		r.NudgeReasonAt = now
+	}
+	s.items[key] = r
+	s.dirty = true
+}
+
+// NudgeReasonSlug is the marker-safe reason class a contributor nudge is
+// keyed by: MentionCauseClass (so every red check is one "check-failing"
+// ask), lower-cased, with anything outside [a-z0-9._-] folded to '-';
+// an empty reason is "unknown". Every CI-failure prefix (required-,
+// optional-, plain check-failing) is the one NudgeReasonCIFailure class
+// (hivecommons/hive#17328): the lane's prefix flaps between them as checks
+// finish, and each flip used to count as a new class.
+func NudgeReasonSlug(reason string) string {
+	class := strings.ToLower(MentionCauseClass(reason))
+	if class == "optional-check-failing" {
+		class = NudgeReasonCIFailure
+	}
+	var b strings.Builder
+	for _, r := range class {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		return "unknown"
+	}
+	return slug
+}
+
+// NudgeReasonCIFailure is the NudgeReasonSlug of every CI-failure reason.
+const NudgeReasonCIFailure = "check-failing"
+
+// MarkNudgedCIFailure records the CI-failure nudge ledger after a nudge for
+// the check-failing class: checks is the failing set the comment now lists
+// (stored sorted), head the red head it was seen on, mode the relay
+// delivery mode, attempt the count the comment shows, and counted whether
+// this nudge started a new cooldown window (a fresh nudge, not a fold into
+// the existing comment).
+func (s *Store) MarkNudgedCIFailure(key string, checks []string, head, mode string, attempt int, counted bool, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok {
+		return
+	}
+	sorted := append([]string(nil), checks...)
+	slices.Sort(sorted)
+	if counted {
+		r.NudgeCIAt = now
+	}
+	r.NudgeCIChecks = sorted
+	r.NudgeCIHead = head
+	r.NudgeCIAttempts = attempt
+	if strings.TrimSpace(mode) != "" {
+		r.NudgeMode = mode
+	}
 	s.items[key] = r
 	s.dirty = true
 }
@@ -1200,6 +1652,16 @@ func (s *Store) HasHivePushEvidence(repo string) bool {
 		}
 	}
 	return false
+}
+
+// IntentBaseHead is the head whose PR diff a hive push on an in-place
+// adoption must keep: the contributor's head at adoption, or AdoptedHead for
+// a record written before AdoptedIntentHead existed.
+func (r Record) IntentBaseHead() string {
+	if r.AdoptedIntentHead != "" {
+		return r.AdoptedIntentHead
+	}
+	return r.AdoptedHead
 }
 
 // AdoptionLive reports whether the hive currently owns this PR (stage 074):
@@ -1365,9 +1827,24 @@ func (s *Store) MarkAdoptedInPlace(key, head, reason string, now time.Time) {
 		return
 	}
 	r.AdoptedHead, r.AdoptedBy, r.AdoptedAt, r.AdoptCheckedAt = head, 0, now, now
+	r.AdoptedIntentHead, r.AdoptedForReview = head, false
 	r.AdoptMode, r.AdoptReason = AdoptModeInPlace, reason
 	r.AdoptBlockedHead, r.AdoptBlockedBy, r.AdoptBlockedAt = "", "", time.Time{}
 	r.AdoptedHeadAt = now
+	s.items[key] = r
+	s.dirty = true
+}
+
+// MarkAdoptedForReview records that the live in-place adoption of head was
+// taken for the review swarm's requested changes (Record.AdoptedForReview).
+func (s *Store) MarkAdoptedForReview(key, head string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok || head == "" || !r.AdoptedInPlace() || r.AdoptedIntentHead != head {
+		return
+	}
+	r.AdoptedForReview = true
 	s.items[key] = r
 	s.dirty = true
 }
@@ -1633,6 +2110,7 @@ func (s *Store) NoteAdmission(key, head, by string, now time.Time) bool {
 	}
 	r.AdmittedHead, r.AdmittedBy, r.AdmittedAt = head, by, now
 	s.items[key] = r
+	s.resetDampenerLocked(key)
 	s.dirty = true
 	return true
 }
@@ -1663,6 +2141,7 @@ func (s *Store) NoteAdoptionForced(key, login string, now time.Time) {
 	r.RerouteTo, r.RerouteBy, r.RerouteAt, r.RerouteReason, r.RerouteHead = "", "", time.Time{}, "", ""
 	r.AdoptBlockedHead, r.AdoptBlockedBy, r.AdoptBlockedAt = "", "", time.Time{}
 	s.items[key] = r
+	s.resetDampenerLocked(key)
 	s.dirty = true
 }
 
@@ -1697,6 +2176,7 @@ func (s *Store) NoteReroute(key, head, login, by, reason string, now time.Time) 
 	r.RerouteTo, r.RerouteBy, r.RerouteAt, r.RerouteReason, r.RerouteHead = login, by, now, reason, head
 	r.RerouteFallbackAt = time.Time{}
 	s.items[key] = r
+	s.resetDampenerLocked(key)
 	s.dirty = true
 }
 
@@ -1926,6 +2406,66 @@ func (s *Store) MarkSuperseded(key string, by int, open bool, now time.Time) {
 	s.dirty = true
 }
 
+// MarkReauthored records that the hive re-authored key itself for issue
+// after its fixer gave up on head after attempts tries. Idempotent per key.
+func (s *Store) MarkReauthored(key string, issue int, head string, attempts int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok || issue <= 0 {
+		return
+	}
+	if r.ReauthorIssue == issue && r.ReauthorHead == head {
+		return
+	}
+	r.ReauthorIssue, r.ReauthorHead, r.ReauthorAttempts, r.ReauthoredAt = issue, head, attempts, now
+	s.items[key] = r
+	s.dirty = true
+}
+
+// MarkReauthorNoted records that the re-author close note was posted.
+func (s *Store) MarkReauthorNoted(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok || r.ReauthorNoted {
+		return
+	}
+	r.ReauthorNoted = true
+	s.items[key] = r
+	s.dirty = true
+}
+
+// Reauthored reports whether the hive re-authored this PR itself.
+func (r Record) Reauthored() bool {
+	return r.ReauthorIssue > 0
+}
+
+// ReauthoredFor returns, over the store, the PR the hive already
+// re-authored for repo's issue (the record's own number), or 0 when the
+// issue has not been re-authored. One automatic re-author per issue.
+func (s *Store) ReauthoredFor(repo string, issue int) int {
+	if s == nil || issue <= 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best := 0
+	for key, r := range s.items {
+		if r.ReauthorIssue != issue {
+			continue
+		}
+		rec, numText, found := strings.Cut(key, "#")
+		if !found || !strings.EqualFold(rec, repo) {
+			continue
+		}
+		if n, err := strconv.Atoi(numText); err == nil && n > 0 && (best == 0 || n < best) {
+			best = n
+		}
+	}
+	return best
+}
+
 // MarkSupersederMergedNoted records that the diverged-head note was posted
 // for head, so the next poll of the same head stays silent.
 func (s *Store) MarkSupersederMergedNoted(key, head string) {
@@ -1957,6 +2497,14 @@ const AdoptionReopenWindow = 24 * time.Hour
 // reopened because its close-first copy was closed unmerged, stayed red
 // across two heads, or could not be pushed: a person must decide.
 const LaneReasonAdoptionCopyFailed = "adoption-copy-failed"
+
+// LaneReasonAdoptionFixerReverts is the 085 reason for an in-place adopted
+// PR whose hive push undid most of the PR's own change: the net diff against
+// the base kept less than half of the lines the PR changed before the push
+// (projectbluefin/utah#1091, where the fixer re-added the 25 triage entries
+// the PR removed and announced a merge). Fixing CI that way would undo the
+// PR, so the author or a maintainer decides. It holds until the head moves.
+const LaneReasonAdoptionFixerReverts = "adoption-fixer-reverts-pr"
 
 // MarkSupersededClosedFirst records that the original was closed as soon
 // as superseding PR `by` existed (close-first supersession). The copy is
@@ -2083,6 +2631,20 @@ func (s *Store) NoteAdoptDiffFence(key, reason string) {
 	s.dirty = true
 }
 
+// NoteForkGuard records the checks fresh evidence showed refusing the PR
+// only because it is from a fork, on an existing record.
+func (s *Store) NoteForkGuard(key string, checks []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.items[key]
+	if !ok || len(checks) == 0 || slices.Equal(r.ForkGuardChecks, checks) {
+		return
+	}
+	r.ForkGuardChecks = append([]string(nil), checks...)
+	s.items[key] = r
+	s.dirty = true
+}
+
 // SetCoveringPR records (or, with an empty prKey, clears) the covering PR
 // of an issue the store knows. A no-op for an unknown key.
 func (s *Store) SetCoveringPR(key, prKey string) {
@@ -2097,13 +2659,92 @@ func (s *Store) SetCoveringPR(key, prKey string) {
 	s.dirty = true
 }
 
-// Forget drops key (closed/merged item).
+// Forget drops key (closed/merged item), lift record included.
 func (s *Store) Forget(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.items[key]; ok {
 		delete(s.items, key)
 		s.dirty = true
+	}
+}
+
+// ForgetStage drops key's stage for an item that is still open but has no
+// stage (a blocked issue, or one outside the hive's buckets). Unlike
+// Forget it keeps the blocked sweep's lift, so the stage-label pass that
+// runs right after an unblock does not reset the row's since-time back to
+// creation (hivecommons/hive#15779).
+func (s *Store) ForgetStage(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r, ok := s.items[key]; ok {
+		s.forgetStageLocked(key, r)
+	}
+}
+
+// forgetStageLocked is ForgetStage with s.mu held and the record in hand.
+func (s *Store) forgetStageLocked(key string, r Record) {
+	if r.UnblockedAt.IsZero() {
+		delete(s.items, key)
+	} else {
+		s.items[key] = Record{UnblockedAt: r.UnblockedAt, LastSeen: s.now()}
+	}
+	s.resetDampenerLocked(key)
+	delete(s.dampenerHead, key)
+	s.dirty = true
+}
+
+func (s *Store) isDampenedLocked(key, head string, from, to Stage, now time.Time) bool {
+	if s.dampener == nil {
+		s.dampener = make(map[string][]dampenerMove)
+	}
+	if s.dampenerHead == nil {
+		s.dampenerHead = make(map[string]string)
+	}
+	if head != "" {
+		if lastHead := s.dampenerHead[key]; lastHead != "" && !strings.EqualFold(lastHead, head) {
+			delete(s.dampener, key)
+			s.dampenerHead[key] = head
+			return false
+		}
+		s.dampenerHead[key] = head
+	}
+	history := s.dampener[key]
+	if len(history) == 0 {
+		return false
+	}
+	active := history[:0]
+	for _, m := range history {
+		if now.Sub(m.at) < transitionDampenerWindow {
+			active = append(active, m)
+		}
+	}
+	s.dampener[key] = active
+	count := 0
+	for _, m := range active {
+		if (m.from == from && m.to == to) || (m.from == to && m.to == from) {
+			count++
+		}
+	}
+	return count >= transitionDampenerMaxFlaps
+}
+
+func (s *Store) recordDampenerTransitionLocked(key, head string, from, to Stage, now time.Time) {
+	if s.dampener == nil {
+		s.dampener = make(map[string][]dampenerMove)
+	}
+	if s.dampenerHead == nil {
+		s.dampenerHead = make(map[string]string)
+	}
+	if head != "" {
+		s.dampenerHead[key] = head
+	}
+	s.dampener[key] = append(s.dampener[key], dampenerMove{from: from, to: to, at: now})
+}
+
+func (s *Store) resetDampenerLocked(key string) {
+	if s.dampener != nil {
+		delete(s.dampener, key)
 	}
 }
 
@@ -2126,6 +2767,8 @@ func (s *Store) Prune(maxAge time.Duration) int {
 		}
 		if r.LastSeen.Before(c) {
 			delete(s.items, k)
+			delete(s.dampener, k)
+			delete(s.dampenerHead, k)
 			n++
 		}
 	}
@@ -2312,9 +2955,11 @@ func (s *Store) NoteHold(key string, hold *HoldProvenance) {
 func (s *Store) ClearHold(key string) { s.NoteHold(key, nil) }
 
 // NoteDCO caches the commit check for head on an existing record:
-// unsignedHive is the App-linked share of the unsigned commits, the rest
-// is recorded as other.
-func (s *Store) NoteDCO(key, head string, total, unsigned, unsignedHive, squashUnsafeHive int) {
+// unsignedHive is the hive's share of the unsigned commits (App bot or a
+// hive identity), the rest is recorded as other. hiveIdentity says the split
+// was computed with a hive identity configured; an App-only split leaves the
+// marker unset so configuring one later triggers the one-time re-read.
+func (s *Store) NoteDCO(key, head string, total, unsigned, unsignedHive, squashUnsafeHive int, hiveIdentity bool) {
 	if head == "" {
 		return
 	}
@@ -2324,11 +2969,15 @@ func (s *Store) NoteDCO(key, head string, total, unsigned, unsignedHive, squashU
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.items[key]
-	if !ok || (r.DCOHead == head && r.DCOTotal == total && r.DCOUnsigned == unsigned && r.DCOUnsignedHive == unsignedHive && r.DCOUnsignedOther == other && r.DCOSquashUnsafeHive == squashUnsafeHive && r.DCOSquashUnsafeKnown) {
+	if !ok || (r.DCOHead == head && r.DCOTotal == total && r.DCOUnsigned == unsigned && r.DCOUnsignedHive == unsignedHive && r.DCOUnsignedOther == other && r.DCOSquashUnsafeHive == squashUnsafeHive && r.DCOSquashUnsafeKnown && (r.DCOSplitHiveIdentity || !hiveIdentity)) {
 		return
 	}
+	headChanged := r.DCOHead != head
 	r.DCOHead, r.DCOTotal, r.DCOUnsigned, r.DCOUnsignedHive, r.DCOUnsignedOther, r.DCOSquashUnsafeHive = head, total, unsigned, unsignedHive, other, squashUnsafeHive
 	r.DCOSquashUnsafeKnown = true
+	if headChanged || hiveIdentity {
+		r.DCOSplitHiveIdentity = hiveIdentity
+	}
 	s.items[key] = r
 	s.dirty = true
 }
@@ -2409,16 +3058,20 @@ func HiveHeld(r Record, overrides map[string]time.Duration, now time.Time) bool 
 }
 
 // NoteLabelsSuppressed records whether the last stage-label write for key
-// was kept off GitHub by the write-back gate. A missing record is left
-// missing.
-func (s *Store) NoteLabelsSuppressed(key string, suppressed bool) {
+// was kept off GitHub by the write-back gate, and the gate's reason. A
+// missing record is left missing.
+func (s *Store) NoteLabelsSuppressed(key string, suppressed bool, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.items[key]
-	if !ok || r.LabelsSuppressed == suppressed {
+	if !suppressed {
+		reason = ""
+	}
+	if !ok || r.LabelsSuppressed == suppressed && r.LabelsSuppressedReason == reason {
 		return
 	}
 	r.LabelsSuppressed = suppressed
+	r.LabelsSuppressedReason = reason
 	s.items[key] = r
 	s.dirty = true
 }

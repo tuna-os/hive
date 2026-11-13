@@ -38,6 +38,7 @@
           <input type="number" min="10" max="86400" value="${evalInterval || ''}" placeholder="300" data-change-action="gh70" style="width:140px">
           <span style="font-size:0.65rem;color:var(--muted);margin-top:var(--sp-2);display:block">Applies from the next eval cycle.</span>
         </div>
+        ${renderGovApiBudgetPacing(genAdv)}
         <div class="config-field" style="margin-top:14px">
           <label>Default explain mode ${yamlHint('governor.explain_mode')} ${settingHelpMark('agent-configuration', 'fleet-wide-default', 'Default explain mode', `Hive-wide default for agents that leave their own Explain Mode unset. Asks agents to say WHY they made each tool call, on EXPLAIN: lines alongside the work &mdash; they still act, they do not narrate instead. Costs extra tokens on every kick, so leave it off unless you are debugging. An agent with its own explicit value, including &quot;off&quot;, keeps it. Takes precedence over the HIVE_EXPLAIN_MODE deployment environment variable.`)}</label>
           <select data-change-action="gh75" style="width:320px">
@@ -50,6 +51,33 @@
           <span class="config-toggle-label">Show attribution trailer on PRs/issues ${settingHelpMark('settings', 'general', 'Show attribution trailer on PRs/issues', `Append attribution trailer (agent, backend, model) to agent-created PRs and issues &mdash; audit log always records regardless. Hive-wide: one setting for all agents.`)}</span>
         </div>
         ${renderGovLoopPacing(genAdv)}`;
+    }
+
+    // renderGovApiBudgetPacing is the API budget pacing toggle
+    // (governor.api_budget_pacing) and its live read-out, under the eval
+    // interval on the General tab. The toggle saves at once through PUT
+    // /api/config/governor/general-advanced, like the attribution toggle.
+    function renderGovApiBudgetPacing(genAdv) {
+      const on = genAdv.api_budget_pacing === true;
+      const owner = dashboardRoleAtLeast(window._hiveRole || 'read', 'owner');
+      const action = owner ? 'data-action="toggleApiBudgetPacing" data-arg-types="t"' : 'aria-disabled="true"';
+      return `
+        <div class="config-toggle mt-4">
+          <div class="config-toggle-switch ${on ? 'on' : ''}" role="switch" aria-checked="${on ? 'true' : 'false'}" ${action}></div>
+          <span class="config-toggle-label">Pace GitHub API calls over the rate-limit window ${yamlHint('governor.api_budget_pacing')} ${settingHelpMark('settings', 'general', 'Pace GitHub API calls over the rate-limit window', `Off by default. When on, the hive measures how fast its own loops spend the GitHub API budget. If that rate would use up the calls left above the reserve (github.api_reserve) before the rate-limit window resets, the eval interval and the sweep intervals are lengthened so the budget lasts until the reset. It never shortens an interval and never goes past the max eval interval. Webhook and review wakes still run at once. Owner only; applies from the next eval cycle.`)}</span>
+        </div>
+        <div class="config-help" id="gov-api-budget-pacing-state">${apiBudgetPacingStateHtml(genAdv.api_budget_pacing_state)}</div>`;
+    }
+
+    // apiBudgetPacingStateHtml is the live pacing read-out: api_budget_pacing_state
+    // of the general-advanced settings (the same block /api/status serves).
+    function apiBudgetPacingStateHtml(st) {
+      if (!st) return '';
+      if (!st.enabled) return 'Pacing is off: the loop runs at its usual interval.';
+      const head = st.active ? `Pacing now: interval stretched &times;${esc(String(st.factor))}.` : 'Pacing is on and not stretching.';
+      const interval = st.effective_interval_s ? ` Eval interval now ${esc(String(st.effective_interval_s))}s.` : '';
+      const burn = ` The hive's own loops use about ${esc(String(st.burn_per_min || 0))} GitHub calls a minute.`;
+      return `${head}${interval}${burn} ${esc(st.reason || '')}`;
     }
 
     // renderGovLoopPacing is the governor eval-loop pacing block on the General
@@ -139,6 +167,29 @@
       } catch (err) {
         el.classList.toggle('on'); // revert on failure
         showToast('Failed to update attribution trailer: ' + err.message, 'error');
+      }
+    }
+
+    async function toggleApiBudgetPacing(el) {
+      const turningOn = !el.classList.contains('on');
+      el.classList.toggle('on');
+      el.setAttribute('aria-checked', turningOn ? 'true' : 'false');
+      try {
+        const res = await fetch('/api/config/governor/general-advanced', {
+          method: 'PUT',
+          headers: _inceptionAuthHeaders(),
+          body: JSON.stringify({ api_budget_pacing: turningOn }),
+        });
+        if (!res.ok) throw new Error(await saveErrorMessage(res));
+        const data = await res.json();
+        _configState.data.general_advanced = data;
+        const note = document.getElementById('gov-api-budget-pacing-state');
+        if (note) note.innerHTML = apiBudgetPacingStateHtml(data.api_budget_pacing_state);
+        showToast('GitHub API budget pacing ' + (turningOn ? 'on' : 'off') + ' — applies from the next eval cycle');
+      } catch (err) {
+        el.classList.toggle('on'); // revert on failure
+        el.setAttribute('aria-checked', turningOn ? 'false' : 'true');
+        showToast('Failed to update GitHub API budget pacing: ' + err.message, 'error');
       }
     }
 
@@ -386,7 +437,7 @@
         ['open_to_merge_h', 'Open → merge', 'Hours from the issue opening on GitHub to the fixing PR merging.'],
       ];
       return `<div class="config-field mb-7">
-          <label>Delivery SLA targets (hours) ${settingHelpMark('operator-reference', 'delivery-sla', 'Delivery SLA targets', `Per-span budgets the Throughput section's Delivery SLA tiles and sparklines are coloured against: green within target, amber up to ${PRT_SLA_WARN_RATIO}× target, red beyond. 0 restores the default (${defaults.start_to_pr_h} / ${defaults.pr_to_merge_h} / ${defaults.open_to_merge_h} h).`)}</label>
+          <label>Delivery SLA targets (hours) ${settingHelpMark('operator-reference/sweeps-and-operations', 'delivery-sla', 'Delivery SLA targets', `Per-span budgets the Throughput section's Delivery SLA tiles and sparklines are coloured against: green within target, amber up to ${PRT_SLA_WARN_RATIO}× target, red beyond. 0 restores the default (${defaults.start_to_pr_h} / ${defaults.pr_to_merge_h} / ${defaults.open_to_merge_h} h).`)}</label>
           <div class="config-field-row">${fields.map(([key, label, tip]) => {
             const v = dirty[key] !== undefined ? dirty[key] : (eff[key] !== undefined ? eff[key] : defaults[key]);
             return `<div class="config-field" data-setting-key="sla.targets.${esc(key)}"><label for="cfg-sla-${esc(key)}" title="${esc(tip)}">${esc(label)}</label><input type="number" min="0" max="8760" step="0.5" id="cfg-sla-${esc(key)}" value="${esc(String(v))}" data-input-action="markDirty" data-arg0="sla" data-arg1="${esc(key)}" data-arg-types="s,s,N" data-setting-path="sla.targets.${esc(key)}" aria-label="${esc(label)} target in hours"></div>`;
@@ -704,6 +755,12 @@
       const stageNudgeRenudge = (_configState.dirty.labels && _configState.dirty.labels.stage_nudge_renudge_interval !== undefined)
         ? _configState.dirty.labels.stage_nudge_renudge_interval
         : (_configState.data.stageNudgeRenudge || '');
+      const nudgeRepeatAfter = (_configState.dirty.labels && _configState.dirty.labels.nudge_repeat_after !== undefined)
+        ? _configState.dirty.labels.nudge_repeat_after
+        : (_configState.data.nudgeRepeatAfter || '');
+      const stageNudgeCICooldown = (_configState.dirty.labels && _configState.dirty.labels.stage_nudge_ci_failure_cooldown !== undefined)
+        ? _configState.dirty.labels.stage_nudge_ci_failure_cooldown
+        : (_configState.data.stageNudgeCICooldown || '');
       const stagePresenceWindow = (_configState.dirty.labels && _configState.dirty.labels.stage_presence_window !== undefined)
         ? _configState.dirty.labels.stage_presence_window
         : (_configState.data.stagePresenceWindow || '');
@@ -777,8 +834,18 @@
         <div class="config-toggle"><div class="config-toggle-switch ${stageNudgeOn ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="labels" data-key="stage_nudge_enabled"></div><span class="config-toggle-label">Contributor nudge on returned-to-contributor ${yamlHint('governor.labels.stage.contributor_nudge.enabled')} ${settingHelpMark('settings', 'labels', 'Contributor nudge', `When a contributor's PR enters stage/072-returned-to-contributor (red CI, changes requested, conflicts) the hive posts ONE @-mention comment per head with the failing checks / review asks and, for relay contributors, pushes a fix-pr task to their relay session (parallel sub-session when the relay advertises parallel_sessions, otherwise preempting the current task). Re-nudged once at the stall threshold; cap 2 per head. See docs/labels-and-control-signals.md.`)}</span></div>
         <div class="config-field">
           <label for="cfg-stage-nudge-renudge">Re-nudge interval ${yamlHint('governor.labels.stage.contributor_nudge.renudge_interval')}</label>
-          <input type="text" id="cfg-stage-nudge-renudge" value="${esc(stageNudgeRenudge)}" placeholder="24h (stage dwell)" data-change-action="markDirty" data-arg0="labels" data-arg1="stage_nudge_renudge_interval" data-arg-types="s,s,w">
-          <div class="config-help">Go duration before the single re-nudge; empty = the returned-to-contributor dwell.</div>
+          <input type="text" id="cfg-stage-nudge-renudge" value="${esc(stageNudgeRenudge)}" placeholder="unset (uses re-nudge after)" data-change-action="markDirty" data-arg0="labels" data-arg1="stage_nudge_renudge_interval" data-arg-types="s,s,w">
+          <div class="config-help">Legacy override: Go duration before the single re-nudge; empty defers to the re-nudge-after setting below.</div>
+        </div>
+        <div class="config-field">
+          <label for="cfg-nudge-repeat-after">Re-nudge after ${yamlHint('auto_merge.nudge_repeat_after')}</label>
+          <input type="text" id="cfg-nudge-repeat-after" value="${esc(nudgeRepeatAfter)}" placeholder="72h" data-change-action="markDirty" data-arg0="labels" data-arg1="nudge_repeat_after" data-arg-types="s,s,w">
+          <div class="config-help">How long a contributor PR must stay red for the same reason before its one <code>hive:contributor-nudge</code> comment is rewritten a second (and last) time; empty = 72h.</div>
+        </div>
+        <div class="config-field">
+          <label for="cfg-stage-nudge-ci-cooldown">CI-failure nudge cooldown ${yamlHint('governor.labels.stage.contributor_nudge.ci_failure_cooldown')}</label>
+          <input type="text" id="cfg-stage-nudge-ci-cooldown" value="${esc(stageNudgeCICooldown)}" placeholder="6h" data-change-action="markDirty" data-arg0="labels" data-arg1="stage_nudge_ci_failure_cooldown" data-arg-types="s,s,w">
+          <div class="config-help">After a CI-failure nudge, a new head failing a different set of checks within this window is folded into the PR's existing <code>hive:contributor-nudge</code> comment instead of counting as a fresh nudge; empty = 6h.</div>
         </div>
         <div class="config-field">
           <label for="cfg-stage-presence-window">Contributor presence window ${yamlHint('governor.labels.stage.presence_window')}</label>
@@ -799,7 +866,7 @@
         <div class="config-field">
           <label for="cfg-stage-grace-offline">Offline contributor grace ${yamlHint('governor.labels.stage.contributor_grace_offline')}</label>
           <input type="text" id="cfg-stage-grace-offline" value="${esc(stageGraceOffline)}" placeholder="1h" data-change-action="markDirty" data-arg0="labels" data-arg1="stage_grace_offline" data-arg-types="s,s,w">
-          <div class="config-help">Go duration after the comment-only nudge before an offline or external author's red PR is adopted. With live hub presence the hive instead waits ${yamlHint('governor.labels.stage.adoption.after_offline')} (default 30m) after a registered relay's last heartbeat, or ${yamlHint('governor.labels.stage.adoption.after_unregistered')} (default 2h) for an author with no profile here, and adopts in place on the PR's own branch when GitHub permits ${yamlHint('governor.labels.stage.adoption.in_place')} (default on) rather than opening a superseding PR. An in-place adoption keeps a changed head only when GitHub links the commit to the App bot ${yamlHint('governor.labels.stage.adoption.strict_attribution')} (default on); otherwise the hive hands the PR back to the contributor. Once the hive owns the head, the contributor lane merges it under the hive's own authority when the hive-authored gates pass (CI green on the adopted head, reviewer verdict, DCO, diff fences, soak), without requiring the original author's trust tier ${yamlHint('governor.labels.stage.adoption.auto_merge')} (default on). When the hive supersedes instead, it closes the original in the same pass that opens its copy — one note naming the copy, <code>hive/superseded</code> — and reopens it if the copy is closed unmerged or red at two heads ${yamlHint('governor.labels.stage.adoption.supersede.close_first')} (default on; off keeps the original open at stage 074 until the copy merges). A clanker- or hive-authored original closes in that pass by policy even without the repo's write-back opt-in label, since the copy carries its commits and sign-off ${yamlHint('governor.labels.stage.adoption.close_superseded')} (default <code>on_adopt</code>; <code>on_merge</code> waits for the copy to merge; a person's PR always waits unless the label is present). A copy that conflicts with the base is handed to the fixer's rebase-resolve episode (two attempts, then stage 085 <code>rebase-failed-twice</code>); an adoption attempt that opened nothing is retried once the author's clanker has stayed offline for ${yamlHint('governor.labels.stage.adoption.offline_grace')} (default 30m).</div>
+          <div class="config-help">Go duration after the comment-only nudge before an offline or external author's red PR is adopted. With live hub presence the hive instead waits ${yamlHint('governor.labels.stage.adoption.after_offline')} (default 30m) after a registered relay's last heartbeat, or ${yamlHint('governor.labels.stage.adoption.after_unregistered')} (default 2h) for an author with no profile here, and adopts in place on the PR's own branch when GitHub permits ${yamlHint('governor.labels.stage.adoption.in_place')} (default on) rather than opening a superseding PR. An in-place adoption keeps a changed head only when GitHub links the commit to the App bot ${yamlHint('governor.labels.stage.adoption.strict_attribution')} (default on); otherwise the hive hands the PR back to the contributor. Once the hive owns the head, the contributor lane merges it under the hive's own authority when the hive-authored gates pass (CI green on the adopted head, reviewer verdict, DCO, diff fences, soak), without requiring the original author's trust tier ${yamlHint('governor.labels.stage.adoption.auto_merge')} (default on). When the hive supersedes instead, it closes the original in the same pass that opens its copy — one note naming the copy, <code>hive/superseded</code> — and reopens it if the copy is closed unmerged or red at two heads ${yamlHint('governor.labels.stage.adoption.supersede.close_first')} (default on; off keeps the original open at stage 074 until the copy merges). A clanker- or hive-authored original closes in that pass by policy even without the repo's write-back opt-in label, since the copy carries its commits and sign-off ${yamlHint('governor.labels.stage.adoption.close_superseded')} (default <code>on_adopt</code>; <code>on_merge</code> waits for the copy to merge; a person's PR always waits unless the label is present). A copy that conflicts with the base is handed to the fixer's rebase-resolve episode (two attempts, then stage 085 <code>rebase-failed-twice</code>); each fixer rebase attempt that sees no push within ${yamlHint('governor.labels.stage.adoption.rebase_attempt_timeout')} (default 15m) counts as failed, and an in-place adoption whose attempts are spent re-homes to a superseding PR at once; an adoption attempt that opened nothing is retried once the author's clanker has stayed offline for ${yamlHint('governor.labels.stage.adoption.offline_grace')} (default 30m).</div>
         </div>
         ${renderReporterTrustBlock()}
         <h4>Writing guide</h4>
@@ -1088,7 +1155,7 @@
           </div>`;
         // Fully forge-qualified so the row is unambiguous: github.ibm.com/org/repo.
         const displayName = ghHost + '/' + r;
-        return `<div class="config-list-item config-repo-row" style="align-items:center;gap:var(--sp-3)"><span data-action="setDefaultRepo" data-arg0="${esc(r)}" style="${starStyle}" title="${starTitle}">${isDefault ? '★' : '☆'}</span><span class="config-repo-name" title="${esc(displayName)}">${esc(displayName)}</span><label class="rt-check" title="${holdTitle}"><input type="checkbox" ${effectiveHold ? 'checked' : ''} ${selfAuthEnvLocked ? 'disabled' : ''} data-change-action="toggleRepoSelfAuthHold" data-arg0="${esc(r)}" data-arg-types="s,c"> Hold hive-authored PRs for human sign-off (#5117)</label>${inheritButton}${rtRow}${cbRow}<span style="${pillBase}" title="${pillTitle}">${pillLabel}</span><button class="remove-item" data-action="removeListItem" data-arg0="repos" data-arg1="list" data-arg2="${i}" data-arg-types="s,s,j">&#x2715;</button></div>` + ldSub;
+        return `<div class="config-list-item config-repo-row" style="align-items:center;gap:var(--sp-3)"><span data-action="setDefaultRepo" data-arg0="${esc(r)}" style="${starStyle}" title="${starTitle}">${isDefault ? '★' : '☆'}</span><span class="config-repo-name" title="${esc(displayName)}">${esc(displayName)}</span><label class="rt-check" title="${holdTitle}"><input type="checkbox" ${effectiveHold ? 'checked' : ''} ${selfAuthEnvLocked ? 'disabled' : ''} data-change-action="toggleRepoSelfAuthHold" data-arg0="${esc(r)}" data-arg-types="s,c"> Hold hive-authored PRs for human sign-off (#5117)</label>${inheritButton}${rtRow}${cbRow}<span style="${pillBase}" title="${pillTitle}">${pillLabel}</span><button class="remove-item" data-action="removeListItem" data-arg0="repos" data-arg1="list" data-arg2="${i}" data-arg-types="s,s,j">&#x2715;</button></div>` + ldSub + renderRepoWorkflowRow(r);
       }).join('');
       const hostNote = isGHE
         ? ` on <strong style="color:var(--indigo)">${esc(ghHost)}</strong> (GitHub Enterprise)`
@@ -1131,15 +1198,15 @@
         ${anyLabelDriven ? `<div class="ld-defaults" id="cfg-label-driven-defaults">
           <div class="config-toggle">
             <div class="config-toggle-switch ${ldApproval.trustOrgMembers !== false ? 'on' : ''} ${ldLocked ? 'disabled' : ''}" data-action="${ldLocked ? '' : 'toggleLabelDrivenTrustOrgMembers'}" data-arg-types="t" title="Prow's own rule: public members of the repo's org may apply the approval label. Off: only triage/write/maintain/admin collaborators and trusted bots."></div>
-            <span class="config-toggle-label">Label-driven repos: trust public org members to apply approval labels ${settingHelpMark('operator-reference', 'label-driven-approval', 'Trust org members', 'When on (default), a public member of the repository owner org who applies the approval label is trusted, matching Prow. Collaborators with the triage role or higher are always trusted.')}</span>
+            <span class="config-toggle-label">Label-driven repos: trust public org members to apply approval labels ${settingHelpMark('operator-reference/README', 'label-driven-approval', 'Trust org members', 'When on (default), a public member of the repository owner org who applies the approval label is trusted, matching Prow. Collaborators with the triage role or higher are always trusted.')}</span>
           </div>
           <div class="config-field-row">
             <div class="config-field">
-              <label>Default approval labels ${settingHelpMark('operator-reference', 'label-driven-approval', 'Default approval labels', 'Comma-separated. Applies to every label-driven repo without its own list. Empty restores triage/accepted.')}</label>
+              <label>Default approval labels ${settingHelpMark('operator-reference/README', 'label-driven-approval', 'Default approval labels', 'Comma-separated. Applies to every label-driven repo without its own list. Empty restores triage/accepted.')}</label>
               <input type="text" id="cfg-label-driven-approval-labels" ${ldLocked ? 'disabled' : ''} value="${esc(ldDefaultLabels.join(', '))}" placeholder="triage/accepted" data-change-action="setLabelDrivenApprovalDefault" data-arg-types="v">
             </div>
             <div class="config-field">
-              <label>Trusted bots ${settingHelpMark('operator-reference', 'label-driven-approval', 'Trusted bots', 'Comma-separated bot logins (for example kubestellar-prow[bot]) whose label additions count as a trusted triager. Empty restores the built-in list.')}</label>
+              <label>Trusted bots ${settingHelpMark('operator-reference/README', 'label-driven-approval', 'Trusted bots', 'Comma-separated bot logins (for example kubestellar-prow[bot]) whose label additions count as a trusted triager. Empty restores the built-in list.')}</label>
               <input type="text" id="cfg-label-driven-trusted-bots" ${ldLocked ? 'disabled' : ''} value="${esc((ldApproval.trustedBots || []).join(', '))}" placeholder="kubestellar-prow[bot]" data-change-action="setLabelDrivenTrustedBots" data-arg-types="v">
             </div>
           </div>
@@ -1858,14 +1925,54 @@
         ${channelsSecret('escalationPush', 'pagerdutyRoutingKey', !!pu.hasPagerdutyRoutingKey, 'PagerDuty routing key', 'escalation.push.pagerduty.routing_key', 'key', settingHelpMark('settings', 'channels', 'PagerDuty routing key', `Events API v2 integration (routing) key for the on-call service.`))}`;
     }
 
+    // The admin_mcp.writes_enabled switch. Once used it decides in both
+    // directions; while unset, HIVE_ADMIN_MCP_ENABLE_WRITES on the hive
+    // process decides (writesSource says which). "Use environment default"
+    // sends writesFollowEnv to clear it again. The two are mutually exclusive
+    // on the server, so each replaces the other in the dirty bag. The PUT is
+    // owner-only on the server; a viewer known not to be the owner sees the
+    // controls disabled.
+    function toggleAdminMcpWrites(el) {
+      if (!el || el.classList.contains('disabled')) return;
+      const isOn = el.classList.toggle('on');
+      el.setAttribute('aria-checked', isOn ? 'true' : 'false');
+      const st = channelsGroupState('adminMcp');
+      if (st) st.writesEnabled = isOn;
+      markDirty('channels', 'adminMcp', { writesEnabled: isOn });
+    }
+
+    function resetAdminMcpWritesToEnv(el) {
+      if (el && el.disabled) return;
+      const st = channelsGroupState('adminMcp');
+      if (st) {
+        st.writesEnabled = !!st.envWritesOn;
+        st.writesSource = st.envWritesSet ? 'env' : 'default';
+      }
+      markDirty('channels', 'adminMcp', { writesFollowEnv: true });
+      if (_configState.tab === 'Channels') renderConfigTab('Channels');
+    }
+
     function renderGovChannelsAdminMcp(mcp) {
-      const writes = mcp.writesEnabled ? statusBadgeHTML('ready', 'writes enabled', 'Writes enabled', 'done') : statusBadgeHTML('idle', 'read-only', 'Read-only', 'idle');
+      const on = !!mcp.writesEnabled;
+      const envName = esc(mcp.writesEnv || 'HIVE_ADMIN_MCP_ENABLE_WRITES');
+      const readOnly = !!window._hiveRole && window._hiveRole !== 'owner';
+      const writes = on ? statusBadgeHTML('ready', 'writes enabled', 'Writes enabled', 'done') : statusBadgeHTML('idle', 'read-only', 'Read-only', 'idle');
+      const fallback = mcp.envWritesSet ? `env: ${mcp.envWritesOn ? 'on' : 'off'}` : 'default: off';
+      let source;
+      if (mcp.writesSource === 'config') {
+        source = `Set by this switch, which overrides <code>${envName}</code>. Without it: ${fallback}. <button type="button" class="hv-btn btn-secondary" data-action="resetAdminMcpWritesToEnv" data-arg-types="t" ${readOnly ? 'disabled' : ''}>Use environment default</button>`;
+      } else if (mcp.writesSource === 'env') {
+        source = `Currently ${on ? 'on' : 'off'} from <code>${envName}</code> on the hive process; using this switch overrides it.`;
+      } else {
+        source = `Off by default: <code>${envName}</code> is not set and this switch has not been used.`;
+      }
       return `
-        <div class="config-subgroup">Admin MCP ${settingHelpMark('admin-mcp', 'http-endpoint', 'Admin MCP', `The admin MCP endpoint lets an external agent (Claude Code, Bob CLI…) operate this hive. It is always registered; there is no hive.yaml section. Writes are gated by an environment variable on the hive process.`)}</div>
-        <div class="config-field">
-          <label>Status ${settingHelpMark('admin-mcp', 'writes', 'Admin MCP writes', `Set the environment variable to 1/true on the hive process and restart to allow write tools. Without it the endpoint answers read tools only.`)}</label>
-          <div class="config-help">Endpoint <code>${esc(mcp.endpoint || '/api/admin/mcp')}</code> · ${writes} · toggle with <code>${esc(mcp.writesEnv || 'HIVE_ADMIN_MCP_ENABLE_WRITES')}</code> on the hive process (requires restart).</div>
-        </div>`;
+        <div class="config-subgroup">Admin MCP ${settingHelpMark('admin-mcp', 'http-endpoint', 'Admin MCP', `The admin MCP endpoint lets an external agent (Claude Code, Bob CLI…) operate this hive. It is always registered. Its write tools are off until the owner turns them on here or with an environment variable on the hive process.`)}</div>
+        <div class="config-toggle mt-3">
+          <div class="config-toggle-switch ${on ? 'on' : ''} ${readOnly ? 'disabled' : ''}" data-action="${readOnly ? '' : 'toggleAdminMcpWrites'}" data-arg-types="t" data-disabled="${readOnly ? 'true' : 'false'}" role="switch" aria-checked="${on ? 'true' : 'false'}" aria-disabled="${readOnly ? 'true' : 'false'}"></div>
+          <span class="config-toggle-label">Allow admin MCP writes ${yamlHint('admin_mcp.writes_enabled')} ${settingHelpMark('admin-mcp', 'writes', 'Allow admin MCP writes', `Turns the write tools (write_preview, write_confirm) of this hive's /api/admin/mcp endpoint on or off. Owner only and audited. It takes effect on the next MCP call with no restart, and turning it off refuses any pending confirmation. Once used it overrides HIVE_ADMIN_MCP_ENABLE_WRITES in both directions; until then that variable decides, and Use environment default hands the decision back to it (or to the default, off). A caller with a read-only role still cannot write. The stdio hive-admin-mcp binary keeps its own variable.`)}</span>
+        </div>
+        <div class="config-help">Endpoint <code>${esc(mcp.endpoint || '/api/admin/mcp')}</code> · ${writes} · ${source}${readOnly ? ' Only the owner can change this.' : ''}</div>`;
     }
 
     // ── Stats tab for per-agent stat config ──
@@ -1880,7 +1987,7 @@
       }
       return _statSources;
     }
-    ensureStatSources();
+    dashboardScheduleWork('stat-sources', ensureStatSources).catch(console.error);
 
     /* statSourcesForDialog returns the source catalogue for the agent the
        config dialog is showing. The agent config response carries a catalogue
@@ -2062,7 +2169,7 @@
         <p style="font-size:var(--fs-sm);color:var(--muted);margin:0 0 10px">
           Observes each agent's actual terminal rather than its configured state, and can restart agents that are running but dead.
         </p>
-        <p class="config-help">YAML keys: <code>governor.watchdog.enabled</code>, <code>governor.watchdog.mode</code>, <code>governor.watchdog.auth_probe</code>, <code>governor.watchdog.probe_interval_s</code>, <code>governor.watchdog.liveness.shell_prompt_after</code>, <code>governor.watchdog.liveness.stuck_overlay_after</code>, <code>governor.watchdog.readiness.no_production_for</code>, <code>governor.watchdog.restart.backoff[]</code>, <code>governor.watchdog.restart.crash_loop_after</code>, <code>governor.watchdog.restart.healthy_reset</code>.</p>
+        <p class="config-help">YAML keys: <code>governor.watchdog.enabled</code>, <code>governor.watchdog.mode</code>, <code>governor.watchdog.auth_probe</code>, <code>governor.watchdog.probe_interval_s</code>, <code>governor.watchdog.liveness.login_streak</code>, <code>governor.watchdog.liveness.shell_prompt_after</code>, <code>governor.watchdog.liveness.stuck_overlay_after</code>, <code>governor.watchdog.readiness.no_production_for</code>, <code>governor.watchdog.restart.backoff[]</code>, <code>governor.watchdog.restart.crash_loop_after</code>, <code>governor.watchdog.restart.healthy_reset</code>.</p>
         ${pausedBanner}${healBanner}${observeBanner}
         ${renderWatchdogActivityShell()}
         <div class="config-field-row">
@@ -2092,4 +2199,3 @@
           <span style="opacity:0.8">— fixed progression; the last step is the cap.</span>
         </div>`;
     }
-

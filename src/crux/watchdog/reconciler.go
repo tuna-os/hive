@@ -286,9 +286,9 @@ type agentRecord struct {
 	// alert fire once, not every tick.
 	CrashLooping bool
 	// LastClass is the previous liveness verdict, for transition logging.
-	LastClass PaneClass
-	// restartInFlight is true while a restart goroutine is running; the
-	// reconciler never stacks a second restart on a wedged one.
+	LastClass   PaneClass
+	loginStreak int // consecutive polls showing login chrome; see classifyLocked
+	// restartInFlight: a restart goroutine is running; never stack another on a wedged one.
 	restartInFlight bool
 	// restartStartedAt dates the in-flight restart so a wedge past the hard
 	// timeout is alerted on (the control-plane guard for failure mode 4).
@@ -351,31 +351,6 @@ func (r *Reconciler) TakeRestarted() []string {
 	out := r.restarted
 	r.restarted = nil
 	return out
-}
-
-// Option customizes a Reconciler.
-type Option func(*Reconciler)
-
-// WithClock injects a fake clock for tests.
-func WithClock(now func() time.Time) Option {
-	return func(r *Reconciler) { r.now = now }
-}
-
-// WithAuthProbes registers per-provider credential probes.
-func WithAuthProbes(probes map[string]AuthProbe) Option {
-	return func(r *Reconciler) { r.authProbes = probes }
-}
-
-// WithBackendProvider injects the backend→provider mapping.
-func WithBackendProvider(f func(string) string) Option {
-	return func(r *Reconciler) { r.backendProvider = f }
-}
-
-// WithConditionReporter injects the host sink for the watchdog's
-// agent_crash_loop self-report (hive wires pkg/fleetreport). Without one the
-// crash loop still pauses and alerts; it just is not reported upstream.
-func WithConditionReporter(rep crux.ConditionReporter) Option {
-	return func(r *Reconciler) { r.conditions = rep }
 }
 
 func (r *Reconciler) observeCondition(class, key, message, diagnostics string) {
@@ -548,10 +523,13 @@ func (r *Reconciler) recordLocked(name string) *agentRecord {
 }
 
 // Tick runs one reconciliation sweep. It is synchronous and bounded: every
-// probe carries a deadline and every restart runs detached under the hard
-// RestartTimeout, so the governor tick that hosts it can never wedge on a
-// stuck agent (the RFC's control-plane guard). Calls inside ProbeInterval of
-// the previous sweep are no-ops.
+// probe carries a deadline (Source implementations must bound Observe —
+// crux/agent's WatchdogFleet caps its tmux probes at ObserveProbeTimeout) and
+// every restart runs detached under the hard RestartTimeout, so the governor
+// tick that hosts it can never wedge on a stuck agent (the RFC's control-plane
+// guard). ctx is checked between agents, so a cancelled ctx (shutdown) ends
+// the sweep early. Calls inside ProbeInterval of the previous sweep are
+// no-ops.
 func (r *Reconciler) Tick(ctx context.Context) {
 	now := r.now()
 	r.mu.Lock()
@@ -568,6 +546,9 @@ func (r *Reconciler) Tick(ctx context.Context) {
 
 	authCache := make(map[string]authVerdict)
 	for _, name := range r.fleet.AgentNames() {
+		if ctx.Err() != nil {
+			return
+		}
 		r.reconcileAgent(ctx, name, now, authCache)
 	}
 }
@@ -583,11 +564,11 @@ func (r *Reconciler) reconcileAgent(ctx context.Context, name string, now time.T
 		r.logger.Warn("watchdog: agent unobservable", "agent", name, "error", err)
 		return
 	}
-	cls := Classify(obs, now, r.snapshotSettings())
 	paused := r.fleet.IsPaused(name)
 
 	r.mu.Lock()
 	rec := r.recordLocked(name)
+	cls := r.classifyLocked(rec, obs, now)
 	if cls.Class != rec.LastClass {
 		r.logger.Info("watchdog: liveness transition",
 			"agent", name, "from", string(rec.LastClass), "to", string(cls.Class), "reason", cls.Reason)
@@ -811,6 +792,12 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 	// standing operator alert must be cleared.
 	healable := cls.Class == ClassAuthRequired && obs.CredentialProven
 
+	// The classifier withheld ClassAuthRequired for login chrome (boot grace).
+	// For claude the per-agent probe only answers known-absent from that same
+	// pane signal (AgentAuthState), so CredentialMissing would re-page the
+	// very sighting the classifier just declined to act on.
+	loginChromeSuppressed := obs.ShowsLoginPrompt && cls.Class != ClassAuthRequired
+
 	if healable {
 		// A login screen over a credential that demonstrably still works is
 		// the token-restart heal's case, not an operator's — the same division
@@ -833,7 +820,7 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 		status = ConditionFalse
 		reason = "PaneShowsLogin"
 		message = cls.Reason
-	} else if obs.AuthKnown && !obs.AuthAvailable {
+	} else if obs.AuthKnown && !obs.AuthAvailable && !loginChromeSuppressed {
 		// The manager's owner-aware per-agent credential probe (#4619/#4641)
 		// says the credential file is definitively absent for an agent whose
 		// backend requires interactive auth.

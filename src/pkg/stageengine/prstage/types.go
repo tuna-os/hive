@@ -10,6 +10,15 @@ import (
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
+// ChangeRequestRef is one standing CHANGES_REQUESTED review: who left it,
+// the commit it was left on, when, and its URL.
+type ChangeRequestRef struct {
+	Login       string
+	CommitID    string
+	SubmittedAt time.Time
+	URL         string
+}
+
 // Detail is what a lane's deep evaluation learned beyond the reason:
 // the reviewer verdict for the head and the author's admission tier.
 type Detail struct {
@@ -48,6 +57,14 @@ type Detail struct {
 	// was seen this cycle.
 	Reviews      int
 	ReviewsKnown bool
+	// StandingChangeRequests are the people (the hive app and bots
+	// excluded) whose latest opinionated review on the PR — APPROVED,
+	// CHANGES_REQUESTED or DISMISSED — is CHANGES_REQUESTED, on any head,
+	// from the same ListReviews walk. GitHub keeps such a review standing
+	// across pushes until its author re-reviews or it is dismissed, so the
+	// 085 ask for an approving review names it instead of inviting an
+	// approval over it (projectbluefin/utah-packages#633).
+	StandingChangeRequests []ChangeRequestRef
 	// DCO, DCOTotal and DCOUnsigned are the stage pass's own commit check
 	// for the head (hivecommons/hive#12542); filled by ApplyStageLabels,
 	// not by the lanes.
@@ -84,6 +101,14 @@ type Detail struct {
 	// there. Only repositories that carry that workflow run it, so the
 	// sign-off attribution notes name it only where it is.
 	SquashSignoffGate bool
+	// MergeableState is GitHub's mergeable_state ("behind", "clean",
+	// "blocked", …, lower-cased; "" when unknown) from a lane's fresh PR
+	// fetch this cycle, for MergeableStateHead only. GitHub reports
+	// "behind" only when the base requires up-to-date branches, so the
+	// 090 entry comment names it instead of calling trust the only
+	// blocker (projectbluefin/common#1619).
+	MergeableState     string
+	MergeableStateHead string
 }
 
 // RedCheck returns the first red non-required check on head, or "".
@@ -151,6 +176,12 @@ type Observation struct {
 	// because it is from a fork (StageLabelPolicy.ForkGuard); non-empty only
 	// when every failing check does.
 	ForkGuardChecks []string
+	// ForkGuardCarried marks ForkGuardChecks as carried from the PR's stage
+	// record onto a head the shared-CI index has not read yet (the lane's
+	// red check is one the guard refused before) rather than fresh evidence
+	// for this head; the stage sweep verifies it against the head's check
+	// digest before it refuses a nudge or an adoption on its strength.
+	ForkGuardCarried bool
 	// Hold is who set the `hold` label the PR wears and why, read by
 	// ApplyStageLabels from the label event and the hive's notice comment
 	// (hivecommons/hive#15020); nil when not held or unreadable.
@@ -195,6 +226,12 @@ type ReviewVerdict struct {
 	// Approved is true when the aggregate verdict for the head is approve and
 	// merge-eligible.
 	Approved bool
+	// ReviewOff is true when no verdict for the head exists and none can
+	// come: a reviewer agent is configured, but this hive does not dispatch
+	// the review swarm (review.require_approval or review.fan_out is off).
+	// The lane then skips with contributor-lane:review-off instead of
+	// contributor-lane:no-verdict, which reads as a review on its way.
+	ReviewOff bool
 	// Verdict is the aggregate verdict for routing, if any.
 	Verdict           string
 	DecisionRequested bool
@@ -210,6 +247,15 @@ type ReviewVerdict struct {
 	// and for the hive's own PR the lane performs it (hivecommons/hive#15499).
 	RedundantOf    int
 	HumanSummaries []string
+	// FindingAsks are the verdict's in-scope findings, one readable line
+	// each (review.Aggregate.FindingAsks), so the contributor nudge on a
+	// changes_requested lists what the review asked for.
+	FindingAsks []string
+	// SummaryAsks are what the blocking reviewers said in their summaries,
+	// one readable line each (review.Aggregate.BlockSummaryAsks). The nudge
+	// lists them when a blocking verdict carries no FindingAsks: a reviewer
+	// can ask for changes and explain itself only in its summary.
+	SummaryAsks []string
 	// HiveAuthoredKnown is true for verdicts read from aggregates that recorded
 	// authorship. The stage fallback normalizer leaves those alone: aggregation
 	// already applied the configured self-authored decision policy.
@@ -253,7 +299,7 @@ func (v ReviewVerdict) WithDecisionAnswer(by, head, directive string) ReviewVerd
 }
 
 func NormalizeReviewVerdict(v ReviewVerdict) ReviewVerdict {
-	if !v.Configured || v.Approved || v.DecisionRequested || (v.HiveAuthoredKnown && !v.HiveAuthored) || v.FixCycleCapReached || strings.ToLower(strings.TrimSpace(v.Verdict)) != "requires_human" {
+	if !v.Configured || v.Approved || v.DecisionRequested || (v.HiveAuthoredKnown && !v.HiveAuthored) || v.FixCycleCapReached || strings.TrimSpace(v.DecisionFinding) != "" || strings.ToLower(strings.TrimSpace(v.Verdict)) != "requires_human" {
 		return v
 	}
 	text := strings.TrimSpace(v.DecisionQuestion + "\n" + strings.Join(v.HumanSummaries, "\n"))

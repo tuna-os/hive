@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hivecommons/hive/pkg/stagelabels"
+	"github.com/hivecommons/hive/pkg/workflowmodel"
 )
 
 // Transition is what Reconcile reports to its caller and the audit log.
@@ -38,14 +39,32 @@ type Reconciler interface {
 
 // Options configures New.
 type Options struct {
-	Mode    Mode
-	Store   *stagelabels.Store // stagelabels.Shared() by default; API unchanged
-	Writer  StageWriter
-	Issue   Deriver // defaults to DeriveIssue
-	PR      Deriver // defaults to DerivePR
-	Now     func() time.Time
-	Logger  *slog.Logger
-	Metrics Metrics
+	Mode   Mode
+	Store  *stagelabels.Store // stagelabels.Shared() by default; API unchanged
+	Writer StageWriter
+	Issue  Deriver // defaults to DeriveIssue
+	PR     Deriver // defaults to DerivePR
+	// Workflow, when set, derives through the compiled workflow model
+	// (DeriveFromModel) and overrides Issue and PR. hivecommons/hive#17620.
+	Workflow *workflowmodel.Profile
+	// WorkflowFor, when set, resolves the compiled model bound to a
+	// repository (owner/repo) at derivation time; nil means the repository
+	// is unbound and the Issue/PR derivers run unchanged. It composes with
+	// Workflow: Workflow is the engine-wide model, WorkflowFor the
+	// per-repository override. hivecommons/hive#17620 (RFC phase 2).
+	WorkflowFor func(owner, repo string) *workflowmodel.Profile
+	// WorkflowProvisioned remembers, per repository, the model labels the
+	// label reconciler created, so a later pass can tell its own labels
+	// from the repository's. nil: nothing is remembered and no model label
+	// is ever deleted. hivecommons/hive#17620 (RFC phase 4 follow-up).
+	WorkflowProvisioned workflowmodel.ProvisionedStore
+	// WorkflowLabelGC, read on every pass, says whether a remembered model
+	// label the current binding no longer declares may be deleted from the
+	// repository (workflow.label_gc). nil means true.
+	WorkflowLabelGC func() bool
+	Now             func() time.Time
+	Logger          *slog.Logger
+	Metrics         Metrics
 }
 
 // ErrNoWriter is returned by an enforce-mode Reconcile with no Writer.
@@ -55,7 +74,8 @@ type reconciler struct {
 	opts Options
 	mode atomic.Pointer[Mode]
 
-	locks sync.Map // Ref.Key() → *sync.Mutex
+	locks  sync.Map // Ref.Key() → *sync.Mutex
+	writes sync.Map // Ref.Key() → stageWriteTransition; protected by the per-Ref lock
 
 	mu        sync.Mutex
 	anomalies map[string]bool // key+from→to already logged
@@ -72,11 +92,19 @@ func New(o Options) Reconciler {
 	if o.Store == nil {
 		o.Store = stagelabels.Shared()
 	}
+	if o.Workflow != nil {
+		o.Issue = DeriveFromModel(o.Workflow, stagelabels.IssueItem)
+		o.PR = DeriveFromModel(o.Workflow, stagelabels.PRItem)
+	}
 	if o.Issue == nil {
 		o.Issue = IssueDeriver()
 	}
 	if o.PR == nil {
 		o.PR = PRDeriver()
+	}
+	if o.WorkflowFor != nil {
+		o.Issue = DeriveForRepo(o.WorkflowFor, o.Issue)
+		o.PR = DeriveForRepo(o.WorkflowFor, o.PR)
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -149,20 +177,44 @@ func (r *reconciler) Reconcile(ctx context.Context, f Facts) (Transition, error)
 	key := f.Ref.Key()
 	prev, _ := r.opts.Store.Get(key)
 	tr.From, tr.To, tr.Reason = prev.Stage, d.Stage, d.Reason
+	if last, suppressed := r.suppressStageFlap(f, d); suppressed {
+		tr.From, tr.To, tr.Reason = last.to, last.to, last.reason
+		// Legacy sweep callers may already have observed their opinion.
+		// Restore the last written stage rather than retaining that reversal.
+		r.opts.Store.ObserveProgress(key, last.to, last.reason, false)
+		tr.Outcome.Suppressed = true
+		return tr, nil
+	}
 	if a := Anomaly(f.Ref.Kind, tr.From, tr.To); a != "" {
 		tr.Anomaly = a
 		r.recordAnomaly(f.Ref, tr.From, tr.To, d.Reason, a)
 	}
-	r.opts.Store.ObserveProgress(key, d.Stage, d.Reason, d.Progress)
+	head := ""
+	if f.PR != nil {
+		head = f.PR.HeadSHA
+	}
+	storeTr := r.opts.Store.ObserveProgressHead(key, head, d.Stage, d.Reason, d.Progress)
+	if storeTr.Suppressed {
+		tr.From, tr.To, tr.Reason = prev.Stage, prev.Stage, prev.Reason
+		tr.Outcome.Suppressed = true
+		return tr, nil
+	}
 	noteCoveringPR(r.opts.Store, key, f, d.Stage)
 
 	out, err := r.opts.Writer.Apply(ctx, f.Ref, f.Labels, d.Desired())
 	tr.Outcome = out
+	if err == nil && !out.Suppressed {
+		// Use the writer's fresh-read removal, not Store: legacy callers
+		// can pre-observe a different opinion before entering Reconcile.
+		if from := stagelabels.Current(out.Removed); from != stagelabels.None && from != out.Stage {
+			r.rememberStageWrite(f, from, out.Stage, d.Reason)
+		}
+	}
 	if err == nil {
 		// The gate's refusal is a fact about the record: readers that
 		// compare the record with the item's labels must know the labels
 		// never carried the stage.
-		r.opts.Store.NoteLabelsSuppressed(key, out.Suppressed)
+		r.opts.Store.NoteLabelsSuppressed(key, out.Suppressed, out.SuppressedReason)
 	}
 	r.opts.Metrics.WriterWrite(f.Ref.Kind, OpAdd, len(out.Added))
 	r.opts.Metrics.WriterWrite(f.Ref.Kind, OpRemove, len(out.Removed))

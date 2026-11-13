@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -312,6 +314,9 @@ func TestStageTrackerAPIMergedShape(t *testing.T) {
 	deps.GHClient = github.NewClientForTest(gh.URL, "acme", []string{"console"}, covBLogger())
 	s.deps = deps
 	isolateMergedLedger(t)
+	oldNow := mergedLedgerNow
+	mergedLedgerNow = func() time.Time { return now }
+	t.Cleanup(func() { mergedLedgerNow = oldNow })
 
 	get := func() map[string]json.RawMessage {
 		req := httptest.NewRequest(http.MethodGet, "/api/stage-tracker", nil)
@@ -353,7 +358,8 @@ func TestStageTrackerAPIMergedShape(t *testing.T) {
 		}
 	}
 
-	s.recordMergedSnapshots([]github.WebhookItemSnapshot{{Repo: "acme/console", Number: 102, IsPR: true, Merged: true, Title: "feat: soak done", URL: "https://github.com/acme/console/pull/102", MergedAt: time.Now().Add(-time.Minute), MergedBy: "octocat"}})
+	// Stamp "now", not now-1m: a seed on the previous calendar day fails the today==1 check in the first minute after midnight (#16963).
+	s.recordMergedSnapshots([]github.WebhookItemSnapshot{{Repo: "acme/console", Number: 102, IsPR: true, Merged: true, Title: "feat: soak done", URL: "https://github.com/acme/console/pull/102", MergedAt: now, MergedBy: "octocat"}})
 	if err := json.Unmarshal(get()["merged"], &merged); err != nil {
 		t.Fatal(err)
 	}
@@ -423,5 +429,35 @@ func TestClosedSweepBackfillsMergedLedger(t *testing.T) {
 	s2 := closedRowsFixture(t)
 	if s2.mergedLedger().NeedsBackfill() || s2.mergedLedger().Summary(closedRowsViewedAt, nil).AllTime != 1 {
 		t.Fatal("a ledger with history on disk does not widen the first sweep")
+	}
+}
+
+// TestWriteFileAtomicUniqueConcurrent: concurrent writers to one path never
+// fail with a missing temp file, and a missing parent dir is created
+// (hivecommons/hive#16629).
+func TestWriteFileAtomicUniqueConcurrent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "merged-ledger.json")
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := writeFileAtomicUnique(path, []byte(`{"v":1}`)); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent write failed: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected only the final file, got %d entries", len(entries))
 	}
 }

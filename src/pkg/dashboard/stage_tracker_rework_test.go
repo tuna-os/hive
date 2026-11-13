@@ -88,7 +88,27 @@ func TestStageTrackerReworkFor(t *testing.T) {
 			rec: stagelabels.Record{Stage: stagelabels.ReturnedToContributor, EnteredAt: requested, NudgeHead: "aaa", FirstNudgeAt: requested, LastNudgeAt: requested, NudgeCount: 1, RerouteTo: "kai", RerouteHead: "000"}, hasRec: true, fixWork: rerouted,
 			state: "requested", actor: "zoe", since: requested, reqAtFrom: requested},
 		{name: "new head pushed", it: pr("bbb", tp(-3*time.Minute)), login: "zoe", stage: stagelabels.ReturnedToContributor, rec: nudged, hasRec: true, fixWork: inflight,
-			state: "pushed", evidence: "commit", actor: "zoe", since: now.Add(-3 * time.Minute), head: "bbb", reqAtFrom: requested},
+			state: "pushed", evidence: "commit", actor: "zoe", head: "bbb", reqAtFrom: requested},
+		// hivecommons/hive#16021: the author force-pushed (rebased commits
+		// keep their old dates; the list payload's updated_at predates the
+		// ask), the sweep re-entered 071 for the new red head and re-nudged
+		// for it. The record remembers the push: pushed, dated from the
+		// push, requested_at from the original ask.
+		{name: "re-asked on the pushed head still reads pushed", it: pr("bbb", tp(-2*time.Hour)), login: "zoe", stage: stagelabels.NeedsAuthor,
+			rec: stagelabels.Record{Stage: stagelabels.NeedsAuthor, Reason: "optional-check-failing:server-tests", EnteredAt: now.Add(-10 * time.Minute), NudgeHead: "bbb", FirstNudgeAt: now.Add(-10 * time.Minute), LastNudgeAt: now.Add(-10 * time.Minute), NudgeCount: 1,
+				ReworkAskedAt: requested, ReworkPushedHead: "bbb", ReworkPushedAt: now.Add(-12 * time.Minute)}, hasRec: true, fixWork: none,
+			state: "pushed", evidence: "commit", actor: "zoe", since: now.Add(-12 * time.Minute), head: "bbb", reqAtFrom: requested},
+		{name: "review verdict on the pushed head is a fresh ask", it: pr("bbb", nil), login: "zoe", stage: stagelabels.NeedsAuthor,
+			rec: stagelabels.Record{Stage: stagelabels.NeedsAuthor, Reason: stagelabels.LaneReasonChangesRequested, EnteredAt: now.Add(-10 * time.Minute), NudgeHead: "bbb", FirstNudgeAt: now.Add(-10 * time.Minute), LastNudgeAt: now.Add(-10 * time.Minute), NudgeCount: 1,
+				ReworkAskedAt: requested, ReworkPushedHead: "bbb", ReworkPushedAt: now.Add(-12 * time.Minute)}, hasRec: true, fixWork: none,
+			state: "requested", actor: "zoe", since: now.Add(-10 * time.Minute), reqAtFrom: now.Add(-10 * time.Minute)},
+		{name: "remembered push on another head does not vouch for this one", it: pr("ccc", nil), login: "zoe", stage: stagelabels.NeedsAuthor,
+			rec: stagelabels.Record{Stage: stagelabels.NeedsAuthor, Reason: "conflicting", EnteredAt: now.Add(-10 * time.Minute), NudgeHead: "ccc", FirstNudgeAt: now.Add(-10 * time.Minute), LastNudgeAt: now.Add(-10 * time.Minute), NudgeCount: 1,
+				ReworkAskedAt: requested, ReworkPushedHead: "bbb", ReworkPushedAt: now.Add(-12 * time.Minute)}, hasRec: true, fixWork: none,
+			state: "requested", actor: "zoe", since: now.Add(-10 * time.Minute), reqAtFrom: now.Add(-10 * time.Minute)},
+		{name: "webhook-booked push dates the pushed state", it: pr("bbb", tp(-2*time.Hour)), login: "zoe", stage: stagelabels.ReturnedToContributor,
+			rec: stagelabels.Record{Stage: stagelabels.ReturnedToContributor, EnteredAt: requested.Add(-time.Minute), NudgeHead: "aaa", FirstNudgeAt: requested, LastNudgeAt: requested, NudgeCount: 1, LastPushSha: "bbb", LastPushAt: now.Add(-4 * time.Minute)}, hasRec: true, fixWork: none,
+			state: "pushed", evidence: "commit", actor: "zoe", since: now.Add(-4 * time.Minute), head: "bbb", reqAtFrom: requested},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -108,7 +128,10 @@ func TestStageTrackerReworkFor(t *testing.T) {
 			if got.RequestedAt == nil || !got.RequestedAt.Equal(tc.reqAtFrom) {
 				t.Fatalf("requested_at = %v, want %v", got.RequestedAt, tc.reqAtFrom)
 			}
-			if got.Since == nil || !got.Since.Equal(tc.since) {
+			if tc.since.IsZero() && got.Since != nil {
+				t.Fatalf("unknown push time became a PR update timestamp: %v", got.Since)
+			}
+			if !tc.since.IsZero() && (got.Since == nil || !got.Since.Equal(tc.since)) {
 				t.Fatalf("since = %v, want %v", got.Since, tc.since)
 			}
 		})
@@ -184,6 +207,10 @@ func TestStageTrackerReworkJS(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_REWORK_WORDS"),
 		jsFunc(t, html, "stageTrackerReworkOf"),
 		jsFunc(t, html, "stageTrackerReworkWord"),
+		jsConstLine(t, html, "STAGE_TRACKER_REWORK_OWED_BY_HIVE"),
+		jsFunc(t, html, "stageTrackerReReviewOwedByHive"),
+		jsFunc(t, html, "stageTrackerReReviewWord"),
+		jsFunc(t, html, "stageTrackerHiveReviewerChipText"),
 		jsFunc(t, html, "stageTrackerReworkSuffix"),
 		jsFunc(t, html, "stageTrackerReworkTip"),
 		jsFunc(t, html, "stageTrackerReworkJoinTip"),
@@ -217,12 +244,18 @@ assert.strictEqual(stageTrackerPresenceChipText(requested), 'waiting on @Danatha
 assert.strictEqual(stageTrackerPresenceChipText(queued), 'waiting on @Danathar · queued');
 assert.strictEqual(stageTrackerPresenceChipText(acked), 'waiting on @Danathar · acknowledged');
 assert.strictEqual(stageTrackerPresenceChipText(working), 'waiting on @Danathar · working');
-assert.strictEqual(stageTrackerPresenceChipText(pushed), 'waiting on @Danathar · re-review pending');
+// A pushed head with nothing against it waits on the hive's reviewer (hivecommons/hive#16615).
+assert.strictEqual(stageTrackerPresenceChipText(pushed), 'waiting on 🐝 hive reviewer · re-review of bbb');
+assert.strictEqual(stageTrackerPresenceChipText(w(Object.assign({}, pushed.rework, { owed_by: 'author' }))), 'waiting on @Danathar · re-review pending', 'the server says the author still owes it');
+// hivecommons/hive#17789: an older payload without owed_by reads a DCO ask as the author's move too.
+assert.strictEqual(stageTrackerReReviewOwedByHive(Object.assign({}, pushed, { reason: 'hive-signoff-attribution' })), false);
+assert.strictEqual(stageTrackerReReviewOwedByHive(Object.assign({}, pushed, { reason: 'dco-missing' })), false);
+assert.strictEqual(stageTrackerPresenceChipText(Object.assign({}, pushed, { reason: 'hive-signoff-attribution', rework: Object.assign({}, pushed.rework, { owed_by: 'author' }) })), 'waiting on @Danathar · sign-off owed', 'no re-review is queued for a DCO ask');
 assert.match(stageTrackerReworkTip(requested, NOW), /^rework requested 1 hour ago \(\S+ .*\) · no response from @Danathar yet$/);
 assert.match(stageTrackerReworkTip(queued, NOW), /^rework queued for @Danathar's clanker · 2 ahead · queued 10 min ago \(/);
 assert.match(stageTrackerReworkTip(acked, NOW), /^@Danathar acknowledged · activity on the PR 20 min ago \(/);
 assert.match(stageTrackerReworkTip(working, NOW), /^@Danathar's clanker picked up the rework 5 min ago \(.*\) \(spawn\)$/);
-assert.match(stageTrackerReworkTip(pushed, NOW), /^@Danathar pushed a new head 1 min ago \(.*\) · re-review pending$/);
+assert.match(stageTrackerReworkTip(pushed, NOW), /^@Danathar pushed a new head 1 min ago \(.*\) · hive reviewer owes the re-review of bbb$/);
 // The pill keeps its class, dot and login; title and aria carry the rework line after the presence line.
 const chip = stageTrackerPresenceChipHtml(acked);
 assert.ok(/^<span class="ham-badge ham-badge-waiting" title="Waiting on @Danathar&#39;s clanker \(online, last seen 2 min ago\) — hive is waiting for them · @Danathar acknowledged · activity on the PR 20 min ago[^"]*" aria-label="Waiting on @Danathar&#39;s clanker[^"]*acknowledged[^"]*">waiting on <span class="ham-presence ham-presence-online ham-presence-clanker"[^>]*>[\s\S]*<\/span>@Danathar · acknowledged<\/span>$/.test(chip), chip);
@@ -231,7 +264,7 @@ const adopt = Object.assign({}, working, { stage: 72, adoption: { author: 'Danat
 const achip = stageTrackerAdoptionChipHtml(adopt);
 assert.ok(/@Danathar · working<\/span>$/.test(achip), achip);
 assert.ok(achip.includes("picked up the rework 5 min ago"), achip);
-assert.strictEqual(stageTrackerAdoptionChipText(Object.assign({}, adopt, { adoption: Object.assign({}, adopt.adoption, { blocked_by: 'x' }) })), 'not adopted', 'a blocked adoption keeps its own word');
+assert.strictEqual(stageTrackerAdoptionChipText(Object.assign({}, adopt, { adoption: Object.assign({}, adopt.adoption, { blocked_by: 'x' }) })), 'adoption blocked', 'a blocked adoption keeps its own word');
 // Event line: the stage does not change, the pickup does.
 const states = (items) => stageTrackerStateMap(items);
 const before = states([requested]), after = states([acked]);
@@ -247,4 +280,69 @@ const lk = Object.keys(states([issue])).find(k => k.endsWith('#14989'));
 assert.strictEqual(states([issue])[lk].rework, 'acknowledged');
 `}, "\n")
 	runStageTrackerRowActionsScript(t, script)
+}
+
+// hivecommons/hive#16615: @thatguywob's clanker pushed d88928e; every check
+// on it is green and no findings stand against it. "re-review pending" is
+// the HIVE reviewer's debt, so the row says so (`owed_by`) and the pill
+// stops naming the author. The author keeps the pill only when the pushed
+// head asks them for something.
+func TestStageTrackerReworkOwedBy16615(t *testing.T) {
+	const head = "d88928e16f21ab6e653e5d06f137926bc0db1c0d"
+	base := func() StageTrackerItem {
+		return StageTrackerItem{Kind: "pr", Number: 16615, Head: head, Author: "thatguywob", AuthorKind: "clanker", Stage: 72,
+			Rework:         &StageTrackerRework{State: reworkStatePushed, Actor: "thatguywob", Evidence: reworkEvidenceCommit, Head: head},
+			CIActivity:     &StageTrackerActivity{Head: head, State: "passing", ChecksPassed: 11, ChecksTotal: 11},
+			ReviewActivity: &StageTrackerActivity{Head: head, State: "unknown", PerspectivesTotal: 5}}
+	}
+	it := base()
+	stageTrackerApplyReworkOwedBy(&it)
+	if it.Rework.OwedBy != reworkOwedByHiveReviewer {
+		t.Fatalf("green pushed head: owed_by = %q, want %q", it.Rework.OwedBy, reworkOwedByHiveReviewer)
+	}
+	raw, _ := json.Marshal(it.Rework)
+	if !strings.Contains(string(raw), `"owed_by":"hive-reviewer"`) {
+		t.Fatalf("payload lacks owed_by: %s", raw)
+	}
+
+	for name, mutate := range map[string]func(*StageTrackerItem){
+		"red CI on the pushed head":           func(it *StageTrackerItem) { it.CIActivity.State = "failing" },
+		"findings on the pushed head":         func(it *StageTrackerItem) { it.ReviewActivity.State = "changes_requested" },
+		"conflict nobody in the hive rebases": func(it *StageTrackerItem) { it.Reason = "conflicting" },
+		// hivecommons/hive#17789: a DCO ask is the author's move; no
+		// re-review of the pushed head is queued for it.
+		"hive-signoff-attribution": func(it *StageTrackerItem) { it.Reason = "hive-signoff-attribution" },
+		"dco-missing":              func(it *StageTrackerItem) { it.Reason = "dco-missing" },
+	} {
+		it := base()
+		mutate(&it)
+		stageTrackerApplyReworkOwedBy(&it)
+		if it.Rework.OwedBy != reworkOwedByAuthor {
+			t.Fatalf("%s: owed_by = %q, want %q so the author keeps the pill", name, it.Rework.OwedBy, reworkOwedByAuthor)
+		}
+	}
+	// The hive rebasing the conflict is the hive's move.
+	it = base()
+	it.Reason, it.Rebase = "conflicting", &StageTrackerRebase{Attempt: 1, Max: 2}
+	stageTrackerApplyReworkOwedBy(&it)
+	if it.Rework.OwedBy != reworkOwedByHiveReviewer {
+		t.Fatalf("hive rebasing: owed_by = %q, want %q", it.Rework.OwedBy, reworkOwedByHiveReviewer)
+	}
+	// Red CI on an OLDER head says nothing about the pushed one.
+	it = base()
+	it.CIActivity = &StageTrackerActivity{Head: "6384f9b", State: "failing"}
+	stageTrackerApplyReworkOwedBy(&it)
+	if it.Rework.OwedBy != reworkOwedByHiveReviewer {
+		t.Fatalf("stale red CI: owed_by = %q, want %q", it.Rework.OwedBy, reworkOwedByHiveReviewer)
+	}
+	// Before the push the author owes the rework; nothing to attribute.
+	it = base()
+	it.Rework.State = reworkStateAcknowledged
+	stageTrackerApplyReworkOwedBy(&it)
+	if it.Rework.OwedBy != "" {
+		t.Fatalf("acknowledged: owed_by = %q, want empty", it.Rework.OwedBy)
+	}
+	var none *StageTrackerItem
+	stageTrackerApplyReworkOwedBy(none)
+	stageTrackerApplyReworkOwedBy(&StageTrackerItem{})
 }

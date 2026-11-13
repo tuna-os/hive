@@ -550,6 +550,9 @@ func runEvalCycle(
 		attribute.String("hive.id", cfg.HiveID),
 		attribute.Int(tracing.AttrHiveACMMLevel, inferACMMLevel(cfg)))
 	defer span.End()
+	// GitHub calls this cycle makes are "hive:eval_cycle" in
+	// /api/gh-rate-limits unless a step below names itself more narrowly.
+	ctx = github.WithRESTCaller(ctx, "hive:eval_cycle")
 
 	// A hive running without GitHub credentials (placeholder app_id, or a real
 	// App whose key could not be read) has nothing to enumerate. Return before
@@ -611,7 +614,7 @@ func runEvalCycle(
 			"stale", actionable.Stale())
 	} else {
 		enumCtx, enumSpan := tracing.StartSpan(ctx, "governor.enumerate_actionable")
-		fresh, err := ghClient.EnumerateActionable(enumCtx)
+		fresh, err := ghClient.EnumerateActionable(github.WithRESTCaller(enumCtx, "hive:enumerate_actionable"))
 		enumSpan.End()
 		var ok bool
 		actionable, ok = actionableAfterGitHubEnumerate(cfg, fresh, err, logger)
@@ -631,12 +634,20 @@ func runEvalCycle(
 			reportWorkSourceDisplayStats(dashSrv, ws)
 		}
 	}
+	reconcileDeferredFixQueue(gov, cfg.Project.Org, actionable)
 	if swarmRepo := dashSrv.ActiveSwarmRepo(); swarmRepo != "" {
 		github.BoostActionableRepoPriority(actionable.Issues.Items, swarmRepo)
 		logger.Info("swarm priority boost applied", "repo", swarmRepo)
 	}
 
 	ghClient.EnrichCIStatus(ctx, actionable.PRs.Items)
+	// Approve workflow runs GitHub holds behind its approve-workflows gate
+	// on trusted heads (hivecommons/hive#16603). An optional step: shed with
+	// the other enrichment steps, while EnrichCIStatus keeps the gate and any
+	// recorded permission refusal visible.
+	if !budgetDecision.SkipOptional {
+		ghClient.SweepWorkflowApprovals(ctx, actionable.PRs.Items, cfg.Governor.CI)
+	}
 	// Held PRs need CI status too, or a red held PR can never be repaired:
 	// the hold label kept it out of PRs.Items, so nothing ever learned it was
 	// red and no agent was ever told to fix it (hivecommons/hive#7438). This
@@ -683,12 +694,12 @@ func runEvalCycle(
 	// another. Backed by a PVC ledger so it survives those restarts, and fails
 	// closed (keeps the last known claims) when the GitHub API is unavailable.
 	if !budgetDecision.SkipOptional {
-		applyDuplicatePRGuard(ctx, cfg, ghClient, actionable, logger)
+		applyDuplicatePRGuard(github.WithRESTCaller(ctx, "hive:duplicate_pr_guard"), cfg, ghClient, actionable, logger)
 	}
 	// Every cycle, cached ones included: heal issue stage records the
 	// claim ledger says an open PR covers but the store still holds below
 	// 040 (a claim release written over the cover between reconcile passes).
-	reconcileLedgerCoverRecords(ctx, cfg, ghClient, actionable, logger)
+	reconcileLedgerCoverRecords(github.WithRESTCaller(ctx, "hive:ledger_cover"), cfg, ghClient, actionable, logger)
 
 	// PR review queue (#9590): stamp each PR's rank, priority and reasons
 	// onto the snapshot so last-actionable.json carries them next to
@@ -723,13 +734,19 @@ func runEvalCycle(
 
 	escalatedPRs := map[string]bool{}
 	if !budgetDecision.SkipUnstick {
-		escalatedPRs = runEscalationSweep(ctx, cfg, governorForge(cfg, ghClient, logger), actionable, notifier, dashSrv, logger)
+		escalatedPRs = runEscalationSweep(github.WithRESTCaller(ctx, "hive:escalation_sweep"), cfg, governorForge(cfg, ghClient, logger), actionable, notifier, dashSrv, logger)
 		runDependencyBotConflictSweep(ctx, cfg, governorForge(cfg, ghClient, logger), ghClient, actionable, logger)
 	}
 	runWaitEscalationSweep(cfg, dashSrv, logger)
 
 	intentVerdicts := writeIntentVerdicts(ctx, cfg, ghClient, actionable, beadStores, logger)
-	refreshReviewVerdicts(cfg, logger)
+	reviewTargets := make([]review.PullRequest, 0, len(actionable.PRs.Items)+len(actionable.PRs.Held))
+	for _, items := range [][]github.PullRequest{actionable.PRs.Items, actionable.PRs.Held} {
+		for _, pr := range items {
+			reviewTargets = append(reviewTargets, review.PullRequest{Repo: fullRepoName(pr.Repo, cfg.Project.Org), Number: pr.Number})
+		}
+	}
+	refreshReviewVerdictsForPRs(cfg, reviewTargets, logger)
 	recordReviewOutcomes(ctx, cfg, ghClient, actionable, logger)
 	requiredCheckSet, _ := cfg.AutoMerge.RequiredCheckSetForRepo("")
 
@@ -744,7 +761,7 @@ func runEvalCycle(
 		}
 		return cfg.SelfAuthorizationHoldEnabledForRepoAtLevel(repo, level)
 	}
-	holdDriftPRs := enforceHoldGuard(ctx, cfg, ghClient, governorForge(cfg, ghClient, logger), actionable, logger, selfAuthorizationHoldEnabled)
+	holdDriftPRs := enforceHoldGuard(github.WithRESTCaller(ctx, "hive:hold_guard"), cfg, ghClient, governorForge(cfg, ghClient, logger), actionable, logger, selfAuthorizationHoldEnabled)
 
 	// The per-PR verdicts come back so the dashboard's PR pills can be
 	// painted from the sweep's own classification rather than a looser
@@ -771,7 +788,7 @@ func runEvalCycle(
 	// PR this hive opened back into the CLI session that authored it, while
 	// that session is still live. Anything it cannot resume stays on the
 	// fix-before-new path above, unchanged.
-	routePRFollowUps(ctx, cfg, ghClient, actionable, escalatedPRs, agentMgr, logger)
+	routePRFollowUps(github.WithRESTCaller(ctx, "hive:pr_follow_ups"), cfg, ghClient, actionable, escalatedPRs, agentMgr, logger)
 
 	// Stuck-PR reaper (backstop): DELIVER a targeted FIX-BEFORE-NEW kick for any
 	// hive-authored PR that is red on a required check AND stale (its red head
@@ -784,7 +801,36 @@ func runEvalCycle(
 	// re-engagement budget only for kicks that were accepted. Composes with the
 	// merge watcher (#2): both go through the same per-red-SHA cap, so the same
 	// PR is never double-dispatched within a red-SHA's budget.
-	reapStuckRedPRs(cfg, actionable, escalatedPRs, agentKicker{mgr: agentMgr},
+	//
+	// A head an agent triaged as transient infrastructure (hive-ci-transient
+	// markers) is re-run once here instead: the reaper and the merge watcher
+	// hold their fix kicks while that re-run is owed
+	// (projectbluefin/common#1647).
+	reapSkip := escalatedPRs
+	if ghClient != nil {
+		var audit func(string, int, string)
+		if dashSrv != nil {
+			audit = func(repo string, number int, detail string) {
+				dashSrv.AuditLogRecord("system", "transient-ci-rerun", detail, "", repo, number)
+			}
+		}
+		reran := rerunTransientTriagedPRs(ctx, cfg, ghClient, actionable, escalatedPRs, audit, logger)
+		reapSkip = reaperSkipAfterRerun(escalatedPRs, reran)
+		// A red PR whose failing checks are green on its base tip needs only
+		// the base merged in (projectbluefin/actions#544); the reaper does
+		// not also kick a fixer for a head the merge replaces.
+		if !budgetDecision.SkipUnstick {
+			var refreshAudit func(string, int, string)
+			if dashSrv != nil {
+				refreshAudit = func(repo string, number int, detail string) {
+					dashSrv.AuditLogRecord("system", "stale-red-base-refresh", detail, "", repo, number)
+				}
+			}
+			refreshed := refreshStaleRedBehindPRs(ctx, cfg, ghClient, actionable, refreshAudit, logger, time.Now())
+			reapSkip = reaperSkipAfterRerun(reapSkip, refreshed)
+		}
+	}
+	reapStuckRedPRs(cfg, actionable, reapSkip, agentKicker{mgr: agentMgr},
 		agentAvailability(cfg, agentMgr), logger)
 
 	// Release sentinel (hivecommons/hive#9585), opt-in and default OFF: when
@@ -830,8 +876,8 @@ func runEvalCycle(
 				"skipped", shaResult.Skipped,
 			)
 		}
-		runHardSuppressReconcile(ctx, cfg, ghClient, logger)
-		runParkRecheck(ctx, cfg, ghClient, logger)
+		runHardSuppressReconcile(github.WithRESTCaller(ctx, "hive:hard_suppress_reconcile"), cfg, ghClient, logger)
+		runParkRecheck(github.WithRESTCaller(ctx, "hive:park_recheck"), cfg, ghClient, logger)
 	}
 
 	// Refresh budget spend from lifetime token totals before Evaluate so
@@ -862,6 +908,12 @@ func runEvalCycle(
 	// and the fix. Computed from the spoke's own governor config, no hub
 	// round-trip; self-clears the moment a cadence is set or any kick lands.
 	applyNoCadenceAlert(gov, dashSrv)
+
+	// Contributor-first lanes (agents.<name>.contributor_first): tell the
+	// governor which roles a connected contributor relay is covering right
+	// now, so it withholds those agents' kicks and the hive's own budget is
+	// not spent on work a contributor is already doing.
+	gov.SetContributorCoverage(contributorRoleCoverage(dashSrv, time.Now()))
 
 	agentsDue := gov.EvaluateWithRepoDepths(
 		actionable.Issues.Count,
@@ -989,7 +1041,7 @@ func runEvalCycle(
 	// paused agent or exhausted budget. Fully guarded/cheap: with no `triggers:`
 	// configured, celEngineFor returns nil and celMatchedAgents does zero work.
 	if celEngine := celEngineFor(cfg, logger); celEngine != nil {
-		celAgents := celMatchedAgents(celEngine, actionable, cfg, gov, agentMgr.IsPaused, logger)
+		celAgents := celMatchedAgentsOnce(celEngine, actionable, cfg, gov, agentMgr.IsPaused, logger, &globalCELSeen)
 		if len(celAgents) > 0 {
 			before := len(agentsDue)
 			agentsDue = unionAgents(agentsDue, celAgents)
@@ -1011,6 +1063,24 @@ func runEvalCycle(
 	// policy, dashboard status, PR/review dispatch, escalation, and every path
 	// not explicitly enrolled.
 	kickActionable := applyConvergenceKickAdmission(cfg, dashSrv, actionable, notifier, logger)
+	if cfg.AutoMerge.NativeMergeQueue.Enabled {
+		go func() {
+			if err := dashSrv.ReconcileNativeQueues(ctx); err != nil {
+				logger.Warn("native queue observations incomplete", "error", err)
+			}
+		}()
+	}
+	if err := dashSrv.ReconcileIntegration(ctx); err != nil {
+		logger.Warn("integration observations incomplete", "error", err)
+	}
+	if cfg.IntegrationOrchestration.Execution.Effective().Mode != config.IntegrationOff {
+		go func() {
+			if err := dashSrv.ReconcileIntegrationExecution(ctx); err != nil {
+				logger.Warn("integration execution bounded reconciliation incomplete", "error", err)
+			}
+		}()
+	}
+	kickActionable = dashSrv.IntegrationKickAdmission(kickActionable)
 
 	sched.SetLastActionable(kickActionable)
 	// The filter compacts agentsDue in place, so snapshot it first to report
@@ -1052,6 +1122,7 @@ func runEvalCycle(
 		"agents_skipped", agentsSkipped,
 	)
 
+	reconcilePlannedFixQueue(gov, cfg.Project.Org, actionable, reviewPlan.FixKicks)
 	reviewKickByMessage := map[string]review.DispatchKick{}
 	for _, k := range append(reviewPlan.ReviewKicks, reviewPlan.FixKicks...) {
 		if !gov.AgentEligibleForCELKick(k.Agent) || agentMgr.IsPaused(k.Agent) {
@@ -1370,6 +1441,9 @@ func runEvalCycle(
 			// The App is the sole advisory-digest writer (#1927): a user-token
 			// failure must never drive the App banner, so every banner hook
 			// below is fed exclusively by the App's own error.
+			// digest_min_interval is read live like the other advisory knobs
+			// (#17435): a dashboard edit applies from the next cycle.
+			ghClient.SetAdvisoryDigestMinInterval(advCfg.EffectiveDigestMinInterval())
 			publishAdvisoryDigest(ctx, md, digest, advisoryPublishRoute{
 				target:         advisoryTarget,
 				linearIssue:    advisoryLinearIssue,
@@ -1512,6 +1586,7 @@ func runEvalCycle(
 	// previously unreachable without a tmux session and a live governor.
 	var deliveredReviewKicks []review.DispatchKick
 	var deliveredKicks []scheduler.KickMessage
+	fixQueue := reviewFixKickQueue{governor: gov, org: cfg.Project.Org, kicks: reviewKickByMessage}
 	if len(messages) > 0 {
 		// governor.kick wraps the whole dispatch pass; each delivered kick
 		// still gets its own agent.kick child via startKickSpan below.
@@ -1556,11 +1631,13 @@ func runEvalCycle(
 				}
 			},
 			onReviewDelivered: func(msg scheduler.KickMessage) {
+				fixQueue.Delivered(msg)
 				if k, ok := reviewKickByMessage[msg.Agent+"\x00"+msg.Message]; ok {
 					deliveredReviewKicks = append(deliveredReviewKicks, k)
 					persistReviewDispatchStateInProgress(reviewPlan, deliveredReviewKicks, logger)
 				}
 			},
+			onDeferred: fixQueue.Deferred,
 			onFailed: func(msg scheduler.KickMessage, err error) {
 				gov.RecordKickFailure(msg.Agent, err, time.Now())
 				if k, ok := reviewKickByMessage[reviewKickKey(msg)]; ok {

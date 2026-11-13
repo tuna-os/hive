@@ -37,11 +37,15 @@ const (
 	operatorActionCloseSuperseded = "close-superseded"
 	operatorActionWontFix         = "wontfix"
 	operatorActionCloseRead       = "close-read"
+	operatorActionCloseIssue      = "close-issue"
 	operatorActionLetHiveDecide   = "let-hive-decide"
 	operatorActionHold            = "hold"
 	operatorActionRelease         = "release"
 	operatorActionAcceptTriage    = "accept-triage"
 	operatorActionMarkNeedsHuman  = "mark-needs-human"
+	// operatorActionConfirmSentinel is the human-gate pill's "Confirm safe"
+	// on a sentinel alert: the confirmation comment and the label removal.
+	operatorActionConfirmSentinel = "confirm-sentinel"
 	// Merge-gate answers on a 090 Ready-for-human-merge PR
 	// (hivecommons/hive#15078): merged by the operator through the hive's
 	// App, or queued for the hive's merge sweep.
@@ -142,6 +146,11 @@ type OperatorAction struct {
 	// parsing Detail (hivecommons/hive#15126).
 	Verdict string `json:"verdict,omitempty"`
 	Rule    string `json:"rule,omitempty"`
+	// JobID is the let-hive-decide job this record is for (the `id` the
+	// endpoint answered with), so the job's status can still be read back
+	// from the ledger once the in-memory job is gone: evicted after
+	// delegatedDecisionJobTTL, or lost with the process that ran it.
+	JobID string `json:"job_id,omitempty"`
 }
 
 type operatorActionStore struct {
@@ -222,7 +231,7 @@ func (st *operatorActionStore) Settle(repo string, number int, action, outcome, 
 
 // SettleDecision is Settle with the delegate's structured verdict and
 // rule kept on the record.
-func (st *operatorActionStore) SettleDecision(repo string, number int, action, outcome, detail, verdict, rule string) (bool, error) {
+func (st *operatorActionStore) SettleDecision(repo string, number int, action, outcome, detail, verdict, rule string, appliedHead ...string) (bool, error) {
 	if st == nil {
 		return false, nil
 	}
@@ -236,10 +245,61 @@ func (st *operatorActionStore) SettleDecision(repo string, number int, action, o
 			list[i].Detail = detail
 			list[i].Verdict = verdict
 			list[i].Rule = rule
+			if len(appliedHead) > 0 && appliedHead[0] != "" {
+				list[i].HeadSHA = appliedHead[0]
+			}
 			return true, st.persist()
 		}
 	}
 	return false, nil
+}
+
+// operatorActionRestartInterrupted is one record InterruptPendingAfterRestart
+// settled: the item it was on, and the record as it was before.
+type operatorActionRestartInterrupted struct {
+	Repo   string
+	Number int
+	Record OperatorAction
+}
+
+// InterruptPendingAfterRestart settles, as failed with detail, every record
+// of action still pending when this process opened the ledger, and returns
+// what it changed. It must run before this process records anything: a
+// record still pending then was left by a process that ended before its job
+// did, and no job of this process will ever settle it.
+func (st *operatorActionStore) InterruptPendingAfterRestart(action, detail string) ([]operatorActionRestartInterrupted, error) {
+	if st == nil {
+		return nil, nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.load()
+	var out []operatorActionRestartInterrupted
+	for key, list := range st.items {
+		for i := range list {
+			if list[i].Action != action || list[i].Outcome != operatorActionOutcomePending {
+				continue
+			}
+			it := operatorActionRestartInterrupted{Record: list[i]}
+			if cut := strings.LastIndex(key, "#"); cut > 0 {
+				it.Repo = key[:cut]
+				it.Number, _ = strconv.Atoi(key[cut+1:])
+			}
+			list[i].Outcome = operatorActionOutcomeFailed
+			list[i].Detail = detail
+			out = append(out, it)
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	slices.SortFunc(out, func(a, b operatorActionRestartInterrupted) int {
+		if c := strings.Compare(a.Repo, b.Repo); c != 0 {
+			return c
+		}
+		return a.Number - b.Number
+	})
+	return out, st.persist()
 }
 
 // List returns a copy of the actions recorded for repo#number, oldest first.
@@ -279,6 +339,10 @@ func (s *Server) operatorActions() *operatorActionStore {
 		if s.operatorActionStore == nil {
 			s.operatorActionStore = newOperatorActionStore(operatorActionsPath)
 		}
+		// Before this process records anything: a let-hive-decide still
+		// pending was started by a previous process (a restart or upgrade
+		// ended it mid-job) and would otherwise read "pending" forever.
+		s.settleDelegatedInterruptedByRestart(s.operatorActionStore)
 	})
 	return s.operatorActionStore
 }
@@ -338,6 +402,8 @@ func operatorActionFromBody(endpoint string, body []byte) (operatorActionRequest
 			out.Action = operatorActionWontFix
 		case repoItemDecisionCloseRead:
 			out.Action = operatorActionCloseRead
+		case repoItemDecisionCloseIssue:
+			out.Action = operatorActionCloseIssue
 		case repoItemDecisionMergeNow:
 			out.Action = operatorActionMergeNow
 		case repoItemDecisionQueueMerge:
@@ -375,10 +441,25 @@ func operatorActionFromBody(endpoint string, body []byte) (operatorActionRequest
 	case "send-to-human":
 		out.Action = operatorActionMarkNeedsHuman
 		out.Note = truncateOperatorNote(raw.Reason)
+	case "sentinel-confirm":
+		out.Action = operatorActionConfirmSentinel
+		out.Note = truncateOperatorNote(raw.Comment)
 	default:
 		return out, false
 	}
 	return out, true
+}
+
+// operatorActionJobID reads the job id out of a decide-delegated answer
+// (the job snapshot); "" when there is none.
+func operatorActionJobID(body []byte) string {
+	var resp struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(body, &resp) != nil {
+		return ""
+	}
+	return strings.TrimSpace(resp.ID)
 }
 
 func truncateOperatorNote(s string) string {
@@ -540,6 +621,11 @@ func (s *Server) recordOperatorAction(h http.HandlerFunc) http.HandlerFunc {
 			Action: req.Action, Actor: requestUser(r), At: time.Now().UTC(),
 			Note: req.Note, Target: req.Target, Outcome: outcome, Detail: detail, HeadSHA: head,
 		}
+		if req.Action == operatorActionLetHiveDecide && (cw.status == http.StatusAccepted || cw.status == http.StatusOK) {
+			// Only a request that started the job names it: a 409 answers
+			// with the job some other request is running.
+			a.JobID = operatorActionJobID(cw.body.Bytes())
+		}
 		if rec, ok := s.stageStoreOrShared().Get(stagelabels.Key(repoFull, number)); ok {
 			a.Stage = rec.Stage.Number()
 		}
@@ -561,7 +647,7 @@ func (s *Server) settleOperatorAction(repoFull string, number int, job *delegate
 	if job.Decision != nil {
 		verdict, rule = string(job.Decision.Verdict), job.Decision.Rule
 	}
-	if _, err := s.operatorActions().SettleDecision(repoFull, number, operatorActionLetHiveDecide, outcome, detail, verdict, rule); err != nil && s.logger != nil {
+	if _, err := s.operatorActions().SettleDecision(repoFull, number, operatorActionLetHiveDecide, outcome, detail, verdict, rule, job.ApprovalHeadSHA); err != nil && s.logger != nil {
 		s.logger.Warn("operator action ledger write failed", "path", operatorActionsPath, "error", err)
 	}
 	s.invalidateStageTrackerCache()
@@ -908,7 +994,7 @@ func operatorActionClosedGrace() time.Duration {
 
 // operatorClosedActions are the row actions whose applied outcome is a
 // closed issue or PR.
-var operatorClosedActions = []string{operatorActionCloseSuperseded, operatorActionWontFix, operatorActionCloseRead}
+var operatorClosedActions = []string{operatorActionCloseSuperseded, operatorActionWontFix, operatorActionCloseRead, operatorActionCloseIssue}
 
 // operatorActionClosedItem reports whether the item's newest recorded
 // action closed it from the dashboard within grace of now: GitHub's list

@@ -58,6 +58,7 @@ const (
 	ContributorLaneReasonNoReviewer        = "contributor-lane:no-reviewer"
 	ContributorLaneReasonNoVerdict         = "contributor-lane:no-verdict"
 	ContributorLaneReasonReporterTrustHold = "contributor-lane:reporter-trust-hold"
+	ContributorLaneReasonReviewOff         = "contributor-lane:review-off"
 	ContributorLaneReasonSentinelBlocked   = "contributor-lane:sentinel-blocked"
 	ContributorLaneReasonSoaking           = "contributor-lane:soaking"
 	ContributorLaneReasonTestsRemoved      = "contributor-lane:tests-removed"
@@ -69,9 +70,13 @@ const (
 	StageLaneSelf                          = "self-authored"
 	StageLaneTrusted                       = "trusted-author"
 	StageReasonBaseBranchRed               = "base-branch-red:"
-	StageReasonForkGuard                   = "fork-guard:"
-	StageReasonOptionalCheckFailing        = "optional-check-failing:"
-	StageReasonSharedCIIncident            = "shared-ci-incident:"
+	// StageReasonBaseRefreshMergeGuard: the lane did not evaluate the PR
+	// this pass because a merge to its destination was in flight
+	// (hivecommons/hive#16520); it says nothing about the stage.
+	StageReasonBaseRefreshMergeGuard = "base-refresh:merge-guard"
+	StageReasonForkGuard             = "fork-guard:"
+	StageReasonOptionalCheckFailing  = "optional-check-failing:"
+	StageReasonSharedCIIncident      = "shared-ci-incident:"
 	// StageReasonUnauthorizedPrefix: the lane's next step needs an API
 	// call the hive's GitHub App is not permitted to make (403 "Resource
 	// not accessible by integration"); the rest names the step
@@ -88,6 +93,11 @@ const (
 	TrustedAuthorReasonAppAuthored    = "trusted-author:app-authored"
 	TrustedBotLaneSkipReason          = "trusted-bot-lane"
 	WorkflowApprovalRequiredPrefix    = "workflow-approval-required:"
+	// RequiredCheckNeverReportedPrefix: auto_merge.required_checks names a
+	// check that has never reported on this repo, so the trusted-bot lane
+	// cannot gate on it and no other check vouches for the head. A person
+	// (or a per-repo required_checks override) resolves it.
+	RequiredCheckNeverReportedPrefix = "required-check-never-reported:"
 )
 
 // Closing-link reasons (hivecommons/hive#15025): a closing keyword the

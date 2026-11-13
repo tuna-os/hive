@@ -196,17 +196,23 @@ process cannot forge. Only `api.github.com` is inspected; other hosts are
 tunnelled without inspection. See
 [net-admin-requirement.md](net-admin-requirement.md).
 
-**Plain-HTTP forwards.** The redirect covers port 443 only, so plain HTTP
-reaches the proxy through its explicit proxy port. Those forwards are
-identified like any other request and dialled only when the resolved address
-is globally routable: loopback services beside the proxy, the link-local
-metadata endpoint, RFC 1918/CGNAT cluster addresses and multicast are refused
-with `403` and counted as violations (loopback excepted — agents are handed
-`NO_PROXY` for it, so it is logged as the client misconfiguration it is). The
-check runs at dial time on the resolved address, so a hostname pointed inward
-is refused on the same evidence as a literal IP. Set
-`HIVE_PROXY_ALLOW_PRIVATE_FORWARD=true` only where a private-network plain-HTTP
-destination is intended.
+**Plain-HTTP forwards and uninspected tunnels.** The redirect covers port 443
+only, so plain HTTP reaches the proxy through its explicit proxy port. Those
+forwards are identified like any other request and dialled only when the
+resolved address is globally routable: loopback services beside the proxy, the
+link-local metadata endpoint, RFC 1918/CGNAT cluster addresses and multicast
+are refused with `403` and counted as violations (loopback excepted — agents
+are handed `NO_PROXY` for it, so it is logged as the client misconfiguration it
+is). The same policy applies to the tunnels the proxy does not inspect: a
+CONNECT to a host other than the inspected API and the transparent-TLS
+passthrough for such a host are dialled through the same guarded dialer, so
+`CONNECT 169.254.169.254:80` or an SNI naming a cluster address is refused on
+the same terms rather than tunnelled from the proxy's own uid. The check runs
+at dial time on the resolved address, so a hostname pointed inward is refused
+on the same evidence as a literal IP. Set
+`HIVE_PROXY_ALLOW_PRIVATE_FORWARD=true` only where a private-network
+destination is intended; it lifts the guard for all three legs at once, and the
+proxy warns at boot when it is set.
 
 **Hub-to-spoke channel.** Heartbeats carry a per-hive bearer key derived from
 the hub master secret and are compared in constant time. The payload is
@@ -267,8 +273,13 @@ do not.
 * **PR commands (085/070).** Bare `/hive approve` is acknowledged only.
   On an eligible Hive-authored PR, `/hive decision <instruction>` routes
   the full text to the author/fixer. `/hive decision approve <rationale>`
-  records approval for the current head and can release `requires_human`.
-  This requires repo write access or higher **and** configured merger trust.
+  records approval for the current head and can release `requires_human`:
+  on any PR at 085/070, on a workflow-path PR whose fence it releases, and
+  on any other contributor-lane PR whose verdict asks for a person, when a
+  trusted merger posts it after the head (see the review-verdict gate in
+  [hive-merge.md](hive-merge.md#contributor-lane-auto-merge)). An edited comment
+  never counts. This requires repo write access or higher **and**
+  configured merger trust.
   Other authors use GitHub reviews/manual merging. Commands do not waive
   CI, holds, author admission or path fences. See
   [the exact gate contract](running-at-level-6.md#does-the-hive-reviewer-stop-a-merge).
@@ -376,9 +387,10 @@ until code-owner review is required in branch protection.
 * **PR decision parking is 085.** A trusted merger's GitHub **Approve**
   review must name the current head to clear the enforcing sweep gate.
   It can override any swarm outcome, including a request for changes;
-  the audit records who overrode what. On eligible Hive-authored PRs,
-  `/hive decision approve` can answer `requires_human`, while other decision
-  text sends work to the fixer. Bare `/hive approve` never releases a PR.
+  the audit records who overrode what. A trusted merger's
+  `/hive decision approve` can answer `requires_human` on any PR, while
+  other decision text sends work to the fixer on eligible Hive-authored
+  PRs. Bare `/hive approve` never releases a PR.
   The detailed [command boundaries](#7-contributor-trust) above still apply.
 * **Owner-only security settings.** Changes to `ioscan`, intent enforcement,
   review requirements and the agent sandbox require the `owner` role.

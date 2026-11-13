@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hivecommons/hive/pkg/fleetreport"
+	"github.com/hivecommons/hive/pkg/fleetreport/slogfeed"
 	"github.com/hivecommons/hive/pkg/forgestate"
 	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/scheduler"
@@ -75,17 +78,22 @@ func TestFreshenKickMessages_WithholdsStaleAndClosed(t *testing.T) {
 // A refusal from the API budget or rate-limit caution window is the designed
 // back-off, not a fault: it is withheld but logged below WARN so the fleet
 // self-report feed does not file it as an unclassified repeated error
-// (#15465). Any other refusal still logs at WARN.
+// (#15465). A re-read that finds the item closed is likewise the guard
+// working as designed and repeats every cycle until the cache catches up,
+// so it logs below WARN with reason=closed (#17518). Any other refusal still
+// logs at WARN.
 func TestFreshenKickMessages_DeferredReadLogsBelowWarn(t *testing.T) {
 	cases := []struct {
-		name     string
-		err      error
-		wantWarn bool
+		name       string
+		err        error
+		wantWarn   bool
+		wantReason string
 	}{
-		{"budget critical", github.ErrAPIBudgetCritical, false},
-		{"caution window", github.ErrRateLimitCaution, false},
-		{"stale snapshot", github.ErrSnapshotStaleForDecision, true},
-		{"item closed", github.ErrItemNotOpen, true},
+		{"budget critical", github.ErrAPIBudgetCritical, false, "github read deferred"},
+		{"caution window", github.ErrRateLimitCaution, false, "github read deferred"},
+		{"stale snapshot", github.ErrSnapshotStaleForDecision, true, "stale snapshot"},
+		{"item closed", github.ErrItemNotOpen, false, "closed"},
+		{"read error", errors.New("private endpoint failed"), true, "re-read"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -105,7 +113,45 @@ func TestFreshenKickMessages_DeferredReadLogsBelowWarn(t *testing.T) {
 			if got := strings.Contains(log, "level=WARN"); got != tc.wantWarn {
 				t.Fatalf("WARN logged = %v, want %v: %q", got, tc.wantWarn, log)
 			}
+			if want := "reason=" + strconv.Quote(tc.wantReason); !strings.Contains(log, want) && !strings.Contains(log, "reason="+tc.wantReason) {
+				t.Fatalf("reason not logged, want %s: %q", want, log)
+			}
 		})
+	}
+}
+
+func TestFreshenKickMessages_FleetReportIncludesFailureCategories(t *testing.T) {
+	var diagnostics string
+	logger := slog.New(slogfeed.NewWithObserver(slog.NewTextHandler(io.Discard, nil),
+		func(class, _, _, detail string) {
+			if class == fleetreport.ClassKickFreshnessWithheld {
+				diagnostics = detail
+			}
+		}))
+	guard := github.IrreversibleGuard(func(_ context.Context, _ string, number int, _ bool) error {
+		switch number {
+		case 1:
+			return fmt.Errorf("private-repo#1: %w", github.ErrSnapshotStaleForDecision)
+		case 2:
+			return fmt.Errorf("private-repo#2: %w", github.ErrItemNotOpen)
+		case 3:
+			return github.ErrAPIBudgetCritical
+		default:
+			return errors.New("private endpoint failed")
+		}
+	})
+	out := freshenKickMessages(context.Background(), guard, nil,
+		freshKickMsgs([]string{"acme/private#1", "acme/private#2", "acme/private#3", "acme/private#4"}), logger)
+	if len(out) != 0 {
+		t.Fatalf("message not withheld: %+v", out)
+	}
+	for _, field := range []string{"stale=1", "closed=1", "deferred=1", "read_error=1"} {
+		if !strings.Contains(diagnostics, field) {
+			t.Errorf("fleet diagnostics missing %q: %q", field, diagnostics)
+		}
+	}
+	if strings.Contains(diagnostics, "private") {
+		t.Fatalf("fleet diagnostics exposed a ref or error: %q", diagnostics)
 	}
 }
 

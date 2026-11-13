@@ -19,6 +19,7 @@ func stageTrackerRowActionsPreamble(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_GROUP_KEY_PREFIX"),
 		jsConstLine(t, html, "STAGE_TRACKER_DECISION_STAGES"),
 		jsConstLine(t, html, "STAGE_TRACKER_SEL_ACTIONS"),
+		jsConstLine(t, html, "STAGE_TRACKER_ACTION_CONSEQUENCES"),
 		jsConstLine(t, html, "STAGE_TRACKER_MENU_MARGIN"),
 		jsConstLine(t, html, "STAGE_TRACKER_MENU_FAIL_LINES"),
 		jsConstBlock(t, html, "STAGE_TRACKER_DECISION_GLOSSARY"),
@@ -38,6 +39,7 @@ func stageTrackerRowActionsPreamble(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_DELEGATE_ALL_MIN"),
 		jsConstLine(t, html, "STAGE_TRACKER_MERGE_ACTIONS"),
 		jsConstLine(t, html, "STAGE_TRACKER_GENERIC_ACTIONS"),
+		jsConstLine(t, html, "_stageTrackerCloseIssueBusy"),
 		jsConstLine(t, html, "STAGE_TRACKER_TERMINAL"),
 		"var _stageTrackerSel = new Set(); var _stageTrackerSelAnchor = ''; var _stageTrackerMenu = null; var _stageTracker = null; var _statusSeqFloor = 0; var _stageTrackerEtag = 'e'; var _stageTrackerSig = 's';",
 		jsFunc(t, html, "esc"),
@@ -61,6 +63,7 @@ func stageTrackerRowActionsPreamble(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerParkedNestedPRs"),
 		jsFunc(t, html, "stageTrackerDecisionTarget"),
 		jsFunc(t, html, "stageTrackerDelegateTargets"),
+		jsFunc(t, html, "stageTrackerServerDelegate"),
 		jsFunc(t, html, "stageTrackerDecideOptions"),
 		jsFunc(t, html, "stageTrackerSupersederOptions"),
 		jsFunc(t, html, "stageTrackerSupersederDefault"),
@@ -96,8 +99,13 @@ func stageTrackerRowActionsPreamble(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerLeadAction"),
 		jsFunc(t, html, "stageTrackerMaintainerMoved"),
 		jsFunc(t, html, "stageTrackerDevWarn"),
+		jsFunc(t, html, "stageTrackerPRListedOwnRow"),
+		jsFunc(t, html, "stageTrackerPRDrawnUnderOther"),
 		jsFunc(t, html, "stageTrackerLeadActionOnRow"),
+		jsFunc(t, html, "stageTrackerLeadCompanion"),
+		jsFunc(t, html, "stageTrackerLeadActionsOnRow"),
 		jsFunc(t, html, "stageTrackerLeadActionHtml"),
+		jsFunc(t, html, "stageTrackerLeadPillHtml"),
 		jsFunc(t, html, "stageTrackerMenuTextHtml"),
 		jsFunc(t, html, "stageTrackerFlatActions"),
 		jsFunc(t, html, "stageTrackerSelectionActions"),
@@ -116,6 +124,8 @@ func stageTrackerRowActionsPreamble(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerDelegatedDone"),
 		jsFunc(t, html, "stageTrackerAwaitDelegated"),
 		jsFunc(t, html, "stageTrackerPatchItem"),
+		jsConstLine(t, html, "STAGE_TRACKER_PLAN_GATEWAY_ERROR"),
+		jsFunc(t, html, "stageTrackerActionError"),
 		jsFunc(t, html, "stageTrackerRunActions"),
 		// runRowAction: result toasts + acting rows (owner request).
 		jsConstLine(t, html, "STAGE_TRACKER_ACTION_NOOP"),
@@ -160,6 +170,7 @@ func stageTrackerRowActionsPreamble(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerClearPending"),
 		jsFunc(t, html, "stageTrackerPendingLive"),
 		jsFunc(t, html, "stageTrackerPendingExpire"),
+		jsFunc(t, html, "stageTrackerLeadBusySync"),
 		jsFunc(t, html, "stageTrackerPendingSync"),
 		// Progress + failure surfacing for every mutating action (hivecommons/hive#15436).
 		jsConstBlock(t, html, "STAGE_TRACKER_TERMINAL_CAPTIONS"),
@@ -172,7 +183,11 @@ func stageTrackerRowActionsPreamble(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerAdvisoryOf"),
 		jsFunc(t, html, "stageTrackerAdvisoryCloseHint"),
 		jsFunc(t, html, "stageTrackerAdvisoryCloseMessage"),
+		jsFunc(t, html, "stageTrackerDeferralOf"),
+		jsFunc(t, html, "stageTrackerDeferralCloseHint"),
+		jsFunc(t, html, "stageTrackerDeferralCloseMessage"),
 		jsFunc(t, html, "stageTrackerNothingToActOn"),
+		jsFunc(t, html, "stageTrackerCopyLink"),
 		jsFunc(t, html, "runRowAction"),
 		jsFunc(t, html, "makeToastSticky"),
 		stageTrackerDomStubJS,
@@ -187,10 +202,14 @@ function hamStubEl(tag) {
   const el = { tagName: tag, className: '', textContent: '', children: [], attrs: {}, parentNode: null, _listeners: {},
     classList: { add(c) { if (!el.className.split(' ').includes(c)) el.className = (el.className + ' ' + c).trim(); }, remove(c) { el.className = el.className.split(' ').filter(x => x && x !== c).join(' '); }, contains(c) { return el.className.split(' ').includes(c); } },
     appendChild(c) { c.parentNode = el; el.children.push(c); return c; }, prepend(c) { c.parentNode = el; el.children.unshift(c); },
-    setAttribute(k, v) { el.attrs[k] = String(v); }, getAttribute(k) { return k in el.attrs ? el.attrs[k] : null; },
+    setAttribute(k, v) { el.attrs[k] = String(v); }, getAttribute(k) { return k in el.attrs ? el.attrs[k] : null; }, removeAttribute(k) { delete el.attrs[k]; },
     addEventListener(n, fn) { el._listeners[n] = fn; }, remove() { if (el.parentNode) el.parentNode.children = el.parentNode.children.filter(c => c !== el); el.parentNode = null; },
     get lastChild() { return el.children[el.children.length - 1] || null; },
-    querySelector(sel) { const m = sel.match(/^:scope > \.([\w-]+)$/); if (!m) return null; return el.children.find(c => c.classList.contains(m[1])) || null; },
+    querySelector(sel) {
+      // ":scope > .child .descendant[attr]" — the lead button under the row head.
+      const d = sel.match(/^:scope > \.([\w-]+) \.([\w-]+)(?:\[([\w-]+)\])?$/);
+      if (d) { const head = el.children.find(c => c.classList && c.classList.contains(d[1])); if (!head) return null; const walk = n => { for (const c of (n.children || [])) { if (c.classList && c.classList.contains(d[2]) && (!d[3] || c.attrs[d[3]] != null)) return c; const r = walk(c); if (r) return r; } return null; }; return walk(head); }
+      const m = sel.match(/^:scope > \.([\w-]+)$/); if (!m) return null; return el.children.find(c => c.classList && c.classList.contains(m[1])) || null; },
     querySelectorAll(sel) { const out = []; const walk = n => { for (const c of (n.children || [])) { if (!c.attrs) continue; if ((sel.includes('[data-ham-key]') && c.attrs['data-ham-key'] != null) || (sel.includes('[data-ham-sub-key]') && c.attrs['data-ham-sub-key'] != null)) out.push(c); walk(c); } }; walk(el); return out; },
   };
   return el;
@@ -281,12 +300,12 @@ const ids = as => as.map(a => a.id);
 const ctx = { user: true, canHold: true, canHuman: true };
 const parked = { repo: 'o/r', kind: 'issue', number: 1, title: 'Parked', url: 'https://github.com/o/r/issues/1', stage: 45, modifiers: ['needs-decision'] };
 let as = stageTrackerRowActions(parked, ctx);
-assert.deepStrictEqual(ids(as), ['decide', 'hold', 'retry', 'needs-human', 'open', 'copy']);
+assert.deepStrictEqual(ids(as), ['decide', 'hold', 'retry', 'needs-human', 'decide:close-issue', 'open', 'copy']);
 assert.deepStrictEqual(ids(as[0].submenu), ['decide:delegate', 'decide:approve', 'decide:direction', 'decide:close-superseded', 'decide:close-wontfix'], 'an issue gets let-hive-decide first, then approve / direction / close');
 assert.ok(as.every(a => a.enabled), 'everything is enabled for a writer');
 
 const plain = { repo: 'o/r', kind: 'issue', number: 2, url: 'u', stage: 20, modifiers: [] };
-assert.deepStrictEqual(ids(stageTrackerRowActions(plain, ctx)), ['hold', 'retry', 'needs-human', 'open', 'copy'], 'no Decide off 045/085');
+assert.deepStrictEqual(ids(stageTrackerRowActions(plain, ctx)), ['hold', 'retry', 'needs-human', 'decide:close-issue', 'open', 'copy'], 'no Decide off 045/085');
 
 const held = { repo: 'o/r', kind: 'pr', number: 3, url: 'u', stage: 60, modifiers: ['hold', 'needs-human'] };
 as = stageTrackerRowActions(held, ctx);
@@ -364,7 +383,7 @@ assert.strictEqual(by.open.enabled, true);
 const menu = stageTrackerMenuHtml(as, 'o/r#1 · Parked');
 assert.ok(menu.startsWith('<div class="ham-menu ham-menu-hinted" role="menu"'), 'the rescan hint makes it a hinted menu: ' + menu.slice(0, 60));
 assert.ok(menu.includes('<div class="ham-menu-head">o/r#1 · Parked</div>'));
-assert.strictEqual((menu.match(/role="menuitem"/g) || []).length, 11, 'six top-level items + five decide options');
+assert.strictEqual((menu.match(/role="menuitem"/g) || []).length, 12, 'seven top-level items including Close issue + five decide options');
 assert.ok(menu.includes('data-ham-act="hold" tabindex="-1" aria-disabled="true" title="' + STAGE_TRACKER_WHY_WRITE + '"'), 'disabled items carry the reason');
 assert.ok(menu.includes('aria-haspopup="menu" aria-expanded="false"'), 'Decide is a collapsed submenu');
 assert.ok(menu.includes('<div class="ham-submenu" role="menu" aria-label="Decide…">'));
@@ -561,6 +580,40 @@ let refreshed = 0; function stageTrackerAfterActions() { refreshed++; }
 `)
 }
 
+// TestStageTrackerRowActionErrorNamesTheGateway: a failed row action reports
+// the hive's own error when the hive answered (the 424 the hold toggle
+// returns for a GitHub failure, hivecommons/hive#17037) and names the
+// gateway — status included — when a 502–504 carries the hosted Ingress's
+// placeholder body or no JSON at all, instead of the bare "hive unavailable"
+// that read as an outage while the hive was up.
+func TestStageTrackerRowActionErrorNamesTheGateway(t *testing.T) {
+	html := indexHTML(t)
+	runStageTrackerRowActionsScript(t, stageTrackerRowActionsPreamble(t, html)+`
+assert.strictEqual(stageTrackerActionError(424, { ok: false, error: 'GitHub add hold label failed: 422 Validation Failed' }), 'GitHub add hold label failed: 422 Validation Failed', 'the hive answered: its reason verbatim');
+assert.strictEqual(stageTrackerActionError(403, { error: 'write permission required' }), 'write permission required');
+assert.strictEqual(stageTrackerActionError(500, {}), 'HTTP 500', 'no body: the status');
+const gw = stageTrackerActionError(502, { ok: false, error: 'hive unavailable' });
+assert.ok(gw.startsWith('HTTP 502 from the gateway'), gw);
+assert.ok(!gw.includes('hive unavailable'), 'the placeholder is not repeated as if the hive said it');
+assert.ok(gw.includes('retry'), gw);
+assert.ok(stageTrackerActionError(503, {}).startsWith('HTTP 503 from the gateway'), 'a 503 with no JSON body is the gateway too');
+assert.strictEqual(stageTrackerActionError(502, { error: 'spoke said so' }), 'spoke said so', 'a 502 with a real body passes through');
+
+const i1 = { repo: 'o/r', kind: 'issue', number: 17004, url: 'u1' };
+const progress = [];
+global.fetch = async () => ({ ok: false, status: 502, json: async () => ({ ok: false, error: 'hive unavailable' }) });
+global.showToast = () => null; global.dismissToast = () => {};
+function stageTrackerProgressToast(label, n) { return { update() {}, done(msg, type) { progress.push('done:' + type + ':' + msg); } }; }
+function stageTrackerAfterActions() {}
+(async () => {
+  const res = await stageTrackerRunActions([i1], 'hold', {});
+  assert.strictEqual(res[0].ok, false);
+  assert.ok(res[0].error.startsWith('HTTP 502 from the gateway'), res[0].error);
+  assert.ok(progress[0].startsWith('done:error:Hold: 0/1 done. Failed: o/r#17004 — HTTP 502 from the gateway'), progress[0]);
+})().catch(e => { console.error(e); process.exit(1); });
+`)
+}
+
 // TestStageTrackerLetHiveDecide: "Let hive decide" is the first Decide…
 // entry on rows and in the selection bar, posts to the delegated-decision
 // endpoint with the row's park words, polls the job until it ends, reports
@@ -686,7 +739,7 @@ assert.strictEqual(stageTrackerActionRequest(a, 'decide:approve', {}).url, '/api
 // The issue row no longer picks one: no single Decide, an explicit all-PRs item.
 assert.strictEqual(stageTrackerDecisionTarget(issue), null, 'two parked PRs is ambiguous');
 as = stageTrackerRowActions(issue, ctx);
-assert.deepStrictEqual(ids(as), ['decide:delegate-all', 'hold', 'retry', 'needs-human', 'open', 'copy']);
+assert.deepStrictEqual(ids(as), ['decide:delegate-all', 'hold', 'retry', 'needs-human', 'decide:close-issue', 'open', 'copy']);
 assert.strictEqual(as[0].label, 'Let hive decide — all 2 PRs'); assert.strictEqual(as[0].hint, 'per PR'); assert.deepStrictEqual(as[0].prs, [15017, 15020]);
 assert.strictEqual(stageTrackerRowActions(issue, { user: false, canHold: false })[0].enabled, false);
 const req = stageTrackerActionRequest(issue, 'decide:delegate-all');
@@ -839,6 +892,8 @@ func stageTrackerConfirmOptOutJS(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_SENTINEL_TIP"),
 		jsConstLine(t, html, "STAGE_TRACKER_SENTINEL_TIP_FALLBACK"),
 		jsFunc(t, html, "stageTrackerSentinelTip"),
+		jsFunc(t, html, "stageTrackerSentinelPathLines"),
+		jsFunc(t, html, "stageTrackerSentinelTipWithPaths"),
 		jsFunc(t, html, "stageTrackerSentinelPreface"),
 		jsFunc(t, html, "stageTrackerConfirmSkipped"),
 		jsFunc(t, html, "stageTrackerSetConfirmSkip"),
@@ -868,14 +923,47 @@ func stageTrackerConfirmOptOutJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerDelegatePlanMergeLabel"),
 		jsFunc(t, html, "stageTrackerDelegatePlanMergeable"),
 		jsFunc(t, html, "stageTrackerDelegatePlanMergeReason"),
+		jsConstLine(t, html, "STAGE_TRACKER_PLAN_PREFETCH_MS"),
+		jsConstLine(t, html, "_stageTrackerPlanPrefetch"),
+		jsFunc(t, html, "stageTrackerPlanRequestKey"),
+		jsFunc(t, html, "stageTrackerDelegatePlanErrorText"),
+		jsFunc(t, html, "stageTrackerPostDelegatePlan"),
+		jsFunc(t, html, "stageTrackerDelegatePlanFailure"),
+		jsFunc(t, html, "stageTrackerPrefetchDelegatePlan"),
 		jsFunc(t, html, "stageTrackerFetchDelegatePlan"),
+		jsConstLine(t, html, "STAGE_TRACKER_PLAN_SKELETON_LINES"),
+		jsConstLine(t, html, "STAGE_TRACKER_PLAN_RETRY"),
+		jsConstLine(t, html, "STAGE_TRACKER_PLAN_BUTTONS_OPEN"),
+		jsFunc(t, html, "stageTrackerDelegatePlanSkeletonContent"),
+		jsFunc(t, html, "stageTrackerDelegatePlanSkeletonHtml"),
+		jsConstLine(t, html, "STAGE_TRACKER_PLAN_NO_PREVIEW_NO_DECISION"),
+		jsFunc(t, html, "stageTrackerDelegatePlanHiveLabel"),
+		jsFunc(t, html, "stageTrackerDelegatePlanFailureLines"),
+		jsFunc(t, html, "stageTrackerDelegatePlanRetryable"),
+		jsFunc(t, html, "stageTrackerDelegatePlanErrorContent"),
+		jsFunc(t, html, "stageTrackerDelegatePlanSubject"),
+		jsConstLine(t, html, "_stageTrackerDelegatePreviewing"),
 		jsFunc(t, html, "stageTrackerDelegatePreview"),
 		jsFunc(t, html, "stageTrackerActionPayload"),
 		jsFunc(t, html, "stageTrackerDirectionCarrier"),
-		// The preview dialog is recorded like the confirms; its answer is
-		// the "Let hive do that" button unless a test sets planAnswer.
-		`let planAnswer = null;
-function stageTrackerDelegatePlanDialog(plans, sentinel) { const view = stageTrackerDelegatePlanView(plans, sentinel); const html = stageTrackerDelegatePlanHtml(view); dialogs.push({ kind: 'plan', cfg: { title: view.title, message: stageTrackerDelegatePlanVisibleText(html), html, view, plans } }); return Promise.resolve(planAnswer === null ? { chosen: 'Let hive do that · previewed ' + plans.map(p => p.would || '?').join('/') } : planAnswer); }`,
+		// The preview dialog is recorded like the confirms: it opens as the
+		// skeleton (planGate, when a test sets it, holds the plan back), then
+		// shows the plan or the inline error; its answer is the "Let hive do
+		// that" button unless a test sets planAnswer.
+		`let planAnswer = null; let planGate = null;
+function stageTrackerDelegatePlanDialog(load, sentinel, opts) {
+  const skeleton = { kind: 'plan-skeleton', cfg: { html: stageTrackerDelegatePlanSkeletonHtml((opts && opts.subject) || '', sentinel, opts && opts.caption), opts } };
+  dialogs.push(skeleton);
+  return Promise.resolve(planGate).then(() => load()).then(plans => {
+    if (opts && typeof opts.onSettled === 'function') opts.onSettled();
+    dialogs.splice(dialogs.indexOf(skeleton), 1);
+    const failed = plans.filter(p => p.error);
+    if (failed.length) { dialogs.push({ kind: 'plan-error', cfg: { html: stageTrackerDelegatePlanErrorContent((opts && opts.subject) || '', failed), failed } }); return null; }
+    const view = stageTrackerDelegatePlanView(plans, sentinel); const html = stageTrackerDelegatePlanHtml(view);
+    dialogs.push({ kind: 'plan', cfg: { title: view.title, message: stageTrackerDelegatePlanVisibleText(html), html, view, plans } });
+    return planAnswer === null ? { chosen: 'Let hive do that · previewed ' + plans.map(p => p.would || '?').join('/') } : planAnswer;
+  });
+}`,
 		`const store = {}; global.localStorage = { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }, removeItem: k => { delete store[k]; } };
 global.window = { _hiveUser: 'clubanderson' };
 const dialogs = []; let dialogAnswer = true;
@@ -995,7 +1083,7 @@ const flagged = { repo: 'hivecommons/dibs', kind: 'pr', number: 510, url: 'u510'
 const target = { repo: 'hivecommons/dibs', kind: 'pr', number: 510, url: 'u510' };
 const posted = ['\u0060/lgtm\u0060 posted', '\u0060/approve\u0060 posted', '\u0060sentinel-alert\u0060 label removed'];
 // Released: the alert the row carried is gone, so no ⚠ paragraph.
-const cleared = { action: 'approved', target, outcome: 'Approved #510 as @clubanderson · sentinel alert cleared by your review.', next: "Hive's merge sweep merges it on its next pass once CI is green and the head has soaked (≈30 min).", posted, sentinel_cleared: true };
+const cleared = { action: 'approved', target, outcome: 'Approved #510 as @clubanderson · sentinel alert cleared by your review.', next: "Hive merges it on its next merge pass once CI is green and the head has soaked (≈30 min).", posted, sentinel_cleared: true };
 let text = stageTrackerResultText(cleared, flagged, { id: 'decide:approve', rowRef: 'hivecommons/dibs#510' });
 assert.strictEqual(text.head, 'Approve on hivecommons/dibs#510: approved');
 assert.strictEqual(text.outcome, cleared.outcome);
@@ -1008,7 +1096,7 @@ let classes = toast.el.children.map(c => c.className).filter(c => c !== 'toast-c
 assert.deepStrictEqual(classes, ['ham-result-head', 'ham-result-outcome', 'ham-result-next', 'ham-result-posted', 'ham-result-link'], classes.join(','));
 assert.ok(classes.indexOf('ham-result-next') < classes.indexOf('ham-result-posted'), 'the posted list is the muted trailer, under Next');
 // Still open: the ⚠ paragraph stays and Next says what the person must do.
-const open = { action: 'approved', target, outcome: 'Approved #510 as @clubanderson · sentinel alert still open.', next: 'The \u0060sentinel-alert\u0060 label is still on the PR: a maintainer must review the flagged head and take the label off on GitHub before hive\'s merge sweep will touch it.', posted: posted.slice(0, 2), sentinel_open: true };
+const open = { action: 'approved', target, outcome: 'Approved #510 as @clubanderson · sentinel alert still open.', next: 'The \u0060sentinel-alert\u0060 label is still on the PR: a maintainer must review the flagged head and take the label off on GitHub before hive\'s next merge pass will touch it.', posted: posted.slice(0, 2), sentinel_open: true };
 text = stageTrackerResultText(open, flagged, { id: 'decide:approve', rowRef: 'hivecommons/dibs#510' });
 assert.ok(text.warn.startsWith('⚠ hivecommons/dibs#510 — Sentinel flagged security-relevant changes at 30e94a9: possible security override'), text.warn);
 assert.ok(text.next.includes('take the label off on GitHub'), text.next);
@@ -1024,7 +1112,7 @@ text = stageTrackerResultText({ action: 'approved', target, outcome: 'Approved #
 assert.strictEqual(text.warn, '');
 assert.ok(text.next.startsWith('Hive cannot merge this one'), text.next);
 // A Prow-managed repo: the headline says recorded-in-hive, Next says who still approves.
-text = stageTrackerResultText({ action: 'approved', target, outcome: 'Approval of #510 recorded in hive as @clubanderson.', next: 'Prow approval still needs an OWNERS reviewer: the relayed \u0060/approve\u0060 came from hive\'s account, which Prow does not count. Hive\'s merge sweep merges it on its next pass once CI is green and the head has soaked (≈3 min).', posted: posted.slice(0, 2) }, { repo: 'hivecommons/dibs', kind: 'pr', number: 510, url: 'u510', stage: 85 }, { id: 'decide:approve' });
+text = stageTrackerResultText({ action: 'approved', target, outcome: 'Approval of #510 recorded in hive as @clubanderson.', next: 'Prow approval still needs an OWNERS reviewer: the relayed \u0060/approve\u0060 came from hive\'s account, which Prow does not count. Hive merges it on its next merge pass once CI is green and the head has soaked (≈3 min).', posted: posted.slice(0, 2) }, { repo: 'hivecommons/dibs', kind: 'pr', number: 510, url: 'u510', stage: 85 }, { id: 'decide:approve' });
 assert.ok(text.outcome.startsWith('Approval of #510 recorded in hive'), text.outcome);
 assert.ok(text.next.startsWith('Prow approval still needs an OWNERS reviewer'), text.next);
 `)
@@ -1289,7 +1377,7 @@ const merger = { user: true, canHold: true, canHuman: true };
 const writer = { user: true, canHold: true, canHuman: false };
 const decision090 = { question: 'This PR is ready to merge, but the hive will not merge it by itself (untrusted author): @Karibhou is not a collaborator…', blocker: 'The hive never merges this unattended.', asked_by: 'the merge lane', since: '2026-10-28T12:00:00Z',
   options: [
-    { action: 'decide:queue-merge', label: 'Approve and let hive merge', enabled: true, consequence: 'records your approval; the hive\'s merge sweep merges #317 on its next pass once CI is green and the head has soaked' },
+    { action: 'decide:queue-merge', label: 'Approve and let hive merge', enabled: true, consequence: 'records your approval; hive merges #317 on its next merge pass once CI is green and the head has soaked' },
     { action: 'decide:merge-now', label: 'Merge now as maintainer', enabled: true, consequence: 'merges #317 into main now via hive\'s identity, attributed to you' },
     { action: 'decide:delegate', label: 'Let hive decide', enabled: true, consequence: 'the hive answers at once why it will not merge this itself and lists these options; it never merges it' },
     { action: 'decide:direction', label: 'Give direction', enabled: false, reason_if_disabled: 'The hive did not open this PR, so it cannot carry a direction to its author; leave a changes-requested review on GitHub' },
@@ -1338,7 +1426,7 @@ assert.strictEqual(as[1].enabled, false); assert.strictEqual(as[1].why, STAGE_TR
 // The issue row over its one asking PR: the same lead answers, acting on
 // PR #317 (runRowAction resolves the decision target to the PR).
 as = stageTrackerRowActions(issue316, merger);
-assert.deepStrictEqual(ids(as), ['decide:queue-merge', 'decide:merge-now', 'decide', 'hold', 'retry', 'needs-human', 'open', 'copy']);
+assert.deepStrictEqual(ids(as), ['decide:queue-merge', 'decide:merge-now', 'decide', 'hold', 'retry', 'needs-human', 'decide:close-issue', 'open', 'copy']);
 assert.strictEqual(as[0].target.number, 317); assert.strictEqual(as[0].target.kind, 'pr');
 assert.strictEqual(as[2].label, 'Decide PR #317…');
 assert.strictEqual(stageTrackerDecisionTarget(issue316).number, 317, 'a human-merge reason parks the PR for the issue row');
@@ -1348,7 +1436,7 @@ assert.deepStrictEqual(req.body, { decision: 'merge-now', comment: '', type: 'pr
 assert.deepStrictEqual(stageTrackerActionRequest(pr317, 'decide:queue-merge', {}).body, { decision: 'queue-merge', comment: '', type: 'pr' });
 assert.strictEqual(STAGE_TRACKER_ACTING_CAPTIONS['decide:merge-now'], 'Merging…');
 assert.strictEqual(STAGE_TRACKER_ACTION_WORDS.merged, 'merged');
-assert.strictEqual(STAGE_TRACKER_ACTION_WORDS['queued-for-merge'], 'approved — hive will merge on the next tick once CI is green');
+assert.strictEqual(STAGE_TRACKER_ACTION_WORDS['queued-for-merge'], 'queued for merge — hive merges it on its next pass once CI is green');
 assert.strictEqual(STAGE_TRACKER_ACTING_CAPTIONS['decide:queue-merge'], 'Recording approval…');
 assert.strictEqual(STAGE_TRACKER_ACTION_LABELS['decide:queue-merge'], 'Approve and let hive merge');
 assert.strictEqual(STAGE_TRACKER_ACTION_LABELS['decide:merge-now'], 'Merge now as maintainer');
@@ -1426,7 +1514,7 @@ const ids = as => as.map(a => a.id);
 const merger = { user: true, canHold: true, canHuman: true };
 const decision090 = { question: 'This PR is ready to merge, but the hive will not merge it by itself (untrusted author).', blocker: 'The hive never merges this unattended.', asked_by: 'the merge lane', since: '2026-10-28T12:00:00Z',
   options: [
-    { action: 'decide:queue-merge', label: 'Approve and let hive merge', enabled: true, consequence: 'records your approval; the hive\'s merge sweep merges #317 on its next pass' },
+    { action: 'decide:queue-merge', label: 'Approve and let hive merge', enabled: true, consequence: 'records your approval; hive merges #317 on its next merge pass' },
     { action: 'decide:merge-now', label: 'Merge now as maintainer', enabled: true, consequence: 'merges #317 into main now via hive\'s identity, attributed to you' },
     { action: 'decide:delegate', label: 'Let hive decide', enabled: true, consequence: 'the hive answers at once why it will not merge this itself and lists these options; it never merges it' },
     { action: 'decide:close-superseded', label: 'Close as superseded', enabled: true, consequence: 'closes #317 unmerged, naming the PR that replaces it' },
@@ -1478,11 +1566,12 @@ func TestStageTrackerReauthorAndApprovalCaveats(t *testing.T) {
 	html := indexHTML(t)
 	runStageTrackerRowActionsScript(t, stageTrackerRowActionsPreamble(t, html)+stageTrackerConfirmOptOutJS(t, html)+jsConstLine(t, html, "STAGE_TRACKER_ACTED_OPTION_ID")+`
 const ids = as => as.map(a => a.id);
+global.stageTrackerAdoptionTip = () => '';
 const merger = { user: true, canHold: true, canHuman: true };
 const options = [
-  { action: 'decide:queue-merge', label: 'Approve and let hive merge', enabled: true, consequence: 'records your approval as the trust override for this head; the hive\'s merge sweep merges #317 as-is on its next pass once CI is green and the head has soaked, and does not adopt it' },
+  { action: 'decide:queue-merge', label: 'Approve and let hive merge', enabled: true, consequence: 'records your approval as the trust override for this head; hive merges #317 as-is on its next merge pass once CI is green and the head has soaked, and does not adopt it' },
   { action: 'decide:merge-now', label: 'Merge now as maintainer', enabled: true, consequence: 'merges #317 into main now via hive\'s identity, attributed to you; 2 of 3 commits have no Signed-off-by, so GitHub refuses the merge where DCO is required' },
-  { action: 'decide:re-author', label: 'Re-author as hive PR', enabled: true, consequence: 'the hive re-homes #317\'s commits on a hive-owned, signed-off branch and opens a superseding PR; #317 is closed when that one merges; nothing is merged as-is' },
+  { action: 'decide:adopt', label: 'Adopt as hive PR', enabled: true, consequence: 'the hive re-homes #317\'s commits on a hive-owned, signed-off branch and opens a superseding PR; #317 is closed when that one merges; nothing is merged as-is' },
   { action: 'decide:delegate', label: 'Let hive decide', enabled: true, consequence: 'the hive answers at once why it will not merge this itself and lists these options; it never merges it' },
   { action: 'decide:close-wontfix', label: "Close as won't fix", enabled: true, consequence: 'closes #317 unmerged' },
   { action: 'hold', label: 'Hold', enabled: true },
@@ -1492,26 +1581,31 @@ const pr317 = { repo: 'hivecommons/hotshot', kind: 'pr', number: 317, url: 'http
 const issue316 = { repo: 'hivecommons/hotshot', kind: 'issue', number: 316, url: 'u', stage: 90, mirrored: true, modifiers: [],
   linked_prs: [{ number: 317, url: pr317.url, author: 'hive[bot]', author_kind: 'hive', base_ref: 'main', stage: 90, modifiers: [], human_merge_reason: 'untrusted-author', dco_unsigned: 2, dco_total: 3, decision_needed: { question: 'q', options } }] };
 
-// The re-author choice leads right after the two Approve answers, on the
-// PR sub-row and on the issue row over it.
+// The adopt-as-hive-PR choice leads right after the two Approve answers,
+// on the PR sub-row and on the issue row over it. (It was "re-author"
+// before the hive learned to re-author its own exhausted PRs by itself;
+// a person's rewrite of a PR is adopt.)
 let as = stageTrackerRowActions(pr317, merger);
-assert.deepStrictEqual(ids(as).slice(0, 4), ['decide:queue-merge', 'decide:merge-now', 'decide:re-author', 'decide'], ids(as));
-assert.strictEqual(as[2].label, 'Re-author as hive PR');
+assert.deepStrictEqual(ids(as).slice(0, 4), ['decide:queue-merge', 'decide:merge-now', 'decide:adopt', 'decide'], ids(as));
+assert.strictEqual(as[2].label, 'Adopt as hive PR');
 assert.ok(as[2].enabled && as[2].lead);
 assert.ok(as[2].hint.includes('nothing is merged as-is'));
 as = stageTrackerRowActions(issue316, merger);
-assert.deepStrictEqual(ids(as).slice(0, 3), ['decide:queue-merge', 'decide:merge-now', 'decide:re-author'], ids(as));
+assert.deepStrictEqual(ids(as).slice(0, 3), ['decide:queue-merge', 'decide:merge-now', 'decide:adopt'], ids(as));
 assert.strictEqual(as[2].target.number, 317);
 const menu = stageTrackerMenuHtml(as, 'hivecommons/hotshot#316');
-assert.ok(menu.indexOf('data-ham-act="decide:re-author"') > 0 && menu.indexOf('data-ham-act="decide:re-author"') < menu.indexOf('data-ham-act="hold"'));
-// Wiring: request body, acting caption, ledger id, label.
-assert.deepStrictEqual(stageTrackerActionRequest(pr317, 'decide:re-author', {}).body, { decision: 're-author', comment: '', type: 'pr' });
-assert.strictEqual(STAGE_TRACKER_ACTION_LABELS['decide:re-author'], 'Re-author as hive PR');
-assert.strictEqual(STAGE_TRACKER_ACTING_CAPTIONS['decide:re-author'], 'Queuing re-authoring…');
-assert.strictEqual(STAGE_TRACKER_ACTED_OPTION_ID['re-author'], 'decide:re-author');
+assert.ok(menu.indexOf('data-ham-act="decide:adopt"') > 0 && menu.indexOf('data-ham-act="decide:adopt"') < menu.indexOf('data-ham-act="hold"'));
+// Wiring: request body, acting caption, ledger id, label. "decide:re-author"
+// is gone from the vocabulary; a historical "re-author" ledger entry still
+// reads, and maps to adopt.
+assert.deepStrictEqual(stageTrackerActionRequest(pr317, 'decide:adopt', {}).body, { decision: 'adopt', comment: '', type: 'pr' });
+assert.strictEqual(STAGE_TRACKER_ACTION_LABELS['decide:re-author'], undefined);
+assert.strictEqual(STAGE_TRACKER_ACTING_CAPTIONS['decide:re-author'], undefined);
+assert.strictEqual(STAGE_TRACKER_ACTED_OPTION_ID['re-author'], 'decide:adopt');
+assert.strictEqual(STAGE_TRACKER_ACTED_OPTION_ID['adopt'], 'decide:adopt');
 // The DCO caveat, in plain words, only when the record counted unsigned commits.
 assert.ok(stageTrackerDCOCaveat([pr317]).includes('2 of 3 commits on this head lack a Signed-off-by'), stageTrackerDCOCaveat([pr317]));
-assert.ok(stageTrackerDCOCaveat([pr317]).includes('"Re-author as hive PR" is the separate choice'));
+assert.ok(stageTrackerDCOCaveat([pr317]).includes('"Adopt as hive PR" is the separate choice'));
 assert.strictEqual(stageTrackerDCOCaveat([{ ...pr317, dco_unsigned: 0 }]), '');
 assert.strictEqual(stageTrackerDCOCaveat([]), '');
 (async () => {
@@ -1524,14 +1618,11 @@ assert.strictEqual(stageTrackerDCOCaveat([]), '');
   assert.ok(dialogs[1].cfg.message.includes("stands in for the author's trust on this version"), dialogs[1].cfg.message);
   assert.ok(dialogs[1].cfg.message.includes('will not adopt or re-author it'), dialogs[1].cfg.message);
   assert.ok(dialogs[1].cfg.message.includes('lack a Signed-off-by'), dialogs[1].cfg.message);
-  // Re-author has its own confirm, danger-styled, with the don't-ask box.
-  assert.deepStrictEqual(await stageTrackerActionPayload([pr317], 'decide:re-author'), {});
-  assert.strictEqual(dialogs[2].cfg.title, 'Re-author as hive PR');
-  assert.ok(dialogs[2].cfg.danger);
-  assert.ok(dialogs[2].cfg.message.includes('superseding PR') && dialogs[2].cfg.message.includes('Nothing is merged as-is'), dialogs[2].cfg.message);
-  assert.deepStrictEqual(dialogs[2].cfg.check, { label: "Don't ask again for this action" });
+  // Adopt keeps its own confirm; a cancelled confirm acts on nothing.
+  assert.deepStrictEqual(await stageTrackerActionPayload([pr317], 'decide:adopt'), {});
+  assert.strictEqual(dialogs[2].cfg.title, 'Adopt pull request');
   dialogAnswer = false;
-  assert.strictEqual(await stageTrackerActionPayload([pr317], 'decide:re-author'), null, 'cancel acts on nothing');
+  assert.strictEqual(await stageTrackerActionPayload([pr317], 'decide:adopt'), null, 'cancel acts on nothing');
   // A signed head: no DCO sentence in the Approve confirm.
   dialogAnswer = true; dialogs.length = 0;
   await stageTrackerActionPayload([{ ...pr317, dco_unsigned: 0 }], 'decide:merge-now');
@@ -1698,6 +1789,24 @@ assert.ok(html.includes('<span class="ham-plan-chip" title="' + hiveDialogEscape
 assert.deepStrictEqual(buttons(html), ['Cancel', 'Let hive do that'], 'exactly two buttons when the head is not mergeable');
 assert.ok(html.includes('btn-danger hive-dialog-btn primary" data-initial-focus'), 'the sentinel case keeps the danger primary');
 assert.ok(html.indexOf('hive-dialog-btn cancel') < html.indexOf('hive-dialog-btn primary'), 'Cancel first, primary last');
+
+// 1b. The sentinel line names the files and the rule that fired, from the
+//     row's sentinel_details, bounded by the server (hivecommons/hive: "knowing
+//     what the sensitive path(s) (and files) are in this alert dialog would
+//     really help me make a decision"); the Details paragraph keeps the
+//     line breaks (white-space: pre-line) and the chip's tooltip carries it.
+const flagged = { repo: 'hivecommons/hive', number: 16230, kind: 'pr', head: '4396f46abcdef', sentinel_alert: true, sentinel_reason: 'changes 1 sensitive path(s)',
+  sentinel_details: [{ rule: 'sensitive_path', summary: 'changes 1 sensitive path(s)', paths: ['.github/workflows/release.yml'] }, { rule: 'permission_escalation', summary: 'widens workflow permissions' }] };
+assert.deepStrictEqual(stageTrackerSentinelPathLines(flagged), ['sensitive_path: .github/workflows/release.yml', 'permission_escalation (widens workflow permissions)']);
+assert.deepStrictEqual(stageTrackerSentinelPathLines(Object.assign({}, flagged, { sentinel_details: [{ rule: 'sensitive_path', paths: ['a', 'b'], more_paths: 4 }] })), ['sensitive_path: a, b (+4 more)']);
+assert.deepStrictEqual(stageTrackerSentinelPathLines({ sentinel_alert: true }), []);
+let preface = stageTrackerSentinelPreface([flagged]);
+assert.strictEqual(preface, '⚠ hivecommons/hive#16230 — Sentinel flagged security-relevant changes at 4396f46: changes 1 sensitive path(s)\n   · sensitive_path: .github/workflows/release.yml\n   · permission_escalation (widens workflow permissions)', preface);
+assert.strictEqual(stageTrackerSentinelPreface([Object.assign({}, flagged, { sentinel_details: [] })]), '⚠ hivecommons/hive#16230 — Sentinel flagged security-relevant changes at 4396f46: changes 1 sensitive path(s)', 'no details: the line is unchanged');
+html = stageTrackerDelegatePlanHtml(stageTrackerDelegatePlanView([Object.assign({}, pr15332, { ref: 'hivecommons/hive#16230', number: 16230 })], preface));
+assert.ok(detailsOf(html).includes('<p class="ham-plan-finding">' + hiveDialogEscape(preface) + '</p>'), 'the Details finding names the files: ' + detailsOf(html));
+assert.ok(html.includes('<span class="ham-plan-chip" title="' + hiveDialogEscape(preface) + '">⚠ Sentinel</span>'), 'the chip tooltip names the files too');
+assert.ok(!visibleOf(html).includes('.github/workflows/release.yml'), 'the paths stay behind Details');
 
 // 2. A stale "Hive would:" prefix in the payload is still rendered once.
 view = stageTrackerDelegatePlanView([Object.assign({}, pr15332, { summary: 'Hive would: Hive would: send #15332 back' })], '');
@@ -1965,6 +2074,52 @@ _stageTracker = { items: [t1, plain, t2, pr] };
   // The summary counts failures.
   assert.strictEqual(stageTrackerActionSummary('Accept triage', [{ item: t1, ok: true }, { item: t2, ok: false, error: 'HTTP 403' }], 'accept-triage').msg, 'Accepted 1 of 2 issues. Failed: o/r#15438 — HTTP 403');
   assert.strictEqual(stageTrackerActionSummary('Accept triage', [{ item: t1, ok: true }, { item: t2, ok: true }, { item: t3, ok: true }, { item: t4, ok: true }], 'accept-triage').msg, 'Accepted 4 issues');
+})().catch(e => { console.error(e); process.exit(1); });
+`)
+}
+
+// TestStageTrackerReleaseHoldTargetsCoveringPR: an issue row drawn through
+// its one covering PR shows the PR's hold (and sentinel) on its gate pill,
+// so Release hold and Confirm safe post to the PR, not to the issue
+// (hivecommons/hive#17564 — the release ran on the issue, removed nothing
+// and the PR stayed held). An issue that carries the hold itself, or one
+// with several covering PRs, keeps acting on the issue.
+func TestStageTrackerReleaseHoldTargetsCoveringPR(t *testing.T) {
+	html := indexHTML(t)
+	runStageTrackerRowActionsScript(t, stageTrackerRowActionsPreamble(t, html)+`
+const pr = { number: 17561, url: 'https://github.com/o/r/pull/17561', stage: 90, modifiers: ['hold'], hold: { by: 'hive' }, sentinel_alert: true };
+const issue = { repo: 'o/r', kind: 'issue', number: 17558, url: 'u17558', stage: 50, modifiers: [], linked_prs: [pr] };
+const ownHold = Object.assign({}, issue, { number: 17600, modifiers: ['hold'] });
+const twoPRs = Object.assign({}, issue, { number: 17601, linked_prs: [pr, { number: 17562, stage: 40, modifiers: ['hold'] }] });
+const calls = [];
+global.fetch = async (url, init) => { calls.push({ url, body: JSON.parse(init.body) }); return { ok: true, status: 200, json: async () => ({ ok: true, result: { action: 'released', target: { repo: 'o/r', kind: 'pr', number: 17561 }, outcome: 'Hold released.' } }) }; };
+global.showToast = () => null; global.dismissToast = () => {};
+function stageTrackerProgressToast() { return { update() {}, done() {} }; }
+function stageTrackerAfterActions() {}
+function stageTrackerNoteOwnerEvent() {}
+async function stageTrackerActionPayload() { return {}; }
+_stageTracker = { items: [issue, ownHold, twoPRs] };
+(async () => {
+  await runRowAction('release', issue);
+  assert.deepStrictEqual(calls.map(c => c.url), ['/api/repos/o/r/items/17561/hold'], 'Release hold on the issue row posts to the covering PR');
+  assert.deepStrictEqual(calls[0].body, { held: false, type: 'pr' });
+
+  calls.length = 0;
+  await runRowAction('gate:confirm-sentinel', issue);
+  assert.deepStrictEqual(calls.map(c => c.url), ['/api/repos/o/r/items/17561/sentinel-confirm'], 'Confirm safe on the issue row posts to the covering PR');
+  assert.strictEqual(calls[0].body.type, 'pr');
+
+  calls.length = 0;
+  await runRowAction('release', [issue, Object.assign({ repo: 'o/r', kind: 'pr' }, pr)]);
+  assert.deepStrictEqual(calls.map(c => c.url), ['/api/repos/o/r/items/17561/hold'], 'the PR is released once when its row is selected too');
+
+  calls.length = 0;
+  await runRowAction('release', ownHold);
+  assert.deepStrictEqual(calls.map(c => c.url), ['/api/repos/o/r/items/17600/hold'], 'an issue that is held itself releases its own hold');
+
+  calls.length = 0;
+  await runRowAction('release', twoPRs);
+  assert.deepStrictEqual(calls.map(c => c.url), ['/api/repos/o/r/items/17601/hold'], 'several covering PRs: no single PR to retarget to');
 })().catch(e => { console.error(e); process.exit(1); });
 `)
 }

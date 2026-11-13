@@ -336,9 +336,22 @@
     // current model stays selected (as "(current)" when the new backend does
     // not offer it) so the switch never silently changes the model.
     function refreshModelOptions(backend) {
-      const sel = document.getElementById('cfg-model');
+      let sel = document.getElementById('cfg-model');
       if (!sel) return;
       const current = sel.value;
+      const tag = backend === 'cline' ? 'INPUT' : 'SELECT';
+      if (sel.tagName !== tag) {
+        const replacement = document.createElement(tag.toLowerCase());
+        Array.from(sel.attributes).forEach(a => replacement.setAttribute(a.name, a.value));
+        sel.replaceWith(replacement);
+        sel = replacement;
+      }
+      if (backend === 'cline') {
+        sel.type = 'text';
+        sel.placeholder = 'provider/model (required)';
+        sel.value = current;
+        return;
+      }
       const opts = modelsForBackend(backend) || [];
       const match = opts.find(m => _modelsEqual(current, m.value));
       sel.innerHTML = modelSelectOptionsHtml(backend, current, opts);
@@ -516,7 +529,7 @@
         return;
       }
 
-      // Requirement #3: verify the App can access the repo's org.
+      // Verify the App installation covers this repository.
       setStatus('Checking GitHub App access…', 'var(--muted)');
       try {
         const res = await fetch('/api/config/governor/repos/check-access', {
@@ -525,14 +538,11 @@
         });
         const d = await res.json().catch(() => ({}));
         if (res.status === 409 && d && d.needsInstall) {
-          // App not installed on the new org: surface the correct per-forge
-          // install URL wired to the existing pending-install/recheck plumbing.
-          // Clicking Install flags the heartbeat (handleGitHubAppInstallClicked)
-          // exactly like the App-required banner; Re-check re-probes and, on
-          // success, completes the add.
+          // Guide the operator to install the App or update repository access,
+          // then re-check before adding the repo.
           const installBtn = (d.installUrl)
-            ? '<a href="' + esc(d.installUrl) + '" target="_blank" rel="noopener" data-action="markGitHubAppInstallClicked" style="color:var(--accent);font-weight:600">Install/authorize the App for ' + esc(d.org || '') + ' ↗</a>'
-            : '<span class="text-brand">This hive\'s GitHub Enterprise App slug is not configured, so an install link cannot be built — ask your operator to install the Hive App for ' + esc(d.org || '') + '.</span>';
+            ? '<a href="' + esc(d.installUrl) + '" target="_blank" rel="noopener" data-action="markGitHubAppInstallClicked" style="color:var(--accent);font-weight:600">Manage App access for ' + esc(d.org || '') + ' ↗</a>'
+            : '<span class="text-brand">An installation link cannot be built — ask your operator to manage the Hive App access for ' + esc(d.org || '') + '.</span>';
           setStatus('⚠ ' + esc(d.error || ('The App needs access to ' + val)) + '<br>' + installBtn + ' &nbsp;·&nbsp; <a href="#" data-action="recheckRepoAccessThenAdd" data-arg-types="e" style="color:var(--accent);font-weight:600">Re-check &amp; add</a>', 'var(--amber)');
           return;
         }
@@ -541,11 +551,7 @@
           return;
         }
       } catch (e) {
-        // Network error probing access is non-fatal: the server re-validates the
-        // single-host rule and the default-repo rule on save, so let the add
-        // proceed rather than hard-block on a transient dashboard hiccup.
-        _appendRepoAccepted(val);
-        setStatus('Added (App-access check could not be reached; the server will re-validate on save).', 'var(--muted)');
+        setStatus('✕ Could not check GitHub App access. Please retry.', 'var(--red)');
         return;
       }
       _appendRepoAccepted(val);
@@ -946,6 +952,12 @@
             });
             if (!escRes.ok) throw new Error(await saveErrorMessage(escRes));
             _configState.data.escalation = await escRes.json().catch(() => _configState.data.escalation);
+          } else if (_configState.type === 'governor' && section === 'governor') {
+            const govRes = await fetch('/api/config/governor', {
+              method: 'PATCH', headers: _inceptionAuthHeaders(), body: JSON.stringify(values)
+            });
+            if (!govRes.ok) throw new Error(await saveErrorMessage(govRes));
+            Object.assign(_configState.data, await govRes.json());
           } else if (_configState.type === 'governor' && section === 'auto-merge') {
             // auto_merge is a TOP-LEVEL config block, not under governor —
             // it saves through its own /api/config/auto-merge endpoint.
@@ -955,6 +967,7 @@
               body: JSON.stringify(values)
             });
             if (!amRes.ok) throw new Error(await saveErrorMessage(amRes));
+            _configState.data.auto_merge = await amRes.json().catch(() => _configState.data.auto_merge);
           } else if (_configState.type === 'governor' && section === 'sla') {
             // sla is a TOP-LEVEL config block (Delivery SLA targets); it
             // saves through its own owner-only /api/config/sla endpoint.
@@ -966,6 +979,56 @@
             });
             if (!slaRes.ok) throw new Error(await saveErrorMessage(slaRes));
             _configState.data.sla = await slaRes.json().catch(() => _configState.data.sla);
+          } else if (_configState.type === 'governor' && section === 'integration_orchestration') {
+            const body = Object.assign({}, (_configState.data || {}).integration_orchestration || {}, values);
+            const previousExecution = ((_configState.data || {}).integration_orchestration || {}).execution || {mode: 'off'};
+            if (Object.prototype.hasOwnProperty.call(body, 'execution_json')) {
+              const profile = JSON.parse(body.execution_json);
+              if (!profile || Array.isArray(profile) || typeof profile !== 'object') throw new Error('Execution enrollment must be a JSON object');
+              body.execution = Object.assign({}, profile, {mode: previousExecution.mode || 'off'});
+              delete body.execution_json;
+            }
+            if (Object.prototype.hasOwnProperty.call(body, 'execution_mode')) {
+              body.execution = Object.assign({}, body.execution || previousExecution, {mode: body.execution_mode});
+              delete body.execution_mode;
+            }
+            body.expected_execution = previousExecution;
+            const integrationMinuteNanoseconds = 60 * 1e9;
+            for (const key of ['lease_ttl', 'window', 'max_observation_age']) {
+              if (Object.prototype.hasOwnProperty.call(body, key + '_minutes')) {
+                body[key] = Number(body[key + '_minutes']) * integrationMinuteNanoseconds;
+                delete body[key + '_minutes'];
+              }
+            }
+            if (Object.prototype.hasOwnProperty.call(body, 'policy_json')) {
+              body.policies = JSON.parse(body.policy_json);
+              if (!Array.isArray(body.policies)) throw new Error('Integration workflow contracts must be a JSON array');
+              delete body.policy_json;
+            }
+            if (Object.prototype.hasOwnProperty.call(body, 'scope_lines')) {
+              body.scopes = String(body.scope_lines).split('\n').map(s => s.trim()).filter(Boolean).map(s => {
+                const at = s.indexOf('#');
+                if (at < 1 || at === s.length - 1) throw new Error('Each integration scope must be owner/repo#base');
+                return { repo: s.slice(0, at), base: s.slice(at + 1) };
+              });
+              delete body.scope_lines;
+            }
+            const ioRes = await fetch('/api/config/integration-orchestration', {
+              method: 'PUT', headers: _inceptionAuthHeaders(), body: JSON.stringify(body)
+            });
+            if (!ioRes.ok) throw new Error(await saveErrorMessage(ioRes));
+            _configState.data.integration_orchestration = await ioRes.json();
+          } else if (_configState.type === 'governor' && section === 'decisions-delegate') {
+            // decisions.delegate is a TOP-LEVEL config block; it saves through
+            // its own owner-only /api/config/decisions/delegate endpoint.
+            const ddBody = decisionsDelegateSaveBody(values, ((_configState.data || {}).decisions_delegate || {}).repos);
+            const ddRes = await fetch('/api/config/decisions/delegate', {
+              method: 'PUT',
+              headers: _inceptionAuthHeaders(),
+              body: JSON.stringify(ddBody)
+            });
+            if (!ddRes.ok) throw new Error(await saveErrorMessage(ddRes));
+            _configState.data.decisions_delegate = await ddRes.json().catch(() => _configState.data.decisions_delegate);
           } else if (_configState.type === 'governor' && section === 'convergence') {
             // convergence is a TOP-LEVEL config block, not under governor —
             // it saves through its own owner-only /api/config/convergence
@@ -1142,4 +1205,3 @@
         })
         .catch(() => {});
     }
-

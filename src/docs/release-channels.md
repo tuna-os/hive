@@ -10,7 +10,7 @@ Registry (**GHCR**).
 |---|---|
 | `stable` | Newest build promoted as generally safe to run. |
 | `candidate` | A v5 build awaiting the observation/waiting period (“soak”) before stable promotion. |
-| `edge` | An active-development v6 build, with no soak period; not the newest v5 stable build. |
+| `edge` | The newest v6 build, with no soak period; not the newest v5 stable build. Since 2026-11-07 v6 is a release line, so the same digest also carries an immutable `v6.x.y` tag once cut. |
 
 > **Promotion policy:** the channels diverge by release line and maturity. Every green merge to **`v5`** retags **`candidate`** (and `:latest`); **`stable`** advances later by digest through the scheduled/manual stable-promotion workflow after the [stable soak and promotion policy](stable-soak-policy.md) passes. Merges to **`v6`** retag **`edge`**, so `edge` is an active-development v6 build, not a synonym for `stable`. **`v4`** is a maintenance line: its builds publish only `v4-latest` and short-SHA tags, no channel (#7721 Phase 1).
 
@@ -160,7 +160,7 @@ Hosted spoke dashboards that are already following a release-channel tag show a 
 
 The spoke UI keeps reported state and intent separate: after a selection it continues to show the channel observed from the Deployment image, plus a pending "switch requested" note, until the rollout/heartbeat lands on the requested tag. Spokes that are self-hosted, pinned, branch-tracking, missing hub credentials, or otherwise unresolved show an honest "selection unavailable" explanation rather than a dead control.
 
-The panel's second row reports the last upgrade attempt (`releaseStatus.attempt` on `GET /api/version`). When the last spoke-side upgrade landed but the hive has since been rolled to a different commit outside the spoke upgrader — a `kubectl rollout restart`, a direct image bump, or a floating-tag pull — the row headlines the running commit as `↷ Running <sha> (rolled externally) · <age>`, where the age is the running build's start time (`runningSince`), not the superseded upgrade's. The superseded attempt moves to a secondary line, `Last spoke-side upgrade to <sha> superseded · <age>`, carrying its own timestamp; it is dimmed once it predates the running build. The two ages are never conflated: a hive restarted an hour ago reads "1h ago" even if its last spoke-side upgrade was a day earlier.
+The panel's second row reports the last upgrade attempt (`releaseStatus.attempt` on `GET /api/version`). When a successful spoke-side upgrade is followed by a roll to a different commit outside the spoke upgrader — for example, a direct image bump or a floating-tag pull — the row shows `↷ Running <sha> (rolled externally) · <age>` instead of the obsolete attempt. The age is the running build's start time (`runningSince`), not the old upgrade's; when the start time is unavailable, no age is shown. The previous attempt remains available in the API.
 
 For self-hosted Podman Quadlet spokes the selector is intentionally unavailable even when `HIVE_SELF_IMAGE` resolves a channel, because there is no hub-managed Deployment image to patch. The panel says to change `Image=` in `hive.container`; after editing, reload/restart through the Podman lifecycle so `hive.env` carries the updated `HIVE_SELF_IMAGE` and tracking mode.
 

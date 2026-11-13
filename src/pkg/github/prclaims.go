@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 	"log/slog"
@@ -485,13 +486,16 @@ var closingKeywords = []string{
 // released for re-verification every cycle (see FilterClaimedIssues).
 //
 // The gap is bounded exactly as referenceRefPattern's is — at most 40
-// characters, lazily matched, no '.', newline or '#' — so it cannot cross a
+// characters, lazily matched, no '.', newline or '#' — and additionally holds
+// no '(': a number that opens a parenthetical after prose cites a sibling
+// PR/issue rather than naming what this PR closes, as in hotshot#364's "every
+// sibling fix in that section (#333, #335)". So it cannot cross a
 // sentence boundary, swallow a paragraph, or skip over a nearer reference to
 // reach a further one. #7915 kept this parser single-issue for parity with
 // GitHub's "one keyword per number" rule, and that is untouched: with '#'
 // excluded from the gap a match still contains exactly one reference, and
 // referenceListTail remains reference-tier only.
-const claimKeywordGap = `(?:\s*:?\s+|[ \t][^.\n#]{0,39}?)`
+const claimKeywordGap = `(?:\s*:?\s+|[ \t][^.\n#(]{0,39}?)`
 
 // claimRefPattern matches a closing keyword followed by an issue reference in
 // either the same-repo (`#123`) or cross-repo (`owner/repo#123`) form.
@@ -543,12 +547,23 @@ var (
 	fencedCodeBlockPattern = regexp.MustCompile("(?s)```.*?```")
 	inlineCodeSpanPattern  = regexp.MustCompile("`[^`\n]*`")
 	closingURLPattern      = regexp.MustCompile(`https?://[^\s)]+`)
+	// htmlNumericEntityPattern is a decimal character reference; a hex one
+	// (`&#x200b;`) never reads as `#N`. Renovate writes `[#&#8203;628]` and
+	// `@&#8203;user` so GitHub links nothing; the `#8203` inside the entity
+	// is not an issue reference (projectbluefin/gutenprint-printer-app#170
+	// was filed against "#8203").
+	htmlNumericEntityPattern = regexp.MustCompile(`&#[0-9]+;`)
+	passiveClosePattern      = regexp.MustCompile(`(?i)\b(?:closed|fixed|resolved)\s+by\s+((?:[\w.-]+/[\w.-]+)?#\d+)`)
 )
 
 func stripClosingFalsePositiveText(text string) string {
+	text = htmlNumericEntityPattern.ReplaceAllString(text, " ")
 	text = fencedCodeBlockPattern.ReplaceAllString(text, " ")
 	text = inlineCodeSpanPattern.ReplaceAllString(text, " ")
 	text = closingURLPattern.ReplaceAllString(text, " ")
+	// "closed by #359" names the PR that already did the work, not a claim
+	// by this one (hotshot#364).
+	text = passiveClosePattern.ReplaceAllString(text, " $1")
 	return text
 }
 
@@ -671,7 +686,7 @@ var issueRefPattern = regexp.MustCompile(`(?:([\w.-]+/[\w.-]+))?#(\d+)`)
 // It is the weak-evidence companion to ParseClaimedIssues: claimsFromPR reads
 // both and keeps the closing claim wherever the two name the same issue.
 func ParseReferencedIssues(text, defaultRepo string) []ClaimedRef {
-	return parseRefs(referenceRefPattern, text, defaultRepo)
+	return parseRefs(referenceRefPattern, htmlNumericEntityPattern.ReplaceAllString(text, " "), defaultRepo)
 }
 
 // branchIssuePattern matches the branch-naming conventions agents use to encode
@@ -976,6 +991,23 @@ func (c *Client) FetchClaims(ctx context.Context, identity HiveIdentity) ([]Issu
 	return scan.Claims, err
 }
 
+// logMergedClaimScanFailure logs a merged-PR scan failure. A deadline or
+// cancellation is a transient API/rate condition that recurs every tick until
+// the API recovers, so it is logged at Info once per repo until a scan
+// succeeds again; any other error stays a Warn.
+func (c *Client) logMergedClaimScanFailure(repo string, err error) {
+	if c.logger == nil {
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		if _, seen := c.mergedClaimScanTransient.LoadOrStore(repo, true); !seen {
+			c.logger.Info("merged-pr-claim scan timed out (transient); retrying next tick", "repo", repo, "error", err)
+		}
+		return
+	}
+	c.logger.Warn("merged-pr-claim scan failed for repo", "repo", repo, "error", err)
+}
+
 // FetchClaimScan is FetchClaims plus the churn history the same two listings
 // already contain (hivecommons/hive#7995). See ClaimScan.
 func (c *Client) FetchClaimScan(ctx context.Context, identity HiveIdentity) (ClaimScan, error) {
@@ -1047,11 +1079,10 @@ func (c *Client) FetchClaimScan(ctx context.Context, identity HiveIdentity) (Cla
 				if firstErr == nil {
 					firstErr = fmt.Errorf("listing merged PRs for %s/%s: %w", owner, repoName, err)
 				}
-				if c.logger != nil {
-					c.logger.Warn("merged-pr-claim scan failed for repo", "repo", repo, "error", err)
-				}
+				c.logMergedClaimScanFailure(repo, err)
 				break
 			}
+			c.mergedClaimScanTransient.Delete(repo)
 			pastWindow := false
 			for _, pr := range prs {
 				if pr == nil {
@@ -1077,11 +1108,15 @@ func (c *Client) FetchClaimScan(ctx context.Context, identity HiveIdentity) (Cla
 						closedAt = pr.GetUpdatedAt().Time
 					}
 					if !closedAt.Before(mergedCutoff) {
-						c.emitPRTerminalObserved(PRTerminalObservation{
-							Repo:       repo,
-							Number:     pr.GetNumber(),
-							State:      PRStateClosed,
-							ObservedAt: closedAt,
+						c.observeTerminalPR(ctx, terminalEnrichmentTask{
+							owner: owner, repoName: repoName, identity: identity,
+							updatedAt: pr.GetUpdatedAt().Time,
+							observation: PRTerminalObservation{
+								Repo:       repo,
+								Number:     pr.GetNumber(),
+								State:      PRStateClosed,
+								ObservedAt: closedAt,
+							},
 						})
 						history = append(history,
 							prHistoryFromClaims(claimsFromPR(pr, repo, identity, now), PRStateClosed, now)...)
@@ -1091,18 +1126,21 @@ func (c *Client) FetchClaimScan(ctx context.Context, identity HiveIdentity) (Cla
 				if mergedAt.Before(mergedCutoff) {
 					continue
 				}
-				mergedBy := c.prTerminalMergedBy(ctx, owner, repoName, pr)
-				c.emitPRTerminalObserved(PRTerminalObservation{
-					Repo:        repo,
-					Number:      pr.GetNumber(),
-					State:       PRStateMerged,
-					ObservedAt:  mergedAt,
-					Actor:       mergedBy,
-					Attribution: prTerminalMergeAttribution(mergedBy, identity, c.appBotLogin),
-					CreatedAt:   pr.GetCreatedAt().Time,
-					URL:         pr.GetHTMLURL(),
-					Issues:      mergedPRClosingIssues(pr, repo, owner+"/"+repoName),
+				c.observeTerminalPR(ctx, terminalEnrichmentTask{
+					owner: owner, repoName: repoName, identity: identity,
+					updatedAt: pr.GetUpdatedAt().Time, mergedBy: safeGetLogin(pr.GetMergedBy()),
+					observation: PRTerminalObservation{
+						Repo:       repo,
+						Number:     pr.GetNumber(),
+						State:      PRStateMerged,
+						ObservedAt: mergedAt,
+						CreatedAt:  pr.GetCreatedAt().Time,
+						URL:        pr.GetHTMLURL(),
+						Issues:     mergedPRClosingIssues(pr, repo, owner+"/"+repoName),
+					},
 				})
+				// #16116: other people's reviews reach the throughput card's
+				// Reviewed row the way their merges reach Merged·Closed.
 				prClaims := claimsFromPR(pr, repo, identity, now)
 				history = append(history, prHistoryFromClaims(prClaims, PRStateMerged, now)...)
 				for _, claim := range prClaims {
@@ -1826,11 +1864,13 @@ func (l *ClaimLedger) Save() error {
 }
 
 // RedStaleFunc reports whether the claiming PR (prRepo, prNumber) is red on a
-// required check AND stale (its red head SHA unchanged past the staleness
-// threshold). Fix #3 uses it to DECIDE NOT to suppress a claimed issue: a
-// healthy claiming PR (green/pending, or a freshly-changed head) still
-// suppresses its issue, but a red+stale one releases the issue so the work can
-// be re-taken. It is supplied by the caller so this package stays free of the
+// required check AND abandoned (its red head SHA unchanged past the staleness
+// threshold and the hive's fix loop done with it: escalated, re-engagement
+// budget spent, or red for the whole re-engagement window). Fix #3 uses it to
+// DECIDE NOT to suppress a claimed issue: a healthy claiming PR (green/pending,
+// or a freshly-changed head) or one the reaper is still re-engaging keeps
+// suppressing its issue, but an abandoned red one releases the issue so the
+// work can be re-taken (hivecommons/hive#16522). It is supplied by the caller so this package stays free of the
 // escalation-store dependency; a nil func means "never release" (old behavior).
 // GENERIC: the predicate keys only off check state + commit staleness.
 type RedStaleFunc func(prRepo string, prNumber int) bool
@@ -1913,6 +1953,11 @@ func annotateIssueWithClaim(issue *Issue, claim IssueClaim) {
 			// closing keyword means the remainder is still actionable).
 			issue.Labels = removeIssueLabel(issue.Labels, LikelyDoneLabel)
 			issue.Labels = addIssueLabel(issue.Labels, PartiallyAddressedLabel)
+		case issueHasOpenChildren(issue):
+			// A parent whose sub-issues are still open is not likely
+			// done, whatever a merged PR said about it
+			// (issue_open_children.go).
+			issue.Labels = removeIssueLabel(issue.Labels, LikelyDoneLabel)
 		default:
 			issue.Labels = addIssueLabel(issue.Labels, LikelyDoneLabel)
 		}
@@ -2275,7 +2320,10 @@ func SyncIssuePRClaimLabels(ctx context.Context, client *Client, result *Actiona
 		// remainder (#11931 rule; hivecommons/hive#12316 sat in "Confirm &
 		// close" with half its work in an open PR).
 		partialWanted := mergedWanted && claim.Reference
-		likelyWanted := mergedWanted && !claim.Reference && !issueHasLabel(originalLabels, PartiallyAddressedLabel)
+		// A parent with an open sub-issue is never likely-done: the label is
+		// not added, and one carried from before comes off through the
+		// removal branch below (issue_open_children.go).
+		likelyWanted := mergedWanted && !claim.Reference && !issueHasLabel(originalLabels, PartiallyAddressedLabel) && !issueHasOpenChildren(issue)
 		// The covered-by-PR stage label itself is written by the issue stage
 		// reconciler (SyncIssueStageLabels, hivecommons/hive#12436), which
 		// keeps the issue at 040 while the PR is open — planning against the

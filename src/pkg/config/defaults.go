@@ -36,6 +36,10 @@ const (
 	DefaultOptionalSweepEveryNCycles  = 1
 )
 
+// DefaultDependencyBotRebaseAfterS is governor.dependency_bot_rebase_after_s
+// when unset: 4 hours.
+const DefaultDependencyBotRebaseAfterS = 4 * 60 * 60
+
 const (
 	MaxAgentReplicas = 5
 
@@ -492,6 +496,9 @@ func (c *Config) applyDefaults() {
 		}
 		if c.Knowledge.Primer.MaxBytes == 0 {
 			c.Knowledge.Primer.MaxBytes = defaultKnowledgeMaxBytes
+		}
+		if c.Knowledge.AdvisorMaxPerKick == 0 {
+			c.Knowledge.AdvisorMaxPerKick = DefaultKnowledgeAdvisorMaxPerKick
 		}
 		if c.Knowledge.Primer.MergeStrategy == "" {
 			c.Knowledge.Primer.MergeStrategy = DefaultKnowledgePrimerMergeStrategy

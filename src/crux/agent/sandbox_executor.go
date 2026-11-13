@@ -7,14 +7,18 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/crux/cline"
+	"github.com/hivecommons/hive/crux/config"
 	"github.com/hivecommons/hive/crux/effects"
+	"github.com/hivecommons/hive/crux/internal/textutil"
+	"github.com/hivecommons/hive/crux/kubejob"
 	"github.com/hivecommons/hive/crux/logscrub"
 	"github.com/hivecommons/hive/crux/outputschema"
 	"github.com/hivecommons/hive/crux/pushbroker"
@@ -43,11 +47,12 @@ type sandboxCommandRunner interface {
 
 type sandboxExecRunner struct{}
 
+// Run delegates to pushbroker.ExecRunner so the production broker gets the
+// same stdout-only-on-success contract the package's own runner has: the
+// normaliser commits `git show HEAD:<path>` output as file content, and a
+// CombinedOutput runner would amend exit-0 stderr warnings into the blob.
 func (sandboxExecRunner) Run(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	return cmd.CombinedOutput()
+	return pushbroker.ExecRunner{}.Run(ctx, dir, env, name, args...)
 }
 
 // PRCreator is crux.PRCreator, the host-provided pull-request capability.
@@ -67,6 +72,7 @@ type SandboxKickSpec struct {
 	Generation   uint64
 	MaxWorktrees int
 	Image        string
+	Runtime      string
 	EnvAllowlist []string
 	NetworkMode  string
 	Timeout      time.Duration
@@ -83,9 +89,10 @@ type SandboxKickSpec struct {
 }
 
 type configSnapshot struct {
-	Backend   string
-	Model     string
-	LaunchCmd string
+	Backend         string
+	Model           string
+	LaunchCmd       string
+	ReasoningEffort string
 }
 
 type SandboxKickResult struct {
@@ -124,8 +131,16 @@ type SandboxVerifyResult struct {
 	TimedOut bool
 }
 
-// Passed reports whether the command ran to completion with exit 0.
-func (v SandboxVerifyResult) Passed() bool { return v.Err == "" && v.ExitCode == 0 && !v.TimedOut }
+// Passed reports whether the command ran to completion with exit 0. A
+// launcher that returned no error but could not read the exit code back
+// (a Complete Job whose pod is already gone) counts as passed too: the
+// Job's own success condition is the fact, the missing code is not a failure.
+func (v SandboxVerifyResult) Passed() bool {
+	if v.Err != "" || v.TimedOut {
+		return false
+	}
+	return v.ExitCode == 0 || v.ExitCode == kubejob.ExitCodeUnknown
+}
 
 type SandboxExecutor struct {
 	Launcher    sandbox.Launcher
@@ -137,6 +152,7 @@ type SandboxExecutor struct {
 	Logger      *slog.Logger
 	Now         func() time.Time
 	Mutation    effects.Boundary
+	onStarted   func()
 }
 
 func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (SandboxKickResult, error) {
@@ -177,10 +193,19 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 		res.Error = err.Error()
 		return res, err
 	}
-	command, err := sandboxCommand(spec.AgentConfig, sandboxPromptRelPath)
+	command, err := sandboxKickCommand(spec, sandboxPromptRelPath)
 	if err != nil {
 		res.Error = err.Error()
 		return res, err
+	}
+	var provider *cline.ProviderFile
+	if spec.AgentConfig.Backend == "cline" && spec.Runtime != config.SandboxRuntimeJob {
+		provider, err = cline.StageProviderFile(os.Getenv("HIVE_CLINE_CONFIG_DIR"), spec.AgentConfig.Model, workspace)
+		if err != nil {
+			res.Error = err.Error()
+			return res, err
+		}
+		defer provider.Close()
 	}
 	// A spool the relay cannot see is a lost review, not a failed kick: the
 	// rest of the run is still worth doing, so log and go on without one.
@@ -195,6 +220,11 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 	}()
 	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
 	defer cancel()
+	var notifyStarted func()
+	if e.onStarted != nil {
+		var once sync.Once
+		notifyStarted = func() { once.Do(e.onStarted) }
+	}
 	sres, runErr := e.launcher().Run(runCtx, sandbox.LaunchSpec{
 		Image:          spec.Image,
 		Name:           sandbox.LaunchName(spec.Agent),
@@ -205,7 +235,21 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 		Env:            spool.sandboxEnv(),
 		EnvAllowlist:   spec.EnvAllowlist,
 		NetworkMode:    spec.NetworkMode,
+		ClineProvider:  provider,
+		OnStarted:      notifyStarted,
 	})
+	// Launchers that only report a final successful result still prove the
+	// run was accepted; do not infer acceptance from queueing alone.
+	if runErr == nil && notifyStarted != nil {
+		notifyStarted()
+	}
+	if provider != nil {
+		sres.Stdout = provider.Redact(sres.Stdout)
+		sres.Stderr = provider.Redact(sres.Stderr)
+		if err := provider.Close(); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}
 	if ctx.Err() == nil && !spool.awaitDrain(ctx) && e.Logger != nil {
 		e.Logger.Warn("sandbox review spool: requests still pending after the drain wait", "agent", spec.Agent, "spool", spool.entry.Spool)
 	}
@@ -223,7 +267,12 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 	res.Sandbox = sres
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		res.TimedOut = true
-		runErr = fmt.Errorf("sandbox kick timed out after %s", spec.Timeout)
+		timeoutErr := fmt.Errorf("sandbox kick timed out after %s", spec.Timeout)
+		if provider != nil {
+			runErr = errors.Join(timeoutErr, runErr)
+		} else {
+			runErr = timeoutErr
+		}
 	}
 	res.TranscriptPath = filepath.Join(workspace, sandboxTranscriptRelPath)
 	_ = writeTranscript(res.TranscriptPath, sres)
@@ -348,18 +397,12 @@ func readWorkspaceText(path string, max int) string {
 	return truncateRunes(text, max)
 }
 
-func truncateRunes(s string, max int) string {
-	if max <= 0 {
-		return s
-	}
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max])
-}
+func truncateRunes(s string, max int) string { return textutil.Runes(s, max) }
 
 func sandboxCommand(cfg configSnapshot, promptRel string) ([]string, error) {
+	if cfg.Backend == "cline" {
+		return nil, fmt.Errorf("Cline requires scoped provider-file staging or Job Secret references through the canonical sandbox kick path; direct command overrides are unsupported")
+	}
 	if strings.TrimSpace(cfg.LaunchCmd) != "" {
 		return []string{"sh", "-lc", cfg.LaunchCmd + " < " + shellQuote(promptRel)}, nil
 	}
@@ -601,7 +644,9 @@ func sandboxPublishWithheld(res SandboxKickResult) string {
 		}
 		return reason
 	}
-	if res.Sandbox.ExitCode != 0 {
+	// A completed Job whose pod could not be read has no exit code; that is
+	// not a failure, and the guessed 0 it used to carry was not a fact either.
+	if code := res.Sandbox.ExitCode; code != 0 && code != kubejob.ExitCodeUnknown {
 		return fmt.Sprintf("sandbox exited %d", res.Sandbox.ExitCode)
 	}
 	return ""

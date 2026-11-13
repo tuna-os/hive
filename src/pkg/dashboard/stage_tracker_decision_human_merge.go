@@ -91,7 +91,7 @@ func decisionForHumanMerge(it StageTrackerItem, held bool) *StageTrackerDecision
 	delegate := decisionDelegateOption(held, "Hive explains and recommends; merges nothing")
 	d.Options = decisionHumanMergeLeadOptions(mergeNow, queue)
 	if it.DCOUnsigned > 0 {
-		d.Options = append(d.Options, decisionReauthorOption(it, ref, held))
+		d.Options = append(d.Options, decisionAdoptSignedOption(it, ref, held))
 	}
 	d.Options = append(d.Options, delegate, direction, closeSup, closeWontfix, decisionHoldOption(held))
 	return d
@@ -182,7 +182,7 @@ func decisionDCOBlocker(it StageTrackerItem) string {
 	if it.DCOUnsigned <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d of %s no Signed-off-by, so a required DCO check refuses the merge. Re-author as hive PR is the separate choice for that; an Approve never re-authors by itself.",
+	return fmt.Sprintf("%d of %s no Signed-off-by, so a required DCO check refuses the merge. Adopt as hive PR is the separate choice for that; an Approve never re-authors by itself.",
 		it.DCOUnsigned, pluralCommitsHave(it.DCOTotal))
 }
 
@@ -203,19 +203,19 @@ func pluralCommitsHave(total int) string {
 	return "its commits have"
 }
 
-// decisionReauthorOption is the operator's explicit "re-author as hive PR"
+// decisionAdoptSignedOption is the operator's explicit "adopt as hive PR"
 // choice (hivecommons/hive#15136): the hive re-homes the commits on a
 // hive-owned, signed-off branch and opens a superseding PR. A person's PR
-// is never re-authored by the hive, so for a human author the option is
+// is never adopted by the hive, so for a human author the option is
 // shown disabled with the step that does unblock it.
-func decisionReauthorOption(it StageTrackerItem, ref string, held bool) StageTrackerDecisionOption {
-	o := decisionOption(decisionActionReauthor, "Re-author as hive PR", !held && it.AuthorKind != authorKindHuman, "Release the hold first")
+func decisionAdoptSignedOption(it StageTrackerItem, ref string, held bool) StageTrackerDecisionOption {
+	o := decisionOption(decisionActionAdopt, "Adopt as hive PR", !held && it.AuthorKind != authorKindHuman, "Release the hold first")
 	if it.AuthorKind == authorKindHuman {
 		who := "the author"
 		if it.Author != "" {
 			who = "@" + it.Author
 		}
-		o.ReasonIfDisabled = "Hive does not re-author a person's PR; ask " + who + " to sign off and push"
+		o.ReasonIfDisabled = "Hive does not adopt a person's PR; ask " + who + " to sign off and push"
 	}
 	o.Consequence = "Hive reopens " + ref + " as a signed-off hive PR; nothing is merged as-is"
 	return o
@@ -255,3 +255,31 @@ func stageTrackerNeedsRebase(it StageTrackerItem) bool {
 	}
 	return it.RebaseMerge != nil && it.RebaseMerge.State != "" && it.RebaseMerge.State != "merged" && it.RebaseMerge.State != "failed"
 }
+
+// decisionForAutoMergeOffNew: a 000-new pull request on a repo whose
+// auto-merge is off (stageTrackerAutoMergeOffNew), whose merge verdict
+// says GitHub would take the merge. No lane stages or merges anything
+// there, so the row asks a person to merge, like 090 · auto-merge off:
+// Merge now as maintainer leads, and "Approve and let hive merge" is
+// offered greyed, since no merge pass runs on the repo.
+func decisionForAutoMergeOffNew(it StageTrackerItem, held bool) *StageTrackerDecision {
+	ref := "#" + strconv.Itoa(it.Number)
+	d := &StageTrackerDecision{Since: it.StageSince, AskedBy: decisionAskedByLane, BlockerReason: stageTrackerAutoMergeOffBlockerReason}
+	d.Question = "Auto-merge is off for this repo, so a person merges it."
+	d.Blocker = sentence(stageTrackerAutoMergeOffGateText)
+	details := []string{"Hive never stages or merges pull requests on this repo; a maintainer merges here or on GitHub."}
+	if held {
+		details = append(details, decisionHeldBlocker(it.Hold))
+	}
+	d.Detail = stageTrackerSayOnce(d.Question, details...)
+	mergeNow := decisionMergeNowOption(it, held)
+	queue := decisionOption(decisionActionQueueMerge, decisionQueueMergeLabel, false, "Auto-merge is off for this repo; hive never merges here — merge it now as maintainer")
+	closeWontfix := decisionOption(decisionActionCloseWontfix, "Close as won't fix", true, "")
+	closeWontfix.Consequence = "Closes " + ref + " without merging"
+	d.Options = append(decisionHumanMergeLeadOptions(mergeNow, queue), closeWontfix, decisionHoldOption(held))
+	return d
+}
+
+// stageTrackerAutoMergeOffBlockerReason is the lane token every merge sweep
+// logs when it skips a repo whose auto-merge is off.
+const stageTrackerAutoMergeOffBlockerReason = "repo-auto-merge-disabled"

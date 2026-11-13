@@ -157,6 +157,39 @@ The dashboard API can update this field through [`POST /api/effort/{agent}/{effo
 
 The dashboard shows a reasoning-effort dropdown next to the model picker for every method that has an effort control (`codex`, `agy`, `claude`, and `omp`). The value is validated at set time against the method's own set, so a `codex`-only level such as `minimal` is refused for a `claude` agent rather than stored and dropped at launch. For `omp`, the dropdown is per selected model: Hive reads `omp models --json` and uses that model's `thinking` levels, hiding the control for models that report no thinking support. Picking `default` clears the stored value; for `claude` and `omp` that means no effort flag at all and the CLI's own default. The dropdown persists through the same path as the model picker (`hive.yaml` plus the per-agent overlay under `agents_dir`), which is the durable path on a hosted spoke: a hand edit of the agent's file is reverted by the next sync, the dashboard write is not. Each dropdown change is recorded in the audit trail as `set_reasoning_effort` with the new value, like the other per-agent setting changes. The effort the agent was actually launched with is what the run rows and the `- hive:` PR trailer report, so a `claude` agent at `xhigh` shows `effort=xhigh` there and an agent with no stored effort shows none.
 
+#### Claude setup-token
+
+For `backend: claude`, an operator can use a long-lived token instead of the
+dashboard sign-in. Run `claude setup-token` interactively as the licensed
+operator and complete the prompts. The resulting token lasts about a year and
+is inference-only; it is not a general-purpose account credential. See
+[Claude Code authentication](https://code.claude.com/docs/en/authentication).
+
+Supply it to the Hive process as the secret `HIVE_CLAUDE_OAUTH_TOKEN`, or mount
+it in a secret file readable by Hive. Set `HIVE_CLAUDE_OAUTH_TOKEN_FILE` to
+that file's path, or use the default `/secrets/claude-oauth-token`. The
+non-empty environment variable wins over the file. Do not put the token in
+`hive.yaml`, shell history, logs, issues, or agent panes.
+
+Hive passes the token to Claude agents as `CLAUDE_CODE_OAUTH_TOKEN` at launch,
+even when a credentials file exists. It takes precedence over dashboard sign-in;
+signing in again on the dashboard does not replace it. Each agent retains its
+own Claude home and private state; sharing the token does not require sharing
+the whole home. Without an operator token, dashboard sign-in works as before.
+
+To see which mode is live, read `GET /api/claude-auth/status` or the admin MCP
+`claude_auth_status` tool: `mode` is `long-lived token` or `dashboard sign-in`.
+Neither shows the token or any part of it. When Claude answers 401 to the
+long-lived token, Hive reports `Claude token rejected: generate a new one with
+claude setup-token` rather than asking for `/login`. The token cannot read the
+Claude usage API, so Claude usage headroom reads as unknown in this mode.
+
+To replace an expired or revoked token, run `claude setup-token` again, update
+the configured secret source, then recreate or restart Hive to load the new
+token and restart the affected Claude agents so their new sessions receive
+the replacement. Verify an agent completes a turn. See the
+[backend auth recovery runbook](backend-auth-recovery-runbook.md).
+
 #### Oh My Pi (`omp`) hub agents
 
 `backend: omp` launches the OMP CLI as a first-class dashboard method. Hive gives each agent its own durable HOME under `/data/home/agents/<name>`, so `~/.omp/agent/agent.db` can hold several provider sign-ins for that one agent (for example `openai-codex` for the primary model and `anthropic` for an advisor) without sharing refresh-token writers across agents. Select models with their provider prefix (`provider/model`). The dashboard model probe runs `omp models --json` once per omp agent, with `HOME` set to that agent's home, and unions the results; omp lists only models whose provider has a credential in the HOME it runs under, so an agent that is not signed in contributes nothing. When no agent has a sign-in, the dropdown serves a static fallback list, flagged `fallback: true` in the models API and logged at `WARN` with the HOME probed; sign an agent in to see its real models. Each model's `thinking` list drives the effort dropdown. At launch Hive passes `--approval-mode ${HIVE_OMP_APPROVAL_MODE:-yolo}`, `--model <id>`, and `--thinking <effort>` when set.
@@ -285,6 +318,8 @@ spec omits `launch_cmd`, Hive still builds the backend command normally.
     enabled: true                # default true; set false to keep it configured but off
     mode: ISSUES_AND_PRS         # GitHub interaction tier: ADVISORY | ISSUES_ONLY |
                                  #   ISSUES_AND_PRS | ISSUES_PRS_MERGE
+                                 #   (NO_GITHUB is a legacy alias for ADVISORY; the
+                                 #   dashboard lists it only for an agent that has it)
     converse: true               # let this agent comment on issues/PRs and leave PR
                                  #   reviews, INDEPENDENTLY of mode. Off by default.
                                  #   See "Conversation is not a tier" below.
@@ -296,10 +331,14 @@ spec omits `launch_cmd`, Hive still builds the backend command normally.
                                  #   Prompt text only — it authorizes repos, it does
                                  #   NOT clone, mount, or provision anything on disk.
     task_mcp:
-      drop_stuffed_context: false # default false. When the hub gives this agent a
-                                  #   task MCP URL, render ISSUE_LIST/PR_LIST and
+      drop_stuffed_context: false # default false. When this agent has the hive-task
+                                  #   MCP server, render ISSUE_LIST/PR_LIST and
                                   #   MERGE_ELIGIBLE as repo#N refs only and rely on
                                   #   context_bundle / related_work for full context.
+                                  #   Only an agent launched as Claude Code has the
+                                  #   server (docs/design/task-mcp.md); on any other
+                                  #   backend the flag is ignored and the lists stay
+                                  #   complete.
     repos: [console]             # WHICH repos this agent serves. Omit (the default) for
                                  #   the whole hive. Naming repos makes the agent a
                                  #   specialist: it is only handed work on these, its
@@ -337,6 +376,11 @@ spec omits `launch_cmd`, Hive still builds the backend command normally.
       max_rss_mb: 1536           #   policy: recycle this agent's CLI session (a normal
       max_age: 6h                #   restart) once idle at the prompt and over the RSS
       min_idle: 2m               #   or age budget; enabled: false turns it off
+    cli_memory:                  # optional override of the fleet agents.cli_memory
+      auto_memory: false         #   policy: CLI auto-memory (Claude MEMORY.md, Codex
+      clear_on_kick: false       #   memories, Copilot memory) off; wipe before each kick
+      drain_to_knowledge: false  #   first turn each memory fact into a draft knowledge entry
+      drain_on_write: false      #   and drain a Claude memory write at once (PostToolUse hook)
     restart_strategy: immediate  # how to bring a dead session back
     beads_dir: /data/beads/scanner   # work-record (bead) storage; default per-agent
     replicas: 3                  # materialize scanner, scanner-2, scanner-3 (max 5)
@@ -649,9 +693,79 @@ it has no local binary, CLI login, or live model discovery.
 Two rules of thumb:
 
 - **CLI methods are subscriptions.** You log in once per method from the dashboard, and every agent using that method shares the login. For `claude`, sharing is not instantaneous: the OAuth token is shared immediately through the per-agent home bridge, while the session identity (`~/.claude.json`, which is what decides whether the CLI shows a login menu) is adopted from an already-signed-in agent the next time each other agent launches or is restarted. So on a fresh install, expect the remaining agents to clear their 🔑 badge on their next start rather than the moment you finish logging in.
+
+  When you sign in to Claude from the dashboard, hive also reads the plan behind the new token (the same `GET https://api.anthropic.com/api/oauth/profile` call Claude Code makes after its own login) and stores it as `subscriptionType` and `rateLimitTier` in `/data/home/.claude/.credentials.json`. Without them, Claude Code labels a Pro/Max session "Claude API" / "API Usage Billing" in its banner even though it runs on the subscription. If that read fails, the sign-in still succeeds: the token is saved without the two fields, and the hive log shows a `WARN` starting `Claude sign-in: could not read the plan behind the new token`. The plan already on file is kept only when hive recorded it for the same account and organization (hive stores that identity as `hiveSignInAccount` in the same block); otherwise signing in again later fills it in.
 - **Inference methods are endpoints.** You configure a base URL and a key *reference* (env var name or key-file path — the value goes in `/data/secrets/`, never in YAML). Agents on `vllm`/`llm-d`/`litellm` launch the Claude CLI routed through hive's inference translator, so there is no separate login.
 
   Only `POST /v1/messages` is translated into an OpenAI `/v1/chat/completions` call. The Claude CLI also talks to its Anthropic host for housekeeping — telemetry batches (`/api/event_logging/...`), error reports, `POST /v1/messages/count_tokens` — and none of that has a meaning to an OpenAI-compatible gateway; forwarding it used to cost a gateway `400 Missing required parameter: 'messages'` per call, charged against the provider's request rate limit (roughly two failures per real completion in practice). The translator and the MITM reroute now answer those locally: `count_tokens` returns a chars-based estimate, anything under `/api/` returns `{}`, and any other path is a 404 in Anthropic error shape with a `WARN` log line naming the method and path, so a new CLI endpoint shows up in the hive log rather than as gateway noise. Inference-routed `claude` sessions are additionally launched with `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, and `CLAUDE_CODE_AUTO_MODE_SERVER=0`; subscription sessions are not. The last one matters for Claude Code's [auto-mode classifier](https://code.claude.com/docs/en/auto-mode-classifier-billing): the CLI otherwise asks the inference host for a server-side safety verdict (`safeguards` field in, `safeguard_results` out) that an OpenAI-compatible gateway can never return, then halts the session on an interactive "this session isn't eligible because your requests go through 127.0.0.1:18444 … Enter to continue" notice. With the variable set the CLI runs its own classifier requests through the translator like any other call. Should the notice still appear (for example from a settings file that re-enables the server check), the lifetime prompt watcher presses Enter for it.
+
+### Per-agent homes: what is shared and what is private
+
+Each per-UID agent runs with its own durable `HOME` under `/data/home/agents/<name>`. "One login authenticates the fleet" is implemented by *bridging* — symlinks from the per-agent home back to the same path under the shared `/data/home` — and the bridge list is deliberately narrow:
+
+| Path under the agent home | Kind | Shared? | Why |
+|---|---|---|---|
+| `.config/`, `.codex/`, `.cache/` | whole directory | yes | credential/config state only (gh `hosts.yml`, goose keys, codex auth) and tool caches; codex session state lives under a per-agent `CODEX_HOME` |
+| `.claude/.credentials.json`, `.claude/settings.json` | file | yes | the Claude OAuth token and the fleet-wide settings hive seeds |
+| `.claude/projects/`, `.claude/todos/`, `.claude/history.jsonl` | per-agent | **no** | transcripts, todos, and Claude Code's auto-memory (`projects/-data-agents-<name>/memory/MEMORY.md`, keyed by the agent's cwd) |
+| `.gemini/antigravity-cli/`, `.gemini/settings.json`, `oauth_creds.json`, `google_accounts.json`, `installation_id` | dir / file | yes | agy and Gemini CLI sign-in and settings |
+| `.gemini/GEMINI.md`, `.gemini/tmp/` | per-agent | **no** | Gemini's saved memory and session checkpoints |
+| `.bob/settings.json`, `.bob/settings/` | file / dir | yes | the auth-method/provider pins hive asserts for every bob agent |
+| `.bob/tmp/`, `.bob/trustedFolders.json` | per-agent | **no** | chat recordings and folder trust |
+| `.copilot/config.json` | file | yes | the Copilot CLI token map |
+| `.copilot/session-state/` | per-agent | **no** | Copilot CLI transcripts |
+| `.claude.json`, `.bash_history`, `.npm/`, `.local/`, `.gitconfig` | per-agent | **no** | contended session identity, shell history, npm cache, XDG data/state, git identity |
+
+Before [#17031](https://github.com/hivecommons/hive/issues/17031) `.claude`, `.gemini` and `.bob` were bridged whole, so every agent's CLI state sat in one tree that any agent could read and rewrite: the user-level `~/.claude/CLAUDE.md`, `history.jsonl` and `todos/` were a single shared copy, and each agent's cwd-keyed auto-memory (`projects/-data-agents-<name>/memory/MEMORY.md`, per-agent by path) was writable by every other agent and persisted on the PVC forever. Provisioning now retires those whole-directory bridges on the next launch, keeps only the login/settings entries above, and never deletes or moves anything under `/data/home`: a pre-existing shared memory store is left in place and logged once (`shared CLI home still holds a persistent memory store …`) so you can review or drain it ([#17033](https://github.com/hivecommons/hive/issues/17033)) before removing it by hand. The dashboard's token/cost scanners (`data.claude_sessions_dir`, `data.bob_sessions_dir`, `data.copilot_sessions_dir`) walk the shared path **and** every `/data/home/agents/*/…` sibling, attributing each per-agent tree to its owner, so cost accounting does not regress. `HIVE_SHARED_AGENT_HOME=1` restores the legacy single shared `HOME` for every agent (and with it the shared memory).
+
+#### When a Claude token refresh breaks the credential link
+
+The `.claude/.credentials.json` bridge is a symlink, and Claude Code does not write through it. About every 8 hours the CLI refreshes its OAuth token by writing a temp file in `~/.claude` and renaming it over `.credentials.json`. The rename replaces the symlink with a private regular file, owned by the agent's uid with mode `0600`. That agent now runs on its own copy: a later dashboard sign-in rewrites the shared file and never reaches it, and if its private token is revoked it answers every kick with `Login expired · Please run /login` or `OAuth token revoked`.
+
+Claude Code has no supported way to keep the link. `CLAUDE_CONFIG_DIR` moves the whole config directory (settings, transcripts, auto-memory), which would undo the per-agent split above, and a bind mount cannot be renamed over. So hive detects and repairs the replacement instead, in three places:
+
+- at every agent launch;
+- every `HIVE_CLAUDE_CREDENTIAL_BRIDGE_INTERVAL` (default `5s`) from the credential watchdog, and again before each 5-minute probe (`HIVE_CREDENTIAL_WATCHDOG_INTERVAL`). The short cadence matters: every agent holds the same token and refreshes at about the same time, and the first refresh rotates the grant, so publishing it quickly is what keeps the siblings from failing on the old one;
+- right after a successful dashboard Claude sign-in.
+
+When the server cannot open the private file (per-UID hives: it is owned by the agent's uid, mode `0600`, and hive runs as `dev`), it reads it as the agent's own uid through the same `su-exec` seam that adopts `.claude.json` sessions.
+
+The repair never deletes a token:
+
+1. It moves the private file aside to `.credentials.json.stale-<UTC time>` in the agent's `~/.claude`. The file keeps its owner and `0600` mode.
+2. It keeps whichever credential is newer **and** usable in the shared `/data/home/.claude/.credentials.json`. "Usable" is the rule the rest of hive uses: a live access token, or a refresh grant that has not expired. "Newer" means the access token's `expiresAt` is later. The agent's copy wins only when it is complete (access token, refresh token, recorded `expiresAt`); a failed refresh (empty tokens, `expiresAt` 0) never wins. A fresh refresh in one agent therefore becomes the fleet's login, instead of stranding every other agent on the grant it just rotated. When the agent's copy wins, the old shared file is kept beside it as `.credentials.json.stale-<UTC time>` and the new one is written `0660` with the old file's owner and group. On a tie, or when the agent's copy is not usable, the shared file stays as it is.
+3. It restores the symlink.
+
+When the file cannot be read either way (a deployment without `su-exec`), nothing is moved or relinked, the agent keeps the token it already had, and one `ERROR` per agent and file version names the path. The one exception is a dashboard sign-in: a fresh shared login is newer than anything an unreadable private copy could hold, so that trigger moves the unreadable file aside unread and relinks the agent.
+
+Each repair writes a `claude_credential_rebridged` Audit Log entry naming the agent, the trigger (`launch`, `watchdog` or `sign-in`), which credential was kept (`shared` or `agent`) and where the moved-aside file went. It never records token material. Until the repair runs, the agent card shows **credential bridge broken (private stale file)** instead of a generic "needs login". Moved-aside files are not cleaned up automatically; remove them by hand once you no longer need them.
+
+The repair skips an agent whose whole `~/.claude` is still the old directory symlink to `/data/home/.claude`. That happens to an agent that has been paused or stopped since before the per-agent split, because only a launch replaces the directory link. Through that link the agent's `.credentials.json` is the shared login itself, so there is nothing private to move aside. The hive log says so once per agent (`claude credential bridge: this agent's .claude directory resolves to the shared login directory`), the card does not show a broken bridge, and the agent's next launch replaces the directory link with its own `~/.claude`.
+
+Every hive-side write to a shared login or CLI config (`.claude/.credentials.json`, `.copilot/config.json`, the durable Copilot token) goes through `crux/sharedfile`: a randomly named temporary beside the target, mode and owner set on the open descriptor, verified, then renamed into place, and only when the target is absent or a regular file inside a regular directory the server owns. Anything else at those paths is refused and logged once. The entrypoint's root permission guard applies the same rule to the files it repairs, and the shared dot-dirs carry the sticky bit so a dev-owned entry cannot be replaced by another uid. Memory, transcripts and todos stay per agent throughout; only the credential file is published.
+
+### CLI auto-memory (`agents.cli_memory`)
+
+Subscription CLIs keep their own long-lived "memory" next to the transcripts: Claude Code's auto-memory (`~/.claude/projects/-data-agents-<name>/memory/MEMORY.md`), Codex memories (`$CODEX_HOME/memories/`), Copilot CLI's `memory` setting, and Gemini's `~/.gemini/GEMINI.md`. Hive agents already get their durable context from beads, the knowledge store, and the kick prompt, so a hidden per-CLI notebook mostly accumulates stale one-off inferences ([#17032](https://github.com/hivecommons/hive/issues/17032)). The `agents.cli_memory` block controls it fleet-wide, and each agent may override it with its own `cli_memory:` block:
+
+```yaml
+agents:
+  cli_memory:
+    auto_memory: false         # default false: pin every CLI's auto-memory feature off
+    clear_on_kick: false       # default false: true wipes this agent's memory stores before each kick
+    drain_to_knowledge: false  # default false: true drains each memory fact into a draft knowledge entry first
+    drain_on_write: false      # default false: true also drains a Claude memory write at once (needs drain_to_knowledge)
+```
+
+| Key | Default | Effect |
+|---|---|---|
+| `auto_memory` | `false` | When false hive pins the vendor switch off at launch: Claude Code gets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in its environment ([docs](https://code.claude.com/docs/en/memory)); Codex gets `[features] memories = false` merged into `$CODEX_HOME/config.toml` ([docs](https://developers.openai.com/codex/memories)); Copilot CLI gets `"memory": false` in its per-agent `~/.copilot/settings.json` (`copilot help config`). `true` writes the opposite pin so an operator's own setting is never silently shadowed. Gemini CLI has no equivalent switch. |
+| `clear_on_kick` | `false` | Before every non-resume kick (next to the `/clear` sent by `clear_on_kick`), remove this agent's `~/.claude/projects/*/memory/`, `$CODEX_HOME/memories*/`, and `~/.gemini/GEMINI.md`. Only the per-agent home under `/data/home/agents/<name>` is touched; nothing under the shared `/data/home` is removed, and agents running with `HIVE_SHARED_AGENT_HOME=1` or as uid 0 are skipped. Copilot memory is server-side and has no local store. |
+
+| `drain_to_knowledge` | `false` | Before every non-resume kick, and before `clear_on_kick` wipes anything, read this agent's Claude `~/.claude/projects/*/memory/` (`MEMORY.md` plus topic files), Codex `$CODEX_HOME/memories*/` and the `## Gemini Added Memories` section of `~/.gemini/GEMINI.md`, and write each bullet or paragraph as a **draft** entry in the `bead-synth-wiki` vault (`knowledge.bead_synthesizer.vault_path`, default `/data/vaults/bead-synth-wiki`) with `source: cli-memory`, `agent: <name>`, `cli: <claude\|codex\|gemini>` and, when the Claude project slug ends in one of the agent's repos, `repo: <org/repo>`. Entries are deduplicated by a SHA-256 of the normalised text (`memhash`), so repeated drains and the same fact from several agents produce one entry, which gains an `agent:<name>` tag per draining agent; an entry an operator approved, deprecated or renamed is still a duplicate and keeps its state. A memory file whose facts did not all reach the vault (vault unwritable, 200-facts-per-drain cap) is copied to `/data/knowledge/auto-memory-spool/<agent>/` before the wipe and retried on the next drain ([#17056](https://github.com/hivecommons/hive/issues/17056)). Drafts never reach a kick until a human approves them ([#17033](https://github.com/hivecommons/hive/issues/17033)). Needs the in-process crux runtime. |
+| `drain_on_write` | `false` | Needs `drain_to_knowledge`. For Claude Code, Hive always seeds a `SessionEnd` hook with `drain_to_knowledge`; this adds a `PostToolUse` hook on `Write\|Edit\|MultiEdit` that drains a memory file under `~/.claude/projects/*/memory/` as soon as it is written, for long-lived sessions. Both run `hive memory-drain --cli claude --agent "$HIVE_AGENT"`, never fail the session, and are merged into the Claude settings Hive manages without touching your own `hooks` entries ([#17210](https://github.com/hivecommons/hive/issues/17210)). |
+
+Set `auto_memory: true` on a single agent to let it keep a private notebook while the rest of the fleet stays stateless between kicks. The knobs are independent: `auto_memory: true` with `clear_on_kick: true` gives a memory that lives for exactly one kick, and adding `drain_to_knowledge: true` is the "memory → beads" flow: the CLI may take notes during a turn, every note becomes a reviewable draft at the next kick, and the private store is then emptied. The log line per drain is `cli-memory: drained N facts from <agent> into bead-synth-wiki (dupes K, spooled S)`.
 
 Every Model Gateway (and the bob backend) also accepts an optional `key_name` — a human-chosen LABEL for the configured key, e.g. `key_name: openrouter-prod-key`. It is safe-to-show metadata, not a secret: the dashboard's gateway row displays it as "Using key: `<name>`", or "(unnamed)" when no label is set, so operators can tell keys apart without ever seeing the value. For gateway keys, the row and settings/status APIs also expose `keySHA256`, the lowercase SHA-256 of the exact effective key string Hive will inject through the inference proxy; this lets operators compare Hive with LiteLLM/OpenRouter key-hash displays without revealing the secret. Saving a replacement key refreshes live inference proxy routes for running agents, so the next kick uses the new key without an agent restart. See [`inference-backends.md`](../../docs/inference-backends.md) for a full YAML example.
 
@@ -727,7 +841,9 @@ backends:
 Names compare case-insensitively; an empty `backend:` (the hive default) is always allowed. The list is enforced where placements are decided:
 
 - **ACMM pack apply** never places an agent on a disallowed backend. A pack agent whose pack backend is disallowed gets the first allowed `allow` entry instead (or the hive default when `allow` is empty), without the pack's model, so the replacement backend uses its own default model. A pack-owned agent already on a now-disallowed backend is moved the same way on the next apply, and so is an agent whose hand-set backend (no `backend_owner:` line) is disallowed — that one is logged at WARN because it overrides an operator's edit. Backends an operator explicitly chose (operator-owned) are left alone; the deny list is checked when the backend is set, not on later applies.
-- **ACMM pack agents follow the hive's inference gateway** ([#14678](https://github.com/hivecommons/hive/issues/14678)). When every backend you picked yourself (operator-owned — and any inference backend or gateway name with no `backend_owner`, e.g. one written straight into `hive.yaml`, since a pack never writes one) names the same inference backend or configured gateway, and more than half of the other enabled agents already run on it, a pack agent whose pack backend is a subscription CLI is placed on that gateway instead, with no `model:` so the gateway's default model applies. This applies to agents a level creates and, on every apply (each restart), to existing agents whose backend is still pack-owned — so after an upgrade the L2 `supervisor`/`brainstorm` may move from `copilot` onto your LiteLLM gateway alongside the new `reviewer`. An operator-owned `backend:` or a legacy `backend:` without an owner is never moved, a hive with an operator-picked CLI agent or with only a minority of agents on a gateway is left as is, and a pack that itself names a gateway or whose backend the `backends:` list replaced is not redirected.
+- **ACMM pack agents follow the hive's inference gateway** ([#14678](https://github.com/hivecommons/hive/issues/14678)). When every backend you picked yourself (operator-owned — and any inference backend or gateway name with no `backend_owner`, e.g. one written straight into `hive.yaml`, since a pack never writes one) names the same inference backend or configured gateway, and more than half of the other enabled agents already run on it, a pack agent whose pack backend is a subscription CLI is placed on that gateway instead, with no `model:` so the gateway's default model applies — or, when the gateway has no default model, with the model your agents on it run (from their `model:` or the model picked on their dashboard card; the most common one if they differ), so it never launches without a model. An agent the watchdog paused for crash-looping without a model is resumed once it gets one. This applies to agents a level creates and, on every apply (each restart), to existing agents whose backend is still pack-owned — so after an upgrade the L2 `supervisor`/`brainstorm` may move from `copilot` onto your LiteLLM gateway alongside the new `reviewer`. An operator-owned `backend:` or a legacy `backend:` without an owner is never moved, a hive with an operator-picked CLI agent or with only a minority of agents on a gateway is left as is, and a pack that itself names a gateway or whose backend the `backends:` list replaced is not redirected.
+  If no operator model is available on a later apply, a model already written on a pack-placed gateway is retained until an operator model or gateway default becomes available. If no operator backend pick remains (for example after runtime overrides are lost), gateway placements retained on two or more pack-owned agents still count toward the hive's gateway, so agents added at a later level follow it too ([#16740](https://github.com/hivecommons/hive/issues/16740)). The same unanimity, majority, and `backends:` allowlist checks apply. A new operator backend pick takes precedence over retained placements, and a new operator model takes precedence over retained models. Runtime overrides remain separately stored in hive-state.json.
+  When reconciliation changes a gateway-routed agent's model, the log identifies the previous value as `old_model` and the replacement as `gateway_model`.
 - **`PUT /api/config/agent/{name}/models`** rejects a placement onto a disallowed backend with `400` and a message naming it.
 
 ### Changing backend and model together: use the atomic endpoint
@@ -753,14 +869,32 @@ The three routes differ in ways that matter here:
 |---|---|---|
 | Backend and model applied together | **no** — separate requests | **yes** |
 | Backend value validated | yes | yes |
-| Model value validated | yes, but see below | **not yet** — [#5698](https://github.com/hivecommons/hive/issues/5698) phase 2 |
-| Restarts the agent | yes, **once per call** | no — syncs into the live process config |
+| Model value validated | yes, but see below | shape only — see [Model ids are checked when you save them](#model-ids-are-checked-when-you-save-them) |
+| Restarts the agent | yes, **once per call** | yes, **once**, when the backend, model or effort changed |
 | Claims operator ownership | yes | yes |
 
 Two consequences worth knowing:
 
 - **Model validation does not save you here.** `POST /api/model/...` checks the model against the agent's *current effective* backend, and deliberately fails **open** when that backend's model list cannot be enumerated (see `validateModelForAgent`). Codex is exactly such a backend, so `switch` to codex followed by `model` set to a Claude id is accepted. Reverse the order and the model is validated against the backend you are about to leave. Neither order gives you a checked pair.
-- **The atomic route does not restart the agent.** It persists the pair and syncs it into the live process config, so the running CLI keeps its current method until the agent next restarts. That is usually what you want for a scripted change — the two-call path pays for two restarts — but if you need the change to take effect now, restart the agent afterwards.
+- **The atomic route restarts the agent once.** It persists the pair, applies it to the live launch configuration, and restarts the agent a single time when the backend, model or effort changed ([#7374](https://github.com/hivecommons/hive/issues/7374)). The two-call path pays for two restarts. A save that changes nothing restarts nothing.
+
+### Model ids are checked when you save them
+
+Every path that sets an agent's model checks the id against the backend it will launch on: `PUT /api/config/agent/{name}/models`, the Settings dialog (`PUT /api/config/agent/{name}/general`), `POST /api/model/{agent}/{model}` (the card dropdown, `hivectl agent model-set` and the admin MCP `agent.model` operation), and adding an agent with a model.
+
+The rule has two levels, because no model list is ever complete:
+
+| The id is… | Example | Result |
+|---|---|---|
+| Malformed for the backend | `claude-sonnet-5.5` on `claude` | **Refused** with `400` and the dashed spelling suggested. Anthropic model ids are dash-separated, and Claude Code refuses the dotted form. |
+| Well-formed but not in hive's list | `claude-sonnet-9-9` on `claude` | **Saved**, and `PUT .../models` adds a `warning` field to its response. The id may be a model newer than the list. |
+| In the list | `claude-sonnet-5-5` on `claude` | Saved, no warning. |
+
+The shape rule applies only to bare `claude-…` ids on the `claude` backend. The dotted spelling is correct elsewhere: Copilot's ids for the 4.x and 5.5 families are dotted (`claude-sonnet-5.5`), and inference backends and gateways pass ids through verbatim (`anthropic/claude-opus-4.8` on OpenRouter). Bedrock (`us.anthropic.claude-…`) and Vertex (`claude-…@date`) ids are not affected.
+
+The "known list" for the warning is the backend's last model discovery result, or the static fallback list in `src/pkg/dashboard/cli_models.go` when there is none. Saving never runs a discovery probe. `POST /api/model` keeps its stricter rule: when a live, authoritative list is cached, an id not on it is refused.
+
+If the CLI refuses a model anyway, the agent shows the error and backs off instead of restart-looping. See [An agent shows "model … rejected by the CLI"](troubleshooting.md#an-agent-shows-model--rejected-by-the-cli).
 
 ### `launch_cmd` and `backend`
 
@@ -874,7 +1008,7 @@ agents:
 
 ## ACMM levels: agent rosters as packs
 
-You don't have to design a roster. Hive ships six **ACMM packs** (`level-1.yaml` … `level-6.yaml`, embedded in the binary and forkable) that pair a curated agent roster with governor cadences and a merge policy:
+You don't have to design a roster. Hive ships six **ACMM packs** (see [What is a pack?](acmm-policy-matrix.md#what-is-a-pack); `level-1.yaml` … `level-6.yaml`, embedded in the binary and forkable) that pair a curated agent roster with governor cadences and a merge policy:
 
 | Level | Name | Posture |
 |---|---|---|
@@ -887,7 +1021,7 @@ You don't have to design a roster. Hive ships six **ACMM packs** (`level-1.yaml`
 
 Applying a level **reconciles the whole roster**, not just the diff: missing agents are created (as overlay files in `/data/agent-configs/`), existing agents are merged — pack values fill blanks, but your explicit `backend:`, `model:`, and `enabled: false` always win — and the level's `kick_template`, `mode` and `on_demand` are updated so the agent's *policy* matches the level (an `on_demand` you toggled yourself in the agent's settings dialog is operator-owned and left alone; leaving on-demand starts the agent, entering it stops it). One caveat for `backend:` edited by hand in `hive.yaml` or `hive.yaml.runtime` after a pack has been applied: the edit is honoured only when that agent entry carries **no** `backend_owner:` line, so delete the owner line (`pack` or `operator`) alongside your `backend:` change, and the next apply stamps the kept backend `backend_owner: operator` (#13221). A failed agent doesn't abort the rest; the level is only recorded as cleanly applied when every agent reconciled. One exception to "pack values fill blanks": a `backend:` the pack itself wrote may be moved onto the hive's inference gateway, as described under [Disabling a backend spoke-wide](#disabling-a-backend-spoke-wide) ([#14678](https://github.com/hivecommons/hive/issues/14678)). A failed agent doesn't abort the rest; the level is only recorded as cleanly applied when every agent reconciled.
 
-The L5 roster is the canonical worked example — twelve agents, nine on the governor timer, two opt-in agents paused in every governor mode, plus one on demand:
+The L5 roster is the canonical worked example — thirteen agents, nine on the governor timer, three opt-in agents paused in every governor mode, plus one on demand:
 
 | Agent | | Mode | Cadence (all governor modes) |
 |---|---|---|---|
@@ -903,6 +1037,7 @@ The L5 roster is the canonical worked example — twelve agents, nine on the gov
 | experimenter ⚗️ | self-improvement experiment campaigns through an engine (default Nous, inline); never files issues/PRs, never promotes | not in any pack — opt in by hand | 24h suggested |
 | telemetry 📡 | managed-project instrumentation | ISSUES_AND_PRS | paused |
 | operations 🚨 | managed-project operational practice | ISSUES_AND_PRS | paused |
+| redteam 🎭 | measured attacks on hive defenses ([red-team agent](redteam.md)) | ISSUES_AND_PRS | paused |
 | brainstorm 💡 | ideation | ADVISORY | on demand |
 
 At L5, every agent PR gets a `hold` label automatically. The system proposes; it does not merge autonomously.
@@ -948,6 +1083,8 @@ After an initial telemetry advisory run, platforms mentioned in its findings are
 preselected as suggestions in the tab. They remain unsaved until an operator
 reviews them and clicks **Save**; after that, the persisted declaration governs
 future telemetry and operations work.
+
+Redteam is also L5/L6-only and paused until an operator opts in from **Agents → Cadences**. Unlike any other agent it also needs a `repos:` scope: without one it is refused every repository. See [Red-team agent](redteam.md#turning-it-on).
 
 ## Live-linked agent definitions (`definition_source`)
 
@@ -1161,6 +1298,27 @@ github:
 - **Merge.** A PR whose rationale (its closing or referencing links, or the request's declared issue list) traces to an untrusted reporter's issue without any `untrusted_require_labels` acceptance label receives `hold` at **every** ACMM level, including L6, together with a marked notice naming the issue reporter (not the PR author). Any one unaccepted untrusted citation holds. A configured acceptance label supplies maintainer sign-off, so accepted issues do not trigger a new reporter-trust PR hold. A human removes the label; Hive never auto-releases a reporter-trust hold — the level-hold release path recognises the notice and leaves the label, and holdguard re-holds on a new head SHA. `github.reporter_trust_hold` follows `reporter_trust.enabled` unless set explicitly; `project.repo_policies[].reporter_trust_hold` overrides per repo; `HIVE_REPORTER_TRUST_HOLD` locks it from the environment, exactly like the #5117 knobs.
 - **Where you see it.** Both halves are edited in the dashboard: **Settings → Labels → Reporter trust** (the switch, the association checkboxes, extra logins, triage labels) and **Settings → Repos** (the hold, with the same all-repos default / per-repo override / inherit rows as #5117). An active gate is stated in the read-only note under **Projects**, and each repo card counts issues **needs triage** separately from generic filter refusals. The issue itself carries `needs-triage` while waiting when Hive had to add it. Holds carry the reason in the PR notice and in the `agent_pr_created` audit entry (`reporter_trust_held`, `reporter_login`, `reporter_association`).
 
+### Notification mode: how much of the hive's bookkeeping becomes email
+
+```yaml
+github:
+  notifications:
+    mode: quiet                                      # default; "normal" posts every note as its own comment/review
+```
+
+Every issue comment and every review the hive posts emails the PR author
+and every watcher of the repository; editing an existing comment notifies
+nobody. In `quiet` mode (the default) the hive's own PR notes — stage
+stalled/regressed, the trusted-human 071 note, the duplicate-PR redirect —
+are sections of one `<!-- hive:status -->` comment per PR that is created
+once and edited afterwards; a "**Reviewed** — no findings" review is
+recorded as a verdict without a GitHub review and a head carries at most
+one hive review; the 071 note @-mentions the author once per cause rather
+than once per head. Nothing is lost: the Activity Monitor, the evidence
+bundle and the stage labels carry the same facts. See
+[operator-reference.md → Notification mode](operator-reference.md#notification-mode-githubnotificationsmode)
+for the full list. `normal` restores the one-comment-per-event behaviour.
+
 ### Tracking and archive issues
 
 Some issues are never meant to be worked or closed: a standing report archive that a workflow appends to every week, a long-lived checklist, a "Keep this issue open" status thread. Mark them with **any one** of the label `hive/tracking`, the body marker `<!-- hive:tracking -->`, or the literal sentence "Keep this issue open" in the body, and the hive treats the issue as a tracking issue.
@@ -1244,6 +1402,112 @@ T3 list** — for the same reason none proposes lowering a floor.
 `min_model_capability` is readable on every surface and writable **only by editing `hive.yaml`**. There is no dashboard control, no `PUT` field and no chat command, and a test (`TestStandbyFloorHasNoWriterOutsideConfig`) scans every route, template and client file to keep it that way. `hub.standby_item_tiers` is held to the same rule by the same scan (`TestStandbyItemTiersHaveNoWriterOutsideConfig`): widening what a weak configuration may take is the item-side twin of lowering a floor, and it is an edit to `hive.yaml` too. Nor will any surface *suggest* lowering it: a paused lane that nobody qualifies for renders as exactly that and offers no next step — no "0 contributors qualify — lower the floor?", no "2 would qualify at T3".
 
 That is deliberate, and it is the point of the whole feature. A lane that ran on a strong model for months and then quietly starts producing work from a weak one costs more reviewer trust than a paused lane saves queue depth. **"Nobody qualifies, the lane stays paused" is an acceptable answer.** Lowering a floor should be a decision you made, in a file, on purpose.
+
+## Contributor-first lanes (`contributor_first`)
+
+A contributor relay can act as one of your agent roles ("Acting as" on the
+contributor card, or `HIVE_AGENT_ROLE` on the relay; see
+[Delegated ClankeR agent roles](contributor-trust-and-roles.md#delegated-clanker-agent-roles)).
+It then does that role's work on the contributor's own machine, with the
+contributor's own model. By default it does so **in parallel** with your
+resident agent: the governor keeps kicking the resident agent on its cadence,
+so your own inference budget is still spent on a lane a contributor is already
+covering. Standby (above) is the opposite order on purpose — it offers paused
+*budget* work to volunteers and never fires before the budget is gone.
+
+`contributor_first` inverts the order for one lane. While at least one
+contributor relay is **acting as that role and connected, and taking work**,
+the governor **withholds the resident agent's kicks**, at the same gates where it withholds them for an exhausted budget
+(cadence kicks, continuous re-kicks, CEL event kicks and crash-recovery resume
+kicks). The contributor is the lane's primary worker and spends their own
+inference; the resident agent is the fallback. Once no relay has covered the
+role for `contributor_first_grace`, the resident agent resumes on its normal
+cadence. The grace exists because a relay reconnect is routine (the hub keeps
+a dropped relay's lease for thirty minutes for the same reason); without it
+the resident agent would flap on and off with every socket drop.
+
+A relay counts as covering the role only when all of these hold:
+
+- it is acting as the role: its effective role, after any owner "Acting as"
+  assignment, is that role;
+- its heartbeat is fresh;
+- it is signed in as a contributor with a GitHub login;
+- contributions are not suspended (`hub.contribute_suspended`);
+- it is not in standby mode (`just contribute-standby`). A standby relay never
+  asks for ordinary work; it only takes what you dispatch to it by hand;
+- it has not reported a quota hold. A relay whose quota guard is holding stops
+  asking for work but stays connected. A relay new enough to know about this
+  tells the hub (`quota_hold_v1`, see
+  [the contributor relay guide](contributor-relay.md#a-held-relay-tells-the-hub-quota_hold_v1));
+  an older relay is still counted while held;
+- it is not busy on another hive. A relay subscribed to several hives works
+  one task at a time; while that task belongs to another hive it stays
+  connected here but asks this hive for nothing. A relay new enough to know
+  about this tells every other hive it is subscribed to (`busy_elsewhere_v1`, see
+  [the contributor relay guide](contributor-relay.md#a-relay-busy-on-another-hive-tells-the-hub-busy_elsewhere_v1))
+  and clears it when that task ends; its next request for work here clears it
+  too. A relay that this hive has also handed a task or a fix-pr task still
+  counts, and an older relay is still counted while busy elsewhere;
+- it is not in a failure-streak pause;
+- it has not used up its hourly or daily task allowance
+  (`hub.tier_limits.<tier>.max_per_hour` / `max_per_day` for the
+  contributor's trust tier). The hub refuses such a relay work
+  (`hourly_limit` / `daily_limit`) until the window rolls, so it covers
+  nothing in the meantime. Coverage and task assignment use the same check,
+  so they always agree on which limits apply and how they are counted;
+- its access is not revoked and its trust tier is not in
+  `hub.disabled_tiers`. The hub refuses such a relay work (`tier_disabled`),
+  using the same check as coverage, and covers again as soon as you re-enable
+  the tier;
+- it is not idle on an empty queue: a relay holding no task whose every
+  request for work has been answered `no_matching_work` (or `repo_unmintable`,
+  the same answer when the hub had to skip a repository it cannot get a token
+  for) for two minutes is connected but working nothing, so it stops covering.
+  An idle relay asks again about every 30 seconds, so one empty answer between
+  two tasks never drops it. A task or a fix-pr task handed to the relay ends
+  the idle stretch at once.
+
+A relay that is busy on a task still counts, including one holding its
+tier's `max_concurrent` tasks.
+
+```yaml
+agents:
+  quality:
+    contributor_first: true          # default false
+    contributor_first_grace: 10m     # default 10m; how long to wait for a relay to return
+```
+
+| Field | Meaning |
+|---|---|
+| `contributor_first` | Make a connected contributor relay acting as this role the lane's primary worker, and withhold the resident agent's kicks while one is connected. Default off; an absent key changes nothing. **The role must be one contributors may act as** — in `hub.contribute_delegatable_roles`, or one of the default `scanner`, `quality`, `outreach` — or the load fails: a contributor-first lane nobody may claim would sit inert while you believe contributors are taking the load. `supervisor` is never delegatable and is rejected. |
+| `contributor_first_grace` | How long kicks stay withheld after the last covering relay disappears. Default **10m**; negative fails the load. |
+
+Both keys are also on the agent's **General** tab in Settings (**Contributor-first** and **Contributor-first grace**), so a hive owner can switch a lane without editing `hive.yaml`; the save refuses exactly what the load refuses, with the same message, and takes effect on the next governor evaluation without a restart.
+
+What you see: the Governor section gains a **contributor-first** tile naming
+each covered lane and who covers it ("quality covered by alice, resident kicks
+withheld"), and during the grace it says when the resident agent resumes.
+`/api/status` carries the same facts under `governor.covered_lanes`. A
+withheld agent is simply idle; it is not paused, not disabled, and nothing
+about its cadence or mode changes.
+
+What does **not** change:
+
+- **Budget and standby.** A covered lane is never reported as paused for
+  budget: `suppressed_lanes` and `lane_pause_reasons` stay budget-only, so
+  standby dispatch keeps its meaning. If the budget *is* exhausted, the lane
+  reads as paused for budget exactly as before, and the contributor relay
+  keeps working because the contributor path has never been budget-gated.
+- **Who may act as the role.** Trust tier, grants and the delegatable list are
+  decided by the contributor path as before; `contributor_first` only reads
+  the result. A relay that is busy on a task still counts as covering — it is
+  draining the lane, which is the point.
+- **What a relay may take.** Contributors run on their own GitHub identity and
+  scoped token, so work the role does *outside* contributor task assignment
+  (for example pushes to adopted branches, or merges) is not done for the
+  resident agent while it is withheld. Set `contributor_first` on lanes whose
+  work is issue-shaped and delegatable, which is what the delegatable-role
+  gate already expresses.
 
 ## Write-back containment (`writeback`)
 

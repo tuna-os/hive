@@ -1,3 +1,9 @@
+    // The phone-only count line above the list: one button that is the Waiting
+    // on you chip (same hamFilter action). '' when nothing is parked on anyone.
+    function stageTrackerAttentionLineHtml(waiting, attention, on) {
+      if (!waiting && !attention) return '';
+      return `<button type="button" class="ham-attn-line" data-action="hamFilter" data-arg0="waitingOnYou" data-arg1="toggle" aria-pressed="${on ? 'true' : 'false'}" title="${on ? 'Show every row again' : 'Show only the rows waiting on you'}"><span aria-hidden="true">⚠</span> ${waiting} waiting on you · ${attention} need${attention === 1 ? 's' : ''} attention</button>`;
+    }
     function stageTrackerPagerHtml(page) {
       if (page.pages <= 1) return '';
       return `<nav class="ham-pager" aria-label="Tracker pages"><button type="button" class="ham-chip" data-action="hamFilter" data-arg0="page" data-arg1="prev"${page.page <= 1 ? ' disabled' : ''} aria-label="Previous page">‹ Prev</button><span>page ${page.page} of ${page.pages}</span><button type="button" class="ham-chip" data-action="hamFilter" data-arg0="page" data-arg1="next"${page.page >= page.pages ? ' disabled' : ''} aria-label="Next page">Next ›</button></nav>`;
@@ -51,8 +57,8 @@
       _stageTrackerPollErrorSince = 0;
     }
 
-    function renderStageTracker(data) {
-      if (data && typeof data === 'object') { _stageTracker = data; stageTrackerNoteMerges(data); stageTrackerNoteOpened(data); stageTrackerNoteMoves(data); }
+    function renderStageTracker(data, countRefresh = false) {
+      if (data && typeof data === 'object') { _stageTracker = data; stageTrackerReconcileMerges(data); stageTrackerNoteOpened(data); stageTrackerNoteMoves(data); }
       // Row-action feedback rides the payload: a result toast leaves and a
       // row stops "acting" once the item it targets reads a new state.
       if (data && typeof data === 'object' && typeof stageTrackerResultToastsSync === 'function') { stageTrackerNoteEvents(data); stageTrackerResultToastsSync(data); stageTrackerPendingExpire(data); }
@@ -60,12 +66,18 @@
       if (!el) return;
       const nowMs = Date.now();
       // Rows under a "Merging" hold the payload already dropped ride along (#15245).
-      const d = typeof stageTrackerMergingHoldView === 'function' ? stageTrackerMergingHoldView(_stageTracker, _stageTrackerMergingHold, nowMs) : _stageTracker;
+      const held = typeof stageTrackerMergingHoldView === 'function' ? stageTrackerMergingHoldView(_stageTracker, _stageTrackerMergingHold, nowMs) : _stageTracker;
+      const d = typeof stageTrackerTerminalView === 'function' ? stageTrackerTerminalView(held, nowMs) : held;
       if (!d || d.status === 'initializing' || !Array.isArray(d.items)) {
+        if (typeof stageTrackerPreparationVisualSync === 'function') stageTrackerPreparationVisualSync(null, [], [], [], nowMs);
+        if (typeof stageTrackerNativeQueueSync === 'function') stageTrackerNativeQueueSync(null, [], nowMs, '');
+        if (typeof stageTrackerExecutionSync === 'function') stageTrackerExecutionSync(null, nowMs);
+        stageTrackerSidebarCountsUnknown();
         setIfChanged(el, '<div class="ham-empty">Waiting for the first scan…</div>');
         return;
       }
       const f = _stageTrackerFilter = stageTrackerNormalizeFilter(_stageTrackerFilter);
+      if (typeof stageTrackerTerminalEvents === 'function') stageTrackerTerminalEvents(nowMs);
       const stages = d.stages || [];
       const repos = Array.from(new Set(d.items.map(it => it.repo).filter(Boolean))).sort();
       const sel = document.getElementById('activity-monitor-repo');
@@ -75,6 +87,8 @@
       }
       stageTrackerSyncToolbar(f);
       const ctx = { nowMs, stages, moves: _stageTrackerMoves };
+      // Workflow-model columns for bound repositories (hivecommons/hive#17620).
+      ctx.workflows = d.workflows || null;
       ctx.workers = stageTrackerWorkers(window._lastStatus);
       ctx.events = _stageTrackerEvents;
       ctx.noteTuck = stageTrackerNoteTuckSetting();
@@ -83,14 +97,38 @@
       // Repo chips ride the setting against how many repos the payload spans.
       if (stageTrackerRepoChipOn(stageTrackerRepoChipSetting(), repos.length)) ctx.repoChips = { primary: stageTrackerPrimaryRepo(), active: f.repo };
       const visible = stageTrackerVisible(d.items, f, ctx);
-      const ordered = stageTrackerTrainContiguous(stageTrackerSort(visible, stages, f));
-      const grouping = _stageTrackerGroup === 'repo';
-      const page = grouping
-        ? stageTrackerGroupPage(stageTrackerGroups(ordered, { primary: stageTrackerPrimaryRepo(), collapsed: _stageTrackerCollapsed, stages }), f)
-        : stageTrackerPage(ordered, f);
-      if (page.page !== f.page) f.page = page.page;
+      const sorted = stageTrackerTrainContiguous(stageTrackerSort(visible, stages, f, { phone: stageTrackerPhone() }));
+      const prepared = typeof stageTrackerPreparationOrderRows === 'function' ? stageTrackerPreparationOrderRows(d, sorted, stages) : sorted;
+      // Shared-PR groups last, so a secondary issue always sits right after
+      // its primary whatever the lead sort or train put between them; the
+      // groups a viewer folded leave their secondaries out of the list.
+      // Guarded: test harnesses lift renderStageTracker without tracker-words-core.
+      const sharing = typeof stageTrackerSharedPRContiguous === 'function';
+      ctx.shared = sharing ? Object.assign(stageTrackerSharedPRGroups(prepared, stages), { collapsed: _stageTrackerSharedCollapsed }) : null;
+      const ordered = sharing ? stageTrackerSharedPRContiguous(prepared, stages, _stageTrackerSharedCollapsed) : prepared;
+      const foldedShared = prepared.length - ordered.length;
+      // A TV display (display=1&density=tv) shows the rows that fit the
+      // screen, ungrouped, with "+N more" in place of the pager.
+      const tv = typeof stageTrackerDisplayTv === 'function' && stageTrackerDisplayTv();
+      const grouping = _stageTrackerGroup === 'repo' && !tv;
+      const page = tv
+        ? stageTrackerDisplayCapPage(ordered, stageTrackerDisplayTvCap())
+        : grouping
+          ? stageTrackerGroupPage(stageTrackerGroups(ordered, { primary: stageTrackerPrimaryRepo(), collapsed: _stageTrackerCollapsed, stages }), f)
+          : stageTrackerPage(ordered, f);
+      if (!tv && page.page !== f.page) f.page = page.page;
+      // A folded secondary is not filtered out: it counts toward the total.
+      if (foldedShared > 0) page.total += foldedShared;
+      // The rows this render draws (this page, group headers aside), for
+      // stageTrackerPRListedOwnRow: a covered issue defers to its PR's row
+      // only when that row is actually on screen. Kept beside the payload,
+      // not on it — the payload object stays the server's.
+      _stageTrackerRows = page.rows.map(e => grouping ? e.item : e).filter(Boolean);
+      if (typeof stageTrackerPreparationVisualSync === 'function') stageTrackerPreparationVisualSync(d, ordered, page.rows, stages, nowMs);
+      if (typeof stageTrackerNativeQueueSync === 'function') stageTrackerNativeQueueSync(d, page.rows, nowMs, f.repo);
+      if (typeof stageTrackerExecutionSync === 'function') stageTrackerExecutionSync(d, nowMs);
       // Attention is counted over the filtered set, nested PRs included.
-      const filteredAll = d.items.filter(it => stageTrackerMatches(it, f, ctx));
+      const filteredAll = d.items.filter(it => !stageTrackerIsStandingMeta(it) && stageTrackerMatches(it, f, ctx));
       const attention = filteredAll.filter(stageTrackerNeedsAttention).length;
       // "N filtered out" and the sidebar pill count against the default
       // view's rows (stageTrackerRowCount), so drawing a PR on its issue's
@@ -102,25 +140,28 @@
       // disagree: the pill is the default view's row count (owner: rows,
       // not items — a covering PR shares its issue's row); needs-attention
       // is the warn-coloured header suffix and the pill's tooltip, counted
-      // over every item regardless of filter.
-      const attentionAll = d.items.filter(stageTrackerNeedsAttention).length;
-      const counts = stageTrackerCountsText(page, allRows, attention, stageTrackerOpenCounts(d), attentionAll, stageTrackerFoldedCount(d.items, ctx));
+      // over every item regardless of filter. The same count lands on the
+      // monitor header's own pill, the one chrome-less views can see.
+      const attentionAll = d.items.filter(it => !stageTrackerIsStandingMeta(it) && stageTrackerNeedsAttention(it)).length;
+      const counts = stageTrackerCountsText(page, allRows, attention, stageTrackerOpenCounts(d), attentionAll, stageTrackerFoldedCount(d.items, ctx), stageTrackerStandingCount(d.items));
       setSectionSummary('activity-monitor-section', counts.header.replace(/(\d+) needs? attention/, m => `<span class="text-warn">${m}</span>`));
-      const badge = document.getElementById('activity-monitor-sidebar-badge');
-      if (badge) { badge.textContent = String(counts.badge); badge.title = counts.badgeTitle; if (counts.badge) badge.removeAttribute('data-zero'); else badge.setAttribute('data-zero', ''); }
-      stageTrackerRenderWaiting(d, nowMs);
+      navCountBind(STAGE_TRACKER_COUNT_BADGE_IDS, counts.badge, counts.badgeTitle, !!data || countRefresh);
+      stageTrackerRenderWaiting(d, nowMs, !!data || countRefresh);
+      const attnLine = document.getElementById('activity-monitor-attn-line');
+      if (attnLine) setIfChanged(attnLine, stageTrackerAttentionLineHtml(stageTrackerWaitingOnYou(d).count || 0, attentionAll, f.waitingOnYou));
       const labelsEl = document.getElementById('activity-monitor-labels');
       if (labelsEl) setIfChanged(labelsEl, stageTrackerLabelsHtml(stageTrackerLabelFacets(d.items, f)));
       stageTrackerRenderLabelDialog();
       const meta = document.getElementById('activity-monitor-meta');
       if (meta) setIfChanged(meta, `<span class="ham-count"${counts.note ? ` title="${esc(counts.note)}"` : ''}>${esc(counts.showing)}</span>${stageTrackerEngineHtml(d)}${stageTrackerUpdatedHtml(d, nowMs, _stageTrackerPollError, _stageTrackerPollErrorSince)}${stageTrackerPagerHtml(page)}`);
       const foot = document.getElementById('activity-monitor-meta-foot');
-      if (foot) setIfChanged(foot, page.pages > 1 ? `<span class="ham-count">${esc(counts.showing)}</span>${stageTrackerPagerHtml(page)}` : '');
-      const effect = stageTrackerMotionEffect(stageTrackerMotionSetting(), stageTrackerReducedMotion());
+      if (foot) setIfChanged(foot, tv ? stageTrackerDisplayMoreHtml(page.more) : page.pages > 1 ? `<span class="ham-count">${esc(counts.showing)}</span>${stageTrackerPagerHtml(page)}` : '');
+      let effect = stageTrackerMotionEffect(stageTrackerMotionSetting(), stageTrackerReducedMotion());
+      if (typeof stageTrackerDisplayEffect === 'function') effect = stageTrackerDisplayEffect(effect);
       if (!visible.length && !Object.keys(_stageTrackerCelebrating).length) {
         _stageTrackerMoves = {};
         stageTrackerSelectionSync(el, []);
-        const emptyHtml = `<div class="ham-empty">${d.items.length ? 'Nothing matches the current filters.' : 'Nothing open is being tracked right now.'}</div>`;
+        const emptyHtml = (typeof stageTrackerPreparationMissingRows === 'function' ? stageTrackerPreparationMissingRows().map(row => row.html).join('') : '') + `<div class="ham-empty">${d.items.length ? 'Nothing matches the current filters.' : 'Nothing open is being tracked right now.'}</div>`;
         // The counter goes back to its toolbar home before the header
         // (and its slot) leaves with the rows.
         if (el.querySelector('[data-ham-key]')) {
@@ -149,8 +190,9 @@
       const rowOf = (e, i) => grouping && !e.item
         ? { key: e.group.key, html: stageTrackerGroupHeaderHtml(e.group, stages, ctx) }
         : itemRow(pageItems[i], i);
-      const rows = stageTrackerPinnedRows(el, [{ key: STAGE_TRACKER_HEADER_KEY, html: stageTrackerHeaderHtml(stages) }]
-        .concat(stageTrackerTrainRows(page.rows, rowOf, typeof stageTrackerTrainWhere === 'function' ? stageTrackerTrainWhere(ordered, d.items) : null)), nowMs);
+      const trainRows = stageTrackerTrainRows(page.rows, rowOf, typeof stageTrackerTrainWhere === 'function' ? stageTrackerTrainWhere(ordered, d.items) : null);
+      const inlineRows = typeof stageTrackerPreparationInlineRows === 'function' ? stageTrackerPreparationInlineRows(trainRows, pageItems, stages) : trainRows;
+      const rows = stageTrackerPinnedRows(el, [{ key: STAGE_TRACKER_HEADER_KEY, html: stageTrackerHeaderHtml(stages) }].concat(inlineRows), nowMs, it => stageTrackerRowHtml(it, stages, ctx));
       const rec = stageTrackerReconcile(el, rows, { effect, hidden: document.hidden });
       if (rec.deferred) stageTrackerScheduleSettle();
       // Selection is keyed on the row, never baked into its HTML, so a kept
@@ -159,6 +201,7 @@
       if (typeof stageTrackerPendingSync === 'function') stageTrackerPendingSync(el);
       stageTrackerCueAgeSync(el, nowMs);
       stageTrackerCueTick();
+      if (tv) stageTrackerDisplayMeasureRows(el);
       // Moves play once, on the render that follows the payload; a filter
       // or paging re-render of the same payload does not replay them.
       if (Object.keys(_stageTrackerMoves).length) { stageTrackerAnimateMoves(el); _stageTrackerMoves = {}; }
@@ -206,4 +249,3 @@
       _stageTrackerNudgeAt = Date.now();
       fetchStageTracker();
     }
-

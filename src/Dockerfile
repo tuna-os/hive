@@ -292,6 +292,14 @@ ARG COPILOT_VERSION=1.0.88
 RUN npm install -g --ignore-scripts --no-fund --no-audit \
     "@github/copilot@${COPILOT_VERSION}" && npm cache clean --force || \
     echo "WARN: GitHub Copilot CLI install failed — skipping"
+# Wrap the platform binary so it starts through glibc's ld.so (#17729): the
+# Bun single-file ET_EXEC the package ships is rejected with ENOEXEC by Linux
+# 6.12 binfmt_elf (OKE UEK8 upgrade took every copilot agent down), while the
+# dynamic loader maps the same file fine. The installer is idempotent and a
+# no-op when the copilot layer above was skipped.
+COPY bin/install-copilot-exec-shim.sh /usr/local/bin/install-copilot-exec-shim.sh
+RUN chmod +x /usr/local/bin/install-copilot-exec-shim.sh && \
+    /usr/local/bin/install-copilot-exec-shim.sh /usr/local/lib/node_modules
 
 # --- Layer 3b: GitHub Copilot SDK (pinned; powers SDK-based model discovery) ---
 # The dashboard's copilot model discovery prefers a probe through the official
@@ -317,12 +325,25 @@ RUN timeout 120s npm install -g --ignore-scripts --no-fund --no-audit \
 # dashboard's codex model discovery (`codex app-server` model/list — pure
 # local stdio, no network, unaffected by the proxy CA) falls back to the
 # static list, and non-codex backends are unaffected.
-ARG CODEX_VERSION=0.166.0
+ARG CODEX_VERSION=0.167.0
+ARG CLINE_VERSION=3.0.74
+# npm can briefly advertise AWS SDK versions before all registry replicas serve
+# them. Wait at most three minutes between attempts and revalidate metadata.
+RUN attempt=1; \
+    until npm install -g --ignore-scripts --no-fund --no-audit --prefer-online cline@${CLINE_VERSION}; do \
+      status=$?; \
+      if [ "$attempt" -ge 4 ]; then exit "$status"; fi; \
+      echo "Cline install failed (attempt $attempt/4); retrying in 60s" >&2; \
+      sleep 60; \
+      attempt=$((attempt + 1)); \
+    done \
+    && ln -sf "$(npm root -g)/cline/bin/cline" /usr/local/bin/cline \
+    && cline --version
 RUN npm install -g --ignore-scripts --no-fund --no-audit @openai/codex@${CODEX_VERSION} && npm cache clean --force || \
     echo "WARN: OpenAI Codex CLI install failed — skipping"
 
 # --- Layer 7: Claude Code (most frequent updates) ---
-ARG CLAUDE_CODE_VERSION=2.1.314
+ARG CLAUDE_CODE_VERSION=2.1.322
 # --ignore-scripts (kept, deliberately: no arbitrary postinstall runs during the
 # build) skips claude-code's install.cjs, which is what LINKS the platform
 # native binary into the package's bin/. The binary itself ships in the
@@ -343,9 +364,9 @@ RUN npm install -g --ignore-scripts --no-fund --no-audit @anthropic-ai/claude-co
 # Installs from the OFFICIAL aaif-goose/goose repo, pinned to a fixed release and
 # SHA-256-verified before extraction. Download failures are tolerated because
 # Goose is an optional backend; checksum mismatches must hard-fail the build.
-ARG GOOSE_VERSION=1.57.0
-ARG GOOSE_SHA256_AMD64=10eb96cb6a159b6e1d38eeedbef6ab64cd28168aad91948f1fa5c34eefdf98e3
-ARG GOOSE_SHA256_ARM64=c32605acfd560aeb2adbf17ec359cc0217e28022a7e647b35a6af5dcfca91749
+ARG GOOSE_VERSION=1.59.0
+ARG GOOSE_SHA256_AMD64=a774667de6c20206a60d78d7bece2d9dda8389667e4f5c2fc8aaa758d1e81ef3
+ARG GOOSE_SHA256_ARM64=ba96b78394e3050077482bb285ff35f34613646e90b84a18b5d674b71905166e
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     case "$ARCH" in \
       amd64) GOOSE_ARCH=x86_64; GOOSE_SHA256="$GOOSE_SHA256_AMD64" ;; \
@@ -370,10 +391,10 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # complete the interactive OAuth flow itself). This enables a self-hosted Hive
 # controller to use its configured agy fallback rung without pretending that
 # generic contributor containers can bootstrap Google login.
-ARG AGY_VERSION=1.4.0
-ARG AGY_BUILD=5281842794987520
-ARG AGY_SHA512_AMD64=6c4b298c2a69b6bd0f58567031cc56d8097a32be54c4b633aa80ad395871b389618ab3860d4ba0a12599831b8226b51b03e258ee2ec7fae105a45b8e0fce2188
-ARG AGY_SHA512_ARM64=64dfb2a9665ebd19b6e9d687c094673b61ca9f5ffdebc81391cea8e3858773e1c88154f088e8a8691208561d946a7aea9acbec7a3bdca9e5d8a48fa197b0a308
+ARG AGY_VERSION=1.5.0
+ARG AGY_BUILD=5269980577660928
+ARG AGY_SHA512_AMD64=e6031f850929210705d8c2393a5665b82b8c3b19684a6d3c556cafa31f26f77acbf164dfee96ca84a5ae7670ac0cc238a974c981c517b269194bdccff271cbd5
+ARG AGY_SHA512_ARM64=509518b2820945db2bea5e013ca43a49df5c78927c3ac341a1115287d52627356e1e9506ac0d2040fb467915fba4dde90061d091fddbddf8ddc212637ae40150
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     case "$ARCH" in \
       amd64|x86_64) AGY_URL_ARCH=x64; AGY_FILE_ARCH=x64; AGY_SHA512="$AGY_SHA512_AMD64" ;; \
@@ -391,9 +412,9 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # --- Layer 8.27: OMP CLI (Oh My Pi — backend: omp) ---
 # Mirrored from Dockerfile.contributor so hub agents can launch backend: omp.
 # Downloads are optional like Goose/agy, but checksum mismatches are fatal.
-ARG OMP_VERSION=18.14.0
-ARG OMP_SHA256_AMD64=e7dd2b606c4ebe9d1a7bcfad1b8820db968cd6b05409fed1c6bc8db0b6a95a8f
-ARG OMP_SHA256_ARM64=dba8d170499709bc87359e02e677821aa76a6ef998ca0254578fe4ea07aff5bc
+ARG OMP_VERSION=18.19.0
+ARG OMP_SHA256_AMD64=b44fda2ae5c9cce2bbe124d1672cba532a136d9e1eef68599b16efcd3bc5c626
+ARG OMP_SHA256_ARM64=61826bf89c2c0512417fee05fa2f486e60ee11b23ea95a17257a6c49edb6b8d5
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
   && case "$ARCH" in \
        amd64|x86_64) OMP_ASSET=omp-linux-x64; OMP_SHA256="$OMP_SHA256_AMD64" ;; \
@@ -451,7 +472,7 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # Tolerant of failure like the copilot/codex layers: agents configured for
 # backend: pi simply won't launch if this is absent, same degradation as
 # any other missing backend binary.
-ARG PI_VERSION=1.4.0
+ARG PI_VERSION=1.5.0
 RUN npm install -g --ignore-scripts --no-fund --no-audit \
     "@earendil-works/pi-coding-agent@${PI_VERSION}" && npm cache clean --force || \
     echo "WARN: pi CLI install failed — skipping"

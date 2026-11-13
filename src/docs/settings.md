@@ -61,7 +61,7 @@ Every inbound surface that can start or steer agent work from outside the dashbo
 - **Chat surfaces** — the two-way Discord bot (`notifications.discord.bot_token`, `channel_id`, `allowed_users`) and the Slack, Matrix, Telegram and Microsoft Teams bots (`notifications.<surface>.*`). An enabled bot must carry its credentials or the save is rejected. Bots connect at startup, so these apply after a restart.
 - **Dashboard chat** — read-only status. The chat panel and inception-via-chat have no server-side settings of their own; who may post comes from `dashboard.authorized_users` on the Security tab and each agent's converse flag. See [Dashboard chat](dashboard-chat.md).
 - **Escalation & on-call** — `escalation.email.*` (SMTP host/port/credentials, from, recipients, digest recipients and time) and `escalation.push.*` (minimum severity, ntfy, Pushover, PagerDuty). Saving rebuilds the escalation dispatcher's sinks. The breaker thresholds stay on the Health tab.
-- **Admin MCP** — read-only status of the `/api/admin/mcp` endpoint. It is always registered and has no `hive.yaml` section; writes are enabled with `HIVE_ADMIN_MCP_ENABLE_WRITES` on the hive process. See [Admin MCP](admin-mcp.md#writes).
+- **Admin MCP** — status of the `/api/admin/mcp` endpoint, which is always registered, and the owner's **Allow admin MCP writes** switch (`admin_mcp.writes_enabled`). The switch turns the endpoint's write tools on or off with no restart, and turning it off refuses pending confirmations. Once used it overrides `HIVE_ADMIN_MCP_ENABLE_WRITES` in both directions; until then that variable on the hive process decides, and the tab says which one is in effect. **Use environment default** (shown while the switch is in effect) clears the key so the variable, or the default (off), decides again. Each change is audited as `config_admin_mcp_writes`. The stdio `hive-admin-mcp` binary is not affected; it keeps its own variable. See [Admin MCP](admin-mcp.md#writes).
 
 ## Health
 
@@ -88,7 +88,7 @@ Optional capabilities, each off or inert until you turn it on. Where a feature h
 - Audit publication: [Audit campaign](audit-campaign.md#publication).
 - Token mint: [Token mint](token-mint.md).
 - Spek stage runner: [Spektacular](spektacular.md).
-- Auto-merge: [App self-merge sweep](operator-reference.md#app-self-merge-sweep-auto_merge), [Trusted bot authors](hive-merge.md#trusted-bot-authors), [Trusted-author auto-merge](hive-merge.md#trusted-author-auto-merge), and the per-repository merge policy (`auto_merge.require_current_base`, `auto_merge.squash_only`, `auto_merge.human_merge_paths`).
+- Auto-merge: [App self-merge sweep](operator-reference.md#app-self-merge-sweep-auto_merge), [Trusted bot authors](hive-merge.md#trusted-bot-authors), [Trusted-author auto-merge](hive-merge.md#trusted-author-auto-merge), and the per-repository merge policy (`auto_merge.require_current_base`, `auto_merge.squash_only`, `auto_merge.human_merge_paths`, `auto_merge.human_merge_pin_only`).
 - Review gate: [Review swarm](review-swarm.md#configuration), [Blocking line and backlog](review-swarm.md#blocking-line-reviewseverity-reviewbacklog), and [external review bot threads](review-bot-threads.md).
 - Trajectory review: [Trajectory-Review Lane](trajectory-review.md#configuration).
 - Linear agent: [Linear agent integration](linear-agent.md).

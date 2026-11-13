@@ -1,7 +1,9 @@
 package dashboard
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -38,7 +40,7 @@ func TestStageTrackerMotionWiring(t *testing.T) {
 		`function stageTrackerNoteMoves(d)`,
 		`function stageTrackerAnimateMoves(root)`,
 		`function stageTrackerMotionEffect(setting, reduced)`,
-		`stageTrackerNoteMerges(data); stageTrackerNoteOpened(data); stageTrackerNoteMoves(data); }`,
+		`stageTrackerReconcileMerges(data); stageTrackerNoteOpened(data); stageTrackerNoteMoves(data); }`,
 		`const ctx = { nowMs, stages, moves: _stageTrackerMoves };`,
 		`if (Object.keys(_stageTrackerMoves).length) { stageTrackerAnimateMoves(el); _stageTrackerMoves = {}; }`,
 		`window.matchMedia('(prefers-reduced-motion: reduce)').matches`,
@@ -255,6 +257,7 @@ func TestStageTrackerMotionDetector(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED"),
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS"),
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION"),
 		jsConstLine(t, html, "STAGE_TRACKER_PRE_MERGE_SOAK"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTIVE_WORD"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTOR"),
@@ -275,6 +278,7 @@ func TestStageTrackerMotionDetector(t *testing.T) {
 		jsFunc(t, html, "stageTrackerLinkedSupersededGone"),
 		jsFunc(t, html, "stageTrackerLinkedSupersededTip"),
 		jsFunc(t, html, "stageTrackerLinkedSorted"),
+		jsFunc(t, html, "stageTrackerLinkedRiding"),
 		jsConstLine(t, html, "STAGE_TRACKER_ATTENTION_STAGES"),
 		jsConstLine(t, html, "STAGE_TRACKER_HUMAN_MODS"),
 		jsFunc(t, html, "stageTrackerRegressionHandled"),
@@ -298,17 +302,22 @@ const col = (kind, stage) => stageTrackerColIndex({ kind, stage }, stages);
 // Column index follows the drawn anchor: shared columns and detours collapse.
 assert.strictEqual(col('issue', 0), 0); assert.strictEqual(col('issue', 10), 1); assert.strictEqual(col('issue', 15), 1);
 assert.strictEqual(col('issue', 20), 2); assert.strictEqual(col('pr', 30), 3); assert.strictEqual(col('pr', 40), 3);
-assert.strictEqual(col('pr', 50), 4); assert.strictEqual(col('pr', 60), 4, '060 reviewed is pre-admission: CI / Review, not the merge gate'); assert.strictEqual(col('pr', 70), 4); assert.strictEqual(col('pr', 71), 4);
-assert.strictEqual(col('pr', 80), 5); assert.strictEqual(col('pr', 85), 5); assert.strictEqual(col('pr', 90), 5); assert.strictEqual(col('pr', 95), 5); assert.strictEqual(col('pr', 100), 5);
+assert.strictEqual(col('pr', 50), 4); assert.strictEqual(col('pr', 60), 4, '060 reviewed is pre-admission: CI / Review, not the merge gate'); assert.strictEqual(col('pr', 70), 4); assert.strictEqual(col('pr', 71), 3, 'native owner wait is PR in progress, not observed coding');
+assert.strictEqual(col('pr', 80), 6); assert.strictEqual(col('pr', 85), 6); assert.strictEqual(col('pr', 90), 6); assert.strictEqual(col('pr', 95), 6); assert.strictEqual(col('pr', 100), 6);
 assert.strictEqual(col('issue', 45), 1, 'an issue parked on a person lights Actionable');
 assert.strictEqual(col('issue', 110), STAGE_TRACKER_CAP_COLUMN, 'merged is the cap column');
-assert.strictEqual(STAGE_TRACKER_CAP_COLUMN, STAGE_TRACKER_PATH.length);
+assert.strictEqual(STAGE_TRACKER_CAP_COLUMN, STAGE_TRACKER_PATH.length + 1);
 
 const P = (n, stage) => ({ kind: 'pr', repo: 'a/b', number: n, stage });
 const I = (n, stage, linked) => ({ kind: 'issue', repo: 'a/b', number: n, stage, linked_prs: linked });
 // Column map: plain items, an issue riding its single covering PR, nested PRs keyed on their own.
 assert.deepStrictEqual(stageTrackerColMap([P(1, 50), I(2, 20), I(3, 20, [{ number: 9, stage: 30 }]), I(4, 20, [{ number: 7, stage: 50 }, { number: 8, stage: 80 }])], stages),
-  { 'a/b/pr#1': 4, 'a/b/issue#2': 2, 'a/b/issue#3': 3, 'a/b/pr#9': 3, 'a/b/issue#4': 2, 'a/b/pr#7': 4, 'a/b/pr#8': 5 });
+  { 'a/b/pr#1': 4, 'a/b/issue#2': 2, 'a/b/issue#3': 3, 'a/b/pr#9': 3, 'a/b/issue#4': 2, 'a/b/pr#7': 4, 'a/b/pr#8': 6 });
+// A PR closing two issues is drawn under the lower one (drawn_under); the
+// other issue still rides the PR's column — the lane is the PR's, not the
+// issue's own 030/040 (hivecommons/hive#17324).
+assert.deepStrictEqual(stageTrackerColMap([I(10, 40, [{ number: 12, stage: 95, drawn_under: 10 }]), I(11, 30, [{ number: 12, stage: 95, drawn_under: 10 }])], stages),
+  { 'a/b/issue#10': 6, 'a/b/pr#12': 6, 'a/b/issue#11': 6 }, 'the secondary issue lights the Merge queue column with the primary');
 assert.deepStrictEqual(stageTrackerColMap(null, stages), {});
 assert.deepStrictEqual(stageTrackerColMap([{ kind: 'pr', repo: 'a/b', number: 0 }, null], stages), {}, 'items without a number are skipped');
 
@@ -319,17 +328,17 @@ assert.deepStrictEqual(stageTrackerColMoves(null, first), {}, 'no previous paylo
 assert.deepStrictEqual(stageTrackerColMoves(first, first), {}, 'same payload → nothing');
 const second = stageTrackerColMap([P(1, 80), P(2, 50), I(3, 10), P(4, 30), I(5, 20, [{ number: 6, stage: 50 }])], stages);
 assert.deepStrictEqual(stageTrackerColMoves(first, second), {
-  'a/b/pr#1': { from: 4, to: 5 }, 'a/b/pr#2': { from: 5, to: 4 },
+  'a/b/pr#1': { from: 4, to: 6 }, 'a/b/pr#2': { from: 6, to: 4 },
   'a/b/issue#5': { from: 3, to: 4 }, 'a/b/pr#6': { from: 3, to: 4 },
 }, 'advance, regress, covered issue + its PR; #3 unchanged and new #4 are not moves');
 assert.deepStrictEqual(stageTrackerColMoves(stageTrackerColMap([P(1, 50)], stages), stageTrackerColMap([P(1, 70)], stages)), {}, '050 → 070 shares the Review column');
-assert.deepStrictEqual(stageTrackerColMoves(stageTrackerColMap([P(1, 100)], stages), stageTrackerColMap([P(1, 110)], stages)), { 'a/b/pr#1': { from: 5, to: 6 } }, 'merge queue → merged moves to the cap');
+assert.deepStrictEqual(stageTrackerColMoves(stageTrackerColMap([P(1, 100)], stages), stageTrackerColMap([P(1, 110)], stages)), { 'a/b/pr#1': { from: 6, to: 7 } }, 'merge queue → merged moves to the cap');
 assert.deepStrictEqual(stageTrackerColMoves({ 'a/b/pr#1': 4 }, { 'c/d/pr#1': 5 }), {}, 'same number in another repo is another PR');
 
 // Row builder attribute: only the moved key gets the stamp.
 const ctx = { moves: stageTrackerColMoves(first, second) };
-assert.strictEqual(stageTrackerMoveAttrs('a/b/pr#1', ctx), ' data-ham-prev-col="4" data-ham-col="5"');
-assert.strictEqual(stageTrackerMoveAttrs('a/b/pr#2', ctx), ' data-ham-prev-col="5" data-ham-col="4"');
+assert.strictEqual(stageTrackerMoveAttrs('a/b/pr#1', ctx), ' data-ham-prev-col="4" data-ham-col="6"');
+assert.strictEqual(stageTrackerMoveAttrs('a/b/pr#2', ctx), ' data-ham-prev-col="6" data-ham-col="4"');
 assert.strictEqual(stageTrackerMoveAttrs('a/b/issue#3', ctx), '');
 assert.strictEqual(stageTrackerMoveAttrs('a/b/pr#1', {}), '');
 assert.strictEqual(stageTrackerMoveAttrs('a/b/pr#1', null), '');
@@ -338,11 +347,11 @@ assert.strictEqual(stageTrackerMoveAttrs('a/b/pr#1', null), '');
 stageTrackerNoteMoves({ items: [P(1, 50)], stages });
 assert.deepStrictEqual(_stageTrackerMoves, {});
 stageTrackerNoteMoves({ items: [P(1, 80)], stages });
-assert.deepStrictEqual(_stageTrackerMoves, { 'a/b/pr#1': { from: 4, to: 5 } });
+assert.deepStrictEqual(_stageTrackerMoves, { 'a/b/pr#1': { from: 4, to: 6 } });
 stageTrackerNoteMoves({ items: [P(1, 80)], stages });
 assert.deepStrictEqual(_stageTrackerMoves, {}, 'an unchanged payload clears the pending moves');
 stageTrackerNoteMoves({ items: [P(1, 50)], stages });
-assert.deepStrictEqual(_stageTrackerMoves, { 'a/b/pr#1': { from: 5, to: 4 } }, 'regression is a move too');
+assert.deepStrictEqual(_stageTrackerMoves, { 'a/b/pr#1': { from: 6, to: 4 } }, 'regression is a move too');
 
 // Setting: default F (wash), persisted, unknown values fall back, None disables,
 // reduced motion turns every other choice into the crossfade.
@@ -395,6 +404,7 @@ func TestStageTrackerMotionRowStamp(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED"),
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS"),
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION"),
 		jsConstLine(t, html, "STAGE_TRACKER_PRE_MERGE_SOAK"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTIVE_WORD"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTOR"),
@@ -432,6 +442,10 @@ func TestStageTrackerMotionRowStamp(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_HUMAN_MODS"),
 		jsFunc(t, html, "stageTrackerMotion"),
 		jsFunc(t, html, "stageTrackerShortAgo"),
+		jsFunc(t, html, "stageTrackerWaitingOnPerson"),
+		jsFunc(t, html, "stageTrackerTrackRunning"),
+		jsFunc(t, html, "stageTrackerAgoWord"),
+		jsFunc(t, html, "stageTrackerActivityTrackHtml"),
 		jsFunc(t, html, "stageTrackerStripItems"),
 		jsFunc(t, html, "stageTrackerCurrentStageHtml"),
 		jsFunc(t, html, "stageTrackerStageWord"),
@@ -452,6 +466,7 @@ func TestStageTrackerMotionRowStamp(t *testing.T) {
 		stageTrackerActedJS(t, html),
 		jsFunc(t, html, "stageTrackerSubRowHtml"),
 		jsFunc(t, html, "stageTrackerPRPillsHtml"),
+		jsFunc(t, html, "stageTrackerBasePillHtml"),
 		jsFunc(t, html, "stageTrackerLinkedPRItem"),
 		jsFunc(t, html, "stageTrackerLinkedPROpen"),
 		jsFunc(t, html, "stageTrackerNestedOpenPRs"),
@@ -488,11 +503,11 @@ const ctx = { nowMs: now, stages, moves: stageTrackerColMoves(stageTrackerColMap
 const ols = html => Array.from(html.matchAll(/<ol class="ham-strip" aria-label="Pipeline progress"([^>]*)>/g)).map(m => m[1]);
 assert.deepStrictEqual(ols(stageTrackerRowHtml(next[0], stages, ctx)), [' data-ham-prev-col="1" data-ham-col="2"'], 'the moved issue strip is stamped');
 assert.deepStrictEqual(ols(stageTrackerRowHtml(next[2], stages, ctx)), [''], 'an unmoved strip carries nothing');
-assert.deepStrictEqual(ols(stageTrackerRowHtml(next[1], stages, ctx)), ['', ' data-ham-prev-col="4" data-ham-col="5"', ''], 'only the nested PR that moved is stamped (sub-rows sort furthest first)');
+assert.deepStrictEqual(ols(stageTrackerRowHtml(next[1], stages, ctx)), ['', ' data-ham-prev-col="4" data-ham-col="6"', ''], 'only the nested PR that moved is stamped (sub-rows sort furthest first)');
 assert.deepStrictEqual(ols(stageTrackerRowHtml(next[0], stages, { nowMs: now })), [''], 'no moves in ctx → no stamp');
 `
-	cmd := exec.Command(node, "-e", script)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	// Over stdin: the lifted harness is past Linux's -e argument limit.
+	if out, err := runNodeStdin(node, script); err != nil {
 		t.Fatalf("node row stamp fixture failed: %v\n%s", err, out)
 	}
 }
@@ -522,6 +537,7 @@ func TestStageTrackerMotionPreviewSample(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_NEEDS_DECISION"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED"),
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS"),
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION"),
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN"),
 		jsConstLine(t, html, "STAGE_TRACKER_PRE_MERGE_SOAK"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTIVE_WORD"),
@@ -566,6 +582,10 @@ func TestStageTrackerMotionPreviewSample(t *testing.T) {
 		jsFunc(t, html, "stageTrackerHeaderHtml"),
 		jsFunc(t, html, "stageTrackerHoldLabels"),
 		jsFunc(t, html, "stageTrackerSoakLeft"),
+		jsFunc(t, html, "stageTrackerWaitingOnPerson"),
+		jsFunc(t, html, "stageTrackerTrackRunning"),
+		jsFunc(t, html, "stageTrackerAgoWord"),
+		jsFunc(t, html, "stageTrackerActivityTrackHtml"),
 		jsFunc(t, html, "stageTrackerStripItems"),
 		jsFunc(t, html, "stageTrackerCurrentStageHtml"),
 		jsFunc(t, html, "stageTrackerStageWord"),
@@ -584,6 +604,7 @@ func TestStageTrackerMotionPreviewSample(t *testing.T) {
 		stageTrackerActedJS(t, html),
 		jsFunc(t, html, "stageTrackerSubRowHtml"),
 		jsFunc(t, html, "stageTrackerPRPillsHtml"),
+		jsFunc(t, html, "stageTrackerBasePillHtml"),
 		jsFunc(t, html, "stageTrackerLinkedPRItem"),
 		jsFunc(t, html, "stageTrackerLinkedPROpen"),
 		jsFunc(t, html, "stageTrackerNestedOpenPRs"),
@@ -634,7 +655,7 @@ const _stageTracker = { stages };
 const PIPE = 'aria-label="Pipeline progress"';
 const count = (s, needle) => s.split(needle).length - 1;
 const chevrons = (s) => count(s.slice(s.indexOf(PIPE)).split('</ol>')[0], '<li class="ham-seg');
-const activeShort = (s) => { const m = s.slice(s.indexOf(PIPE)).split('</ol>')[0].match(/<span class="ham-seg-t">([^<]+)<\/span>/); return m && m[1].trim(); };
+const activeShort = (s) => { const strip = s.slice(s.indexOf(PIPE)).split('</ol>')[0]; const m = strip.match(/<span class="ham-seg-t">([^<]+)<\/span>/); return m ? m[1].trim() : strip.includes('data-route-state="active"') ? 'CI + Review' : null; };
 
 // A live row for comparison: the sample must have the same chevron count.
 const liveRow = stageTrackerRowHtml({ repo: 'hive/x', number: 7, kind: 'issue', title: 'Live', url: '#', stage: 30, stage_since: '' }, stages, { nowMs: Date.now() });
@@ -675,22 +696,29 @@ function stageTrackerMotionEffect(id) { return id; }
 function stageTrackerReducedMotion() { return false; }
 
 // N Preview clicks: still one row, one strip, lit chevron alternating
-const want = ['CI / Review', 'Claimed', 'CI / Review', 'Claimed', 'CI / Review'];
+const want = ['CI + Review', 'Claimed', 'CI + Review', 'Claimed', 'CI + Review'];
 for (let i = 0; i < want.length; i++) {
   stageTrackerPreviewMotion(i % 2 ? 'comet' : 'wash');
   const s = sampleEl.innerHTML;
   assert.strictEqual(count(s, '<div class="ham-row"'), 1, 'click ' + (i + 1) + ': one row');
   assert.strictEqual(count(s, PIPE), 1, 'click ' + (i + 1) + ': one chevron strip');
   assert.strictEqual(chevrons(s), LIVE_CHEVRONS, 'click ' + (i + 1) + ': chevron count');
-  assert.strictEqual(count(s, 'ham-seg active'), 1, 'click ' + (i + 1) + ': one lit chevron');
+  assert.strictEqual(count(s, 'ham-seg active'), want[i] === 'Claimed' ? 1 : 0, 'unknown CI/review activity cannot get a working chevron');
+  assert.strictEqual(count(s.slice(s.indexOf(PIPE)), 'aria-current="step"'), want[i] === 'Claimed' ? 1 : 2, 'parallel tracks share one native current phase');
   assert.strictEqual(activeShort(s), want[i], 'click ' + (i + 1) + ': destination lit');
 }
 const claimed = stageTrackerColIndex({ kind: 'issue', stage: 20 }, stages), review = stageTrackerColIndex({ kind: 'issue', stage: 50 }, stages);
 assert.deepStrictEqual(animated, [[claimed, review, 'wash'], [review, claimed, 'comet'], [claimed, review, 'wash'], [review, claimed, 'comet'], [claimed, review, 'wash']], 'each click animates origin → destination on the single strip');
 // a re-render after clicks picks up where the preview left off
-assert.strictEqual(activeShort(stageTrackerMotionSectionHtml('wash', stages)), 'CI / Review');
+assert.strictEqual(activeShort(stageTrackerMotionSectionHtml('wash', stages)), 'CI + Review');
 `
-	cmd := exec.Command(node, "-e", script)
+	// The lifted strip exceeds Linux's single-argument limit, so the script
+	// goes through a file rather than -e.
+	path := filepath.Join(t.TempDir(), "motion_preview_sample.js")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, path)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("node motion preview sample fixture failed: %v\n%s", err, out)
 	}

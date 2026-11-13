@@ -353,6 +353,10 @@
       am = am || {};
       rv = rv || {};
       const cv = (_configState.data || {}).convergence || {};
+      const io = (_configState.data || {}).integration_orchestration || { mode: 'off', scopes: [] };
+      const integrationExecution = io.execution || { mode: 'off' };
+      const integrationExecutionProfile = Object.assign({}, integrationExecution);
+      delete integrationExecutionProfile.mode;
       const planOn = f.planFromLabel === true;
       const formalAvailable = f.formalAvailable === true;
       const formalMinACMMLevel = f.formalMinACMMLevel || 5;
@@ -397,6 +401,12 @@
       const amContributorLaneScopes = Array.isArray(amContributorLane.auto_promotion_scopes) && amContributorLane.auto_promotion_scopes.length ? amContributorLane.auto_promotion_scopes : ['hive','repo'];
       const amContributorLaneScopeLabel = { hive: "hive — every repository this hive manages", repo: "repo — the PR's repository only" };
       const amContributorLaneScopeOptions = amContributorLaneScopes.map(v => `<option value="${esc(v)}"${v === amContributorLaneScope ? ' selected' : ''}>${esc(amContributorLaneScopeLabel[v] || v)}</option>`).join('');
+      const amContributorLaneFenceScope = typeof amContributorLane.workflow_fence_scope === 'string' && amContributorLane.workflow_fence_scope ? amContributorLane.workflow_fence_scope : 'all';
+      const amContributorLaneFenceScopes = Array.isArray(amContributorLane.workflow_fence_scopes) && amContributorLane.workflow_fence_scopes.length ? amContributorLane.workflow_fence_scopes : ['all','human_merge_paths'];
+      const amContributorLaneFenceScopeLabel = { all: "all — every workflow / action file edit", human_merge_paths: "human_merge_paths — only workflow / action files listed in Human-merge paths" };
+      const amContributorLaneFenceScopeOptions = amContributorLaneFenceScopes.map(v => `<option value="${esc(v)}"${v === amContributorLaneFenceScope ? ' selected' : ''}>${esc(amContributorLaneFenceScopeLabel[v] || v)}</option>`).join('');
+      const amContributorLaneFenceScopeRepos = Array.isArray(amContributorLane.workflow_fence_scope_repos) ? amContributorLane.workflow_fence_scope_repos : [];
+      const amContributorLaneFenceScopeReposText = amContributorLaneFenceScopeRepos.length ? amContributorLaneFenceScopeRepos.map(o => `<code>${esc(o.repo)}</code>: <code>${esc(o.workflow_fence_scope)}</code>`).join(', ') : 'none';
       const amContributorLaneRepoSet = new Set((Array.isArray(amContributorLane.repos) ? amContributorLane.repos : []).map(r => String(r).toLowerCase()));
       const amContributorLaneRepoOptions = watchedRepos.map(r => `<option value="${esc(r)}"${amContributorLaneRepoSet.has(String(r).toLowerCase()) ? ' selected' : ''}>${esc(r)}</option>`).join('');
       // Per-repo merge policy lists offer project.repos as owner/repo (the form
@@ -404,19 +414,54 @@
       // and selected so saving never drops it silently.
       const amProjectRepos = Array.isArray(am.project_repos) ? am.project_repos : [];
       const amRepoPolicySize = Math.min(Math.max(amProjectRepos.length || 3, 3), 8);
+      // A bare name (no_ci_ok and allow_unprotected_base keep what hive.yaml
+      // says) selects the project repository of that name.
       const amRepoPolicyOptions = (configured) => {
         const list = Array.isArray(configured) ? configured : [];
         const selected = new Set(list.map(r => String(r).toLowerCase()));
+        const has = (r) => { const full = String(r).toLowerCase(); return selected.has(full) || selected.has(full.slice(full.indexOf('/') + 1)); };
         const known = new Set(amProjectRepos.map(r => String(r).toLowerCase()));
-        return amProjectRepos.map(r => `<option value="${esc(r)}"${selected.has(String(r).toLowerCase()) ? ' selected' : ''}>${esc(r)}</option>`).join('')
-          + list.filter(r => !known.has(String(r).toLowerCase())).map(r => `<option value="${esc(r)}" selected>${esc(r)}</option>`).join('');
+        const knownNames = new Set(Array.from(known).map(r => r.slice(r.indexOf('/') + 1)));
+        return amProjectRepos.map(r => `<option value="${esc(r)}"${has(r) ? ' selected' : ''}>${esc(r)}</option>`).join('')
+          + list.filter(r => { const v = String(r).toLowerCase(); return !known.has(v) && (v.includes('/') || !knownNames.has(v)); }).map(r => `<option value="${esc(r)}" selected>${esc(r)}</option>`).join('');
       };
+      // auto_merge.allow_unprotected_base is a deprecated no-op; its select
+      // renders only while the list is set, so an owner can see and clear it.
+      const amUnprotectedBase = Array.isArray(am.allow_unprotected_base) ? am.allow_unprotected_base : [];
       const amHumanMergePaths = (am.human_merge_paths && typeof am.human_merge_paths === 'object') ? am.human_merge_paths : {};
       const amHumanMergePathRepos = amProjectRepos.concat(Object.keys(amHumanMergePaths).filter(k => !amProjectRepos.some(r => String(r).toLowerCase() === k.toLowerCase())));
       const amHumanMergePathsFor = (repo) => {
         const key = Object.keys(amHumanMergePaths).find(k => k.toLowerCase() === String(repo).toLowerCase());
         return key && Array.isArray(amHumanMergePaths[key]) ? amHumanMergePaths[key] : [];
       };
+      // project.repo_policies[].workflow_fence_scope: one row per watched
+      // repository; '' is "use the hive-wide scope". A staged choice wins
+      // over the saved one so a re-render keeps it.
+      const amFenceRepoStaged = ((((_configState.dirty || {})['auto-merge'] || {}).contributor_lane || {}).workflow_fence_scope_repos) || {};
+      const amFenceRepoScope = (repo) => {
+        const staged = Object.keys(amFenceRepoStaged).find(k => k.toLowerCase() === String(repo).toLowerCase());
+        if (staged !== undefined) return amFenceRepoStaged[staged] || '';
+        const o = amContributorLaneFenceScopeRepos.find(x => String(x.repo).toLowerCase() === String(repo).toLowerCase());
+        return o ? String(o.workflow_fence_scope || '') : '';
+      };
+      const amFenceRepoRows = amProjectRepos.map(r => {
+        const cur = amFenceRepoScope(r);
+        const choices = [['', `hive-wide (${amContributorLaneFenceScope})`]].concat(amContributorLaneFenceScopes.map(v => [v, v]));
+        return `<tr class="am-fence-repo-row" data-repo="${esc(r)}"><td><code>${esc(r)}</code></td><td><select aria-label="Workflow fence scope for ${esc(r)}" data-change-action="markDirtyFenceScopeRepo" data-arg0="${esc(r)}" data-arg-types="s,v">${choices.map(([v, l]) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></td><td>${amHumanMergePathsFor(r).length ? 'yes' : 'none, so it keeps the full fence'}</td></tr>`;
+      }).join('');
+      // auto_merge.human_merge_pin_only: one row per repository that has
+      // human-merge paths or already holds an exception (it only ever lifts a
+      // human-merge-path hold, so elsewhere it would never apply).
+      const amPinOnly = (am.human_merge_pin_only && typeof am.human_merge_pin_only === 'object') ? am.human_merge_pin_only : {};
+      const amPinOnlyKinds = Array.isArray(am.pin_only_kinds) && am.pin_only_kinds.length ? am.pin_only_kinds : ['action-sha', 'image-digest', 'version-pin', 'action-sha-ref'];
+      const amPinOnlyFor = (repo) => {
+        const key = Object.keys(amPinOnly).find(k => k.toLowerCase() === String(repo).toLowerCase());
+        const e = key && amPinOnly[key] && typeof amPinOnly[key] === 'object' ? amPinOnly[key] : {};
+        const list = (v) => Array.isArray(v) ? v : [];
+        return { enabled: e.enabled === true, paths: list(e.paths), kinds: list(e.kinds), trusted_authors: list(e.trusted_authors) };
+      };
+      const amPinOnlyRepos = amHumanMergePathRepos.filter(r => amHumanMergePathsFor(r).length || Object.keys(amPinOnly).some(k => k.toLowerCase() === String(r).toLowerCase()))
+        .concat(Object.keys(amPinOnly).filter(k => !amHumanMergePathRepos.some(r => String(r).toLowerCase() === k.toLowerCase())));
       const amBotSourceLabel = { known: 'known bot', discovered: 'seen in open PRs', custom: 'added manually' };
       const amBotRow = (b) => `<div class="config-toggle am-bot-row" data-bot-login="${esc(b.login)}">
               <div class="config-toggle-switch am-bot-switch ${b.trusted ? 'on' : ''}" data-action="gh97" data-arg0="${esc(b.login)}" data-arg-types="s" role="switch" aria-checked="${b.trusted ? 'true' : 'false'}"></div>
@@ -495,8 +540,8 @@
       // Status line: distinguish ON+running from ON+not-configured from OFF.
       let trajStatus, trajStatusColor;
       if (!trajOn) { trajStatus = 'Off'; trajStatusColor = 'var(--muted)'; }
-      else if (trajReady) { trajStatus = 'On — active'; trajStatusColor = 'var(--green)'; }
-      else { trajStatus = 'On — no reviewer endpoint (not running)'; trajStatusColor = 'var(--amber)'; }
+      else if (trajReady) { trajStatus = 'On — active (HTTP endpoint)'; trajStatusColor = 'var(--green)'; }
+      else { trajStatus = 'On — no reviewer endpoint (not running; this lane needs an HTTP endpoint, the Claude CLI path serves only Let hive decide and chat)'; trajStatusColor = 'var(--amber)'; }
       return `
         ${securityModelDatalistHtml()}
         <p class="text-muted fs-sm mb-5">Opt-in capabilities, grouped by what they govern. Each section below has a stable heading; use the chips to jump to one. Hive's own telemetry export lives under <b>Integrations &amp; observability</b>; use <b>Project Observability</b> to choose what telemetry and operations agents target in managed repositories.</p>
@@ -507,21 +552,21 @@
 
         ${featuresSectionHtml('auto-merge', `
         <div class="settings-subsection">
-          <div class="settings-subsection-title">Auto-Merge ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Auto-Merge', `Controls the self-authored sweep: Hive merges its own green PRs directly since Prow cannot self-approve.`)}</div>
+          <div class="settings-subsection-title">Auto-Merge ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Auto-Merge', `Controls the self-authored sweep: Hive merges its own green PRs directly since Prow cannot self-approve.`)}</div>
           <div class="config-toggle">
             <div class="config-toggle-switch ${amSelfOn ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="auto-merge" data-key="self_authored"></div>
-            <span class="config-toggle-label">Auto-merge App-authored PRs ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Auto-merge App-authored PRs', `Controls the self-authored sweep: Hive merges its own green PRs directly since Prow cannot self-approve.`)}</span>
+            <span class="config-toggle-label">Auto-merge App-authored PRs ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Auto-merge App-authored PRs', `Controls the self-authored sweep: Hive merges its own green PRs directly since Prow cannot self-approve.`)}</span>
           </div>
           <div class="config-field" style="margin-top:10px">
-            <label>Max merges per sweep ${yamlHint('auto_merge.max_merges')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Max merges per sweep', `Caps how many PRs one sweep pass may merge. 0 or empty uses the default.`)}</label>
+            <label>Max merges per sweep ${yamlHint('auto_merge.max_merges')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Max merges per sweep', `Caps how many PRs one sweep pass may merge. 0 or empty uses the default.`)}</label>
             <input type="number" min="0" step="1" value="${am.max_merges || ''}" placeholder="3" data-change-action="gh71">
           </div>
           <div class="config-field mt-4">
-            <label>Minimum head age ${yamlHint('auto_merge.min_head_age')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Minimum head age', `How old a PR head must be before the sweep trusts an unknown required-check set. Closes the window after a push where slow GitHub Actions checks have not registered yet. Positive Go duration such as 3m.`)}</label>
+            <label>Minimum head age ${yamlHint('auto_merge.min_head_age')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Minimum head age', `How old a PR head must be before the sweep trusts an unknown required-check set. Closes the window after a push where slow GitHub Actions checks have not registered yet. Positive Go duration such as 3m.`)}</label>
             <input type="text" value="${esc(am.min_head_age || '')}" placeholder="3m0s" data-change-action="markDirty" data-arg0="auto-merge" data-arg1="min_head_age" data-arg-types="s,s,w">
           </div>
           <div class="config-field" style="margin-top:10px">
-            <label>Required CI checks ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Required CI checks', `Comma-separated default status-check/check-run names the sweep must see green before merging, e.g. build-gate. For heterogeneous hives use auto_merge.repos.<repo>.required_checks per repository; keys may be bare repo names or owner/repo.`)}</label>
+            <label>Required CI checks ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Required CI checks', `Comma-separated default status-check/check-run names the sweep must see green before merging, e.g. build-gate. For heterogeneous hives use auto_merge.repos.<repo>.required_checks per repository; keys may be bare repo names or owner/repo.`)}</label>
             <input type="text" value="${esc(amChecks.join(', '))}" placeholder="build-gate, lint" data-change-action="gh72">
             <p class="config-help">Applies to repos without an override. Use <code>auto_merge.repos.&lt;repo&gt;.required_checks</code> for per-repo required checks.</p>
           </div>
@@ -535,26 +580,44 @@
           </div>
           <div class="config-toggle mt-4">
             <div class="config-toggle-switch ${am.bot_takeover_enabled !== false ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="auto-merge" data-key="bot_takeover_enabled"></div>
-            <span class="config-toggle-label">Take over github-actions[bot] PRs whose checks cannot run ${yamlHint('auto_merge.bot_takeover.enabled')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Take over github-actions[bot] PRs', `On by default. Applies only when github-actions[bot] is a trusted bot author above. A PR that bot opens with a workflow GITHUB_TOKEN never triggers pull_request checks, so it can never go green. Once its head is older than both the minimum head age and 30 minutes with no pull_request run, the App pushes the same change as one signed-off commit to hive/takeover-&lt;n&gt;, opens a PR that supersedes it and closes the bot PR. One attempt per bot head SHA. Applies on the next sweep.`)}</span>
+            <span class="config-toggle-label">Take over github-actions[bot] PRs whose checks cannot run ${yamlHint('auto_merge.bot_takeover.enabled')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Take over github-actions[bot] PRs', `On by default. Applies only when github-actions[bot] is a trusted bot author above. A PR that bot opens with a workflow GITHUB_TOKEN never triggers pull_request checks, so it can never go green. Once its head is older than both the minimum head age and 30 minutes with no pull_request run, the App pushes the same change as one signed-off commit to hive/takeover-&lt;n&gt;, opens a PR that supersedes it and closes the bot PR. One attempt per bot head SHA. Applies on the next sweep.`)}</span>
           </div>
           <div class="config-field mt-4" id="am-repo-policy">
-            <label>Per-repository merge policy ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Per-repository merge policy', `Repo-scoped rules every auto-merge lane applies. Repositories come from project.repos; saving writes each list in full and applies on the next sweep.`)}</label>
+            <label>Per-repository merge policy ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Per-repository merge policy', `Repo-scoped rules every auto-merge lane applies. Repositories come from project.repos; saving writes each list in full and applies on the next sweep.`)}</label>
             <div class="config-field mt-3">
-              <label for="am-require-current-base">Require current base ${yamlHint('auto_merge.require_current_base')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Require current base', `Listed repos only merge a head that contains the current base tip. A green head tested against an older base is updated with GitHub update-branch and merges once CI is green on the new head, so a semantic conflict turns the PR red instead of breaking the base. Costs one compare call per merge candidate.`)}</label>
+              <label for="am-require-current-base">Require current base ${yamlHint('auto_merge.require_current_base')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Require current base', `Listed repos only merge a head that contains the current base tip. A green head tested against an older base is updated with GitHub update-branch and merges once CI is green on the new head, so a semantic conflict turns the PR red instead of breaking the base. Costs one compare call per merge candidate.`)}</label>
               <select id="am-require-current-base" multiple size="${amRepoPolicySize}" data-change-action="markDirtyAutoMergeRepoPolicy" class="am-trusted-authors-repos">${amRepoPolicyOptions(am.require_current_base)}</select>
             </div>
             <div class="config-field mt-4">
-              <label for="am-squash-only">Squash only ${yamlHint('auto_merge.squash_only')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Squash only', `Listed repos forbid merge commits. Elsewhere a role/trusted PR mixing the contributor's commits with the hive's own signed-off fixes merges with a merge commit; in a listed repo it parks at stage/085 and the note names this key.`)}</label>
+              <label for="am-squash-only">Squash only ${yamlHint('auto_merge.squash_only')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Squash only', `Listed repos forbid merge commits. Elsewhere a role/trusted PR mixing the contributor's commits with the hive's own signed-off fixes merges with a merge commit; in a listed repo it parks at stage/085 and the note names this key.`)}</label>
               <select id="am-squash-only" multiple size="${amRepoPolicySize}" data-change-action="markDirtyAutoMergeRepoPolicy" class="am-trusted-authors-repos">${amRepoPolicyOptions(am.squash_only)}</select>
             </div>
+            <div class="config-field mt-4">
+              <label for="am-no-ci-ok">Merge with no CI ${yamlHint('auto_merge.no_ci_ok')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Merge with no CI', `Off for every repository by default. A listed repository&apos;s pull requests can merge with no CI checks at all: when GitHub reports no statuses, no check runs and no workflow runs, the merge-request relay counts that as green instead of refusing it. Only for repositories with no CI by design. Red or pending CI still blocks.`)}</label>
+              <select id="am-no-ci-ok" multiple size="${amRepoPolicySize}" data-change-action="markDirtyAutoMergeRepoPolicy" class="am-trusted-authors-repos">${amRepoPolicyOptions(am.no_ci_ok)}</select>
+            </div>
+            ${amUnprotectedBase.length ? `<div class="config-field mt-4">
+              <label for="am-allow-unprotected-base">Unprotected base (no effect) ${yamlHint('auto_merge.allow_unprotected_base')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Unprotected base (no effect)', `Deprecated and ignored: the hive merges into any branch the App can write, protected or not, after positive CI evidence. Shown only because this list is set; deselect a repository to remove it.`)}</label>
+              <select id="am-allow-unprotected-base" multiple size="${amRepoPolicySize}" data-change-action="markDirtyAutoMergeRepoPolicy" class="am-trusted-authors-repos">${amRepoPolicyOptions(am.allow_unprotected_base)}</select>
+            </div>` : ''}
             <div class="config-field mt-4" id="am-human-merge-paths">
-              <label>Paths a person must merge ${yamlHint('auto_merge.human_merge_paths')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Paths a person must merge', `Comma-separated glob patterns per repo (same syntax as intent.guardrail_path_patterns), for example .github/workflows/**. Every App merge path refuses a PR touching one, adds hold and posts one comment; a person must merge it. Leave a repo empty for no such paths.`)}</label>
+              <label>Paths a person must merge ${yamlHint('auto_merge.human_merge_paths')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Paths a person must merge', `Comma-separated glob patterns per repo (same syntax as intent.guardrail_path_patterns), for example .github/workflows/**. Every App merge path refuses a PR touching one, adds hold and posts one comment; a person must merge it. Leave a repo empty for no such paths.`)}</label>
               ${amHumanMergePathRepos.length ? amHumanMergePathRepos.map(r => `<div class="config-field mt-3 am-human-merge-path-row" data-repo="${esc(r)}">
-                <label><code>${esc(r)}</code> ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', r, `Comma-separated glob patterns for ${esc(r)}. A PR there that touches a matching path is held, and a person must merge it. Leave empty for no such paths.`)}</label>
+                <label><code>${esc(r)}</code> ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', r, `Comma-separated glob patterns for ${esc(r)}. A PR there that touches a matching path is held, and a person must merge it. Leave empty for no such paths.`)}</label>
                 <input type="text" class="am-human-merge-path-input" value="${esc(amHumanMergePathsFor(r).join(', '))}" placeholder=".github/workflows/**, CODEOWNERS" data-change-action="markDirtyAutoMergeRepoPolicy">
               </div>`).join('') : '<p class="am-trusted-authors-note">No repositories in project.repos yet.</p>'}
             </div>
-            <p class="config-help">Select nothing (or leave paths empty) to turn a rule off for every repo. YAML keys: <code>auto_merge.require_current_base[]</code>, <code>auto_merge.squash_only[]</code>, <code>${esc('auto_merge.human_merge_paths.<key>')}</code>.</p>
+            <div class="config-field mt-4" id="am-human-merge-pin-only">
+              <label>Pin bumps that skip the hand merge ${yamlHint('auto_merge.human_merge_pin_only')} ${settingHelpMark('operator-reference/README', 'human-merge-pin-only-rollout', 'Pin bumps that skip the hand merge', `Off by default. Per repository, a pull request on a path a person must merge can merge without a hand merge when its only change is a pin bump: an action SHA, an image digest or a version pin, as chosen below. action-sha-ref adds nothing by itself: it lets a bare &quot;key: commit SHA&quot; line (a commit passed on as an input, for example) change when it carries the same old and new commit as a uses: line bumped in the same pull request, so it needs action-sha as well. Its author and the author of every commit behind its head must be a trusted author, every commit must carry a GitHub-verified signature, and every other gate (CI, review, soak, holds) still applies. Any other change to those paths is still held for a person. Saving sends every repository&apos;s entry; turning an exception on needs paths a person must merge for that repository.`)}</label>
+              ${amPinOnlyRepos.length ? amPinOnlyRepos.map(r => { const p = amPinOnlyFor(r); return `<div class="config-field mt-3 am-pin-only-row" data-repo="${esc(r)}">
+                <label><code>${esc(r)}</code> ${settingHelpMark('operator-reference/README', 'human-merge-pin-only-rollout', r, `Pin-only exception for ${esc(r)}. On: a pull request whose whole diff is pin bumps of the ticked kinds to the listed paths, opened and authored by a trusted author, merges without a hand merge. Paths are comma-separated globs within this repository&apos;s paths a person must merge. Off keeps every pin bump a person&apos;s merge.`)}</label>
+                <label class="am-pin-only-opt"><input type="checkbox" class="am-pin-only-enabled"${p.enabled ? ' checked' : ''} data-change-action="markDirtyAutoMergePinOnly"> On</label>
+                <input type="text" class="am-pin-only-paths" aria-label="Pin bump paths for ${esc(r)}" value="${esc(p.paths.join(', '))}" placeholder="paths: .github/workflows/*.yml, Containerfile" data-change-action="markDirtyAutoMergePinOnly">
+                <span class="am-pin-only-kinds">${amPinOnlyKinds.map(k => `<label class="am-pin-only-opt"><input type="checkbox" class="am-pin-only-kind" value="${esc(k)}"${p.kinds.includes(k) ? ' checked' : ''} data-change-action="markDirtyAutoMergePinOnly"> ${esc(k)}</label>`).join(' ')}</span>
+                <input type="text" class="am-pin-only-authors" aria-label="Trusted authors for ${esc(r)}" value="${esc(p.trusted_authors.join(', '))}" placeholder="trusted authors: renovate[bot]" data-change-action="markDirtyAutoMergePinOnly">
+              </div>`; }).join('') : '<p class="am-trusted-authors-note">Set paths a person must merge for a repository first; its pin-only exception is edited here.</p>'}
+            </div>
+            <p class="config-help">Select nothing (or leave paths empty) to turn a rule off for every repo. YAML keys: <code>auto_merge.require_current_base[]</code>, <code>auto_merge.squash_only[]</code>, <code>auto_merge.no_ci_ok[]</code>, <code>auto_merge.allow_unprotected_base[]</code>,<code>${esc('auto_merge.human_merge_paths.<key>')}</code>, <code>${esc('auto_merge.human_merge_pin_only.<key>.enabled')}</code>, <code>${esc('auto_merge.human_merge_pin_only.<key>.paths[]')}</code>, <code>${esc('auto_merge.human_merge_pin_only.<key>.kinds[]')}</code>, <code>${esc('auto_merge.human_merge_pin_only.<key>.trusted_authors[]')}</code>.</p>
           </div>
           <div class="config-field" id="am-trusted-authors">
             <label>Trusted-author auto-merge ${settingHelpMark('hive-merge', 'trusted-author-auto-merge', 'Trusted-author auto-merge', `Operator opt-in for human-authored PRs: Hive may merge a green PR only when the author holds the configured hive role and, when required, GitHub says the author has push/maintain/admin permission on that repository. Fork PRs from non-members are blocked, excluded labels and CHANGES_REQUESTED reviews block, and the head SHA is re-checked at merge.`)}</label>
@@ -627,10 +690,10 @@
                 </div>
               </div>
               <div class="config-field">
-                <label>Owner approval releases the workflow-path fence ${settingHelpMark('hive-merge', 'contributor-lane-auto-merge', 'Owner approval releases the workflow-path fence', `When on (the default), a trusted merger's GitHub Approve review on the current head — or a dashboard /hive decision approve bound to it — lets the contributor lane merge a PR that edits .github/workflows/** or .github/actions/** itself once CI, soak and the other gates are clear. Approval on an earlier head does not count. Needs the App's Workflows: Read and write; without it the merge is refused, the PR is marked hive:unauthorized and parks at 090 for a person's Merge click. Off keeps every workflow-path PR a person's merge.`)}</label>
+                <label>Owner approval releases the workflow-path fence ${settingHelpMark('hive-merge', 'contributor-lane-auto-merge', 'Owner approval releases the workflow-path fence', `When on (the default), a trusted merger's GitHub Approve review on the current head — or a dashboard /hive decision approve bound to it — lets the contributor lane merge a PR that edits .github/workflows/** or .github/actions/** itself once CI, soak and the other gates are clear. Approval on an earlier head does not count, except across the hive's own merge of the base branch that leaves the PR's diff unchanged. Needs the App's Workflows: Read and write; without it the merge is refused, the PR is marked hive:unauthorized and parks at 090 for a person's Merge click. Off keeps every workflow-path PR a person's merge.`)}</label>
                 <div class="config-toggle">
                   <div id="am-contributor-lane-owner-approval-workflow-fence" class="config-toggle-switch ${amContributorLaneWorkflowApproval ? 'on' : ''}" data-action="gh103" role="switch" aria-checked="${amContributorLaneWorkflowApproval ? 'true' : 'false'}"></div>
-                  <span class="config-toggle-label">Merge owner-approved workflow-file PRs ${settingHelpMark('hive-merge', 'contributor-lane-auto-merge', 'Merge owner-approved workflow-file PRs', `YAML: auto_merge.contributor_lane.owner_approval_releases_workflow_fence. If you approved it, the hive merges it; a stale approval re-arms the fence on the next push.`)}</span>
+                  <span class="config-toggle-label">Merge owner-approved workflow-file PRs ${settingHelpMark('hive-merge', 'contributor-lane-auto-merge', 'Merge owner-approved workflow-file PRs', `YAML: auto_merge.contributor_lane.owner_approval_releases_workflow_fence. If you approved it, the hive merges it; a stale approval re-arms the fence on the next push, but the hive's own update-branch keeps it.`)}</span>
                 </div>
               </div>
             </div>
@@ -638,6 +701,17 @@
               <label for="am-contributor-lane-auto-promotion-scope">Auto-promotion scope ${settingHelpMark('hive-merge', 'contributor-lane-auto-merge', 'Auto-promotion scope', `Where the clean-merged-PR ratchet (auto_merge.contributor_tier.auto_promote_after_merged) counts an author's merges. hive (the default) counts clean merged PRs across every repository this hive manages, so a contributor trusted in the main repo is trusted in the small satellite repos too; repo counts only the PR's own repository. Revert and sentinel-alert evidence blocks promotion in either scope.`)}</label>
               <select id="am-contributor-lane-auto-promotion-scope" data-change-action="gh104">${amContributorLaneScopeOptions}</select>
               <p class="am-trusted-authors-note">A contributor's trust is a property of the person, not the repository: with <code>hive</code>, nine clean merges in the main repo also admit their first PR to a docs repo.</p>
+            </div>
+            <div class="config-field mt-4">
+              <label for="am-contributor-lane-workflow-fence-scope">Workflow fence scope ${settingHelpMark('hive-merge', 'contributor-lane-auto-merge', 'Workflow fence scope', `Which CI workflow / action edits wait for an owner's approval of the head before the contributor lane merges them. all (the default) fences every edit under .github/workflows or .github/actions. human_merge_paths fences only an edit to a file that is also in that repository's Human-merge paths, so routine workflow edits (pin bumps, permission tightening) go through review, CI and soak like any other change. A repository with no Human-merge paths keeps the full fence, and a renamed workflow file always trips it. Held fork CI runs are still never approved for a workflow edit, and Sentinel and the tests-removed fence still apply.`)}</label>
+              <select id="am-contributor-lane-workflow-fence-scope" data-change-action="gh104">${amContributorLaneFenceScopeOptions}</select>
+              <p class="am-trusted-authors-note">With <code>human_merge_paths</code>, list every workflow, reusable workflow and local action your release workflows use in Human-merge paths: an edit to an unlisted one merges after review without an owner's approval.</p>
+              <p class="am-trusted-authors-note">Per-repository overrides: ${amContributorLaneFenceScopeReposText}. A listed repository uses its own scope; this setting does not apply to it.</p>
+            </div>
+            <div class="config-field mt-4" id="am-fence-scope-repos">
+              <label>Workflow fence scope per repository ${yamlHint('project.repo_policies[].workflow_fence_scope')} ${settingHelpMark('hive-merge', 'contributor-lane-auto-merge', 'Workflow fence scope per repository', `Gives one repository its own workflow fence scope, so you can loosen the fence only where that repository's maintainer agrees. hive-wide (the default) follows Workflow fence scope above; all or human_merge_paths replaces it for that repository alone, and a later change to the hive-wide scope does not reach it. Choose hive-wide again to clear the override. human_merge_paths still keeps the full fence in a repository with no Human-merge paths. Saving changes only the repositories you changed here, and it is recorded in the audit log.`)}</label>
+              ${amProjectRepos.length ? `<table class="am-fence-repo-table"><thead><tr><th>Repository</th><th>Scope</th><th>Human-merge paths</th></tr></thead><tbody>${amFenceRepoRows}</tbody></table>` : '<p class="am-trusted-authors-note">No repositories in project.repos yet.</p>'}
+              <p class="am-trusted-authors-note">Hive-wide scope: <code>${esc(amContributorLaneFenceScope)}</code>. A repository set to human_merge_paths lets workflow edits outside its Human-merge paths merge without an owner Approve.</p>
             </div>
             <div class="config-field mt-4">
               <label for="am-contributor-lane-exclude-labels">Excluded labels</label>
@@ -648,8 +722,49 @@
               <label for="am-contributor-lane-repos">Repositories</label>
               <select id="am-contributor-lane-repos" multiple size="${Math.min(Math.max(watchedRepos.length || 3, 3), 8)}" data-change-action="gh104" class="am-trusted-authors-repos">${amContributorLaneRepoOptions}</select>
               <p class="am-trusted-authors-note">Leave every repo unselected to allow all watched repositories. Skips are logged as <code>contributor-lane:*</code> reasons (no-claim, no-linked-issue, claim-author-mismatch, claim-other-hive, claim-tier-untrusted, claim-unverified, author-association, workflow-path, tests-removed, no-reviewer, no-verdict, soaking, sentinel-blocked); a registry-admitted PR logs <code>contributor-lane:registry-trusted</code>.</p>
-              <p class="config-help">YAML keys: <code>auto_merge.contributor_lane.enabled</code>, <code>auto_merge.contributor_lane.soak_minutes</code>, <code>auto_merge.contributor_lane.require_reviewer_verdict</code>, <code>auto_merge.contributor_lane.registry_tiers_sufficient</code>, <code>auto_merge.contributor_lane.approve_held_runs_for_registry_trusted</code>, <code>auto_merge.contributor_lane.owner_approval_releases_workflow_fence</code>, <code>auto_merge.contributor_lane.auto_promotion_scope</code>, <code>auto_merge.contributor_lane.repos[]</code>, <code>auto_merge.contributor_lane.exclude_labels[]</code>, <code>auto_merge.contributor_lane.require_tiers[]</code>.</p>
+              <p class="config-help">YAML keys: <code>auto_merge.contributor_lane.enabled</code>, <code>auto_merge.contributor_lane.soak_minutes</code>, <code>auto_merge.contributor_lane.require_reviewer_verdict</code>, <code>auto_merge.contributor_lane.registry_tiers_sufficient</code>, <code>auto_merge.contributor_lane.approve_held_runs_for_registry_trusted</code>, <code>auto_merge.contributor_lane.owner_approval_releases_workflow_fence</code>, <code>auto_merge.contributor_lane.workflow_fence_scope</code>, <code>auto_merge.contributor_lane.auto_promotion_scope</code>, <code>auto_merge.contributor_lane.repos[]</code>, <code>auto_merge.contributor_lane.exclude_labels[]</code>, <code>auto_merge.contributor_lane.require_tiers[]</code>.</p>
             </div>
+          </div>
+          <div class="config-subgroup">Merge train</div>
+          <div class="config-toggle">
+            <div class="config-toggle-switch ${am.merge_train && am.merge_train.enabled === false ? '' : 'on'}" data-action="toggleConfigSwitch" data-keydown-action="toggleConfigSwitch" data-keys="Enter, " data-arg-types="t,s,s" data-arg1="merge-train" data-arg2="enabled" data-prevent="1" data-section="merge-train" data-key="enabled" role="switch" tabindex="0" aria-label="Conflict-aware merge train" aria-checked="${am.merge_train && am.merge_train.enabled === false ? 'false' : 'true'}"></div>
+            <span class="config-toggle-label">Conflict-aware merge train ${yamlHint('auto_merge.merge_train.enabled')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Conflict-aware merge train', `Default on. Runs one front per overlap group so PRs changing the same files merge in order. False restores independent per-PR evaluation.`)}</span>
+          </div>
+          <div class="config-field">
+            <label for="am-merge-train-attempts">Rebase attempts per front ${yamlHint('auto_merge.merge_train.max_rebase_attempts')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Rebase attempts per front', `How many rebase-resolve requests one PR may make behind one front before it parks at stage/085 for a human decision. Default 2; 0 uses that default.`)}</label>
+            <input id="am-merge-train-attempts" type="number" min="0" step="1" value="${esc(String((am.merge_train || {}).max_rebase_attempts ?? 2))}" data-change-action="markDirtyMergeTrain" data-arg0="max_rebase_attempts" data-arg-types="s,N">
+          </div>
+          <div class="config-field">
+            <label for="am-merge-train-stall">Stall warning after ${yamlHint('governor.merge_train_stall_warn_s')} ${settingHelpMark('operator-reference/README', 'notable-fields', 'Stall warning after', `Seconds without progress before the Activity Monitor chip reads &quot;Merge queue · stalled&quot;. Default 3600 seconds; 0 disables the warning.`)}</label>
+            <input id="am-merge-train-stall" type="number" min="0" step="1" value="${esc(String((_configState.data || {}).merge_train_stall_warn_s ?? 3600))}" data-change-action="markDirty" data-arg0="governor" data-arg1="merge_train_stall_warn_s" data-arg-types="s,s,N">
+            <p class="config-help">Seconds; 0 disables the stall warning.</p>
+          </div>
+          <div class="config-field">
+            <label>Native GitHub merge queue ${yamlHint('auto_merge.native_merge_queue')} ${settingHelpMark('native-merge-queue', 'opting-in', 'Native GitHub merge queue', `Default off. Hive controls admission and repair; GitHub tests and merges the synthetic group. Settings requires explicit repositories and exact repo#base pairs. Existing CI, trust, review, hold and attribution gates stay in force.`)}</label>
+            <div class="config-toggle">
+              <div class="config-toggle-switch ${am.native_merge_queue && am.native_merge_queue.enabled ? 'on' : ''}" data-action="toggleConfigSwitch" data-keydown-action="toggleConfigSwitch" data-keys="Enter, " data-arg-types="t,s,s" data-arg1="native-queue" data-arg2="enabled" data-prevent="1" data-section="native-queue" data-key="enabled" role="switch" tabindex="0" aria-label="Enable native GitHub merge queue" aria-checked="${am.native_merge_queue && am.native_merge_queue.enabled ? 'true' : 'false'}"></div>
+              <span class="config-toggle-label">Enable native GitHub merge queue (default OFF) ${settingHelpMark('native-merge-queue', 'pilot-rollout', 'Enable native GitHub merge queue', `Operator opt-in only after the GitHub prerequisites below. Save applies the Hive hand-off policy; it does not create queues or change branch protection. Off preserves conventional direct merge on branches without a required queue; a queue-required branch remains parked, never bypassed.`)}</span>
+            </div>
+            <label>Native queue repositories ${settingHelpMark('native-merge-queue', 'opting-in', 'Native queue repositories', `Comma-separated owner/repo allow-list. Settings refuses enabled queues with an empty list. Start with hivecommons/hive only; other repositories retain direct mode.`)}</label>
+            <input type="text" value="${esc(((am.native_merge_queue || {}).repos || []).join(', '))}" placeholder="hivecommons/hive" data-change-action="markDirtyNativeQueue" data-arg0="repos" data-arg-types="s,w">
+            <label>Native queue bases ${yamlHint('auto_merge.native_merge_queue.bases[]')} ${settingHelpMark('native-merge-queue', 'opting-in', 'Native queue bases', `Comma-separated exact owner/repo#base pairs. Repository names ignore case; branch names preserve case. No wildcards. Start with hivecommons/hive#v5. Every pair must belong to a listed repository.`)}</label>
+            <input type="text" value="${esc(((am.native_merge_queue || {}).bases || []).join(', '))}" placeholder="hivecommons/hive#v5" data-change-action="markDirtyNativeQueue" data-arg0="bases" data-arg-types="s,w">
+            <div class="config-toggle">
+              <div class="config-toggle-switch ${am.native_merge_queue && am.native_merge_queue.skip_current_base_gate ? 'on' : ''}" data-action="toggleConfigSwitch" data-keydown-action="toggleConfigSwitch" data-keys="Enter, " data-arg-types="t,s,s" data-arg1="native-queue" data-arg2="skip_current_base_gate" data-prevent="1" data-section="native-queue" data-key="skip_current_base_gate" role="switch" tabindex="0" aria-label="Native queue owns freshness" aria-checked="${am.native_merge_queue && am.native_merge_queue.skip_current_base_gate ? 'true' : 'false'}"></div>
+              <span class="config-toggle-label">Queue owns freshness (default OFF) ${settingHelpMark('native-merge-queue', 'current-base-gate', 'Queue owns freshness', `Explicitly bypasses current-base and behind refresh only for opted-in repo/base pairs with an actual GitHub queue. Leave off until merge-group CI is proven and HIVE_NATIVE_QUEUE_FRESHNESS suppresses the external branch updater for the same pairs. Other branches retain coordinated refresh.`)}</span>
+            </div>
+            <label>Native queue probe TTL ${settingHelpMark('native-merge-queue', 'api-cost', 'Native queue probe TTL', `How long GitHub queue detection is cached per repo/base. Default 30m; 0 uses that default. Enter a non-negative Go duration, for example 30m.`)}</label>
+            <input type="text" value="${esc((am.native_merge_queue || {}).probe_ttl || '30m0s')}" data-change-action="markDirtyNativeQueue" data-arg0="probe_ttl" data-arg-types="s,w">
+            <p class="config-help">Configured: <strong>${am.native_merge_queue && am.native_merge_queue.enabled ? 'enabled' : 'disabled (default)'}</strong>.
+              Repositories: ${esc(((am.native_merge_queue || {}).repos || []).join(', ') || 'all watched repositories once enabled')}.
+              Bases: ${esc(((am.native_merge_queue || {}).bases || []).join(', ') || 'all queue bases (legacy YAML only)')}.
+              Queue owns freshness: ${am.native_merge_queue && am.native_merge_queue.skip_current_base_gate ? 'explicitly opted in' : 'no (default)'}.
+              Probe TTL: ${esc((am.native_merge_queue || {}).probe_ttl || '30m0s')}.</p>
+            <p class="config-help">Owner-only: stage these controls and click Save only after the
+              <a href="https://github.com/hivecommons/hive/blob/v5/src/docs/native-merge-queue.md#pilot-rollout" target="_blank" rel="noopener noreferrer">checks and branch-rule rollout</a>.
+              Prerequisites: App installation authentication, withdrawal guards, trusted-base policy proof, equivalent required-check migration, MERGE method and a bounded pilot group.
+              Enabled here does not mean deployed or enabled in GitHub. Turning it off does not disable GitHub's queue or withdraw existing entries; drain those before rollback. Direct merge with coordinated refresh remains available; this is not Hive's visual train.
+              Integration-aware multi-agent orchestration is planned, not a selectable implementation.</p>
           </div>
         </div>
         `)}
@@ -723,7 +838,7 @@
           </div>
           <div class="config-toggle">
             <div class="config-toggle-switch ${am.require_current_base_default ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="auto-merge" data-key="require_current_base_default"></div>
-            <span class="config-toggle-label">Merge only on current base ${yamlHint('auto_merge.require_current_base_default')} ${settingHelpMark('operator-reference', 'app-self-merge-sweep-auto_merge', 'Merge only on current base', `OFF by default. Before auto-merging in any lane, require the PR head to contain the current base tip; a green head tested on an older base is updated with GitHub update-branch and merges once CI is green on the new head. Costs one compare call per merge candidate. Per-repo overrides live on the repo card.`)}</span>
+            <span class="config-toggle-label">Merge only on current base ${yamlHint('auto_merge.require_current_base_default')} ${settingHelpMark('operator-reference/README', 'app-self-merge-sweep-auto_merge', 'Merge only on current base', `OFF by default. Before auto-merging in any lane, require the PR head to contain the current base tip; a green head tested on an older base is updated with GitHub update-branch and merges once CI is green on the new head. Costs one compare call per merge candidate. Per-repo overrides live on the repo card.`)}</span>
           </div>
           <div class="config-toggle mt-4">
             <div class="config-toggle-switch ${rv.post_comments ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="review" data-key="post_comments"></div>
@@ -752,6 +867,14 @@
           <div class="config-field" style="margin-top:10px">
             <label>Fixer agent ${yamlHint('review.fixer_agent')} ${settingHelpMark('review-swarm', 'configuration', 'Fixer agent', `The agent kicked to address reviewer findings before re-review. Use the agent ID (the key in the roster, not its display name). Blank falls back to the PR's authoring agent, then scanner.`)}</label>
             <input type="text" value="${esc(rv.fixer_agent || '')}" placeholder="scanner (default)" data-change-action="markDirty" data-arg0="review" data-arg1="fixer_agent" data-arg-types="s,s,w">
+          </div>
+          <div class="config-field mt-3">
+            <label>Fallback fixer agents (comma-separated) ${yamlHint('review.fixer_fallback_agents[]')} ${settingHelpMark('review-swarm', 'configuration', 'Fallback fixer agents', `Ordered agent IDs to try when the primary fixer cannot accept kicks. The first available fallback receives the repair without interrupting another turn. An empty list disables fallback routing.`)}</label>
+            <input type="text" value="${esc((rv.fixer_fallback_agents || []).join(', '))}" placeholder="e.g. fixer, scanner-2" spellcheck="false" data-change-action="markDirtyReviewFixerFallbackAgents" data-arg-types="w">
+          </div>
+          <div class="config-field mt-3">
+            <label>Undeliverable kicks before fallback ${yamlHint('review.fixer_fallback_after_undeliverable')} ${settingHelpMark('review-swarm', 'configuration', 'Undeliverable kicks before fallback', `Consecutive undeliverable kicks before trying a fallback. 0 uses the default of 3. After at least one refusal, a fixer whose transcript exceeds its busy_no_activity_threshold can yield earlier. Requires a non-empty fallback agent list.`)}</label>
+            <input type="number" min="0" step="1" value="${esc(String(rv.fixer_fallback_after_undeliverable || ''))}" placeholder="3 (default)" data-change-action="markDirty" data-arg0="review" data-arg1="fixer_fallback_after_undeliverable" data-arg-types="s,s,N">
           </div>
           <div class="config-field" style="margin-top:10px">
             <label>Human decision label ${yamlHint('review.human_decision_label')} ${settingHelpMark('review-swarm', 'configuration', 'Human decision label', `An EXISTING repo label applied when the review swarm holds a PR for a human, so those PRs can be filtered from the list. There is no fleet-wide default and no standard name &mdash; use whatever the governed repos already maintain (this fleet's bluefin spoke uses 3-human-queue). The label is never created: if it is blank, misspelled, or absent from a repo, labeling is skipped there and the review comment's in-body marker still carries the signal.`)}</label>
@@ -829,6 +952,20 @@
             <div class="config-toggle-switch ${f.evidenceEnabled !== false ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="features" data-key="evidenceEnabled"></div>
             <span class="config-toggle-label">Write evidence bundles ${yamlHint('evidence.enabled')} ${settingHelpMark('settings', 'features', 'Write evidence bundles', `On by default. Off stops writing review evidence bundles. Applies to the next review.`)}</span>
           </div>
+          <div class="settings-subsection-title">Benchmarks ${settingHelpMark('settings', 'features', 'Benchmarks', `This hive contributes anonymized per-PR records (model, harness, sandbox runtime, outcome, time-to-merge, ACMM level) to the fleet leaderboard at hivecommons.dev/benchmarks. No logins, prompts, findings or code ever leave the hive; the hive is identified only by the hash below. Repository names are included only for public repositories.`)}</div>
+          <div class="config-toggle">
+            <div class="config-toggle-switch ${f.benchmarksPublish !== false ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="features" data-key="benchmarksPublish"></div>
+            <span class="config-toggle-label">Publish anonymized benchmark records ${yamlHint('benchmarks.publish')} ${settingHelpMark('settings', 'features', 'Publish benchmark records', `On by default. Off stops the hourly push to the hub and empties GET /api/benchmarks/export.`)}</span>
+          </div>
+          <div class="config-toggle">
+            <div class="config-toggle-switch ${f.benchmarksRepoConsent !== false ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="features" data-key="benchmarksRepoConsent"></div>
+            <span class="config-toggle-label">Name public repositories ${yamlHint('benchmarks.repo_consent')} ${settingHelpMark('settings', 'features', 'Name public repositories', `On by default: records for PUBLIC repositories carry the repository and org name, since that activity is already public. Off anonymizes every record. Private repositories are never named.`)}</span>
+          </div>
+          <div class="config-field settings-subsection-row"><label>Your hive on the leaderboard ${settingHelpMark('settings', 'features', 'Your hive on the leaderboard', `Salted SHA-256 of this hive's id (first 16 hex chars) — the only identifier that leaves the hive. Published records are keyed by it, so this is how you find your own row.`)}</label><input type="text" value="${esc(f.benchmarksHiveHash || '')}" readonly aria-readonly="true"><div class="config-help">Look this hash up in the &quot;Contributing hives&quot; table at <a href="https://hivecommons.dev/benchmarks/" target="_blank" rel="noopener">hivecommons.dev/benchmarks</a> to verify your records arrived${f.benchmarksLastPushAt ? ` &middot; last pushed ${esc(f.benchmarksLastPushAt)} (${esc(String(f.benchmarksLastPushCount || 0))} records)` : ' &middot; nothing pushed yet'}.</div></div>
+        </div>
+
+        <div class="settings-subsection">
+          <div class="settings-subsection-title">Review evidence signing</div>
           <div class="config-field settings-subsection-row"><label>Signing key file ${yamlHint('evidence.signing_key_file')} ${settingHelpMark('settings', 'features', 'Evidence signing key file', `Path to an Ed25519 private key used to sign bundles. Empty means bundles are written unsigned. Only the path is shown; the key is never read by this dialog.`)}</label><input type="text" value="${esc(f.evidenceSigningKeyFile || '')}" placeholder="not set (bundles unsigned)" readonly aria-readonly="true"><div class="config-help">Read-only here: signing keys are provisioned on disk and set in hive.yaml.</div></div>
         </div>
         `)}
@@ -887,6 +1024,7 @@
         `)}
 
         ${featuresSectionHtml('work-intake', `
+        ${renderEventTriggersSection()}
         <div class="settings-subsection">
           <div class="settings-subsection-title">Tier classifier</div>
           <p class="config-help">Override the issue-title keywords that map work to Simple or Complex tiers. Empty lists keep the built-in defaults.</p>
@@ -979,6 +1117,7 @@
         </div>
         ${renderGovReplanSection((_configState.data || {}).replan || {})}
         ${renderGovQuestionAutocloseSection((_configState.data || {}).question_autoclose || {})}
+        ${renderGovDecisionsDelegateSection((_configState.data || {}).decisions_delegate || {})}
 
         <div class="settings-subsection">
           <div class="settings-subsection-title">Superseded PR grace ${settingHelpMark('settings', 'features', 'Superseded PR grace', `Timing of the superseded-PR sweep.`)}</div>
@@ -1407,6 +1546,77 @@
           <div class="config-help">Checkpoint, triage and recheck settings are applied live; no restart is needed.</div>
         </div>
         <div class="settings-subsection">
+          <div class="settings-subsection-title">Integration orchestration</div>
+          <div class="config-help">Default OFF. Coordinates authoring admission above existing preparation and native queues; never replaces CI, review, holds or current-base guards. Advisory cannot block. Enforce requires explicit repository/base scopes and complete runner telemetry. No native queue jumping or GitHub build-window control. 5,000/day is a capacity target, not a measured result.</div>
+          <div class="config-field"><label>Mode ${yamlHint('integration_orchestration.mode')} ${settingHelpMark('settings', 'features', 'Integration mode', `Off preserves existing dispatch. Advisory records observations but cannot block. Enforce applies only enrolled, authoritative constraints; it never replaces merge gates.`)}</label>
+            <select data-change-action="markDirty" data-arg0="integration_orchestration" data-arg1="mode" data-arg-types="s,s,v">
+              ${['off','advisory','enforce'].map(m => `<option value="${esc(m)}" ${io.mode === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="config-field"><label>Exact scopes (one owner/repo#base per line) ${yamlHint('integration_orchestration.scopes[].repo')} ${yamlHint('integration_orchestration.scopes[].base')} ${settingHelpMark('settings', 'features', 'Integration scopes', `At most eight exact repository/base destinations. No wildcard enrollment. Multiple enrolled bases leave issue destination unknown rather than guessing.`)}</label>
+            <textarea data-change-action="markDirty" data-arg0="integration_orchestration" data-arg1="scope_lines" data-arg-types="s,s,v">${esc((io.scopes || []).map(s => s.repo + '#' + s.base).join('\n'))}</textarea>
+          </div>
+          <div class="config-field-row">
+            ${[
+              ['max_active','Active admissions',2,'integration_orchestration.max_active'],
+              ['max_jobs','Executed jobs per window',20,'integration_orchestration.max_jobs'],
+              ['max_runner_minutes','Runner minutes per window',60,'integration_orchestration.max_runner_minutes'],
+              ['max_attempts','Attempt bound',2,'integration_orchestration.max_attempts'],
+              ['admission_jobs','Job allocation per admission',1,'integration_orchestration.admission_jobs'],
+              ['admission_runner_minutes','Minute allocation per admission',10,'integration_orchestration.admission_runner_minutes']
+            ].map(([key,label,def,path]) =>
+              `<div class="config-field"><label>${esc(label)} ${yamlHint(path)} ${settingHelpMark('settings', 'features', label, `Validated static admission bound, not a capacity measurement. Outstanding allocations count conservatively alongside actual assigned-runner execution. Missing accounting freezes growth; retries never rerun or cancel GitHub jobs.`)}</label><input type="number" min="1" value="${esc(String(io[key] || def))}" data-change-action="markDirty" data-arg0="integration_orchestration" data-arg1="${esc(key)}" data-arg-types="s,s,N"></div>`).join('')}
+          </div>
+          <div class="config-field-row">
+            ${[
+              ['lease_ttl','Reservation TTL (minutes)',5,'integration_orchestration.lease_ttl'],
+              ['window','Accounting window (minutes)',60,'integration_orchestration.window'],
+              ['max_observation_age','Maximum observation age (minutes)',30,'integration_orchestration.max_observation_age']
+            ].map(([key,label,def,path]) =>
+              `<div class="config-field"><label>${esc(label)} ${yamlHint(path)} ${settingHelpMark('settings', 'features', label, `Lease TTL is 1–15 minutes and clipped to live ownership. Accounting window is 1 minute–24 hours. Maximum observation age is 1–60 minutes; stale observations are unknown, not zero.`)}</label><input type="number" min="1" value="${esc(String(io[key] ? io[key] / (60 * 1e9) : def))}" data-change-action="markDirty" data-arg0="integration_orchestration" data-arg1="${esc(key)}_minutes" data-arg-types="s,s,N"></div>`).join('')}
+          </div>
+          <div class="config-field"><label>Pinned workflow evidence contracts (JSON array) ${settingHelpMark('settings', 'features', 'Integration workflow contracts', `Pins a separately reviewed workflow blob, event engine, exact required job names and producer App ID. Empty means policy evidence remains unknown. This does not activate native queues or replace full CI, review, DCO or other gates.`)}</label>
+            <textarea data-change-action="markDirty" data-arg0="integration_orchestration" data-arg1="policy_json" data-arg-types="s,s,v">${esc(JSON.stringify(io.policies || [], null, 2))}</textarea>
+          </div>
+          <div class="config-help">${[
+            'integration_orchestration.policies[].repo', 'integration_orchestration.policies[].base',
+            'integration_orchestration.policies[].engine', 'integration_orchestration.policies[].workflow',
+            'integration_orchestration.policies[].blob', 'integration_orchestration.policies[].app_id',
+            'integration_orchestration.policies[].jobs[]'
+          ].map(path => yamlHint(path)).join(' ')} Disabling releases only orchestration reservations; existing claims and native entries remain. Missing group membership, policy or producer proof stays unknown.</div>
+          <button class="hv-btn btn-secondary btn" data-action="loadIntegrationOrchestration">Inspect intents, reservations and CI evidence</button>
+          <pre id="integration-orchestration-summary" class="config-help" aria-live="polite"></pre>
+          <div class="config-field"><label>Candidate execution (independent opt-in) ${yamlHint('integration_orchestration.execution.mode')} ${settingHelpMark('settings', 'features', 'Candidate execution', `Off does not enable a writer. Advisory cannot block or dispatch. Enforce requires exact enrolled repository/base profiles, complete real CI accounting, a designated executor and actual protected qualification. Revoke the old forge epoch before returning Hive authority to legacy flow. This is separate from authoring admission and native queue settings.`)}</label>
+            <select data-change-action="markDirty" data-arg0="integration_orchestration" data-arg1="execution_mode" data-arg-types="s,s,v">
+              ${['off','advisory','enforce'].map(mode => `<option value="${esc(mode)}" ${(integrationExecution.mode || 'off') === mode ? 'selected' : ''}>${esc(mode)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="config-field"><label>Execution profile and bounded enrollment (JSON object) ${settingHelpMark('settings', 'features', 'Execution enrollment', `Explicit scopes, actual repository/actor/App installation/workflow IDs, policy and workflow-tree hashes, immutable authority epoch, isolated qualification ID, job/minute/member/attempt bounds and duration nanoseconds. No inferred actors, spare capacity, wildcard enrollment, automatic growth or failover. The mode selector, not this profile JSON, chooses execution mode.`)}</label>
+            <textarea data-change-action="markDirty" data-arg0="integration_orchestration" data-arg1="execution_json" data-arg-types="s,s,v">${esc(JSON.stringify(integrationExecutionProfile, null, 2))}</textarea>
+          </div>
+          <div class="config-help">Source, published image, running version, desired mode and effective writer are separate receipts. Unknown telemetry is not green or zero. Production requires a real one-member protected qualification and the same complete producer/actor profile. Native authority permits only ordinary Hive enqueue admission, never queue jumping or GitHub build-window control. All participating hives must be upgraded/enrolled or stopped; copied identity and automatic takeover are unsupported.</div>
+          <div class="config-help">${[
+            'integration_orchestration.execution.scopes[].repo', 'integration_orchestration.execution.scopes[].base',
+            'integration_orchestration.execution.scopes[].authority', 'integration_orchestration.execution.scopes[].repository_id',
+            'integration_orchestration.execution.scopes[].request_actor_id', 'integration_orchestration.execution.scopes[].candidate_actor_id',
+            'integration_orchestration.execution.scopes[].producer_app_id', 'integration_orchestration.execution.scopes[].promotion_app_id',
+            'integration_orchestration.execution.scopes[].promotion_installation_id', 'integration_orchestration.execution.scopes[].materializer_id',
+            'integration_orchestration.execution.scopes[].candidate_workflow_id', 'integration_orchestration.execution.scopes[].default_branch',
+            'integration_orchestration.execution.scopes[].policy', 'integration_orchestration.execution.scopes[].workflow_tree',
+            'integration_orchestration.execution.scopes[].required_jobs[]', 'integration_orchestration.execution.scopes[].executor_id',
+            'integration_orchestration.execution.scopes[].authority_ref', 'integration_orchestration.execution.scopes[].authority_commit',
+            'integration_orchestration.execution.scopes[].qualification_id', 'integration_orchestration.execution.scopes[].max_members',
+            'integration_orchestration.execution.scopes[].expected_jobs', 'integration_orchestration.execution.scopes[].expected_minutes',
+            'integration_orchestration.execution.scopes[].purpose', 'integration_orchestration.execution.scopes[].qualified_base',
+            'integration_orchestration.execution.max_active', 'integration_orchestration.execution.max_runner_minutes',
+            'integration_orchestration.execution.max_jobs', 'integration_orchestration.execution.max_attempts',
+            'integration_orchestration.execution.observation_age', 'integration_orchestration.execution.window',
+            'integration_orchestration.execution.cooldown'
+          ].map(path => yamlHint(path)).join(' ')}</div>
+          <button class="hv-btn btn-secondary btn" data-action="prepareIntegrationExecutionIdentity">Prepare local execution identity only</button>
+          <pre id="integration-execution-identity" class="config-help" aria-live="polite"></pre>
+        </div>
+        <div class="settings-subsection">
           <div class="settings-subsection-title">Convergence Rollout ${settingHelpMark('settings', 'features', 'Convergence Rollout', `Convergence checks whether work Hive is about to kick is actually admissible right now &mdash; blocker still open, dependency unmerged, evidence stale &mdash; so agents stop burning tokens rediscovering &quot;not ready yet&quot;. It gates candidates only; it never plans or schedules.`)}</div>
           <div class="config-field">
             <label>Mode ${settingHelpMark('settings', 'features', 'Mode', `Shadow (default) evaluates every internal kick decision and records what it WOULD have withheld, without enforcing anything &mdash; dispatch is identical to off, and it costs no tokens and no extra GitHub calls. Enforce withholds blocked/unknown work from internal scheduled/cached kicks. Off is the rollback control arm, and the one posture that records no evidence. Workflow: leave it in shadow, load the soak summary, and if the would-withhold cases look genuine, switch to enforce. Live &mdash; no restart needed.`)}</label>
@@ -1477,3 +1687,63 @@
         `)}`;
     }
 
+    // renderGovDecisionsDelegateSection renders the "Let hive decide"
+    // settings (decisions.delegate): the hive-wide switch, the LLM step, the
+    // per-repository overrides and the effect timeout. Values are marked dirty
+    // under 'decisions-delegate', which saveConfig PUTs to
+    // /api/config/decisions/delegate (owner only) through
+    // decisionsDelegateSaveBody, the same endpoint as the admin MCP
+    // decisions.delegate_settings operation.
+    function renderGovDecisionsDelegateSection(dd) {
+      dd = dd || {};
+      const llm = dd.llm || {};
+      const on = dd.enabled !== false;
+      const llmOn = llm.enabled === true;
+      // One row per project repository plus any saved override for a
+      // repository outside project.repos; a staged choice wins over the
+      // saved one so a re-render keeps it.
+      const ddProjectRepos = Array.isArray(dd.project_repos) ? dd.project_repos : [];
+      const ddSaved = (dd.repos && typeof dd.repos === 'object') ? dd.repos : {};
+      const ddStaged = ((_configState.dirty || {})['decisions-delegate'] || {}).repos || {};
+      const ddRowRepos = ddProjectRepos.concat(Object.keys(ddSaved).filter(k => !ddProjectRepos.some(r => decisionsDelegateSameRepo(r, k))).sort());
+      const ddRowValue = (repo) => {
+        const sk = Object.keys(ddStaged).find(k => decisionsDelegateSameRepo(k, repo));
+        if (sk !== undefined) return ddStaged[sk] === true ? 'on' : (ddStaged[sk] === false ? 'off' : '');
+        const ck = Object.keys(ddSaved).find(k => decisionsDelegateSameRepo(k, repo));
+        const v = ck !== undefined ? ddSaved[ck] : null;
+        return v && v.enabled === true ? 'on' : (v && v.enabled === false ? 'off' : '');
+      };
+      const ddRepoRows = ddRowRepos.map(r => {
+        const cur = ddRowValue(r);
+        const choices = [['', `hive-wide (${on ? 'on' : 'off'})`], ['on', 'on'], ['off', 'off']];
+        return `<tr class="dd-repo-row" data-repo="${esc(r)}"><td><code>${esc(r)}</code></td><td><select aria-label="Let hive decide for ${esc(r)}" data-change-action="markDirtyDecisionsDelegateRepo" data-arg0="${esc(r)}" data-arg-types="s,v">${choices.map(([v, l]) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></td></tr>`;
+      }).join('');
+      // Which path the decider turn takes (governor.reviewer_backend) and,
+      // when it cannot run, why: the same llm_reviewer_* fields the admin MCP
+      // reads through settings_read.
+      const ddPathLabel = ({ http: 'the reviewer endpoint (HTTP)', 'claude-cli': 'the Claude CLI on this hive\'s Claude login, with every tool off' })[dd.llm_reviewer_path] || '';
+      const readyNote = !llmOn ? '' : (dd.llm_reviewer_ready === false
+        ? '<div class="config-help">The model step cannot run: ' + esc(dd.llm_reviewer_reason || 'no reviewer endpoint or model is configured (governor.trajectory or governor.litellm)') + '. Every decision keeps the rules\' reversible default until it can. governor.reviewer_backend picks the path: auto (default), http or claude-cli.</div>'
+        : (ddPathLabel ? '<div class="config-help">The model step runs through ' + ddPathLabel + ' (governor.reviewer_backend).</div>' : ''));
+      const maskedNote = llm.model_masked
+        ? '<div class="config-help">The stored model looks like an API key, so it is hidden. Enter a model name to replace it.</div>' : '';
+      return `
+        <div class="settings-subsection">
+          <div class="settings-subsection-title">Let hive decide ${settingHelpMark('settings', 'features', 'Let hive decide', `The activity monitor's Let hive decide action: the hive decides a needs-decision item as the owner's delegate and records it as a person's decision would be.`)}</div>
+          <div class="config-toggle">
+            <div class="config-toggle-switch ${on ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="decisions-delegate" data-key="enabled"></div>
+            <span class="config-toggle-label">Let hive decide enabled ${yamlHint('decisions.delegate.enabled')} ${settingHelpMark('settings', 'features', 'Let hive decide enabled', `On by default. Off greys out Let hive decide hive-wide, refuses it through the API and the admin MCP, and stops the reviewer-question sweep from deciding on its own. A per-repository override wins over this switch. Applies without a restart. It never merges anything: a delegated decision records a verdict, and merging stays with the merge settings.`)}</span>
+          </div>
+          <div class="config-toggle">
+            <div class="config-toggle-switch ${llmOn ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="decisions-delegate" data-key="llm_enabled"></div>
+            <span class="config-toggle-label">Ask a model when the rules cannot decide ${yamlHint('decisions.delegate.llm.enabled')} ${settingHelpMark('settings', 'features', 'Ask a model when the rules cannot decide', `Off by default. When on, an item the rules leave at the reversible default is sent to the model: its title, body, comments and linked items go to the reviewer model (the governor reviewer endpoint, or the Claude CLI with every tool off when the hive has no endpoint), and the model's verdict passes the same safety rails as a rule decision. Any failure keeps the reversible default. This spends tokens on each such decision.`)}</span>
+          </div>
+          ${readyNote}
+          <div class="config-field"><label>Decider model ${yamlHint('decisions.delegate.llm.model')} ${settingHelpMark('settings', 'features', 'Decider model', `Model for the decider turn. Empty uses the governor reviewer model. A model name only: the key belongs to the reviewer endpoint, and a value that looks like a key is refused.`)}</label><input type="text" value="${esc(llm.model || '')}" placeholder="${esc(dd.llm_model_effective || 'reviewer model')}" data-change-action="markDirty" data-arg0="decisions-delegate" data-arg1="llm_model" data-arg-types="s,s,w"></div>
+          ${maskedNote}
+          <div class="config-field" id="dd-effect-timeout"><label>Effect timeout ${yamlHint('decisions.delegate.effect_timeout')} ${settingHelpMark('settings', 'features', 'Effect timeout', `How long a recorded decision may go without its expected effect (the park lifted, a merge, a close, a new commit) before a repeat Let hive decide reports it as stuck, with the plain reason and the next actions. A duration above zero such as 30m or 2h; empty uses the default of 30m.`)}</label><input type="text" value="${esc(dd.effect_timeout || '')}" placeholder="${esc(dd.effect_timeout_effective || '30m0s')}" data-change-action="markDirty" data-arg0="decisions-delegate" data-arg1="effect_timeout" data-arg-types="s,s,w"></div>
+          <div class="config-field" id="dd-repo-overrides"><label>Per-repository overrides ${yamlHint('decisions.delegate.repos')} ${settingHelpMark('settings', 'features', 'Per-repository overrides', `Turn Let hive decide on or off for one repository, whatever the hive-wide switch says; hive-wide follows the switch above. The per-repository setting also gates the reviewer-question sweep there. Saving sends every repository&apos;s override, so overrides set in hive.yaml or through the admin MCP are kept.`)}</label>
+            ${ddRowRepos.length ? `<table class="am-fence-repo-table"><thead><tr><th>Repository</th><th>Let hive decide</th></tr></thead><tbody>${ddRepoRows}</tbody></table>` : '<p class="am-trusted-authors-note">No repositories in project.repos yet.</p>'}
+          </div>
+        </div>`;
+    }

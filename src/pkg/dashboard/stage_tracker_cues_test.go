@@ -36,12 +36,15 @@ func stageTrackerCuesJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerNewEvent"),
 		jsFunc(t, html, "stageTrackerNoteOwnerEvent"),
 		jsFunc(t, html, "stageTrackerEventHtml"),
+		jsFunc(t, html, "stageTrackerNoteLineHtml"),
 		jsFunc(t, html, "stageTrackerLocalMidnight"),
 		jsFunc(t, html, "stageTrackerMergedIdent"),
 		jsFunc(t, html, "stageTrackerMergedNext"),
 		jsFunc(t, html, "stageTrackerPRTitles"),
 		jsFunc(t, html, "stageTrackerMergedText"),
 		jsFunc(t, html, "stageTrackerMergedByText"),
+		jsFunc(t, html, "stageTrackerMergerText"),
+		jsFunc(t, html, "stageTrackerMergedByOf"),
 		jsFunc(t, html, "stageTrackerMergedPopHtml"),
 		jsFunc(t, html, "stageTrackerPRKey"),
 		"let _stageTrackerEvents = {}; var _stageTrackerPRTitle = {};",
@@ -318,6 +321,10 @@ func stageTrackerCelebrateJS(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_MERGE_BANNER_MS"),
 		"function stageTrackerMergeBannerMs() { return STAGE_TRACKER_MERGE_BANNER_MS; }",
 		jsConstLine(t, html, "STAGE_TRACKER_MERGE_BANNER_MAX"),
+		jsConstLine(t, html, "STAGE_TRACKER_MERGE_BANNER_PHONE_MAX"),
+		jsConstLine(t, html, "STAGE_TRACKER_MERGE_BANNER_PHONE_QUERY"),
+		jsConstLine(t, html, "STAGE_TRACKER_MERGE_BANNER_LANDSCAPE_MAX"),
+		jsConstLine(t, html, "STAGE_TRACKER_MERGE_BANNER_LANDSCAPE_QUERY"),
 		jsConstLine(t, html, "STAGE_TRACKER_SOUND_MAX_PLAYS"),
 		jsFunc(t, html, "stageTrackerCelebrateSetting"),
 		jsFunc(t, html, "stageTrackerSetCelebrate"),
@@ -331,6 +338,8 @@ func stageTrackerCelebrateJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerPRTitles"),
 		jsFunc(t, html, "stageTrackerMergedText"),
 		jsFunc(t, html, "stageTrackerMergedByText"),
+		jsFunc(t, html, "stageTrackerMergerText"),
+		jsFunc(t, html, "stageTrackerMergedByOf"),
 		jsFunc(t, html, "stageTrackerMergedPopHtml"),
 		jsFunc(t, html, "stageTrackerMergedSync"),
 		jsFunc(t, html, "stageTrackerMergedHoldback"),
@@ -344,6 +353,12 @@ func stageTrackerCelebrateJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerMergedLastSave"),
 		jsFunc(t, html, "stageTrackerMergedInFlight"),
 		jsFunc(t, html, "stageTrackerMergedCountDraw"),
+		jsConstLine(t, html, "STAGE_TRACKER_POP_SHEET_QUERY"),
+		jsConstLine(t, html, "_stageTrackerPopSheets"),
+		jsFunc(t, html, "stageTrackerPopSheetPhone"),
+		jsFunc(t, html, "stageTrackerPopSheet"),
+		jsFunc(t, html, "stageTrackerPopSheetDraw"),
+		jsFunc(t, html, "stageTrackerPopSheetOpen"),
 		jsFunc(t, html, "stageTrackerMergedPopDraw"),
 		jsFunc(t, html, "hamMergedToggle"),
 		jsFunc(t, html, "stageTrackerCelebrateTick"),
@@ -354,20 +369,44 @@ func stageTrackerCelebrateJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerRectInView"),
 		jsFunc(t, html, "stageTrackerFlightTarget"),
 		jsFunc(t, html, "celebrateRow"),
+		jsFunc(t, html, "stageTrackerFlyGlyph"),
+		jsFunc(t, html, "stageTrackerDetachedOrigin"),
+		jsFunc(t, html, "celebrateDetached"),
 		jsFunc(t, html, "stageTrackerMergeBannerNumber"),
+		jsFunc(t, html, "stageTrackerMergeBannerRepo"),
+		jsConstLine(t, html, "STAGE_TRACKER_REPO_TINTS"),
+		jsFunc(t, html, "stageTrackerRepoTint"),
+		jsFunc(t, html, "stageTrackerRepoShort"),
+		jsFunc(t, html, "stageTrackerIsPrimary"),
+		jsFunc(t, html, "stageTrackerRepoChipHtml"),
+		jsFunc(t, html, "stageTrackerPrimaryRepo"),
+		"var _stageTrackerFilter = { repo: '' };",
 		jsFunc(t, html, "stageTrackerMergeBannerText"),
+		jsFunc(t, html, "toastCountdownBar"),
+		jsFunc(t, html, "toastCountdownCancel"),
 		jsFunc(t, html, "stageTrackerMergeBanner"),
+		jsFunc(t, html, "stageTrackerMergeBannerList"),
+		jsFunc(t, html, "stageTrackerMergeBannerMatches"),
+		jsFunc(t, html, "stageTrackerMergeBannerIsPhone"),
+		jsFunc(t, html, "stageTrackerMergeBannerCap"),
+		jsFunc(t, html, "stageTrackerMergeBannerLayout"),
 		jsFunc(t, html, "stageTrackerMergeBannerDismiss"),
+		jsFunc(t, html, "hamBannerOpenLink"),
 		jsFunc(t, html, "hamBannerDismiss"),
 		jsFunc(t, html, "hamBannerShowRow"),
 		jsFunc(t, html, "stageTrackerEventLineInject"),
 		jsFunc(t, html, "stageTrackerEventShownAt"),
 		jsFunc(t, html, "stageTrackerEventHtml"),
+		jsFunc(t, html, "stageTrackerNoteLineHtml"),
 		jsFunc(t, html, "stageTrackerNoteOwnerEvent"),
 		jsFunc(t, html, "stageTrackerCueAgeSync"),
 		jsFunc(t, html, "stageTrackerAgoText"),
 		jsFunc(t, html, "stageTrackerAfter"),
 		jsFunc(t, html, "stageTrackerTransient"),
+		jsConstLine(t, html, "STAGE_TRACKER_MERGE_SESSION_KEY"),
+		jsConstLine(t, html, "STAGE_TRACKER_MERGE_SESSION_PR_KEY_RE"),
+		"var _stageTrackerMergeSessionLoaded = false;",
+		jsFunc(t, html, "stageTrackerReconcileMerges"),
 		jsFunc(t, html, "stageTrackerNoteMerges"),
 		stageTrackerMergingHoldOffJS,
 		jsFunc(t, html, "stageTrackerPRKey"),
@@ -407,13 +446,15 @@ function el(tag, attrs) {
     insertBefore(c, ref) { c.parentNode = e; const i = ref ? e.children.indexOf(ref) : -1; if (i < 0) e.children.push(c); else e.children.splice(i, 0, c); return c; },
     replaceWith(n) { if (!e.parentNode) return; const p = e.parentNode; p.children.splice(p.children.indexOf(e), 1, n); n.parentNode = p; e.parentNode = null; },
     remove() { if (e.parentNode) e.parentNode.children = e.parentNode.children.filter(c => c !== e); e.parentNode = null; },
-    getAttribute(k) { return k in e.attrs ? e.attrs[k] : null; }, setAttribute(k, v) { e.attrs[k] = String(v); },
+    getAttribute(k) { return k in e.attrs ? e.attrs[k] : null; }, setAttribute(k, v) { e.attrs[k] = String(v); }, removeAttribute(k) { delete e.attrs[k]; },
     addEventListener(n, fn) { e._ev[n] = fn; }, removeEventListener(n) { delete e._ev[n]; },
     getBoundingClientRect() { return e.rect || { left: 0, top: 0, width: 10, height: 10 }; },
     get outerHTML() { return '<div class="' + e.className + '"></div>'; },
+    get firstChild() { return e.children[0] || null; },
     querySelector(sel) { return e.querySelectorAll(sel)[0] || null; },
     querySelectorAll(sel) { const out = []; const unesc = v => v.replace(/\\(.)/g, '$1'); const m = sel.match(/^\[([\w-]+)="(.*)"\]$/); const word = sel.match(/^\[([\w-]+)~="(.*)"\]\[data-ham-key\]$/); const cls = sel.match(/^\.([\w-]+)/); const capOfRow = sel === '.ham-row[data-ham-key] .ham-seg.cap'; const walk = n => { for (const c of n.children) { if (capOfRow) { if (c.classList.contains('cap') && c.closest('.ham-row') && c.closest('.ham-row').classList.contains('ham-row')) out.push(c); } else if (m && c.attrs[m[1]] === unesc(m[2])) out.push(c); else if (word && c.attrs['data-ham-key'] != null && String(c.attrs[word[1]] || '').split(' ').includes(unesc(word[2]))) out.push(c); else if (!m && !word && cls && c.classList.contains(cls[1]) && (!sel.includes('[data-at]') || c.attrs['data-at'] != null)) out.push(c); walk(c); } }; walk(e); return out; },
     closest(sel) { let n = e; while (n) { if (n.attrs && n.attrs['data-ham-key'] != null) return n; n = n.parentNode; } return null; },
+    matches() { return false; }, contains(x) { return x === e || e.children.some(c => c.contains(x)); },
   };
   return e;
 }
@@ -421,7 +462,7 @@ global.CSS = { escape: s => String(s).replace(/([^\w-])/g, '\\$1') };
 const body = el('body'); const panel = el('div'); const chip = el('button', { id: 'activity-monitor-merged' }); const n = el('span'); n.classList.add('ham-merged-n'); n.textContent = '0'; chip.appendChild(n); const sub = el('span'); sub.classList.add('ham-merged-sub'); chip.appendChild(sub); chip.rect = { left: 500, top: 10, width: 60, height: 20 };
 const pop = el('div', { id: 'activity-monitor-merged-pop' }); pop.hidden = true; const banners = el('div'); const live = el('span');
 const byId = { 'activity-monitor-panel': panel, 'activity-monitor-merged': chip, 'activity-monitor-merged-pop': pop, 'merge-banners': banners, 'activity-monitor-merged-live': live };
-global.document = { body, hidden: false, getElementById(id) { return byId[id] || null; }, createElement(tag) { if (tag === 'template') { const tpl = el('template'); Object.defineProperty(tpl, 'innerHTML', { set(v) { const c = el('p'); c.classList.add('cue-event'); c.attrs['data-cue-key'] = (v.match(/data-cue-key="([^"]*)"/) || [])[1]; c.textContent = v.replace(/<[^>]+>/g, ''); const age = el('span'); age.classList.add('cue-event-age'); age.attrs['data-at'] = (v.match(/data-at="(\d+)"/) || [])[1]; c.appendChild(age); tpl.content = { firstElementChild: c }; } }); return tpl; } return el(tag); } };
+global.document = { body, hidden: false, activeElement: null, getElementById(id) { return byId[id] || null; }, createElement(tag) { if (tag === 'template') { const tpl = el('template'); Object.defineProperty(tpl, 'innerHTML', { set(v) { const c = el('p'); c.classList.add('cue-event'); c.attrs['data-cue-key'] = (v.match(/data-cue-key="([^"]*)"/) || [])[1]; c.textContent = v.replace(/<[^>]+>/g, ''); const age = el('span'); age.classList.add('cue-event-age'); age.attrs['data-at'] = (v.match(/data-at="(\d+)"/) || [])[1]; c.appendChild(age); tpl.content = { firstElementChild: c }; } }); return tpl; } return el(tag); } };
 const store = {}; global.localStorage = { getItem: k => (k in store ? store[k] : null), setItem(k, v) { store[k] = String(v); } };
 const session = {}; global.sessionStorage = { getItem: k => (k in session ? session[k] : null), setItem(k, v) { session[k] = String(v); } };
 let reduced = false; function stageTrackerReducedMotion() { return reduced; }
@@ -432,7 +473,7 @@ let renders = 0; function renderStageTracker() { renders++; }
 const srcs = new Map(); function stageTrackerRowSrcOf(node) { return srcs.get(node); }
 let _stageTrackerEvents = {};
 const STAGE_TRACKER_TERMINAL = 110;
-var _stageTrackerPRHost = {}; var _stageTrackerPRTitle = {}; var _stageTrackerMergeState = null, _stageTrackerZapped = {}, _stageTrackerMerged = { server: null, local: {} }, _stageTrackerMergedShown = 0, _stageTrackerCelebrating = {}, _stageTrackerCelebratePending = {}, _stageTrackerMergedHeld = {}, _stageTrackerFlights = 0, _stageTrackerReleaseTimer = 0;
+var _stageTrackerPRHost = {}; var _stageTrackerPRTitle = {}; var _stageTrackerMergeState = null, _stageTrackerZapped = {}, _stageTrackerMerged = { server: null, local: {} }, _stageTrackerMergedShown = 0, _stageTrackerCelebrating = {}, _stageTrackerCelebratePending = {}, _stageTrackerFlights = 0, _stageTrackerReleaseTimer = 0;
 let settingsClosed = 0; function closeStageTrackerSettings() { settingsClosed++; }
 const odoText = e => e.getAttribute('data-odo-value');
 const flights = () => body.children.filter(c => c.classList.contains('cue-flight'));
@@ -458,7 +499,7 @@ assert.ok(rows[2].pinned);
 tick(0);
 const r1 = panel.children[0];
 assert.ok(r1.classList.contains('cue-merged'), 'row glows: ' + r1.className);
-assert.ok(r1.children.some(c => c.classList.contains('cue-event') && /merged #1 · by hive/.test(c.textContent)), 'the event line says what happened');
+assert.ok(r1.children.some(c => c.classList.contains('cue-event') && /merged #1/.test(c.textContent) && !/by hive/.test(c.textContent)), 'unknown merger is not attributed to hive');
 assert.strictEqual(flights().length, 1, 'one glyph in flight'); assert.strictEqual(flights()[0].textContent, '🐝', 'the default glyph is the bee');
 assert.strictEqual(flights()[0].style.props['--cue-dx'], (530 - 310) + 'px'); assert.strictEqual(flights()[0].style.props['--cue-dy'], (20 - 410) + 'px', 'the chip is in view: the flight ends on it');
 assert.strictEqual(flights()[0].style.props['--cue-end-opacity'], '0.25');
@@ -501,8 +542,11 @@ assert.strictEqual(flights().length, 0); assert.strictEqual(odoText(n), '7');
 assert.ok(panel.querySelector('[data-ham-key="o/r/pr#8"]').classList.contains('cue-merged'));
 reduced = false;
 
-// 4. A merged PR not on the board still counts.
+// 4. A merged PR not on the board still counts — and its bee flies from
+// the toast (#15808): the count rolls when it lands, not before.
 stageTrackerNoteMerges(items(9)); stageTrackerNoteMerges(payloadMerged(9)); tick(0);
+assert.strictEqual(odoText(n), '7', 'held for the detached bee'); assert.strictEqual(flights().length, 1, 'a bee with no row');
+tick(STAGE_TRACKER_CELEBRATE_FLY_MS * 1.5 + 1);
 assert.strictEqual(odoText(n), '8'); assert.strictEqual(flights().length, 0);
 assert.ok(banners.children.some(b => /#9<\/span> merged/.test(b.innerHTML) && !b.innerHTML.includes('hamBannerShowRow')), 'its banner has no "show row" (no row)');
 
@@ -574,7 +618,7 @@ assert.strictEqual(odoText(n), '1', 'the server already counts it: held back unt
 tick(0);
 const issueRow = panel.children[0];
 assert.ok(issueRow.classList.contains('cue-merged'), 'issue row glows: ' + issueRow.className);
-assert.ok(issueRow.children.some(c => c.classList.contains('cue-event') && /merged #14822 · by hive/.test(c.textContent)), 'event line names the merged PR');
+assert.ok(issueRow.children.some(c => c.classList.contains('cue-event') && /merged #14822/.test(c.textContent) && !/by hive/.test(c.textContent)), 'event line names the merged PR without inventing its merger');
 assert.strictEqual(flights().length, 1, 'a glyph is in flight');
 tick(STAGE_TRACKER_CELEBRATE_FLY_MS * 1.5 + 1);
 assert.strictEqual(flights().length, 0); assert.strictEqual(odoText(n), '2', 'count bumped on landing'); assert.deepStrictEqual(zaps, [1]);
@@ -669,6 +713,36 @@ const before = banners.children.length; assert.ok(before > 0);
 const closeBtn = el('button'); banners.children[0].appendChild(closeBtn); closeBtn.closest = () => banners.children[0];
 hamBannerDismiss(closeBtn); tick(180 * 1.5 + 1);
 assert.strictEqual(banners.children.length, before - 1, 'dismissed');
+// The banner body is itself the dismiss target (a tap on a phone); the title
+// and its "(lane, by, hh:mm)" tail are separate spans so the phone CSS can
+// stack them, while the full line still rides the title attribute.
+while (banners.children.length) banners.children[0].remove();
+const split = stageTrackerMergeBanner({ key: 'o/r/pr#40', repo: 'o/r', number: 40, title: 'fix: forty', merged_by: 'clubanderson', lane: 'review', at: 0 });
+assert.strictEqual(split.attrs['data-action'], 'hamBannerDismiss'); assert.strictEqual(split.attrs['data-arg-types'], 't');
+assert.ok(split.innerHTML.includes('<span class="merge-banner-title">fix: forty</span> <span class="merge-banner-meta">(review, by @clubanderson, '), split.innerHTML);
+assert.ok(split.innerHTML.includes('title="fix: forty (review, by @clubanderson, '), split.innerHTML);
+assert.ok(split.innerHTML.includes('data-action="hamBannerOpenLink" data-stop="1">Open on GitHub</a>'), 'the link stops the tap from also dismissing: ' + split.innerHTML);
+split.remove();
+// Phone (≤480px): only the newest STAGE_TRACKER_MERGE_BANNER_PHONE_MAX banners
+// show; the older ones hide behind a "+N more" pill that opens the Merged
+// list, and the pill tracks dismissals. A desktop never hides or shows a pill.
+window.matchMedia = q => ({ matches: q === STAGE_TRACKER_MERGE_BANNER_PHONE_QUERY });
+const phone = []; for (let i = 0; i < STAGE_TRACKER_MERGE_BANNER_MAX; i++) phone.push(stageTrackerMergeBanner({ key: 'o/r/pr#5' + i, repo: 'o/r', number: 50 + i, at: 0 }));
+const shown = () => phone.filter(b => b.parentNode && !('hidden' in b.attrs)); const hid = () => phone.filter(b => b.parentNode && 'hidden' in b.attrs);
+assert.strictEqual(shown().length, STAGE_TRACKER_MERGE_BANNER_PHONE_MAX, 'phone shows the newest three'); assert.strictEqual(hid().length, STAGE_TRACKER_MERGE_BANNER_MAX - STAGE_TRACKER_MERGE_BANNER_PHONE_MAX);
+assert.deepStrictEqual(hid().map(b => phone.indexOf(b)), [0, 1], 'the oldest are the hidden ones');
+let more = banners.querySelector('.merge-banner-more'); assert.ok(more, 'a +N more pill'); assert.strictEqual(more.textContent, '+2 more'); assert.strictEqual(more.attrs['data-action'], 'hamMergedOpen');
+assert.strictEqual(banners.children[0], more, 'the pill leads the stack'); assert.strictEqual(stageTrackerMergeBannerList(banners).length, STAGE_TRACKER_MERGE_BANNER_MAX, 'the pill is not counted as a banner');
+stageTrackerMergeBannerDismiss(phone[4]); tick(180 * 1.5 + 1);
+assert.strictEqual(shown().length, STAGE_TRACKER_MERGE_BANNER_PHONE_MAX, 'a dismissal reveals the next oldest'); assert.strictEqual(banners.querySelector('.merge-banner-more').textContent, '+1 more');
+stageTrackerMergeBannerDismiss(phone[3]); tick(180 * 1.5 + 1);
+assert.strictEqual(hid().length, 0); assert.strictEqual(banners.querySelector('.merge-banner-more'), null, 'no pill once everything fits');
+// Landscape phone: one banner at a time, the rest behind the pill.
+window.matchMedia = q => ({ matches: q === STAGE_TRACKER_MERGE_BANNER_LANDSCAPE_QUERY });
+stageTrackerMergeBannerLayout(banners);
+assert.strictEqual(shown().length, STAGE_TRACKER_MERGE_BANNER_LANDSCAPE_MAX, 'a landscape phone shows one banner'); assert.strictEqual(banners.querySelector('.merge-banner-more').textContent, '+2 more');
+delete window.matchMedia;
+stageTrackerMergeBannerLayout(banners); assert.strictEqual(hid().length, 0, 'a desktop hides nothing');
 console.log('ok');
 `)
 }
@@ -857,37 +931,24 @@ console.log('ok');
 }
 
 // TestStageTrackerOdometerWaitsForMergingHoldNode (owner: "the odometer
-// still updates before the bee animation lands on it"): the merge gate's
-// hold (#15245) masks a landed merge as still open for the banner's
-// lifetime, and the poll that brought it also brings the server's raised
-// ledger total. The drum used to roll on that poll — the hold kept the
-// bee grounded while nothing kept the number — so the landing, a full
-// hold later, found nothing left to roll. The chip now holds the masked
-// merges back like flights to come: the number waits through the hold,
-// through the flight, and rolls once on the landing. Runs the real hold
-// functions (the other celebration tests stub them off).
+// still updates before the bee animation lands on it"; then #15808: the
+// "Merging · merge landed" mask "displays too long"): with the real hold
+// functions in place of the stubs, the poll that brings the merged fact
+// launches the bee at once — the hold no longer masks a known merge for
+// a fixed window — and the drum still rolls only on the landing (#15763),
+// through a bridged poll (PR dropped before its fact) and through two
+// merges in quick succession.
 func TestStageTrackerOdometerWaitsForMergingHoldNode(t *testing.T) {
 	html := indexHTML(t)
 	for _, want := range []string{
-		"_stageTrackerMergedHeld = {};",
-		"masked.held.forEach(k => { _stageTrackerMergedHeld[k] = true; });",
-		"stageTrackerMergedHoldback(_stageTrackerMerged, _stageTrackerCelebratePending, _stageTrackerMergedHeld)",
+		"stageTrackerMergedHoldback(_stageTrackerMerged, _stageTrackerCelebratePending)",
+		"function stageTrackerMergedInFlight() { return _stageTrackerFlights > 0 || Object.keys(_stageTrackerCelebratePending).length > 0; }",
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("index.html missing %q", want)
 		}
 	}
-	holdOn := strings.Join([]string{
-		jsConstLine(t, html, "STAGE_TRACKER_MERGING_HOLD_MS"),
-		jsConstLine(t, html, "STAGE_TRACKER_MERGE_QUEUE"),
-		"var _stageTrackerMergingHold = {}; var _stageTrackerPRItems = {}; var _stageTrackerMergingHoldTimer = 0; var _stageTracker = null;",
-		jsFunc(t, html, "stageTrackerPRItemsOf"),
-		jsFunc(t, html, "stageTrackerMergingHoldLive"),
-		jsFunc(t, html, "stageTrackerMergingHoldNext"),
-		jsFunc(t, html, "stageTrackerMergingHoldMask"),
-		jsFunc(t, html, "stageTrackerMergingHoldSchedule"),
-		jsFunc(t, html, "stageTrackerMergingHoldRelease"),
-	}, "\n")
+	holdOn := stageTrackerMergingHoldJS(t, html)
 	js := strings.Replace(stageTrackerCelebrateJS(t, html), stageTrackerMergingHoldOffJS, holdOn, 1)
 	if js == stageTrackerCelebrateJS(t, html) {
 		t.Fatal("the hold stub was not swapped for the real functions")
@@ -901,65 +962,69 @@ const pr = (num, stage, mg) => Object.assign({ repo: 'o/r', kind: 'pr', number: 
 // The poll handler: remember the payload (the hold's release re-reads it) and note it.
 const poll = d => { _stageTracker = d; stageTrackerNoteMerges(d); };
 panel.appendChild(row('o/r/pr#1'));
-poll({ items: [pr(1, 90)], merged: srv(40, 2, rec(31, 30)) });
+poll({ items: [pr(1, 90)], merged: srv(40, 2, rec(31, 30)), merged_hold_ms: 8000 });
 assert.strictEqual(odoText(n), '40', 'hydrated'); assert.strictEqual(odoText(sub), '2 today · 2 this week');
+assert.strictEqual(stageTrackerMergingHoldMs(), 8000, 'knob read from the payload');
 // The sweep is merging #1: the gate says so.
 tick(5000);
 const T = clock;
 poll({ items: [pr(1, 95, { state: 'merging', merging_since: iso(T) })], merged: srv(40, 2, rec(31, 30)) });
 assert.strictEqual(odoText(n), '40');
-// Next poll: #1 landed — the items dropped it, the ledger counts it (41),
-// recently_merged settles it. The hold masks the merge for the banner's
-// lifetime, so no bee launches yet; the number must wait with it.
-tick(5000);
+// Next poll: the items dropped #1 but neither the ledger nor
+// recently_merged has it yet — the bridge: no bee, no roll, the row is
+// synthesised at "Merging" (stageTrackerMergingHoldView) and a release is
+// scheduled for the hold's end.
+tick(2000);
+poll({ items: [], merged: srv(40, 2, rec(31, 30)) });
+tick(0);
+assert.strictEqual(flights().length, 0, 'no merged fact yet: no bee');
+assert.strictEqual(odoText(n), '40');
+assert.strictEqual(stageTrackerMergingHoldView(_stageTracker, _stageTrackerMergingHold, clock).items.length, 1, 'bridged row');
+assert.ok(_stageTrackerMergingHoldTimer, 'release scheduled');
+// The merged fact lands 3 s later (well inside the 8 s window): the bee
+// launches NOW, the number waits for it.
+tick(3000);
 poll({ items: [], recently_merged: [{ repo: 'o/r', number: 1, merged_at: iso(clock) }], merged: srv(41, 3, rec(1, 31, 30)) });
 tick(0);
-assert.strictEqual(flights().length, 0, 'the hold keeps the bee grounded');
-assert.strictEqual(odoText(n), '40', 'the total waits for the bee (it used to roll here, a full hold early)'); assert.strictEqual(rolling(n).length, 0);
-assert.strictEqual(odoText(sub), '2 today · 2 this week', 'so does the day line');
-assert.ok(!chip.classList.contains('cue-tick'), 'no pop');
-assert.deepStrictEqual(zaps, []);
-// A further poll inside the hold with the same numbers: still waiting.
-tick(10000);
-poll({ items: [], recently_merged: [{ repo: 'o/r', number: 1, merged_at: iso(T) }], merged: srv(41, 3, rec(1, 31, 30)) });
-assert.strictEqual(odoText(n), '40', 'a repeat poll does not leak the number either');
-// The hold ends: the merge is re-read as fresh, the bee launches, the number still waits.
-tick(T + STAGE_TRACKER_MERGING_HOLD_MS - clock + 60);
-tick(0);
-assert.strictEqual(flights().length, 1, 'the bee launches when the hold ends');
+assert.strictEqual(flights().length, 1, 'the bee launches with the merged fact, not at the end of a fixed hold');
+assert.deepStrictEqual(_stageTrackerMergingHold, {}, 'hold dropped with the fact');
 assert.strictEqual(odoText(n), '40', 'held under the flight'); assert.strictEqual(rolling(n).length, 0);
+assert.strictEqual(odoText(sub), '2 today · 2 this week', 'so does the day line');
+assert.ok(!chip.classList.contains('cue-tick'), 'no pop yet');
+assert.deepStrictEqual(zaps, []);
+assert.strictEqual(banners.children.length, 1, 'one merge banner'); assert.ok(banners.children[0].innerHTML.includes('#1'), banners.children[0].innerHTML);
 // The bee lands: one roll, to the server's number.
 flights()[0]._ev.animationend();
 assert.strictEqual(flights().length, 0);
 assert.strictEqual(odoText(n), '41', 'the landing rolls it'); assert.strictEqual(rolling(n).length, 1, 'rolled, not set');
 assert.strictEqual(odoText(sub), '3 today · 3 this week');
 assert.ok(chip.classList.contains('cue-tick'), 'pop with the roll'); assert.deepStrictEqual(zaps, [1], 'zap with the roll');
-assert.ok(chip.title.startsWith('Merged: 41 all time'), chip.title);
 tick(STAGE_TRACKER_ODOMETER_MS + 100);
+// The scheduled release fires later and finds nothing to do: no second celebration.
+tick(10000);
+assert.strictEqual(flights().length, 0); assert.strictEqual(banners.children.length, 1, 'celebrated exactly once');
 // Steady afterwards: the same ledger does not move it again.
 poll({ items: [], merged: srv(41, 3, rec(1, 31, 30)) });
 assert.strictEqual(odoText(n), '41'); assert.strictEqual(rolling(n).length, 0);
-// Two merges in quick succession, each through its own hold: nothing is lost — the display ends on the server's value.
+// Two merges in quick succession, their facts arriving with the polls
+// that drop them (the webhook-style patch, #15808): each flies at once;
+// the number ends on the server's value after the last landing.
 zaps.length = 0; chip.classList.remove('cue-tick');
 panel.appendChild(row('o/r/pr#2')); panel.appendChild(row('o/r/pr#3'));
 poll({ items: [pr(2, 90), pr(3, 90)], merged: srv(41, 3, rec(1, 31, 30)) });
-tick(1000); const T2 = clock;
-poll({ items: [pr(2, 95, { state: 'merging', merging_since: iso(T2) }), pr(3, 90)], merged: srv(41, 3, rec(1, 31, 30)) });
-tick(3000); const T3 = clock;
-poll({ items: [pr(3, 95, { state: 'merging', merging_since: iso(T3) })], recently_merged: [{ repo: 'o/r', number: 2 }], merged: srv(42, 4, rec(2, 1, 31, 30)) });
-assert.strictEqual(odoText(n), '41', '#2 held');
+tick(1000);
+poll({ items: [pr(2, 95, { state: 'merging', merging_since: iso(clock) }), pr(3, 90)], merged: srv(41, 3, rec(1, 31, 30)) });
 tick(3000);
+poll({ items: [pr(3, 95, { state: 'merging', merging_since: iso(clock) })], recently_merged: [{ repo: 'o/r', number: 2 }], merged: srv(42, 4, rec(2, 1, 31, 30)) });
+tick(0);
+assert.strictEqual(flights().length, 1, '#2 flies at once');
+assert.strictEqual(odoText(n), '41', 'held under #2');
+tick(1000);
 poll({ items: [], recently_merged: [{ repo: 'o/r', number: 2 }, { repo: 'o/r', number: 3 }], merged: srv(43, 5, rec(3, 2, 1, 31, 30)) });
-assert.strictEqual(odoText(n), '41', '#2 and #3 held');
-// #2's hold ends first: its bee flies and lands; the number still waits for #3, whose hold is live.
-tick(T2 + STAGE_TRACKER_MERGING_HOLD_MS - clock + 60); tick(0);
-assert.strictEqual(flights().length, 1, '#2 flies');
+tick(0);
+assert.strictEqual(flights().length, 2, '#3 flies too');
 flights()[0]._ev.animationend();
-assert.strictEqual(odoText(n), '41', 'still held: #3 is masked (its bee is to come), and a landing never leaves a merge uncounted');
-// #3's hold ends: its bee flies and lands; the display reaches the server's value.
-tick(T3 + STAGE_TRACKER_MERGING_HOLD_MS - clock + 60); tick(0);
-assert.strictEqual(flights().length, 1, '#3 flies');
-assert.strictEqual(odoText(n), '41', 'held under its flight');
+assert.strictEqual(odoText(n), '41', 'still held: #3 is in the air, and a landing never leaves a merge uncounted');
 flights()[0]._ev.animationend();
 assert.strictEqual(odoText(n), '43', 'final displayed value == server value');
 assert.strictEqual(odoText(sub), '5 today · 5 this week');
@@ -1059,4 +1124,54 @@ func TestStageTrackerMergeBannersAboveChatFab(t *testing.T) {
 	if !strings.Contains(fab, "z-index: 9000;") {
 		t.Errorf(".hive-chat-fab z-index moved; keep it below --z-merge-banner (10001): %s", fab)
 	}
+}
+
+// TestStageTrackerDetachedCelebrationNode (hivecommons/hive#15808, #15707):
+// a merge whose row is not in the DOM — below the fold, filtered, already
+// evicted — still gets all three: the toast, a bee that flies from the
+// toast's ✓ to the chip, and the odometer rolling +1 once it lands. The
+// pipeline is one: no second toast, flight or count for the same PR on a
+// later payload.
+func TestStageTrackerDetachedCelebrationNode(t *testing.T) {
+	html := indexHTML(t)
+	runStageTrackerRowActionsScript(t, stageTrackerCelebrateJS(t, html)+stageTrackerCelebrateFixture+`
+stageTrackerSetCelebrate(true);
+panel.rect = { left: 0, top: 100, width: 900, height: 600 };
+const srv = (all, today, recent) => ({ all_time: all, today, total_7d: today, total_30d: today, recent, tz: 'UTC', day_start: clock - 3600000 });
+const rec = (num) => ({ repo: 'o/r', number: num, title: 't' + num, merged_at: new Date(clock).toISOString(), lane: 'trusted-author' });
+// #15707 was listed open once but never drawn into the panel (below the
+// fold / filtered / evicted by the webhook before the ledger listed it).
+stageTrackerNoteMerges(Object.assign(items(1, 15707), { merged: srv(40, 1, []) }));
+stageTrackerMergedCountDraw(false);
+assert.strictEqual(odoText(n), '40', 'seeded');
+assert.strictEqual(flights().length, 0);
+// Merged fact arrives; the row is not in the DOM.
+stageTrackerNoteMerges({ items: items(1).items, recently_merged: [{ repo: 'o/r', number: 15707 }], merged: srv(41, 2, [rec(15707)]) });
+stageTrackerMergedCountDraw(false);
+assert.strictEqual(banners.children.length, 1, 'toast');
+assert.ok(banners.children[0].innerHTML.includes('#15707'), 'toast names the PR');
+assert.strictEqual(odoText(n), '40', 'odometer waits for the bee (#15763)');
+tick(0);
+assert.strictEqual(flights().length, 1, 'bee flies without a row');
+assert.strictEqual(odoText(n), '40', 'still held while in flight');
+tick(STAGE_TRACKER_CELEBRATE_FLY_MS * 1.5 + 10);
+assert.strictEqual(flights().length, 0, 'landed');
+assert.strictEqual(odoText(n), '41', 'odometer +1 after landing');
+assert.deepStrictEqual(zaps, [1], 'one zap');
+// Same PR again (ledger still lists it; payload repeats): nothing more.
+stageTrackerNoteMerges({ items: items(1).items, recently_merged: [{ repo: 'o/r', number: 15707 }], merged: srv(41, 2, [rec(15707)]) });
+tick(STAGE_TRACKER_CELEBRATE_FLY_MS * 1.5 + 10);
+assert.strictEqual(banners.children.length, 1, 'one toast');
+assert.strictEqual(flights().length, 0, 'no second bee');
+assert.strictEqual(odoText(n), '41', 'count unchanged');
+assert.deepStrictEqual(zaps, [1]);
+// Pure origin: banner box wins, then the panel's foot, then the viewport, else null.
+const bn = { left: 10, top: 20, width: 16, height: 16 };
+assert.strictEqual(stageTrackerDetachedOrigin(bn, panel.rect, 1280, 800), bn);
+const foot = stageTrackerDetachedOrigin(null, panel.rect, 1280, 800);
+assert.strictEqual(foot.left + foot.width / 2, 450, 'panel centre');
+assert.ok(foot.top + foot.height <= 700, 'at the panel foot');
+assert.strictEqual(stageTrackerDetachedOrigin(null, null, 1280, 800).top + 2 * STAGE_TRACKER_CELEBRATE_GLYPH_HALF, 800);
+assert.strictEqual(stageTrackerDetachedOrigin(null, null, 0, 0), null);
+`)
 }

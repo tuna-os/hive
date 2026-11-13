@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -130,6 +131,33 @@ func TestRepoItemAdoptNowGuards(t *testing.T) {
 	}
 }
 
+// An operator may take over anyone's PR, a hive owner's included: Adopt now
+// on an owner-authored PR records the forced mark and the audit names the
+// author as an owner.
+func TestRepoItemAdoptNowOnOwnerAuthoredPR(t *testing.T) {
+	srv, store := takeoverServer(t, &repoItemDecisionMock{prForeign: true})
+	srv.deps.Config.Dashboard.AuthorizedUsers = []string{"someone:owner"}
+	w := postRepoItemDecision(t, srv, 8, "writer", `{"decision":"adopt","force":true,"type":"pr"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("owner-authored: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if rec, _ := store.Get(stagelabels.Key("testorg/testrepo", 8)); !recForced(rec) {
+		t.Fatalf("forced mark not recorded for an owner's PR: %+v", rec)
+	}
+	found := false
+	for _, e := range srv.GetAudit().Recent(20) {
+		if e.Action == auditRepoItemDecisionAdoptNow {
+			found = true
+			if !strings.Contains(e.Detail, "author=someone") || !strings.Contains(e.Detail, "author_owner=true") {
+				t.Fatalf("audit detail %q lacks the owner attribution", e.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("audit = %v", decisionAuditActions(srv))
+	}
+}
+
 func TestRepoItemRerouteNoneOnlineIsConflict(t *testing.T) {
 	srv, _ := takeoverServer(t, &repoItemDecisionMock{prForeign: true})
 	w := postRepoItemDecision(t, srv, 8, "writer", `{"decision":"reroute","to":"any","type":"pr"}`)
@@ -209,6 +237,9 @@ func TestRepoItemReroutePickupLapseFallsBackToAdoptNow(t *testing.T) {
 	srv, store := takeoverServer(t, mock)
 	hub := srv.contributeHub
 	hub.fixDispatched = func(_ *ContributorConnection, _ WSMessage) {}
+	// org/other#1 is a fixture the GitHub mock does not serve: report it
+	// open so the dispatch check keeps it.
+	hub.fixPRStateHook = func(context.Context, string, int) (fixPRState, string, error) { return fixPRStateOpen, "", nil }
 	// bee2 is online but already holds a task: the reroute queues behind it.
 	c := fixConn(hub, "bee2", fixCaps(capFixPRInterrupt), time.Now())
 	c.mu.Lock()
@@ -338,7 +369,7 @@ func TestStageTrackerTakeoverQueuedAfterAdoptNow(t *testing.T) {
 	store.NoteAdmission(key, "feed", stagelabels.OperatorApprovalAdmission("andan02"), now.Add(-10*time.Minute))
 	store.NoteAdoptionBlocked(key, "feed", stagelabels.AdoptBlockedOperatorAdmission, now.Add(-9*time.Minute))
 	it := trackerItem(t, s.buildStageTracker(status, store, now), "pr", 14524)
-	if it.Adoption == nil || it.Adoption.BlockedBy != stagelabels.AdoptBlockedOperatorAdmission || !strings.Contains(it.Adoption.Text, "a maintainer approved this head") || it.Takeover == nil || !it.Takeover.AdoptNow {
+	if it.Adoption == nil || it.Adoption.BlockedBy != stagelabels.AdoptBlockedOperatorAdmission || !strings.Contains(it.Adoption.Text, "operator approval recorded for this head; existing review/CI requirements still apply") || it.Takeover == nil || !it.Takeover.AdoptNow {
 		t.Fatalf("precondition (approved, blocked, Adopt now offered): adoption=%+v takeover=%+v", it.Adoption, it.Takeover)
 	}
 
@@ -354,8 +385,8 @@ func TestStageTrackerTakeoverQueuedAfterAdoptNow(t *testing.T) {
 	if it.DecisionNeeded != nil {
 		t.Fatalf("queued adoption still asks a person: %+v", it.DecisionNeeded)
 	}
-	if strings.Contains(it.Caption, "not adopted") {
-		t.Fatalf("caption still says not adopted: %q", it.Caption)
+	if strings.Contains(it.Caption, "not adopted") || strings.Contains(it.Caption, "contributor-managed") {
+		t.Fatalf("explicit queued adoption still shows the prior ownership-only state: %q", it.Caption)
 	}
 	for _, o := range takeoverDecisionOptions(tk, false) {
 		if o.Action == decisionActionAdoptNow {

@@ -140,27 +140,22 @@
       const n = Number(minSeq);
       if (Number.isFinite(n) && n > _statusSeqFloor) _statusSeqFloor = n;
     }
+    // A snapshot accepted before a mutation can become stale while queued.
+    function dashboardStatusCanRender(data) {
+      return data.statusSeq == null ||
+        (data.statusSeq >= _statusSeqFloor && data.statusSeq >= _lastStatusSeq &&
+          (!data.statusInstance || !_statusInstance || data.statusInstance === _statusInstance));
+    }
     var SCROLL_SETTLE_DELAY_MS = 500;
     var _deferredLoadPromise = null;
     function _afterPaint(callback) {
       _hashScrollPending = true;
-      if (_deferredLoadPromise) {
-        _deferredLoadPromise.then(function() {
-          requestAnimationFrame(function() {
-            requestAnimationFrame(function() {
-              callback();
-              setTimeout(function() { _hashScrollPending = false; }, 200);
-            });
-          });
-        });
-      } else {
+      requestAnimationFrame(function() {
         requestAnimationFrame(function() {
-          requestAnimationFrame(function() {
-            setTimeout(callback, SCROLL_SETTLE_DELAY_MS);
-            setTimeout(function() { _hashScrollPending = false; }, 500);
-          });
+          setTimeout(callback, SCROLL_SETTLE_DELAY_MS);
+          setTimeout(function() { _hashScrollPending = false; }, SCROLL_SETTLE_DELAY_MS);
         });
-      }
+      });
     }
 
     const NAVBAR_CLOCK_TICK_MS = 1000;
@@ -484,6 +479,10 @@
         if (data.statusSeq < _statusSeqFloor || data.statusSeq < _lastStatusSeq) return;
         _lastStatusSeq = data.statusSeq;
       }
+      if (typeof data.matrixEnabled === 'boolean') {
+        const codeActivityTab = document.getElementById('oc-matrix-tab');
+        if (codeActivityTab) codeActivityTab.hidden = !data.matrixEnabled;
+      }
       if (document.body.style.opacity === '0') document.body.style.opacity = '1';
       const scrollAnchor = captureScrollAnchor();
       updateNavbarClockTimeZone(data);
@@ -501,7 +500,9 @@
       applyDashboardFeatureVisibility();
       // The tracker's hop cue reads which agent is on which item from this
       // payload; redraw the rows when that set changes (no extra fetch).
-      if (typeof stageTrackerWorkers === 'function' && JSON.stringify(stageTrackerWorkers(data)) !== prevWorkers && typeof renderStageTracker === 'function') renderStageTracker();
+      if (typeof stageTrackerWorkers === 'function' && JSON.stringify(stageTrackerWorkers(data)) !== prevWorkers && typeof renderStageTracker === 'function') {
+        dashboardRenderSection('tracker-workers', ['activity-monitor-section'], () => renderStageTracker());
+      }
       if (typeof refreshThroughputSLA === 'function') refreshThroughputSLA();
       if (window._acmmOverride) {
         if (data.acmmLevel === window._acmmOverride.level) {
@@ -524,40 +525,47 @@
       if (hiveIdBadge) hiveIdBadge.textContent = hiveId;
       const ocHiveId = document.getElementById('oc-hive-id');
       if (ocHiveId) ocHiveId.textContent = hiveId;
+      if (typeof stageTrackerPopoutSyncTitle === 'function') stageTrackerPopoutSyncTitle(hiveId);
       // Update Light health badge with hover detail
       renderNavbarHealthBadge(document.getElementById('oc-health'), data);
       renderProviderStrip(document.getElementById('oc-providers'), data.providers);
       renderGhRateLimits(data.ghRateLimits || {});
       renderGitHubAppBanner(data);
       renderRepoTargetBanner(data);
+      renderOnboardingGuideChip(data);
       renderIssuesDisabledBanner(data);
+      renderCodeScanningBanner(data);
       refreshWelcomeAutoChecks(data);
       renderHubBanner(data.hubBanner);
       maybePlanningIntro(data);
       renderSystemAlerts(data.systemAlerts || []);
       if (!_dropdownOpen && !_configModalOpen) {
         applyPinOverrides(data.agents || []);
-        renderAgents(data.agents || []);
-        renderGovernor(data.governor || {}, data.cadenceMatrix || [], data);
+        dashboardRenderSection('agents', ['agents-section', 'agent-activity-section'], () => {
+          if (!_dropdownOpen && !_configModalOpen) renderAgents(data.agents || []);
+        }, data);
+        dashboardRenderSection('governor', ['governor'], () => {
+          if (!_dropdownOpen && !_configModalOpen) renderGovernor(data.governor || {}, data.cadenceMatrix || [], data);
+        }, data);
         // Keep the focused agent detail in sync with fresh payloads — its
         // fast path only rebuilds when the config fingerprint changes.
         if (_ocSelectedAgent) ocRenderAgentDetail();
       }
-      renderTokens(data.tokens || {});
-      renderAdvisoryDigest(data.advisoryDigest || null);
-      renderRepos(data.repos || []);
-      renderRuns(dashboardRunsFromStatus(data));
-      renderSwarm(data.swarm || {});
+      dashboardRenderSection('tokens', ['token-panel'], () => renderTokens(data.tokens || {}), data);
+      dashboardRenderSection('advisory', ['advisory-section'], () => renderAdvisoryDigest(data.advisoryDigest || null), data);
+      dashboardRenderSection('repos', ['repos-section', 'overview-section'], () => renderRepos(data.repos || []), data);
+      dashboardRenderSection('runs', ['runs-section'], () => renderRuns(dashboardRunsFromStatus(data)), data);
+      dashboardRenderSection('swarm', ['repos-section'], () => renderSwarm(data.swarm || {}), data);
       var reposBadge = document.getElementById('repos-sidebar-badge');
       if (reposBadge) setSidebarCountBadge(reposBadge, (data.repos || []).length, (data.repos || []).length + ' repositories');
-      updateContributorBadge(data.contributorPool || null);
       renderPlatform(data.platform || null);
-      renderHiveAdvice(data.hiveAdvice || null);
-      renderFleetReport(data.fleetReport || null);
-      renderSystemGauges(data.systemResources || null);
+      dashboardRenderSection('hive-advice', ['advisory-section'], () => renderHiveAdvice(data.hiveAdvice || null), data);
+      dashboardRenderSection('fleet-report', ['advisory-section'], () => renderFleetReport(data.fleetReport || null), data);
+      dashboardRenderSection('system-gauges', ['debug-section'], () => renderSystemGauges(data.systemResources || null), data);
       ocUpdateSidebarAgents();
-      renderDebugSection();
-      renderFAQ();
+      dashboardRenderSection('debug', ['debug-section'], () => renderDebugSection(), data);
+      dashboardRenderSection('faq', ['faq-section'], () => renderFAQ(), data);
+      dashboardRenderSection('inbox', ['inbox-section'], () => renderInbox(), data);
       initializeDashboardSectionCards();
       // Restore persisted collapsed state for all collapsible sections
       const COLLAPSIBLE_SECTION_IDS = [
@@ -566,7 +574,7 @@
         'advisory-section', 'advisory-digest-section', 'hive-advice-section', 'acmm-reco-section', 'lifecycle-section', 'pr-throughput-section',
         'overview-section', 'governor', 'token-panel', 'cost-panel', 'repos-section', 'acmm-eval-section',
         'fleet-report-section', 'audit-section', 'review-queue-section', 'nous-section', 'inception-section',
-        'knowledge-section', 'search-section', 'contributors-section', 'debug-section', 'logs-section',
+        'knowledge-section', 'search-section', 'inbox-section', 'contributors-section', 'debug-section', 'logs-section',
         'activity-monitor-section', 'agents-section', 'agent-activity-section', 'faq-section'
       ];
       COLLAPSIBLE_SECTION_IDS.forEach(applySectionCollapse);
@@ -603,4 +611,3 @@
         if (!_hashScrollPending) restoreScrollAnchor(scrollAnchor);
       }
     }
-

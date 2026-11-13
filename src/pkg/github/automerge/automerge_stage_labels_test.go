@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -36,7 +37,9 @@ type stageAPI struct {
 	creates  []string
 	lists    int
 	gets     int
-	url      string
+	// issueGets counts GET /issues/N per number.
+	issueGets map[int]int
+	url       string
 	// commits is what GET /pulls/N/commits answers (one message per
 	// commit); a PR not listed has no commits, so its DCO state stays
 	// unknown and the test's label expectations are unaffected.
@@ -63,6 +66,13 @@ type stageAPI struct {
 	// (hivecommons/hive#15020). Unlisted PRs answer empty lists.
 	issueComments map[int][]map[string]any
 	issueEvents   map[int][]map[string]any
+	// statefulComments makes POST /issues/N/comments persist into the
+	// GET list (ids 1001, 1002, …) and accepts PATCH /issues/comments/ID,
+	// recording each edit in commentEdits: the quiet-notification tests
+	// need the status comment to survive between sweeps.
+	statefulComments bool
+	posted           map[int][]map[string]any
+	commentEdits     []string
 }
 
 type stageCommitFixture struct {
@@ -114,6 +124,10 @@ func newStageAPI(t *testing.T, api *stageAPI) *httptest.Server {
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/issues/") && !strings.Contains(strings.TrimPrefix(path, "/repos/acme/widget/issues/"), "/"):
 			n, _ := strconv.Atoi(strings.TrimPrefix(path, "/repos/acme/widget/issues/"))
 			api.gets++
+			if api.issueGets == nil {
+				api.issueGets = map[int]int{}
+			}
+			api.issueGets[n]++
 			stagePRTruthMu.Lock()
 			labels := make([]map[string]string, 0)
 			for _, l := range stagePRTruth[n] {
@@ -146,7 +160,21 @@ func newStageAPI(t *testing.T, api *stageAPI) *httptest.Server {
 			if out == nil {
 				out = []map[string]any{}
 			}
+			out = append(out, api.posted[n]...)
 			_ = json.NewEncoder(w).Encode(out)
+		case api.statefulComments && r.Method == http.MethodPatch && strings.HasPrefix(path, "/repos/acme/widget/issues/comments/"):
+			id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/repos/acme/widget/issues/comments/"), 10, 64)
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for _, list := range api.posted {
+				for _, c := range list {
+					if c["id"] == id {
+						c["body"] = body["body"]
+					}
+				}
+			}
+			api.commentEdits = append(api.commentEdits, body["body"])
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "body": body["body"]})
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/issues/") && strings.HasSuffix(path, "/events"):
 			n, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(path, "/repos/acme/widget/issues/"), "/events"))
 			out := api.issueEvents[n]
@@ -159,6 +187,13 @@ func newStageAPI(t *testing.T, api *stageAPI) *httptest.Server {
 			// before proving a new head is the hive's own base refresh.
 			n, _ := strconv.Atoi(strings.TrimPrefix(path, "/repos/acme/widget/pulls/"))
 			_ = json.NewEncoder(w).Encode(map[string]any{"number": n, "base": map[string]any{"ref": "main"}})
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/branches/") && strings.HasSuffix(path, "/protection/required_status_checks"):
+			// The human-routing check digest reads the base branch's
+			// required checks: none here (an unprotected branch, no rules).
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Branch not protected"}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/rules/branches/"):
+			_, _ = w.Write([]byte(`[]`))
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/acme/widget/commits/"):
 			// No single-commit detail is seeded: a new head is never a base
 			// refresh here, so a recorded decision stays on its own head.
@@ -205,8 +240,17 @@ func newStageAPI(t *testing.T, api *stageAPI) *httptest.Server {
 				return
 			}
 			api.comments = append(api.comments, body["body"])
+			id := int64(1)
+			if api.statefulComments {
+				n, _ := strconv.Atoi(strings.TrimSuffix(path[strings.LastIndex(path, "/issues/")+len("/issues/"):], "/comments"))
+				if api.posted == nil {
+					api.posted = map[int][]map[string]any{}
+				}
+				id = int64(1000 + len(api.comments))
+				api.posted[n] = append(api.posted[n], map[string]any{"id": id, "body": body["body"], "user": map[string]any{"login": testHiveAppBotLogin}})
+			}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, path)
 			w.WriteHeader(http.StatusTeapot)
@@ -332,7 +376,7 @@ func TestPreserveNormalizedFixingStageBlocksRawHumanFlap(t *testing.T) {
 		Reason:       stagelabels.LaneReasonChangesRequested,
 		ActivityHead: "bbb5676",
 	}
-	obs := stageObservation{HeadSHA: "bbb5676", Detail: stageDetail{VerdictKnown: true, Verdict: ContributorLaneVerdict{Configured: true, Verdict: "requires_human", HumanSummaries: []string{"correctness requires human: field is plumbed but never populated; add the producer."}}}}
+	obs := stageObservation{Lane: stageLaneSelf, HeadSHA: "bbb5676", Detail: stageDetail{VerdictKnown: true, Verdict: ContributorLaneVerdict{Configured: true, Verdict: "requires_human", HumanSummaries: []string{"correctness requires human: field is plumbed but never populated; add the producer."}}}}
 	rawHuman := stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Reason: stageReasonVerdictRequiresHuman, Human: true}
 
 	got, ok := preserveNormalizedFixingStage(prev, true, obs, rawHuman)
@@ -414,9 +458,12 @@ func TestClassifyStageMapping(t *testing.T) {
 		{name: "soaking is pre-merge soak", obs: stageObservation{Lane: stageLaneContributor, Reason: contributorLaneReasonSoaking + "(remaining=30m)"}, want: stagelabels.PreMergeSoak, rank: stageRankOwned},
 		{name: "soak complete waiting on github is merge queue", obs: stageObservation{Lane: stageLaneContributor, Reason: "required-checks-expected"}, want: stagelabels.MergeQueue, rank: stageRankOwned},
 		{name: "merge pool", obs: stageObservation{Lane: stageLaneSelf, Reason: "head-changed-since-eval"}, want: stagelabels.MergeQueue, rank: stageRankOwned},
-		{name: "hold", obs: stageObservation{Lane: stageLaneSelf, Reason: "label:hold"}, want: stagelabels.NeedsDecision, rank: stageRankOwned},
+		// A hold label or sentinel alert is a gate, not a stage
+		// (hivecommons/hive#17327): the opinion is a 090 candidate the
+		// route refines against the head's evidence.
+		{name: "hold", obs: stageObservation{Lane: stageLaneSelf, Reason: "label:hold"}, want: stagelabels.ReadyForHumanMerge, rank: stageRankOwned},
 		{name: "workflow approval held", obs: stageObservation{Lane: stageLaneSelf, Reason: workflowApprovalRequiredPrefix + "build"}, want: stagelabels.NeedsDecision, rank: stageRankOwned},
-		{name: "sentinel blocked", obs: stageObservation{Lane: stageLaneContributor, Reason: contributorLaneReasonSentinelBlocked}, want: stagelabels.NeedsDecision, rank: stageRankOwned},
+		{name: "sentinel blocked", obs: stageObservation{Lane: stageLaneContributor, Reason: contributorLaneReasonSentinelBlocked}, want: stagelabels.ReadyForHumanMerge, rank: stageRankOwned},
 		{name: "needs-rebase hold", obs: stageObservation{Lane: stageLaneSelf, Reason: "excluded-label:needs-rebase", Labels: []string{"needs-rebase"}}, want: stagelabels.Fixing, rank: stageRankOwned},
 		{name: "no claim is a weak admission opinion", obs: stageObservation{Lane: stageLaneContributor, Reason: contributorLaneReasonNoClaim}, want: stagelabels.ReadyForHumanMerge, rank: stageRankAdmission},
 		{name: "claim tier below require_tiers", obs: stageObservation{Lane: stageLaneContributor, Reason: contributorLaneReasonClaimTier}, want: stagelabels.ReadyForHumanMerge, rank: stageRankAdmission},
@@ -671,12 +718,14 @@ func TestResolveStageAdmissionOpinions(t *testing.T) {
 		},
 		{
 			// A hold-class reason applies whoever the author is.
-			name: "trusted author sentinel-blocked is needs-decision",
+			// The sentinel gate is a 090 candidate owned by the contributor
+			// lane (hivecommons/hive#17327); the route rides the alert on it.
+			name: "trusted author sentinel-blocked is a held 090 candidate",
 			list: []stageObservation{
 				{Lane: stageLaneTrusted, Reason: "untrusted-author-role"},
 				{Lane: stageLaneContributor, Reason: contributorLaneReasonSentinelBlocked, Detail: trusted},
 			},
-			stage: stagelabels.NeedsDecision, rank: stageRankOwned, author: stagelabels.RoleTrusted, lane: stageLaneContributor,
+			stage: stagelabels.ReadyForHumanMerge, rank: stageRankOwned, author: stagelabels.RoleTrusted, lane: stageLaneContributor,
 		},
 		{
 			// #13115: a requires_human verdict on an admission reason is 085,
@@ -1430,7 +1479,7 @@ func TestApplyStageLabelsRequiresHumanBeatsAdmissionReason(t *testing.T) {
 	}
 }
 
-// The sweep's own comments (Dependabot rebase request, stale-approval note,
+// The sweep's own comments (ok-to-test command, stale-approval note,
 // hold release) land after the lane's deep fetch and before
 // ApplyStageLabels, so the credit must go on this cycle's observation, not
 // on the store's last count (which ApplyStageLabels overwrites with the
@@ -1745,10 +1794,11 @@ func TestClassifyStageRedCheckIsRepairStageNever080Or100(t *testing.T) {
 			}
 		})
 	}
-	// Modifiers that park the PR still outrank a red optional check.
+	// A hold is a gate, not a stage (hivecommons/hive#17327): the red
+	// optional check is the head's real progress, so the author fixes it.
 	held := classifyStage(stageObservation{Lane: stageLaneContributor, HeadSHA: "sha", Reason: "label:hold", Detail: red})
-	if held.Stage != stagelabels.NeedsDecision || !held.Human {
-		t.Fatalf("held=%+v want needs-decision (human)", held)
+	if held.Stage != stagelabels.NeedsAuthor || held.Human || !strings.HasPrefix(held.Reason, stageReasonOptionalCheckFailing) {
+		t.Fatalf("held=%+v want needs-author on the red check", held)
 	}
 }
 
@@ -2246,7 +2296,7 @@ func TestApplyStageLabelsHiveBotSignoffOnHumanHeadNeedsAuthorWithInstructions(t 
 	if len(api.comments) != 1 {
 		t.Fatalf("comments %q", api.comments)
 	}
-	for _, want := range []string{SignoffAttributionMarkerPrefix + " head=sha -->", "@clubanderson", "`stage/071-needs-author`", "git commit --amend --reset-author -s && git push --force-with-lease", "git config user.email"} {
+	for _, want := range []string{SignoffAttributionMarker + "\n", "Current head: `sha`.", "@clubanderson", "`stage/071-needs-author`", "git commit --amend --reset-author -s && git push --force-with-lease", "git config user.email"} {
 		if !strings.Contains(api.comments[0], want) {
 			t.Fatalf("comment lacks %q:\n%s", want, api.comments[0])
 		}
@@ -2414,6 +2464,123 @@ func TestDCOCommitStatsSkipsMerges(t *testing.T) {
 	}
 }
 
+// hivecommons/hive#16685: an unsigned commit GitHub links to one of the
+// hive's identities (project.ai_author) is the hive's to sign; a
+// collaborator's unsigned commit is not, whatever its git author name says.
+func TestDCOCommitStatsForHiveCountsHiveIdentities(t *testing.T) {
+	commits := []*gh.RepositoryCommit{
+		{Author: &gh.User{Login: gh.Ptr("thatguywob")}, Commit: &gh.Commit{Message: gh.Ptr("hive fix")}, Parents: []*gh.Commit{{}}},
+		{Author: &gh.User{Login: gh.Ptr("collaborator")}, Commit: &gh.Commit{Message: gh.Ptr("drive-by"), Author: &gh.CommitAuthor{Name: gh.Ptr("thatguywob")}}, Parents: []*gh.Commit{{}}},
+		{Author: &gh.User{Login: gh.Ptr(testHiveAppBotLogin)}, Commit: &gh.Commit{Message: gh.Ptr("app fix")}, Parents: []*gh.Commit{{}}},
+	}
+	isHive := func(login string) bool { return strings.EqualFold(login, "thatguywob") }
+	stats := dcoCommitStatsForHive(commits, testHiveAppBotLogin, "thatguywob", true, isHive)
+	if stats.unsigned != 3 || stats.unsignedHive != 2 || stats.unsignedOther != 1 {
+		t.Fatalf("with hive identities: %+v, want unsigned=3 hive=2 other=1", stats)
+	}
+	stats = dcoCommitStatsForHive(commits, testHiveAppBotLogin, "thatguywob", true, nil)
+	if stats.unsigned != 3 || stats.unsignedHive != 1 || stats.unsignedOther != 2 {
+		t.Fatalf("nil predicate: %+v, want unsigned=3 hive=1 other=2", stats)
+	}
+	if old := dcoCommitStatsForSquashAuthor(commits, testHiveAppBotLogin, "thatguywob", true); old != stats {
+		t.Fatalf("dcoCommitStatsForSquashAuthor=%+v, want App-only split %+v", old, stats)
+	}
+}
+
+// hivecommons/hive#16703: the squash-unsafe count uses the same ownership
+// rule as the unsigned split, so a signed commit GitHub links to a hive
+// identity is the hive's to misattribute on a PR a squash would credit to
+// someone else.
+func TestDCOCommitStatsForHiveSquashUnsafeCountsHiveIdentities(t *testing.T) {
+	commits := []*gh.RepositoryCommit{
+		{Author: &gh.User{Login: gh.Ptr("thatguywob")}, Commit: &gh.Commit{Message: gh.Ptr("hive fix\n\nSigned-off-by: Hive <hive@users.noreply.github.com>")}, Parents: []*gh.Commit{{}}},
+		{Author: &gh.User{Login: gh.Ptr("collaborator")}, Commit: &gh.Commit{Message: gh.Ptr("drive-by\n\nSigned-off-by: C <c@x>")}, Parents: []*gh.Commit{{}}},
+	}
+	isHive := func(login string) bool { return strings.EqualFold(login, "thatguywob") }
+	if stats := dcoCommitStatsForHive(commits, testHiveAppBotLogin, "person", false, isHive); stats.unsigned != 0 || stats.squashUnsafeHive != 1 {
+		t.Fatalf("with hive identities: %+v, want squashUnsafeHive=1", stats)
+	}
+	if stats := dcoCommitStatsForHive(commits, testHiveAppBotLogin, "person", true, isHive); stats.squashUnsafeHive != 0 {
+		t.Fatalf("self squash: %+v, want squashUnsafeHive=0", stats)
+	}
+	if stats := dcoCommitStatsForHive(commits, testHiveAppBotLogin, "person", false, nil); stats.squashUnsafeHive != 0 {
+		t.Fatalf("nil predicate: %+v, want App-only squashUnsafeHive=0", stats)
+	}
+}
+
+// hivecommons/hive#17789: a hive rebase + force-push makes the App bot the
+// committer of the PR author's own commit. A sign-off with the commit
+// author's own email, on a commit GitHub links to the PR author, certifies
+// the PR author (the squash attribution gate agrees), so it is never
+// squash-unsafe; a foreign sign-off under the same committer still is.
+func TestDCOCommitStatsForHiveAuthorSignedAfterHiveRebase(t *testing.T) {
+	rebased := func(authorLogin, authorEmail, signoff string) *gh.RepositoryCommit {
+		return &gh.RepositoryCommit{
+			Author:    &gh.User{Login: gh.Ptr(authorLogin)},
+			Committer: &gh.User{Login: gh.Ptr(testHiveAppBotLogin)},
+			Commit: &gh.Commit{
+				Author:  &gh.CommitAuthor{Email: gh.Ptr(authorEmail)},
+				Message: gh.Ptr("fix: openshell sandbox names\n\nSigned-off-by: " + signoff),
+			},
+			Parents: []*gh.Commit{{}},
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		commit *gh.RepositoryCommit
+		want   int
+	}{
+		{"author's real email", rebased("clubanderson", "andy@clubanderson.com", "Andrew Anderson <andy@clubanderson.com>"), 0},
+		{"author email case differs", rebased("ClubAnderson", "Andy@ClubAnderson.com", "Andrew Anderson <andy@clubanderson.com>"), 0},
+		{"author's noreply", rebased("clubanderson", "andy@clubanderson.com", "A <123+clubanderson@users.noreply.github.com>"), 0},
+		{"someone else's sign-off", rebased("clubanderson", "andy@clubanderson.com", "Other <other@example.com>"), 1},
+		{"commit authored by someone else", rebased("collaborator", "andy@clubanderson.com", "Andrew Anderson <andy@clubanderson.com>"), 1},
+		{"author login unlinked", rebased("", "andy@clubanderson.com", "Andrew Anderson <andy@clubanderson.com>"), 1},
+	} {
+		stats := dcoCommitStatsForHive([]*gh.RepositoryCommit{tc.commit}, testHiveAppBotLogin, "clubanderson", false, nil)
+		if stats.unsigned != 0 || stats.squashUnsafeHive != tc.want {
+			t.Errorf("%s: %+v, want squashUnsafeHive=%d", tc.name, stats, tc.want)
+		}
+	}
+}
+
+// hivecommons/hive#16701: a split cached before hive identities counted filed
+// a project.ai_author commit as "other"; stageDCO reads that head's commits
+// once more so the hive's own commit can be re-signed, then trusts the
+// refreshed cache.
+func TestStageDCORereadsSplitCachedBeforeHiveIdentities(t *testing.T) {
+	api := &stageAPI{labels: map[string]string{}, commitDetails: map[int][]stageCommitFixture{
+		42: {{message: "hive fix", authorLogin: "thatguywob"}},
+	}}
+	srv := newStageAPI(t, api)
+	defer srv.Close()
+	e, _, _ := newStageEngine(t, srv.URL, &contributorLaneClock{at: time.Now()})
+	key := stageKey("acme", "widget", 42)
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	data, err := json.Marshal(map[string]stagelabels.Record{key: {DCOHead: "aaa", DCOTotal: 1, DCOUnsigned: 1, DCOUnsignedOther: 1, DCOSquashUnsafeKnown: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := stagelabels.NewStore(path, nil)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	policy := StageLabelPolicy{HiveAuthor: func(login string) bool { return strings.EqualFold(login, "thatguywob") }}
+	obs := stageObservation{Owner: "acme", Repo: "widget", Number: 42, HeadSHA: "aaa", Author: "thatguywob"}
+	got, err := e.stageDCO(context.Background(), store, key, obs, policy)
+	if err != nil || got.unsigned != 1 || got.unsignedHive != 1 || got.unsignedOther != 0 || api.commitReads != 1 {
+		t.Fatalf("legacy split: %+v, %v, reads=%d; want hive=1 other=0 after one read", got, err, api.commitReads)
+	}
+	store.NoteDCO(key, obs.HeadSHA, got.total, got.unsigned, got.unsignedHive, got.squashUnsafeHive, true)
+	got, err = e.stageDCO(context.Background(), store, key, obs, policy)
+	if err != nil || got.unsignedHive != 1 || got.unsignedOther != 0 || api.commitReads != 1 {
+		t.Fatalf("refreshed split: %+v, %v, reads=%d; want the cache served", got, err, api.commitReads)
+	}
+}
+
 // hivecommons/hive#12557: a gate flapping between merge-queue and a pending
 // stage on one unchanged head used to post a stage-regressed comment every
 // sweep, because each recover re-armed the dedupe. One comment per head.
@@ -2450,8 +2617,10 @@ func TestApplyStageLabelsRegressionFlapOnSameHeadCommentsOnce(t *testing.T) {
 		comments += len(api.comments)
 		api.reset()
 	}
-	if comments != 1 {
-		t.Fatalf("regression comments across 4 flaps on one head = %d, want 1", comments)
+	// A min_head_age wait is the hive's own gate: nothing failed, so since
+	// the notification-spam fix no regression note is posted for it at all.
+	if comments != 0 {
+		t.Fatalf("regression comments across 4 pending flaps on one head = %d, want 0", comments)
 	}
 }
 
@@ -2871,5 +3040,80 @@ func TestApplyStageLabelsAnyAuthorAlreadyLandedKeptStillParks(t *testing.T) {
 	}
 	if !parked {
 		t.Fatalf("kept contributor PR must still reach 085: added=%v", api.added)
+	}
+}
+
+// hivecommons/hive#16974: check runs fired by the hive's own label write must
+// not be treated as new pending evidence pulling a PR off stage/085-needs-decision
+// to 050 or 070.
+func TestApplyStageLabelsNeedsDecisionStableAcrossPendingChecks(t *testing.T) {
+	api := &stageAPI{labels: map[string]string{}}
+	for _, d := range stagelabels.AllLabelDefs() {
+		api.labels[d.Name] = d.Color
+	}
+	srv := newStageAPI(t, api)
+	defer srv.Close()
+	clock := &contributorLaneClock{at: time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)}
+	e, _, store := newStageEngine(t, srv.URL, clock)
+	e.trustedAuthorPolicy = func() TrustedAuthorPolicy { return TrustedAuthorPolicy{Enabled: true} }
+	e.contributorLanePolicy = func() ContributorLanePolicy { return ContributorLanePolicy{} }
+
+	const number = 16607
+	const head = "687f4cb"
+	verdict := ContributorLaneVerdict{
+		Configured:        true,
+		Verdict:           "requires_human",
+		DecisionRequested: true,
+		DecisionQuestion:  "@hanthor should confirm that the hive-merge relay may now App-merge trusted-author pin-only PRs",
+	}
+	e.contributorLaneVerdict = func(string, int, string) ContributorLaneVerdict { return verdict }
+
+	pending := false
+	e.checkSummary = func(context.Context, string, string, string) (hgithub.CommitChecksSummary, error) {
+		if pending {
+			return hgithub.CommitChecksSummary{Total: 3, Green: 1, Pending: 2, DCO: 1}, nil
+		}
+		return hgithub.CommitChecksSummary{Total: 3, Green: 3, Pending: 0, DCO: 1}, nil
+	}
+
+	ctx := context.Background()
+	pr := stagePR(number)
+	pr.User = &gh.User{Login: gh.Ptr(testHiveAppBotLogin)}
+	pr.Head = &gh.PullRequestBranch{SHA: gh.Ptr(head)}
+	pr.Body = gh.Ptr("Closes #16265\nSupersedes #16456\n\n— hive: agent=scanner backend=copilot\n")
+
+	feedObservation := func(labels []string) {
+		pr.Labels = make([]*gh.Label, 0, len(labels))
+		for _, l := range labels {
+			pr.Labels = append(pr.Labels, &gh.Label{Name: gh.Ptr(l)})
+		}
+		e.recordStage(stageLaneSelf, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
+		e.noteStageRole("acme", "widget", number, stagelabels.RoleTrusted)
+		e.noteStageVerdict("acme", "widget", number, verdict)
+		e.noteStagePR("acme", "widget", number, pr)
+		if _, err := e.ApplyStageLabels(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Iteration 1: initial sweep places PR at 085.
+	feedObservation([]string{"stage/050-review-pending", "role/trusted", "author/hive"})
+	rec, ok := store.Get(stageKey("acme", "widget", number))
+	if !ok || rec.Stage != stagelabels.NeedsDecision {
+		t.Fatalf("iteration 1: expected 085, got %+v", rec)
+	}
+
+	// Iteration 2: label write fired workflows, toggling Checks.Pending to > 0.
+	pending = true
+	api.reset()
+	feedObservation([]string{"stage/085-needs-decision", "role/trusted", "author/hive"})
+
+	// Stage must remain NeedsDecision (085) with no flap to 050 or 070.
+	rec, ok = store.Get(stageKey("acme", "widget", number))
+	if !ok || rec.Stage != stagelabels.NeedsDecision {
+		t.Fatalf("iteration 2: expected 085 preserved across pending checks, got %+v", rec)
+	}
+	if api.writes() != 0 {
+		t.Fatalf("iteration 2: expected no label changes, got added=%v removed=%v", api.added, api.removed)
 	}
 }

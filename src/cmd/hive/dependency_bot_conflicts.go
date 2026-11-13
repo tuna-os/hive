@@ -68,6 +68,12 @@ type depBotConflictStore struct {
 	// holds per PR head.
 	observed map[string]*depBotObservation
 	holds    map[string]depBotHold
+
+	// rebase holds the persisted stranded-branch records
+	// (dependency_bot_rebase_request.go); branchFacts, in memory only, what
+	// each PR's commit list said about its current head.
+	rebase      map[string]*depBotRebaseState
+	branchFacts map[string]depBotBranchFacts
 }
 
 func loadDepBotConflictStore(path string) *depBotConflictStore {
@@ -77,6 +83,9 @@ func loadDepBotConflictStore(path string) *depBotConflictStore {
 		noMarker: map[string]string{},
 		observed: loadDepBotObservations(depBotObservedPath(path)),
 		holds:    map[string]depBotHold{},
+
+		rebase:      loadDepBotRebaseStates(depBotRebasePath(path)),
+		branchFacts: map[string]depBotBranchFacts{},
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -180,14 +189,14 @@ func (s *depBotConflictStore) saveLocked() {
 }
 
 // dependencyBotHandoffCandidate is the cheap, call-free half of selection: an
-// open, non-draft dependency-bot PR (dependencyBots) that is not already
+// open, non-draft dependency-bot PR (github.IsDependencyBotAuthor) that is not already
 // parked (needs-human, hold, do-not-merge). dependencyBotHandoffReason says
 // whether it needs a person.
 func dependencyBotHandoffCandidate(pr github.PullRequest) bool {
 	if pr.Draft || (pr.State != "" && !strings.EqualFold(pr.State, "open")) {
 		return false
 	}
-	if !dependencyBots[pr.Author] {
+	if !github.IsDependencyBotAuthor(pr.Author) {
 		return false
 	}
 	if escalation.HasNeedsHumanLabel(pr.Labels) || github.HasHoldLabel(pr.Labels) || hasLabel(pr.Labels, "do-not-merge") {
@@ -227,32 +236,44 @@ func dependencyBotConflictComment(base string) string {
 
 // runDependencyBotConflictSweep closes hivecommons/hive#11558 and #12379. A
 // dependency-bot PR is outside the fix-loop escalation sweep
-// (isHiveAgentAuthor excludes dependencyBots) and the hive never pushes to bot
+// (isHiveAgentAuthor excludes dependency bots) and the hive never pushes to bot
 // branches, so a bot PR stuck on something only a person can clear had
 // nobody saying so. Per pass this deterministic sweep hands such a PR to a
 // person with one comment naming the action and needs-human:
 //   - a conflict: at once for a Renovate `rebaseWhen: never` PR, otherwise
 //     once it has conflicted past depBotConflictGrace;
 //   - a failing required check that stayed red on the same head past
-//     depBotRedCIGrace (the PR stays out of the fix loop);
+//     depBotRedCIGrace (the PR stays out of the fix loop); on a trusted-bot
+//     head triaged as transient, only once the hive's one re-run of it
+//     failed again or re-ran nothing (dependency_bot_transient_rerun.go);
 //   - a terminal required-check hold the automerge sweep reported (held for
-//     approval, never started, never ran).
+//     approval, never started, never ran);
+//   - a stranded branch: behind or conflicting past
+//     governor.dependency_bot_rebase_after_s while the bot no longer rebases
+//     it, one window after a request to the bot through its own mechanism
+//     (dependency_bot_rebase_request.go) went unanswered, or as soon as the
+//     window passes when that request is not allowed or not safe.
 //
 // It takes that label back off once the reason is over (see
 // depBotHandoffResolved) or the PR closes — only if this sweep is the one
-// that added it. It never pushes, rebases, closes, approves or ticks.
+// that added it. It never pushes, rebases, closes or approves; the only
+// write besides the hand-off is that one rebase request per head (a ticked
+// Renovate rebase/retry box), gated as write-back kind bot_rebase_request.
+// A stranded Dependabot PR is handed to a person instead of asked:
+// Dependabot refuses comment commands from GitHub Apps.
 func runDependencyBotConflictSweep(ctx context.Context, cfg *config.Config, writer forge.IssueWriter, reader depBotPRReader, actionable *github.ActionableResult, logger *slog.Logger) {
 	org := ""
 	if cfg != nil {
 		org = cfg.Project.Org
 	}
-	sweepDependencyBotConflicts(ctx, getDepBotConflictStore(), org, writer, reader, actionable, time.Now, logger)
+	sweepDependencyBotConflicts(ctx, getDepBotConflictStore(), org, cfg.DependencyBotRebaseAfter(), writer, reader, actionable, time.Now, logger)
 }
 
 func sweepDependencyBotConflicts(
 	ctx context.Context,
 	store *depBotConflictStore,
 	org string,
+	rebaseAfter time.Duration,
 	writer forge.IssueWriter,
 	reader depBotPRReader,
 	actionable *github.ActionableResult,
@@ -282,17 +303,51 @@ func sweepDependencyBotConflicts(
 
 	undoDependencyBotConflicts(ctx, store, writer, reader, seen, logger)
 
+	if rebaseAfter <= 0 {
+		rebaseAfter = config.DefaultDependencyBotRebaseAfterS * time.Second
+	}
+	stranded := depBotRebaseCheck{store: store, reader: reader, window: rebaseAfter, now: now(), logger: logger}
+	store.pruneRebase(seen)
+
 	waiting := map[string]bool{}
 	defer store.pruneObservations(waiting)
 	for _, pr := range actionable.PRs.Items {
-		if pr.HeadSHA == "" || !dependencyBotHandoffCandidate(pr) {
+		if pr.HeadSHA == "" {
+			continue
+		}
+		botAuthor := dependencyBotHandoffCandidate(pr)
+		if !botAuthor && !dependencyBotBranchCandidate(pr) {
 			continue
 		}
 		repo := qualify(pr.Repo)
 		key := escalation.Key(repo, pr.Number)
-		heldReason := store.heldReason(key, pr.HeadSHA)
-		reason, ok := dependencyBotHandoffReason(pr, heldReason)
+		heldReason, reason, ok := "", "", false
+		if botAuthor {
+			heldReason = store.heldReason(key, pr.HeadSHA)
+			reason, ok = dependencyBotHandoffReason(pr, heldReason)
+		}
+		// A stranded branch (the bot stopped rebasing it) is asked about
+		// before any conflict or red-CI hand-off: holdHandoff keeps that
+		// comment back (its grace clock still runs) while a rebase request is
+		// due or pending, so the PR never gets the request and a person's
+		// comment at once.
+		holdHandoff := false
+		if heldReason == "" {
+			switch stranded.step(ctx, repo, key, pr) {
+			case depBotStrandedHandoff:
+				reason, ok = depBotHandoffStranded, true
+			case depBotStrandedHold:
+				holdHandoff = true
+				waiting[key] = true
+			}
+		}
 		if !ok {
+			if botAuthor && heldReason == "" && depBotTransientRerunRunning(dbrLedger(), repo, pr) {
+				// The hive re-ran this head's failed jobs and CI is running
+				// again: keep the red-CI grace clock, so a head that fails
+				// again is handed off without a fresh grace period.
+				waiting[key] = true
+			}
 			continue
 		}
 		if rec, ok := store.get(key); ok && rec.HeadSHA == pr.HeadSHA && rec.Reason == reason {
@@ -309,6 +364,13 @@ func sweepDependencyBotConflicts(
 		case depBotHandoffHeld:
 			comment = dependencyBotHeldCheckComment(pr.Author, heldReason)
 		case depBotHandoffConflict:
+			if holdHandoff {
+				// A rebase request is due or pending: keep the grace clock
+				// running, post nothing yet.
+				waiting[key] = true
+				store.observe(key, pr.HeadSHA, reason, now())
+				continue
+			}
 			if pr.Author == renovateBotAuthor && !store.lacksMarker(key, pr.HeadSHA) {
 				body, err := reader.GetPRBody(ctx, repo, pr.Number)
 				if err != nil {
@@ -332,10 +394,24 @@ func sweepDependencyBotConflicts(
 			}
 		case depBotHandoffRedCI:
 			waiting[key] = true
-			if now().Sub(store.observe(key, pr.HeadSHA, reason, now())) < depBotRedCIGrace {
+			// A trusted-bot head triaged as transient waits for the hive's
+			// one re-run (rerunTransientTriagedPRs, later in this cycle);
+			// the comment then says whether it ran and failed again or was
+			// not allowed.
+			rerun := depBotTransientRerunFor(dbrLedger(), repo, pr)
+			red := now().Sub(store.observe(key, pr.HeadSHA, reason, now()))
+			var owed time.Duration
+			if rerun.State == depBotRerunOwed {
+				owed = now().Sub(store.rerunOwedSince(key, pr.HeadSHA, now()))
+			}
+			if red < depBotRedCIGrace || holdHandoff || rerun.holdsHandoff(red, owed) {
 				continue
 			}
-			comment = dependencyBotRedCIComment(pr)
+			comment = dependencyBotRedCIComment(pr, rerun)
+		case depBotHandoffStranded:
+			st, _ := store.rebaseState(key)
+			facts, known := store.branchFactsFor(key, pr.HeadSHA)
+			comment = dependencyBotStrandedComment(pr, st, facts, known, rebaseAfter)
 		}
 		if !depBotWritebackAllowed(ctx, reader, repo, pr.Number, writeback.KindNeedsDecisionComment, comment, logger) {
 			continue

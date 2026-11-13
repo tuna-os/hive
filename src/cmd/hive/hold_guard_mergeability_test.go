@@ -5,7 +5,9 @@ package main
 // integration style of hold_guard_test.go.
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -395,5 +397,117 @@ func TestMaintainHeldPRMergeabilityStopsOnForkWorkflowRefusal(t *testing.T) {
 	rec, ok := store.Recorded("acme/widgets", 7)
 	if !ok || rec.UpdateStoppedReason != holdguard.UpdateStopForkWorkflowUpdate {
 		t.Fatalf("snapshot = %+v ok=%v, want an update stop for %q", rec, ok, holdguard.UpdateStopForkWorkflowUpdate)
+	}
+}
+
+// projectbluefin/utah#1097: Renovate stops rebasing a branch once another
+// identity commits to it, so the hive's merge-from-base on a held Renovate PR
+// stranded it behind its base. Branches a dependency bot owns are left to the
+// bot (no update, no conflict notice, baseline pinned); an ordinary held PR
+// still gets the base merged in.
+func TestMaintainHeldPRMergeabilityLeavesDependencyBotBranchesToTheBot(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		headRef   string
+		author    string
+		state     string
+		wantCalls int
+		wantHead  string
+	}{
+		{name: "renovate head ref behind", headRef: "renovate/actions-checkout-6.x", author: "projectbluefin-deps[bot]", state: "behind", wantHead: "c1"},
+		{name: "renovate head ref dirty", headRef: "renovate/actions-checkout-6.x", author: "projectbluefin-deps[bot]", state: "dirty", wantHead: "c1"},
+		{name: "renovate author", headRef: "deps/bump", author: "renovate[bot]", state: "behind", wantHead: "c1"},
+		{name: "mergeraptor author", headRef: "deps/bump", author: "mergeraptor[bot]", state: "behind", wantHead: "c1"},
+		{name: "ordinary PR", headRef: "feat/renovate-config", author: "castrojo", state: "behind", wantCalls: 1, wantHead: "c2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestHoldGuardStore(t)
+			fake := &holdGuardServer{
+				failUpdateBranch: tt.state == "dirty",
+				commits: map[int][]map[string]any{
+					7: {ghCommit("c1", tt.author, "chore(deps): update"), ghMergeCommit("c2", "hive-bot", "Merge branch 'main' into feature", "c1", "b1")},
+				},
+			}
+			client := newHoldGuardClient(t, fake)
+			cfg := escalationTestConfig()
+			store.Snapshot("acme/widgets", 7, "c1", []holdguard.Commit{{SHA: "c1", Author: tt.author}})
+
+			held := heldPRsActionable(github.PullRequest{Repo: "widgets", Number: 7, Author: tt.author, HeadRef: tt.headRef, HeadSHA: "c1", BaseSHA: "b1", MergeableState: tt.state})
+			if got := enforceHoldGuard(context.Background(), cfg, client, client, held, discardLogger()); len(got) != 0 {
+				t.Fatalf("held-PR upkeep must not flag it for re-review, got %v", got)
+			}
+
+			fake.mu.Lock()
+			calls := fake.updateBranchCalls[7]
+			comments := append([]string(nil), fake.comments...)
+			fake.mu.Unlock()
+			if calls != tt.wantCalls {
+				t.Fatalf("update-branch calls for PR 7 = %d, want %d", calls, tt.wantCalls)
+			}
+			if len(comments) != 0 {
+				t.Fatalf("held-PR upkeep must not comment here, saw %v", comments)
+			}
+			rec, ok := store.Recorded("acme/widgets", 7)
+			if !ok || rec.HeadSHA != tt.wantHead || rec.ConflictNoted {
+				t.Fatalf("snapshot = %+v ok=%v, want baseline %s and no conflict noted", rec, ok, tt.wantHead)
+			}
+		})
+	}
+}
+
+// A held PR whose repo's base refresh belongs to the automerge preparation
+// front is a policy deferral: it must not log the failure WARN every tick.
+func TestMaintainHeldPRMergeabilityDefersScheduledBaseRefreshWithoutWarn(t *testing.T) {
+	store := newTestHoldGuardStore(t)
+	fake := &holdGuardServer{commits: map[int][]map[string]any{
+		7: {ghCommit("c1", "strategist-bot", "docs: plan")},
+	}}
+	client := newHoldGuardClient(t, fake)
+	client.SetScheduledBaseRefresh(func(string) bool { return true })
+	cfg := escalationTestConfig()
+	store.Snapshot("acme/widgets", 7, "c1", []holdguard.Commit{{SHA: "c1", Author: "strategist-bot"}})
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	held := heldPRsActionable(github.PullRequest{Repo: "widgets", Number: 7, HeadSHA: "c1", BaseSHA: "b1", MergeableState: "behind"})
+	if got := enforceHoldGuard(context.Background(), cfg, client, client, held, logger); len(got) != 0 {
+		t.Fatalf("deferred base refresh must not flag the PR for re-review, got %v", got)
+	}
+
+	out := buf.String()
+	if strings.Contains(out, "keeping held PR mergeable failed") || strings.Contains(out, "level=WARN") {
+		t.Fatalf("deferred base refresh logged a warning:\n%s", out)
+	}
+	if !strings.Contains(out, "base refresh deferred to the automerge preparation front") {
+		t.Fatalf("missing debug deferral log:\n%s", out)
+	}
+}
+
+// The deferral is scoped to `behind`: a held PR that GitHub reports `dirty` on
+// a scheduled-base-refresh repo is a real conflict, and the preparation front
+// does not tell the human about held PRs, so the conflict notice must still
+// be posted.
+func TestMaintainHeldPRMergeabilityStillNotesConflictWhenBaseRefreshIsScheduled(t *testing.T) {
+	store := newTestHoldGuardStore(t)
+	fake := &holdGuardServer{commits: map[int][]map[string]any{
+		7: {ghCommit("c1", "strategist-bot", "docs: plan")},
+	}}
+	client := newHoldGuardClient(t, fake)
+	client.SetScheduledBaseRefresh(func(string) bool { return true })
+	cfg := escalationTestConfig()
+	store.Snapshot("acme/widgets", 7, "c1", nil)
+
+	held := heldPRsActionable(github.PullRequest{Repo: "widgets", Number: 7, HeadSHA: "c1", BaseSHA: "b1", MergeableState: "dirty"})
+	_ = enforceHoldGuard(context.Background(), cfg, client, client, held, discardLogger())
+
+	if len(fake.comments) != 1 {
+		t.Fatalf("want one conflict notice on a dirty held PR, got %v", fake.comments)
+	}
+	if !strings.Contains(fake.comments[0], "conflict") {
+		t.Fatalf("conflict comment = %q, want it to name the conflict", fake.comments[0])
+	}
+	rec, ok := store.Recorded("acme/widgets", 7)
+	if !ok || !rec.ConflictNoted {
+		t.Fatalf("snapshot = %+v ok=%v, want ConflictNoted set", rec, ok)
 	}
 }

@@ -50,12 +50,15 @@ package automerge
 //     other tiers use;
 //   - a reviewer agent is configured, and its verdict for the head approves
 //     (unless require_reviewer_verdict is off). With no reviewer agent the
-//     tier skips rather than merging unreviewed;
+//     tier skips rather than merging unreviewed; with the review swarm off
+//     (no verdict will ever be requested) it skips as contributor-lane:
+//     review-off, a person's call, rather than no-verdict;
 //   - the head has been unchanged and green for the configured soak;
 //   - the head SHA is re-verified immediately before the squash merge.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -92,6 +95,7 @@ const (
 	contributorLaneReasonClaimOtherHive    = prstage.ContributorLaneReasonClaimOtherHive
 	contributorLaneReasonNoLinkedIssue     = prstage.ContributorLaneReasonNoLinkedIssue
 	contributorLaneReasonNoVerdict         = prstage.ContributorLaneReasonNoVerdict
+	contributorLaneReasonReviewOff         = prstage.ContributorLaneReasonReviewOff
 	contributorLaneReasonSoaking           = prstage.ContributorLaneReasonSoaking
 	contributorLaneReasonSentinelBlocked   = prstage.ContributorLaneReasonSentinelBlocked
 	contributorLaneReasonReporterTrustHold = prstage.ContributorLaneReasonReporterTrustHold
@@ -226,6 +230,16 @@ type ContributorLanePolicy struct {
 	// (auto_merge.contributor_lane.owner_approval_releases_workflow_fence,
 	// default on). See automerge_contributor_workflow_approval.go.
 	OwnerApprovalReleasesWorkflowFence bool
+	// WorkflowFenceScope is auto_merge.contributor_lane.workflow_fence_scope:
+	// "human_merge_paths" fences only workflow / action edits that match the
+	// repository's auto_merge.human_merge_paths; anything else (the default,
+	// "all") fences every such edit. See automerge_workflow_fence_scope.go.
+	WorkflowFenceScope string
+	// WorkflowFenceScopeForRepo, when set, resolves the scope for one
+	// "owner/repo", applying project.repo_policies[].workflow_fence_scope
+	// over WorkflowFenceScope. nil means every repository uses
+	// WorkflowFenceScope.
+	WorkflowFenceScopeForRepo func(repo string) string
 }
 
 // Contributor-lane auto-promotion scopes; mirrors
@@ -414,7 +428,14 @@ func (c *Engine) SweepContributorLaneAutoMerges(ctx context.Context, opts AutoMe
 			continue
 		}
 		if !c.repoAutoMergeAllowed(displayRepo) {
-			c.info("contributor-lane automerge sweep skipped repo", "repo", displayRepo, "reason", "repo-auto-merge-disabled")
+			c.info("contributor-lane automerge sweep skipped repo", "repo", displayRepo, "reason", "repo-auto-merge-disabled", "observe_only", c.stagePolicy().Enabled && c.repoObservedOnly(displayRepo))
+			c.observeAutoMergeOffRepo(ctx, stageLaneContributor, displayRepo, opts.Targets, func(ctx context.Context, oc *Engine, owner, repoName string, pr *gh.PullRequest) (string, error) {
+				if reason := oc.sentinelBlockedUnlessHumanChangesRequested(ctx, owner, repoName, pr, oc.prefilterContributorLanePR(pr, policy)); reason != "" {
+					return reason, nil
+				}
+				_, reason, err := oc.trySweepContributorLanePR(mergeDecisionPriority(ctx), displayRepo, owner, repoName, pr.GetNumber(), policy)
+				return reason, err
+			})
 			continue
 		}
 		prs, skipReason, err := c.openPullRequests(ctx, owner, repoName, opts.Targets)
@@ -471,7 +492,9 @@ func (c *Engine) SweepContributorLaneAutoMerges(ctx context.Context, opts AutoMe
 				continue
 			}
 			result.Candidates++
-			event, reason, err := c.trySweepContributorLanePR(mergeDecisionPriority(ctx), displayRepo, owner, repoName, number, policy)
+			c.sweepClock.evaluating(displayRepo, number)
+			event, reason, err := c.trySweepContributorLanePR(c.mergeTrainEvalContext(mergeDecisionPriority(ctx), train, number), displayRepo, owner, repoName, number, policy)
+			c.sweepClock.evaluated()
 			if err == nil {
 				c.noteMergeTrainOutcome(stageLaneContributor, owner, repoName, number, pr.GetHead().GetSHA(), reason)
 			}
@@ -522,8 +545,13 @@ func (c *Engine) prefilterContributorLanePR(pr *gh.PullRequest, policy Contribut
 		return contributorLaneReasonNoAuthor
 	}
 	// The App's own PRs and allow-listed bots belong to the self-authored
-	// lane; a claim marker can never make them contributor work.
-	if _, ok := c.sweepLaneForAuthor(author); ok {
+	// lane; a claim marker can never make them contributor work. A trusted
+	// bot is handed off under its own reason so the log names the lane that
+	// owns it rather than calling the operator's bot "app-authored".
+	if lane, ok := c.sweepLaneForAuthor(author); ok {
+		if lane == laneTrustedBot {
+			return trustedBotLaneSkipReason
+		}
 		return contributorLaneReasonAppAuthored
 	}
 	// author_association is deliberately not checked here: a verified claim
@@ -576,9 +604,11 @@ type contributorClaimMatch struct {
 	// OperatorLogin is set when a person's Approve admitted the head
 	// (hivecommons/hive#15136, operatorAdmission).
 	OperatorLogin string
-	// ObservedTier is the raw tier the lane saw for the author (registry
-	// profile or this hive's claim marker), admitted or not. It feeds the
-	// author/* stage label; admission itself still goes through Reason.
+	// ObservedTier is the tier the lane saw for the author (registry
+	// profile, this hive's claim marker, or "trusted" when the clean
+	// merged-history ratchet promotes them), admitted or not, and whatever
+	// route admitted the head. It feeds the role/* stage label; admission
+	// itself still goes through Reason.
 	ObservedTier string
 }
 
@@ -660,11 +690,17 @@ func (c *Engine) admittedRegistryTier(author string, policy ContributorLanePolic
 // its skip reasons exactly as before.
 func (c *Engine) admitContributor(ctx context.Context, owner, repo string, pr *gh.PullRequest, policy ContributorLanePolicy) (contributorClaimMatch, error) {
 	author := hgithub.SafeGetLogin(pr.GetUser())
+	// The adoption and operator routes admit a HEAD (the hive's own push, a
+	// person's Approve), not the author, so they return before the
+	// merged-history ratchet runs. The role label still shows the author's
+	// own standing, never the raw registry tier: a hive merge of main that a
+	// person's approval was carried onto flipped an auto-promoted maintainer
+	// from role/trusted to role/newcomer (projectbluefin/utah#1132).
 	if headSHA := pr.GetHead().GetSHA(); c.adoptedHeadOwnedByHive(owner, repo, pr.GetNumber(), headSHA) {
-		return contributorClaimMatch{AdoptedHead: headSHA, ObservedTier: c.observedRegistryTier(author)}, nil
+		return contributorClaimMatch{AdoptedHead: headSHA, ObservedTier: c.authorStandingTier(ctx, owner, repo, author, policy)}, nil
 	}
 	if login := c.operatorAdmission(ctx, owner, repo, pr.GetNumber(), pr.GetHead().GetSHA()); login != "" {
-		return contributorClaimMatch{OperatorLogin: login, ObservedTier: c.observedRegistryTier(author)}, nil
+		return contributorClaimMatch{OperatorLogin: login, ObservedTier: c.authorStandingTier(ctx, owner, repo, author, policy)}, nil
 	}
 	if tier := c.admittedRegistryTier(author, policy); tier != "" {
 		return contributorClaimMatch{RegistryTier: tier, ObservedTier: tier}, nil
@@ -673,7 +709,7 @@ func (c *Engine) admitContributor(ctx context.Context, owner, repo string, pr *g
 	if match.ObservedTier == "" {
 		match.ObservedTier = c.observedRegistryTier(author)
 	}
-	if err == nil && match.Reason != "" && policy.AutoPromoteAfterMergedPR > 0 && !contributorRegistryTierRevoked(c.observedRegistryTier(author)) && !strings.HasSuffix(strings.ToLower(author), "[bot]") && (c.transport == nil || !strings.EqualFold(author, c.transport.AppBotLogin())) {
+	if err == nil && match.Reason != "" && c.autoPromotionEligible(author, policy) {
 		history, promoteErr := c.contributorCleanMergedHistory(ctx, owner, repo, author, policy.AutoPromoteAfterMergedPR, policy.hiveWideAutoPromotion())
 		if promoteErr != nil {
 			return contributorClaimMatch{Reason: "contributor-lane:auto-promote-history"}, promoteErr
@@ -733,6 +769,42 @@ func (c *Engine) observedRegistryTier(author string) string {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSpace(tier))
+}
+
+// autoPromotionEligible reports whether the clean-merged-PR ratchet may run
+// for author: it is configured, the operator has not revoked the author,
+// and the author is neither a bot nor this hive's App.
+func (c *Engine) autoPromotionEligible(author string, policy ContributorLanePolicy) bool {
+	if policy.AutoPromoteAfterMergedPR <= 0 || strings.TrimSpace(author) == "" {
+		return false
+	}
+	if contributorRegistryTierRevoked(c.observedRegistryTier(author)) || strings.HasSuffix(strings.ToLower(author), "[bot]") {
+		return false
+	}
+	return c.transport == nil || !strings.EqualFold(author, c.transport.AppBotLogin())
+}
+
+// authorStandingTier is the tier the role label shows for a PR the lane
+// admitted by a head-scoped route (in-place adoption, a person's Approve).
+// It is the author's registry tier, or "trusted" when that tier is below
+// require_tiers and the author's clean merged history would auto-promote
+// them, which is what the author's own route would have recorded. Nothing
+// about the head (who pushed it, who approved it) enters. A history read
+// that fails keeps the registry tier and never fails the admission.
+func (c *Engine) authorStandingTier(ctx context.Context, owner, repo, author string, policy ContributorLanePolicy) string {
+	tier := c.observedRegistryTier(author)
+	if (tier != "" && policy.RequireTiers[tier]) || !c.autoPromotionEligible(author, policy) {
+		return tier
+	}
+	history, err := c.contributorCleanMergedHistory(ctx, owner, repo, author, policy.AutoPromoteAfterMergedPR, policy.hiveWideAutoPromotion())
+	if err != nil {
+		c.debug("contributor-lane: author standing read failed; role keeps the registry tier", "repo", owner+"/"+repo, "author", author, "error", err)
+		return tier
+	}
+	if history.Clean {
+		return "trusted"
+	}
+	return tier
 }
 
 // contributorRegistryTierRevoked reports whether the registry tier is the
@@ -908,7 +980,12 @@ type contributorMergedReposEntry struct {
 // 256-character query limit, so a ten-repo hive costs one or two search
 // calls instead of ten closed-PR listings. A search failure degrades to the
 // PR's own repository with a warning rather than blocking the sweep: the
-// result is then exactly the pre-#14517 per-repo count.
+// result is then exactly the pre-#14517 per-repo count. A 422 — GitHub
+// refusing to search a listed repository or user — is not a failure of the
+// whole search: the chunk's repositories are re-asked one at a time so one
+// renamed or invisible repository does not hide the others, and each refused
+// (author, repository) pair is left out of later searches for
+// contributorUnsearchableTTL (hivecommons/hive#17148).
 //
 // The answer covers every active repository and is kept on the Engine per
 // author for contributorMergedReposTTL (a failure for
@@ -919,6 +996,7 @@ func (c *Engine) contributorMergedRepos(ctx context.Context, owner, repo, author
 	if c == nil || c.gh == nil || c.transport == nil {
 		return nil
 	}
+	author = strings.TrimPrefix(strings.TrimSpace(author), "@")
 	own := strings.ToLower(owner + "/" + repo)
 	others := func(refs []contributorRepoRef) []contributorRepoRef {
 		var out []contributorRepoRef
@@ -942,13 +1020,17 @@ func (c *Engine) contributorMergedRepos(ctx context.Context, owner, repo, author
 			continue
 		}
 		seen[full] = true
-		candidates = append(candidates, contributorRepoRef{Owner: o, Repo: r})
+		ref := contributorRepoRef{Owner: o, Repo: r}
+		if c.contributorSearchSkips(author, ref) {
+			continue
+		}
+		candidates = append(candidates, ref)
 		names = append(names, full)
 	}
 	if len(others(candidates)) == 0 {
 		return nil
 	}
-	key := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(author), "@"))
+	key := strings.ToLower(author)
 	repos := strings.Join(names, ",")
 	now := c.clock()
 	c.contributorMergedReposMu.Lock()
@@ -965,15 +1047,14 @@ func (c *Engine) contributorMergedRepos(ctx context.Context, owner, repo, author
 		}
 		c.contributorMergedReposCache[key] = contributorMergedReposEntry{refs: refs, repos: repos, expires: now.Add(ttl)}
 	}
-	base := "is:pr is:merged author:" + strings.TrimPrefix(strings.TrimSpace(author), "@")
+	base := "is:pr is:merged author:" + author
 	found := map[string]bool{}
-	query := base
-	flush := func() error {
-		if query == base {
-			return nil
+	search := func(refs []contributorRepoRef) error {
+		query := base
+		for _, ref := range refs {
+			query += " repo:" + ref.Owner + "/" + ref.Repo
 		}
 		result, _, err := c.gh.Search.Issues(ctx, query, &gh.SearchOptions{Sort: "updated", Order: "desc", ListOptions: gh.ListOptions{PerPage: 100}})
-		query = base
 		if err != nil {
 			return err
 		}
@@ -987,21 +1068,46 @@ func (c *Engine) contributorMergedRepos(ctx context.Context, owner, repo, author
 		}
 		return nil
 	}
+	flush := func(chunk []contributorRepoRef) error {
+		err := search(chunk)
+		if !searchQueryUnsearchable(err) {
+			return err
+		}
+		if len(chunk) == 1 {
+			c.noteContributorUnsearchable(owner, repo, author, chunk[0], err)
+			return nil
+		}
+		for _, ref := range chunk {
+			err := search([]contributorRepoRef{ref})
+			if searchQueryUnsearchable(err) {
+				c.noteContributorUnsearchable(owner, repo, author, ref, err)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	failed := func(err error) []contributorRepoRef {
 		c.warn("contributor-lane auto-promotion repo search failed; counting the PR's repository only", "repo", owner+"/"+repo, "author", author, "error", err, "retry_after", contributorMergedReposFailureTTL)
 		remember(nil, contributorMergedReposFailureTTL)
 		return nil
 	}
+	var chunk []contributorRepoRef
+	length := len(base)
 	for _, ref := range candidates {
-		qualifier := " repo:" + ref.Owner + "/" + ref.Repo
-		if len(query)+len(qualifier) > contributorSearchQueryMaxLen {
-			if err := flush(); err != nil {
+		qualifier := len(" repo:") + len(ref.Owner) + len("/") + len(ref.Repo)
+		if len(chunk) > 0 && length+qualifier > contributorSearchQueryMaxLen {
+			if err := flush(chunk); err != nil {
 				return failed(err)
 			}
+			chunk, length = nil, len(base)
 		}
-		query += qualifier
+		chunk = append(chunk, ref)
+		length += qualifier
 	}
-	if err := flush(); err != nil {
+	if err := flush(chunk); err != nil {
 		return failed(err)
 	}
 	out := make([]contributorRepoRef, 0, len(found))
@@ -1352,6 +1458,11 @@ type contributorLaneEval struct {
 	// workflowApprover is the trusted merger whose approval released the
 	// workflow-path fence for headSHA ("" when the fence did not trip).
 	workflowApprover string
+	// workflowUnfenced is set when the head edits CI workflow / action files
+	// that workflow_fence_scope left outside the fence, so a merge GitHub
+	// refuses for want of `workflows: write` is handled like a released
+	// fence's (workflowFenceMergeUnauthorized).
+	workflowUnfenced bool
 	// soakStartedAt / soakRemaining are the soak clock the lane holds
 	// headSHA on when the skip reason is contributorLaneReasonSoaking:
 	// when the head was first seen green and how long is left. The reason
@@ -1382,7 +1493,7 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 	}
 	c.noteStagePR(owner, repo, number, pr)
 	if reason := c.sentinelBlockedUnlessHumanChangesRequested(caller, owner, repo, pr, c.prefilterContributorLanePR(pr, policy)); reason != "" {
-		if reason == contributorLaneReasonAppAuthored {
+		if reason == contributorLaneReasonAppAuthored || reason == trustedBotLaneSkipReason {
 			c.noteStageRole(owner, repo, number, stagelabels.RoleTrusted)
 		} else {
 			c.noteRegistryRole(owner, repo, number, hgithub.SafeGetLogin(pr.GetUser()), policy)
@@ -1400,6 +1511,11 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 		return contributorLaneEval{pr: pr}, reason, nil
 	}
 	if reason := c.closingContradictionGate(owner, repo, pr); reason != "" {
+		return contributorLaneEval{pr: pr}, reason, nil
+	}
+	// A hive push on an adopted PR merges only once it is known to keep the
+	// PR's own change (automerge_adoption_intent.go).
+	if reason := c.adoptionIntentGate(owner, repo, number, pr.GetHead().GetSHA()); reason != "" {
 		return contributorLaneEval{pr: pr}, reason, nil
 	}
 	author := hgithub.SafeGetLogin(pr.GetUser())
@@ -1451,7 +1567,23 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 	if err != nil {
 		return eval, contributorLaneReasonFilesEvidence, err
 	}
-	if reason := contributorLaneDiffReason(files); reason != "" {
+	// The stage pass reads from this list whether the head is a person's
+	// merge under human_merge_paths, so its 085 note never asks for an
+	// approval the human-merge-path gate would refuse (no extra read).
+	c.noteHumanMergePathFenceHead(c.stageTrackerOrShared(), stageKey(owner, repo, number), owner, repo, headSHA, pr, files)
+	// The merge fence for this head, with the workflow-path verdict scoped by
+	// workflow_fence_scope (automerge_workflow_fence_scope.go). A workflow
+	// edit the scope waives still stays fenced once the App has been refused
+	// this head's merge for want of `workflows: write`.
+	diffReason := c.contributorLaneMergeFence(policy, owner, repo, number, headSHA, files)
+	if diffReason == "" && contributorLaneTouchesWorkflowFiles(files) {
+		if c.workflowMergeRefusedOnRecord(ctx, displayRepo, owner, repo, pr, number, headSHA) {
+			diffReason = contributorLaneReasonWorkflowPath
+		} else {
+			eval.workflowUnfenced = true
+		}
+	}
+	if reason := diffReason; reason != "" {
 		// contributorLaneDiffReason names only the first fence, and the
 		// owner-approval release lifts the workflow fence alone: a head that
 		// also removes tests merged on that approval with its test removal
@@ -1462,11 +1594,18 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 				return eval, tests, nil
 			}
 		}
-		approver, released := c.workflowFenceReleased(ctx, displayRepo, owner, repo, pr, number, headSHA, reason, policy)
+		approval, released := c.workflowFenceReleased(ctx, displayRepo, owner, repo, pr, number, headSHA, reason, policy, verdict, humanApproved)
 		if !released {
 			return eval, reason, nil
 		}
-		eval.workflowApprover = approver
+		eval.workflowApprover = approval.Login
+		if approval.AnswersVerdict && !humanApproved {
+			approver, humanApproved = approval.Login, true
+		}
+	} else if !humanApproved {
+		if login, ok := c.typedDecisionApprovalAnswer(ctx, displayRepo, owner, repo, pr, number, headSHA, verdict); ok {
+			approver, humanApproved = login, true
+		}
 	}
 	if held, err := c.hasReporterTrustHold(ctx, owner, repo, number); err != nil {
 		return eval, "reporter-trust-check", err
@@ -1485,11 +1624,11 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 	queueSkipsBase := sync.OnceValue(func() bool {
 		return !serialized && !relay && c.nativeQueueSkipsCurrentBase(ctx, owner+"/"+repo, pr)
 	})
-	if mergeableState == "behind" && (!serialized || relay) && !queueSkipsBase() {
+	if mergeableState == "behind" && (!serialized || relay) && !queueSkipsBase() && !c.requireCurrentBaseFor(owner+"/"+repo) && !integrationCombinedBaseProvided(ctx) {
 		if relay {
 			return eval, "behind", nil
 		}
-		_, reason, err := c.updateBranchAndSkip(ctx, displayRepo, owner, repo, number, headSHA, pr.GetBase().GetSHA(), "behind", c.isForkPR(pr))
+		_, reason, err := c.updateBranchAndSkip(ctx, displayRepo, owner, repo, number, headSHA, pr.GetBase().GetSHA(), "behind", pr)
 		return eval, reason, err
 	}
 	if mergeableState == "dirty" || mergeableState == "conflicting" {
@@ -1519,6 +1658,11 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 		return eval, reason, err
 	}
 	if !green {
+		if !relay {
+			// A non-member fork head on a Prow repo gets no presubmits until
+			// someone posts /ok-to-test (#17474); the relay stays read-only.
+			c.requestProwPresubmitsForFork(ctx, displayRepo, owner, repo, pr, number, headSHA)
+		}
 		if contributorHeldRunsReason(reason) {
 			_, reason = c.approveHeldRunsForRegistryTrusted(ctx, displayRepo, owner, repo, pr, number, headSHA, claim, policy, files, reason)
 		}
@@ -1538,6 +1682,11 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 		if !humanApproved {
 			if verdictBlocks(stageDetail{Verdict: verdict, VerdictKnown: true}) {
 				return eval, contributorLaneReasonChangesRequested, nil
+			}
+			if verdict.ReviewOff {
+				// No reviewer will be asked for this head: no-verdict would
+				// park it at 050 "review swarm requested" indefinitely.
+				return eval, contributorLaneReasonReviewOff, nil
 			}
 			return eval, contributorLaneReasonNoVerdict, nil
 		}
@@ -1566,7 +1715,7 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 	// The serialized lane alone updates its front PR. Relay/authorization
 	// evaluations remain read-only and still require the current base.
 	if (!serialized || relay) && c.requireCurrentBaseFor(owner+"/"+repo) && !queueSkipsBase() {
-		if _, reason, stop, err := c.currentBaseGate(ctx, displayRepo, owner, repo, number, baseBranch, headSHA, !relay, "behind", c.isForkPR(pr)); stop {
+		if _, reason, stop, err := c.currentBaseGate(ctx, displayRepo, owner, repo, number, baseBranch, headSHA, !relay, "behind", pr, stageLaneContributor); stop {
 			return eval, reason, err
 		}
 	}
@@ -1588,6 +1737,18 @@ func (c *Engine) evaluateContributorLanePR(ctx context.Context, displayRepo, own
 
 func (c *Engine) trySweepContributorLanePR(ctx context.Context, displayRepo, owner, repo string, number int, policy ContributorLanePolicy) (AutoMergeSweepEvent, string, error) {
 	serialized, laneGate := c.serializedLane(displayRepo)
+	ctx, unlock, err := c.acquireDestinationMerge(ctx, owner, repo, number)
+	if err != nil {
+		if isGitHubStatus(err, http.StatusNotFound) {
+			return AutoMergeSweepEvent{}, "gone", nil
+		}
+		var response *gh.ErrorResponse
+		if errors.As(err, &response) {
+			return AutoMergeSweepEvent{}, "fetch-pr", err
+		}
+		return AutoMergeSweepEvent{}, basePreparationPrefix + "merge-guard", err
+	}
+	defer unlock()
 	eval, reason, err := c.evaluateContributorLanePR(ctx, displayRepo, owner, repo, number, policy, false)
 	if err != nil {
 		return AutoMergeSweepEvent{}, reason, err
@@ -1595,7 +1756,20 @@ func (c *Engine) trySweepContributorLanePR(ctx context.Context, displayRepo, own
 	if reason != "" {
 		return c.rejectBeforeLane(ctx, serialized, laneGate, owner, repo, number, eval.pr, hgithub.PRAuditPathSweep, reason)
 	}
+	if !hgithub.DestinationMergeHeld(ctx, destinationDirectory(c), owner+"/"+repo, eval.pr.GetBase().GetRef()) {
+		return AutoMergeSweepEvent{}, basePreparationPrefix + "snapshot-changed", nil
+	}
+	if hold := mergeTrainCandidateHold(ctx); hold != "" {
+		return AutoMergeSweepEvent{}, hold, nil
+	}
+	requiredNative, integrationReason, integrationErr := c.routeIntegrationMerge(ctx, eval.pr, eval.mergeClaim)
+	if integrationReason != "" || integrationErr != nil {
+		return AutoMergeSweepEvent{}, integrationReason, integrationErr
+	}
 	if serialized {
+		if requiredNative {
+			return AutoMergeSweepEvent{}, "integration native authority cannot use serialized REST lane; no direct fallback", nil
+		}
 		event := AutoMergeSweepEvent{Repo: displayRepo, Number: number, Author: eval.author, HeadSHA: eval.headSHA, Tier: contributorLaneTier}
 		// The lane retains the front on merge API failures. Preserve the
 		// workflow fence's human-action parking when that failure is a
@@ -1633,7 +1807,10 @@ func (c *Engine) trySweepContributorLanePR(ctx context.Context, displayRepo, own
 	}
 	author, headSHA, claim, verdict, method, mergeClaim := eval.author, eval.headSHA, eval.claim, eval.verdict, eval.method, eval.mergeClaim
 	fullRepo := owner + "/" + repo
-	if reason, err := c.tryNativeQueue(ctx, eval.pr, mergeClaim); reason != "" || err != nil {
+	if hold := mergeTrainCandidateHold(ctx); hold != "" {
+		return AutoMergeSweepEvent{}, hold, nil
+	}
+	if reason, err := c.tryNativeQueueAfterRouting(ctx, eval.pr, mergeClaim, requiredNative); reason != "" || err != nil {
 		return AutoMergeSweepEvent{}, reason, err
 	}
 
@@ -1654,7 +1831,7 @@ func (c *Engine) trySweepContributorLanePR(ctx context.Context, displayRepo, own
 	})
 	if err != nil {
 		if c.requiredChecksExpected(attempt, err) {
-			return c.updateBranchAndSkip(ctx, displayRepo, owner, repo, number, headSHA, eval.pr.GetBase().GetSHA(), "required-checks-expected", c.isForkPR(eval.pr))
+			return c.updateBranchAndSkip(ctx, displayRepo, owner, repo, number, headSHA, eval.pr.GetBase().GetSHA(), "required-checks-expected", eval.pr)
 		}
 		if reason := c.workflowFenceMergeUnauthorized(ctx, displayRepo, owner, repo, eval, err); reason != "" {
 			return AutoMergeSweepEvent{}, reason, nil

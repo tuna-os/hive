@@ -13,7 +13,7 @@
     // marker key records whether the browser predates the defaults ('legacy',
     // keeps the historical all-expanded default forever) or is new ('v1').
     const DASHBOARD_DEFAULT_COLLAPSED_SECTIONS = Object.freeze([
-      'pr-throughput-section', 'token-panel', 'cost-panel', 'advisory-section', 'knowledge-section',
+      'pr-throughput-section', 'token-panel', 'cost-panel', 'advisory-section', 'knowledge-section', 'inbox-section',
       'contributors-section', 'inception-section', 'acmm-eval-section', 'debug-section', 'audit-section',
       'logs-section', 'nous-section', 'faq-section', 'runs-section', 'search-section'
     ]);
@@ -78,6 +78,31 @@
       return `<button type="button" class="config-info section-settings-gear" data-section-settings="1" data-action="${esc(action)}" data-stop="1"${extraAttrs || ''} title="${esc(title || (label + ' settings'))}" aria-label="${esc(label)} settings"><svg class="section-settings-gear-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" fill-rule="evenodd" d="M13.3 2.25h-2.6l-.42 2.66a7.46 7.46 0 0 0-1.24.52L6.86 3.84 5.02 5.68 6.61 7.86c-.22.4-.4.82-.52 1.25l-2.66.42v2.6l2.66.42c.13.43.3.85.52 1.25l-1.59 2.18 1.84 1.84 2.18-1.59c.4.22.81.39 1.24.52l.42 2.66h2.6l.42-2.66c.43-.13.85-.3 1.24-.52l2.18 1.59 1.84-1.84-1.59-2.18c.22-.4.4-.82.52-1.25l2.66-.42v-2.6l-2.66-.42a7.4 7.4 0 0 0-.52-1.25l1.59-2.18-1.84-1.84-2.18 1.59c-.4-.22-.81-.39-1.24-.52l-.42-2.66ZM12 14.9a2.9 2.9 0 1 0 0-5.8 2.9 2.9 0 0 0 0 5.8Z"/></svg></button>`;
     }
 
+    // Pop out / full screen / return (hivecommons/hive#15829), rendered next to
+    // the activity monitor's gear; handlers live in js/tracker-popout.js and
+    // css/popout.css decides which of the three show in which mode.
+    const STAGE_TRACKER_HEADER_TOOLS_HTML = '<button type="button" class="config-info section-settings-gear ham-header-tool ham-popout-btn" id="activity-monitor-popout" data-action="openStageTrackerPopout" data-stop="1" title="Pop out — open the activity monitor in its own window, for another monitor" aria-label="Pop out the Hive activity monitor into its own window">⧉</button>'
+      + '<button type="button" class="config-info section-settings-gear ham-header-tool ham-fullscreen-btn" id="activity-monitor-fullscreen" data-action="toggleStageTrackerFullscreen" data-stop="1" aria-pressed="false" title="Full screen — fill the screen with the activity monitor (f, Esc exits)" aria-label="Full screen — fill the screen with the activity monitor (f, Esc exits)">⛶</button>'
+      + '<button type="button" class="config-info section-settings-gear ham-header-tool ham-display-btn" id="activity-monitor-display" data-action="toggleStageTrackerDisplay" data-stop="1" aria-pressed="false" title="Display — show the activity monitor as a wall view with no row actions (d; Esc or d leaves)" aria-label="Display — show the activity monitor as a wall view with no row actions (d; Esc or d leaves)">📺</button>'
+      + '<button type="button" class="ham-popout-return" id="activity-monitor-return" data-action="stageTrackerReturnToDashboard" data-stop="1" title="Focus the main dashboard window and close this pop-out">⤶ Return to dashboard</button>';
+    // The monitor's own item count (hivecommons/hive#16243): the sidebar
+    // badge's twin, written by the same navCountBind call in
+    // renderStageTracker so kiosk, pop-out, display and full screen — which
+    // hide the sidebar — still show the count and its ↑/↓ cue.
+    const STAGE_TRACKER_HEADER_COUNT_HTML = '<span id="activity-monitor-header-badge" class="badge-count ham-header-count" data-zero title="Open items in the hive activity monitor" aria-label="0 items">0</span>';
+    // Display controls (hivecommons/hive#15929): the overlay
+    // stageTrackerDisplayControlsInit() appends to the body in display mode
+    // only. Full screen and Keep awake are explicit clicks; their disabled /
+    // denied states are rendered by stageTrackerRenderDisplayControls().
+    // Full screen and Keep awake get their title from
+    // stageTrackerRenderDisplayControls (STAGE_TRACKER_DISPLAY_CONTROL_LABELS
+    // in tracker-popout.js) as soon as the overlay mounts, so it is not
+    // repeated here.
+    const STAGE_TRACKER_DISPLAY_CONTROLS_HTML = '<button type="button" class="ham-display-control" data-display-control="exit" data-action="stageTrackerDisplayExit" aria-label="Exit display" title="Leave display mode (Esc or d)">✕ Exit display</button>'
+      + '<button type="button" class="ham-display-control" data-display-control="copy" data-action="stageTrackerCopyDisplayLink" aria-label="Copy display link" title="Copy a link that opens this display — view parameters only, never a token">🔗 Copy link</button>'
+      + '<button type="button" class="ham-display-control" data-display-control="fullscreen" data-action="toggleStageTrackerFullscreen" aria-label="Full screen" aria-pressed="false">⛶ Full screen</button>'
+      + '<button type="button" class="ham-display-control" data-display-control="wakelock" data-action="stageTrackerToggleWakeLock" aria-label="Keep screen awake" aria-pressed="false">☀ Keep awake</button>'
+      + '<input type="text" class="ham-input ham-display-link" id="activity-monitor-display-link" readonly aria-label="Display link" hidden>';
     const DASHBOARD_SECTION_CARD_CONFIG = Object.freeze({
       'runs-section': { title: '🏃 Runs', summary: '0 active' },
       'overview-section': { title: '🍩 Overview', summary: 'overview', actionIds: ['overview-chart-settings'], settingsHtml: sectionSettingsGear('Overview', 'toggleOverviewChartSettings', 'Configure Overview chart types, carousel timing, and transitions', ' aria-haspopup="true" aria-expanded="false" aria-controls="overview-chart-settings"') },
@@ -104,12 +129,13 @@
       'inception-section': { title: '💡 Inception (spektacular)', summary: 'ready', badgeHtml: '<a class="dash-card-badge" href="https://github.com/jumppad-labs/spektacular" target="_blank" rel="noopener noreferrer" data-stop="1" title="Spektacular project">⚡ Powered by Spektacular</a>' },
       'knowledge-section': { title: '📚 Knowledge', summary: '0 facts' },
       'search-section': { title: '🔍 Search', summary: 'search' },
+      'inbox-section': { title: '📥 Inbox', summary: '0 to triage' },
       'contributors-section': { title: '👥 Contributors', summary: '0 online / 0 registered' },
       'debug-section': { title: '🩺 Diagnostics', summary: 'health' },
       'logs-section': { title: '📋 Agent Logs', summary: 'logs' },
       'agents-section': { title: '🤖 Agents', summary: '0 running / 0 total' },
       'agent-activity-section': { title: '📡 Agent activity', summary: '0 working / 0 total' },
-      'activity-monitor-section': { title: '📍 Hive activity monitor', summary: '0 items', actionIds: ['activity-monitor-settings'], settingsHtml: sectionSettingsGear('Hive activity monitor', 'toggleStageTrackerSettings', 'Configure Hive activity monitor sounds — open buzz, merge zap, your own WAV files, volume', ' aria-haspopup="true" aria-expanded="false" aria-controls="activity-monitor-settings"') },
+      'activity-monitor-section': { title: '📍 Hive activity monitor', summary: '0 items', actionIds: ['activity-monitor-settings'], settingsHtml: sectionSettingsGear('Hive activity monitor', 'toggleStageTrackerSettings', 'Configure Hive activity monitor sounds — open buzz, merge zap, your own WAV files, volume', ' aria-haspopup="true" aria-expanded="false" aria-controls="activity-monitor-settings"') + STAGE_TRACKER_HEADER_TOOLS_HTML, countHtml: STAGE_TRACKER_HEADER_COUNT_HTML },
       'faq-section': { title: '❓ FAQ', summary: 'questions' },
     });
     // Section help marks (#10915). Each entry's help sentence is word for word
@@ -142,6 +168,7 @@
       'inception-section': { heading: 'Inception', help: 'A step-by-step guide that turns a new project idea into a first set of files and planned work.' },
       'knowledge-section': { heading: 'Knowledge', help: 'The facts Hive has learned about your projects, where they came from, and how much Hive trusts each one.' },
       'search-section': { heading: 'Search', help: 'Find past pull requests, issues, review records and findings across your projects by keyword, with a link to each one.' },
+      'inbox-section': { heading: 'Inbox', help: 'Voice recordings and dictations waiting for you to file them as an RFC, send to dibs, or keep as knowledge.' },
       'contributors-section': { heading: 'Contributors', help: 'The people who lend their computers or AI helpers to your projects, and how far Hive trusts each of them.' },
       'debug-section': { heading: 'Diagnostics', help: 'Health checks for Hive itself, such as its connections, credentials and safety switches, to help you find out why something is not working.' },
       'logs-section': { heading: 'Agent Logs', help: 'The raw text output of each worker, for following what it is doing line by line.' },
@@ -160,7 +187,7 @@
       return `https://github.com/hivecommons/hive/blob/${line}/src/docs/${page}.md${anchor ? '#' + anchor : ''}`;
     }
     function dashboardDocsHrefFromPath(path) {
-      const m = /^\/docs\/([\w-]+)\.md(?:#([\w-]+))?$/.exec(String(path || ''));
+      const m = /^\/docs\/([\w-]+(?:\/[\w-]+)*)\.md(?:#([\w-]+))?$/.exec(String(path || ''));
       return m ? dashboardDocsHref(m[1], m[2] || '') : String(path || '');
     }
     function setDashboardDocsLine(branch) {
@@ -194,7 +221,9 @@
     function sectionCardHeader(opts) {
       opts = opts || {};
       const id = opts.id || '';
-      const title = opts.titleHtml || esc(opts.title || id || 'Section');
+      // countHtml: a live count pill that reads as part of the title
+      // ("Hive activity monitor · 57"), before the help mark and the gear.
+      const title = (opts.titleHtml || esc(opts.title || id || 'Section')) + (opts.countHtml || '');
       const bodyId = opts.bodyId || (id + '-body');
       const action = opts.action || 'toggleSection';
       const keyAction = opts.keyAction || 'sectionHeaderKey';
@@ -252,7 +281,7 @@
       if (!body) return;
       const bodyId = sectionId + '-body';
       const template = document.createElement('template');
-      template.innerHTML = sectionCardShell({ id: sectionId, title: cfg.title, summaryHtml: cfg.summary, bodyId: bodyId, badgeHtml: cfg.badgeHtml, subtitleHtml: cfg.subtitleHtml, settingsHtml: cfg.settingsHtml }, '');
+      template.innerHTML = sectionCardShell({ id: sectionId, title: cfg.title, summaryHtml: cfg.summary, bodyId: bodyId, badgeHtml: cfg.badgeHtml, subtitleHtml: cfg.subtitleHtml, settingsHtml: cfg.settingsHtml, countHtml: cfg.countHtml }, '');
       const card = template.content.firstElementChild;
       const newHeader = card.querySelector('.dash-card-header');
       const badges = newHeader.querySelector('.dash-card-badges');
@@ -996,10 +1025,38 @@
         badge.setAttribute('aria-hidden', label ? 'false' : 'true');
       }
     }
+    // A replica or a review head is a copy of its base agent and keeps the
+    // base's displayName, so a tile that shows only that name cannot tell the
+    // copies apart. The status payload marks a copy with replicaBase,
+    // replicaIndex and replicaCount (the Agents cards read the same fields).
+    // A review head ("base-alias-N") counts from 1 under its own alias, so its
+    // index alone does not tell it from the base: its marker is the part of
+    // its name after the base. An agent with no replicaBase gets no marker.
+    function agentTileReplicaInfo(a) {
+      const base = String((a && a.replicaBase) || '');
+      if (!base) return null;
+      const key = String(a.name || '');
+      const index = Number(a.replicaIndex) || 0;
+      const count = Number(a.replicaCount) || 0;
+      const tail = key.startsWith(base + '-') ? key.slice(base.length + 1) : '';
+      if (tail && tail !== String(index)) return { marker: tail, detail: tail };
+      if (index > 1) return { marker: String(index), detail: count >= index ? `replica ${index} of ${count}` : `replica ${index}` };
+      return null;
+    }
+    function agentTileTitleName(name, replica) {
+      return replica ? `${name} · ${replica.detail}` : name;
+    }
+    // The marker is its own element so that a narrow tile shortens the base
+    // name with an ellipsis and still shows which copy it is.
+    function agentTileNameHtml(name, replica) {
+      if (!replica) return `<span class="agent-tile-name">${esc(name)}</span>`;
+      return `<span class="agent-tile-name agent-tile-name--replica"><span class="agent-tile-name-base">${esc(name)}</span><span class="agent-tile-replica">·${esc(replica.marker)}</span></span>`;
+    }
     function agentCollapsedTileHtml(a, nowMs, tileState) {
       tileState = tileState || {};
       const name = (a && (a.displayName || a.name)) || 'agent';
       const key = (a && a.name) || name;
+      const replica = agentTileReplicaInfo(a);
       const disabled = agentIsDisabled(a);
       const isDown = a && a.state !== 'running';
       const active = tileState.running === true || agentTileIsRunning(a);
@@ -1011,10 +1068,10 @@
       const sortKey = tileState.sortKey || agentCollapsedSortKey(a, 0, nowMs);
       const label = tileState.label || null;
       const classes = ['agent-collapsed-tile', active ? 'active' : '', label === 'running' ? 'running-now' : '', disabled ? 'disabled' : '', isDown && !disabled ? 'stopped' : '', auth.needsLogin ? 'needs-login' : '', label === 'next' ? 'up-next' : ''].filter(Boolean).join(' ');
-      const title = agentCollapsedTileTitle(a || {}, name, power, auth, nextMs);
+      const title = agentCollapsedTileTitle(a || {}, agentTileTitleName(name, replica), power, auth, nextMs);
       const labelHtml = agentTileLabelHtml(label);
       const stateHtml = state ? `<span class="agent-tile-state"> · ${esc(state)}</span>` : '<span class="agent-tile-state"></span>';
-      return `<button type="button" class="${classes}" data-action="openAgentCollapsedTile" data-agent="${esc(key)}" data-agent-order-key="${esc(key)}" data-agent-next-kick-ms="${Number.isFinite(nextMs) ? String(nextMs) : ''}" data-agent-sort-group="${sortKey.group}" data-agent-queue-index="${tileState.queuedIndex >= 0 ? String(tileState.queuedIndex) : ''}" data-agent-running="${active ? '1' : ''}" data-agent-running-since="${esc((a && (a.busySince || a.runningSince || a.startedAt)) || '')}" data-agent-can-up-next="${tileState.canBeNext ? '1' : ''}" data-agent-tile-label="${esc(label || '')}" data-agent-active="${active ? '1' : ''}" data-stop="1" title="${esc(title)}" aria-label="${esc(title)}"><span class="agent-tile-name">${esc(name)}</span>${labelHtml}<span class="agent-tile-dot" data-status="${auth.status}" aria-hidden="true"></span><span class="agent-tile-next"><span class="agent-tile-countdown">${esc(countdown)}</span>${stateHtml}</span></button>`;
+      return `<button type="button" class="${classes}" data-action="openAgentCollapsedTile" data-agent="${esc(key)}" data-agent-order-key="${esc(key)}" data-agent-next-kick-ms="${Number.isFinite(nextMs) ? String(nextMs) : ''}" data-agent-sort-group="${sortKey.group}" data-agent-queue-index="${tileState.queuedIndex >= 0 ? String(tileState.queuedIndex) : ''}" data-agent-running="${active ? '1' : ''}" data-agent-running-since="${esc((a && (a.busySince || a.runningSince || a.startedAt)) || '')}" data-agent-can-up-next="${tileState.canBeNext ? '1' : ''}" data-agent-tile-label="${esc(label || '')}" data-agent-active="${active ? '1' : ''}" data-stop="1" title="${esc(title)}" aria-label="${esc(title)}">${agentTileNameHtml(name, replica)}${labelHtml}<span class="agent-tile-dot" data-status="${auth.status}" aria-hidden="true"></span><span class="agent-tile-next"><span class="agent-tile-countdown">${esc(countdown)}</span>${stateHtml}</span></button>`;
     }
     function refreshAgentsCollapsedCountdowns(nowMs) {
       const strip = document.querySelector('.agents-collapsed-tiles');
@@ -1076,10 +1133,64 @@
       const countdown = tileState.countdown || (active ? agentTileRunningLabel(a, nowMs) : agentTileCadenceLabel(a, nowMs));
       const label = tileState.label || null;
       const classes = ['agent-navbar-tile', active ? 'active' : '', label === 'running' ? 'running-now' : '', isDown && !disabled ? 'stopped' : '', auth.needsLogin ? 'needs-login' : '', label === 'next' ? 'up-next' : ''].filter(Boolean).join(' ');
-      const title = `${name}
+      const replica = agentTileReplicaInfo(a);
+      const title = `${agentTileTitleName(name, replica)}
 next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextKick))}`;
       const labelHtml = agentTileLabelHtml(label);
-      return `<button type="button" class="${classes}" data-action="openAgentsUpNextPanel" data-agent-key="${esc(key)}" data-agent-next-kick-ms="${Number.isFinite(nextMs) ? String(nextMs) : ''}" data-agent-running="${active ? '1' : ''}" data-agent-running-since="${esc((a && (a.busySince || a.runningSince || a.startedAt)) || '')}" data-agent-can-up-next="${tileState.canBeNext ? '1' : ''}" data-agent-tile-label="${esc(label || '')}" data-agent-active="${active ? '1' : ''}" data-stop="1" title="${esc(title)}" aria-label="${esc(title)}"><span class="agent-tile-name">${esc(name)}</span><span class="agent-tile-dot" data-status="${auth.status}" aria-hidden="true"></span><span class="agent-tile-next"><span class="agent-tile-countdown">${esc(countdown)}</span></span>${labelHtml}</button>`;
+      return `<button type="button" class="${classes}" data-action="openAgentsUpNextPanel" data-agent-key="${esc(key)}" data-agent-next-kick-ms="${Number.isFinite(nextMs) ? String(nextMs) : ''}" data-agent-running="${active ? '1' : ''}" data-agent-running-since="${esc((a && (a.busySince || a.runningSince || a.startedAt)) || '')}" data-agent-can-up-next="${tileState.canBeNext ? '1' : ''}" data-agent-tile-label="${esc(label || '')}" data-agent-active="${active ? '1' : ''}" data-stop="1" title="${esc(title)}" aria-label="${esc(title)}">${agentTileNameHtml(name, replica)}<span class="agent-tile-dot" data-status="${auth.status}" aria-hidden="true"></span><span class="agent-tile-next"><span class="agent-tile-countdown">${esc(countdown)}</span></span>${labelHtml}</button>`;
+    }
+    // The strip is one row that wraps: a tile that does not fit whole drops to
+    // a second row the CSS keeps out of sight, so there is never part of a
+    // tile or a scrollbar. This takes the dropped tiles out of the layout (and
+    // so out of the tab order; every agent stays reachable in the Agents
+    // section) and shows how many were dropped. The count chip is measured
+    // first in the row, so its width is reserved before the tiles are counted.
+    const AGENT_NAVBAR_STRIP_TITLE = 'Upcoming agent run order';
+    function fitAgentNavbarTiles(wrap) {
+      if (!wrap) return 0;
+      const tiles = Array.from(wrap.querySelectorAll('.agent-navbar-tile')).filter(tile => !tile.classList.contains('exiting'));
+      tiles.forEach(tile => tile.removeAttribute('data-agent-overflow'));
+      wrap.removeAttribute('data-agent-more');
+      wrap.classList.remove('agent-navbar-upnext--measuring');
+      // A tile is dropped when it sits below the visible row or sticks out
+      // past the end of the strip. A tile that is not rendered at all (the
+      // strip is hidden at this width) is left alone.
+      const dropped = () => tiles.filter(tile => {
+        if (!tile.offsetParent) return false;
+        const own = tile.offsetParent === wrap;
+        const bottom = (own ? 0 : wrap.offsetTop) + wrap.clientHeight;
+        const end = (own ? 0 : wrap.offsetLeft) + wrap.clientWidth;
+        return tile.offsetTop >= bottom || tile.offsetLeft + tile.offsetWidth > end;
+      });
+      let out = dropped();
+      if (out.length) {
+        wrap.setAttribute('data-agent-more', '+' + out.length);
+        wrap.classList.add('agent-navbar-upnext--measuring');
+        out = dropped();
+        wrap.classList.remove('agent-navbar-upnext--measuring');
+        if (out.length) wrap.setAttribute('data-agent-more', '+' + out.length);
+        else wrap.removeAttribute('data-agent-more');
+        out.forEach(tile => tile.setAttribute('data-agent-overflow', '1'));
+      }
+      const title = out.length ? `${AGENT_NAVBAR_STRIP_TITLE} (${out.length} more in the Agents section)` : AGENT_NAVBAR_STRIP_TITLE;
+      wrap.setAttribute('title', title);
+      wrap.setAttribute('aria-label', title);
+      return out.length;
+    }
+    // Refit when the centre of the navbar changes width (window resize, a chip
+    // appearing beside it). Width only, and on the next frame, so the refit
+    // never feeds the observer that asked for it.
+    function ensureAgentNavbarFitObserver(wrap) {
+      const center = wrap && wrap.parentElement;
+      if (!center || window._agentNavbarFitObserver || typeof ResizeObserver === 'undefined') return;
+      let lastWidth = -1;
+      window._agentNavbarFitObserver = new ResizeObserver(entries => {
+        const width = Math.round((entries[0] && entries[0].contentRect && entries[0].contentRect.width) || 0);
+        if (width === lastWidth) return;
+        lastWidth = width;
+        requestAnimationFrame(() => fitAgentNavbarTiles(wrap));
+      });
+      window._agentNavbarFitObserver.observe(center);
     }
     function agentNavbarTileFromHtml(html) {
       const template = document.createElement('template');
@@ -1112,7 +1223,7 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
         const key = tile.getAttribute('data-agent-key') || '';
         if (desired.has(key)) return;
         tile.classList.add('exiting');
-        window.setTimeout(() => tile.remove(), AGENT_NAVBAR_EXIT_MS);
+        window.setTimeout(() => { tile.remove(); fitAgentNavbarTiles(wrap); }, AGENT_NAVBAR_EXIT_MS);
       });
       const previousUpNext = wrap.dataset.upNextKey || '';
       list.forEach((item, i) => {
@@ -1151,6 +1262,8 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
       wrap.hidden = list.length === 0;
       wrap.dataset.agentSummary = list.length ? String(list.length) + ' agents ▾' : '';
       renderAgentNavbarTileDiff(wrap, list, now);
+      fitAgentNavbarTiles(wrap);
+      ensureAgentNavbarFitObserver(wrap);
       if (list.length) ensureAgentsCollapsedCountdownTicker();
     }
     function refreshAgentNavbarUpNextCountdowns(nowMs) {
@@ -1171,6 +1284,7 @@ next kick: ${agentCollapsedTimestampDetail(nextMs, a && (a.nextKickAt || a.nextK
         const el = tile.querySelector('.agent-tile-countdown');
         if (el && el.textContent !== countdown) el.textContent = countdown;
       });
+      fitAgentNavbarTiles(wrap);
     }
     function openAgentsUpNextPanel() {
       navPeekRestore('agents-section', { instant: true });

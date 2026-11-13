@@ -50,6 +50,8 @@ func ConfigLeaves(repoRoot string) ([]Leaf, error) {
 		filepath.Join("crux", "config"),
 		filepath.Join("pkg", "dashboard", "theme"),
 		filepath.Join("pkg", "writeback"),
+		filepath.Join("pkg", "attention"),
+		filepath.Join("pkg", "attentionbudget"),
 	} {
 		if err := c.collect(fset, repoRoot, rel); err != nil {
 			return nil, err
@@ -147,6 +149,10 @@ func ConfigLeaves(repoRoot string) ([]Leaf, error) {
 		Leaf{Path: "agents.session_recycle.max_rss_mb", Type: "int"},
 		Leaf{Path: "agents.session_recycle.max_age", Type: "time.Duration"},
 		Leaf{Path: "agents.session_recycle.min_idle", Type: "time.Duration"},
+		Leaf{Path: "agents.cli_memory.auto_memory", Type: "*bool"},
+		Leaf{Path: "agents.cli_memory.clear_on_kick", Type: "bool"},
+		Leaf{Path: "agents.cli_memory.drain_to_knowledge", Type: "bool"},
+		Leaf{Path: "agents.cli_memory.drain_on_write", Type: "bool"},
 	)
 	byPath := map[string]Leaf{}
 	for _, leaf := range leaves {

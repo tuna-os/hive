@@ -92,8 +92,17 @@ func TestDelegatedDecisionUntrustedReadyForHumanMergeDecides(t *testing.T) {
 			if len(mock.merges) != 0 {
 				t.Fatalf("the dashboard merges nothing itself: %v", mock.merges)
 			}
-			if len(mock.comments) == 0 || !strings.Contains(mock.comments[0], tc.wantRule) {
+			decisionComment := false
+			for _, comment := range mock.comments {
+				if job.Marker != "" && strings.Contains(comment, tc.wantRule) && strings.Contains(comment, job.Marker) {
+					decisionComment = true
+				}
+			}
+			if !decisionComment {
 				t.Fatalf("decision comment must carry rule %q: %v", tc.wantRule, mock.comments)
+			}
+			if !tc.wantAdopt && job.ApprovalRecordedAt == nil {
+				t.Fatal("approved native decision must be recorded before optional comments")
 			}
 
 			// The ✓ hover reads the ledger detail: recorded from the response
@@ -170,6 +179,45 @@ func TestDelegatedHumanMergeDecisionPersonAuthoredNeverAdopts(t *testing.T) {
 			}
 			if d.Rule == delegatedHumanMergeAdoptDCORule && d.Verdict != delegatedecision.VerdictAdoptSupersede {
 				t.Fatalf("clanker DCO-less head should adopt: %+v", d)
+			}
+		})
+	}
+}
+
+// TestDelegatedHumanMergeGatedPRIsNotDecided: a sentinel alert or a hold
+// label is a gate riding the PR's real stage (hivecommons/hive#17327), so a
+// green, reviewed PR wears the 090 label while held. Neither human-merge
+// shortcut may approve, admit or adopt it on "Let hive decide": both step
+// aside and the policy (sentinel question, rail-hold) answers as it did
+// when the gate pinned 085.
+func TestDelegatedHumanMergeGatedPRIsNotDecided(t *testing.T) {
+	srv := newDelegatedServer(t, &repoItemDecisionMock{})
+	srv.deps.Config.Governor.Labels.Stage.Adoption.Enabled = boolPtr(true)
+	base := delegatedecision.Input{
+		Repo: "testorg/testrepo", Number: 17327, Kind: delegatedecision.KindPR, Author: "clubanderson", OwnerAuthor: true,
+		Labels: []string{stagelabels.ReadyForHumanMerge.Label(), "role/newcomer"}, CIGreen: true,
+	}
+	req := delegatedDecisionRequest{Type: "pr", Reason: "contributor-lane:author-association"}
+	if d, _, ok := srv.delegatedHumanMergeDecision(base, req, "writer", true); !ok || d.Rule != delegatedHumanMergeApproveRule {
+		t.Fatalf("clean owner 090 PR should approve: ok=%v %+v", ok, d)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(in *delegatedecision.Input)
+	}{
+		{"sentinel alert", func(in *delegatedecision.Input) { in.SentinelAlert = true }},
+		{"hold label", func(in *delegatedecision.Input) { in.Labels = append(in.Labels, "hold") }},
+		{"do-not-merge label", func(in *delegatedecision.Input) { in.Labels = append(in.Labels, "do-not-merge/wip") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := base
+			in.Labels = append([]string(nil), base.Labels...)
+			tc.mutate(&in)
+			if d, notes, ok := srv.delegatedHumanMergeDecision(in, req, "writer", true); ok {
+				t.Fatalf("gated 090 PR decided by the human-merge path: %+v notes=%q", d, notes)
+			}
+			if out, ok := srv.delegatedHumanMergeOutcome("testorg/testrepo", in.Number, "pr", "writer", true, in, req); ok {
+				t.Fatalf("gated 090 PR answered by the human-merge outcome: %+v", out)
 			}
 		})
 	}

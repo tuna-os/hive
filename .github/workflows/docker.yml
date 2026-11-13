@@ -56,16 +56,22 @@ on:
         required: false
         type: string
 
-# Serialize Docker builds per branch so concurrent merges don't race. Do NOT
-# cancel in-progress builds: on a fast-merging release branch (v2 saw ~34 merges
-# in 2h), cancel-in-progress meant every build was killed by the next merge and
-# NONE ever completed, freezing <branch>-latest and blocking all deploys. With
-# cancel-in-progress:false the builds queue and each runs to completion. Each
-# completed build publishes an immutable SHA tag; publish-image-tags.sh uses a
-# per-tag workflow generation to advance moving tags without either starving
-# during a merge burst or regressing when queued runs execute out of order.
+# Concurrency. PR builds share a group per PR with cancel-in-progress, so a
+# force-push supersedes the previous build. PUSH builds (release lines and the
+# other long-lived branches) get a group of their own per run, i.e. they are
+# never cancelled and never queued behind each other. The earlier shape — one
+# group per branch with cancel-in-progress:false — was meant to make them
+# "queue and each run to completion", but GitHub's concurrency queue holds at
+# most ONE pending run per group: when a third push arrives, the pending
+# second run is CANCELLED (not queued) in favour of the newest. On a branch
+# merging every few minutes that cancelled most builds (runs 42400016149,
+# 42401056583, 42403292505 on 2026-11-07), so most commits never published
+# images and Tagged Release had nothing to tag. Parallel push builds are safe:
+# each completed build publishes an immutable SHA tag, and
+# publish-image-tags.sh uses a per-tag workflow generation (run number) to
+# advance moving tags without regressing when builds finish out of order.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -279,7 +285,9 @@ jobs:
             self_hosted: true
             qemu: true
             timeout_minutes: 75
-    runs-on: ${{ matrix.qemu && fromJSON(vars.HIVE_ARM64_RUNNER || vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest') }}
+    # Public PRs use the same free native ARM64 VM as the Podman arm64 lane.
+    # Explicit ARM64 overrides and all release/push runner selection stay intact.
+    runs-on: ${{ matrix.qemu && fromJSON(vars.HIVE_ARM64_RUNNER || (github.event_name == 'pull_request' && github.event.repository.private == false && '["ubuntu-24.04-arm"]' || vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]')) || ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest') }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Checkout repository
@@ -293,7 +301,7 @@ jobs:
           fetch-tags: true
 
       - name: Set up QEMU for arm64 emulation
-        if: matrix.qemu
+        if: matrix.qemu && runner.arch != 'ARM64'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
@@ -305,7 +313,7 @@ jobs:
 
       - name: Log in to GHCR
         if: needs.gate.outputs.push == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -439,6 +447,7 @@ jobs:
           else
             IMG=hive-freshness-probe:local
             docker buildx build --load \
+              --platform "${{ matrix.platform }}" \
               -f src/Dockerfile \
               --build-arg BASE_REGISTRY="$BASE_REGISTRY" \
               --build-arg GIT_HASH="$EXPECTED_SHA" \
@@ -541,7 +550,7 @@ jobs:
           driver-opts: network=host
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -603,7 +612,7 @@ jobs:
       # credential for public reads regardless of org.
       - name: Log in to GHCR as the cross-org publisher
         if: steps.crosspat.outputs.available == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -681,7 +690,7 @@ jobs:
             self_hosted: true
             qemu: true
             timeout_minutes: 75
-    runs-on: ${{ matrix.qemu && fromJSON(vars.HIVE_ARM64_RUNNER || vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest') }}
+    runs-on: ${{ matrix.qemu && fromJSON(vars.HIVE_ARM64_RUNNER || (github.event_name == 'pull_request' && github.event.repository.private == false && '["ubuntu-24.04-arm"]' || vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]')) || ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest') }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Checkout repository
@@ -690,7 +699,7 @@ jobs:
           ref: ${{ needs.gate.outputs.sha }}
 
       - name: Set up QEMU for arm64 emulation
-        if: matrix.qemu
+        if: matrix.qemu && runner.arch != 'ARM64'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
@@ -702,7 +711,7 @@ jobs:
 
       - name: Log in to GHCR
         if: needs.gate.outputs.push == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -778,7 +787,7 @@ jobs:
           driver-opts: network=host
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -820,7 +829,7 @@ jobs:
 
       - name: Log in to GHCR as the cross-org publisher
         if: steps.crosspat.outputs.available == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -890,7 +899,7 @@ jobs:
             self_hosted: true
             qemu: true
             timeout_minutes: 75
-    runs-on: ${{ matrix.qemu && fromJSON(vars.HIVE_ARM64_RUNNER || vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest') }}
+    runs-on: ${{ matrix.qemu && fromJSON(vars.HIVE_ARM64_RUNNER || (github.event_name == 'pull_request' && github.event.repository.private == false && '["ubuntu-24.04-arm"]' || vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]')) || ((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest') }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Checkout repository
@@ -904,7 +913,7 @@ jobs:
           fetch-tags: true
 
       - name: Set up QEMU for arm64 emulation
-        if: matrix.qemu
+        if: matrix.qemu && runner.arch != 'ARM64'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
@@ -916,7 +925,7 @@ jobs:
 
       - name: Log in to GHCR
         if: needs.gate.outputs.push == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1001,7 +1010,7 @@ jobs:
           driver-opts: network=host
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1043,7 +1052,7 @@ jobs:
 
       - name: Log in to GHCR as the cross-org publisher
         if: steps.crosspat.outputs.available == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

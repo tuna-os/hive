@@ -189,16 +189,26 @@ type CompetingPR struct {
 
 // Input is everything the delegate reads about one parked item.
 type Input struct {
-	Repo   string
-	Number int
-	Kind   Kind
-	Title  string
-	Body   string
-	Labels []string
+	Repo    string
+	Number  int
+	Kind    Kind
+	Title   string
+	Body    string
+	HeadSHA string
+	Labels  []string
 	// Reasons are the park reasons; Question is the reviewer's decision
 	// question, when one was recorded.
 	Reasons  []string
 	Question string
+	// Options are the alternatives an issue offers its owner, read from its
+	// body or the hive's park comment; RecommendedOption is the Label of the
+	// one that text recommends, "" when it names none.
+	Options           []Option
+	RecommendedOption string
+	// SignOffQuestion: the caller classified Question as a policy sign-off
+	// using the reviewer's wording and the head's changed files. Scope and
+	// follow-up questions remain eligible for the superseder auto-decision.
+	SignOffQuestion bool
 	// Author is the PR's / issue's GitHub login, for plain-words answers.
 	Author string
 	// HiveAuthored: the hive opened the PR / filed the issue.
@@ -263,6 +273,13 @@ type Input struct {
 	// refused by the adoption fence: deciding to adopt cannot take effect
 	// (hivecommons/hive#15188).
 	WorkflowPath bool
+	// WorkflowsPushable: the hive checked that it can land a
+	// .github/workflows change in this repository. The App installation
+	// grants `workflows: write` and an enabled lane whose token carries it
+	// serves the repository. An agent writing "the hive's token cannot
+	// change workflow files" is then describing its own lane's ceiling, not
+	// a missing App permission (Danathar/goodreads-mcp#440).
+	WorkflowsPushable bool
 	// BlockedOnPRClosed: a review-backlog item whose PR closed unmerged.
 	BlockedOnPRClosed bool
 	// SupersededBy names the merged PR that already delivered this PR's
@@ -293,6 +310,12 @@ type Input struct {
 	// the contributor's (hivecommons/hive#15722: "send #15722 back to its
 	// author" on a PR the hive had adopted).
 	AdoptedByHive bool
+	// AdoptedPushRefused names why the hive cannot push the adopted PR's
+	// branch (fork-rehome-refused, a fork without maintainer edits or with
+	// a workflow-file diff, a recorded capability blocker); "" when it can.
+	// The fixer cannot carry out a direction then (projectbluefin/utah#919,
+	// projectbluefin/testsuite#1037).
+	AdoptedPushRefused string
 	// ReviewerRequiresHuman: the recorded park reason is the reviewer
 	// swarm's requires_human on the current head; ReviewerFinding is what
 	// the review found ("the reviewer marked this change high-risk"), and
@@ -301,11 +324,53 @@ type Input struct {
 	ReviewerRequiresHuman bool
 	ReviewerFinding       string
 	SecurityFinding       bool
+	// ChangesRequestedBy are the maintainers whose standing GitHub review
+	// asks for changes: their latest opinionated review is
+	// CHANGES_REQUESTED, the request that keeps GitHub's reviewDecision at
+	// CHANGES_REQUESTED and blocks the merge. The hive's own reviews are
+	// not listed; HeadReviewVerdict carries the swarm's.
+	ChangesRequestedBy []string
+	// HeadReviewVerdict is the review swarm's aggregate verdict on the
+	// current head ("changes_requested", "requires_human", …); "" when the
+	// head has none recorded.
+	HeadReviewVerdict string
+	// HiveSuperseding: the hive App's own superseding copy of another PR
+	// (hive-authored, body declares `Supersedes #N`). The owner's rule is
+	// that it auto-merges with no operator decision; HiveSupersederHardStop
+	// is the one stagelabels.HiveSupersederHardStop* token that parked it
+	// anyway ("" when the park is an ordinary one the rule overrides).
+	HiveSuperseding        bool
+	HiveSupersederHardStop string
 }
 
 // CIRed reports a head that is not green because a check failed (or none
 // ever reported), as opposed to one still waiting on running checks.
 func (in Input) CIRed() bool { return !in.CIGreen && !in.CIPending }
+
+// Swarm verdicts on the head that hold it back from the merge queue.
+const (
+	headVerdictChangesRequested = "changes_requested"
+	headVerdictRequiresHuman    = "requires_human"
+)
+
+// ChangeRequest names the standing request for changes on the PR, in
+// plain words: a maintainer's GitHub review, else the swarm's verdict on
+// the current head. "" when nothing asks for changes.
+func (in Input) ChangeRequest() string {
+	if len(in.ChangesRequestedBy) > 0 {
+		return "the changes @" + strings.Join(in.ChangesRequestedBy, ", @") + " requested on GitHub"
+	}
+	if strings.EqualFold(strings.TrimSpace(in.HeadReviewVerdict), headVerdictChangesRequested) {
+		return "the changes the hive's review requested on this head"
+	}
+	return ""
+}
+
+// HeadNeedsPerson: the swarm's verdict on the current head is
+// requires_human, a question for a person rather than a change request.
+func (in Input) HeadNeedsPerson() bool {
+	return strings.EqualFold(strings.TrimSpace(in.HeadReviewVerdict), headVerdictRequiresHuman)
+}
 
 // RuleAdoptNow is the rule name of the grace-elapsed Adopt now decision;
 // the dashboard runs it as a forced adoption (Adopt now), not a queued one.
@@ -326,6 +391,9 @@ type Decision struct {
 	// Ladder is the contributor-PR rung the decision landed on and why
 	// the rungs above it did not apply (hivecommons/hive#15289).
 	Ladder *Ladder `json:"ladder,omitempty"`
+	// Option is the issue's option the decision goes with, when it offered
+	// several (RuleRecommendedOption).
+	Option *Option `json:"option,omitempty"`
 }
 
 // Marker is the audit stamp every delegated comment carries.
@@ -428,10 +496,15 @@ func HivePolicyChange(in Input) bool {
 // CapabilityGap reports a needs-human whose blocker is a missing GitHub App
 // capability rather than an open question. Shared ledger inference handles
 // known capability kinds; a generic App-permission guard keeps other missing
-// permissions parked. Human-only blockers are handled by the ledger.
+// permissions parked. Human-only blockers are handled by the ledger. Prose
+// claiming the workflows permission is missing is not a gap when the hive
+// checked that it can push workflow files here (WorkflowsPushable).
 func CapabilityGap(in Input) bool {
 	isCapability := func(text string) bool {
 		k, ok := blocker.Infer(text)
+		if ok && k == blocker.CapabilityWorkflowsPermission && in.WorkflowsPushable {
+			return false
+		}
 		return ok && k.IsCapability() || appPermissionRE.MatchString(text)
 	}
 	return isCapability(in.headline()) ||
@@ -510,6 +583,11 @@ func decideIssue(in Input) Decision {
 	if in.BlockedOnPRClosed || blockedOnPRRE.MatchString(in.text()) && strings.Contains(strings.ToLower(in.text()), "unmerged") {
 		return approveIssue("review-backlog", "keep "+ref+" open: drop the relation to the closed PR, note it here and re-triage; a review-backlog item is never auto-closed when its PR closes unmerged",
 			"the PR closing unmerged leaves the work undone")
+	}
+	// Every rule below approves a direction. An issue that offers a choice
+	// is approved only as the option it recommends, never as a bare one.
+	if d, ok := competingOptionsDecision(in); ok {
+		return d
 	}
 	if hasLabel(in.Labels, labelFlaky) || flakyRE.MatchString(in.Title) || flakyRE.MatchString(firstLines(in.Body, 6)) {
 		d := approveIssue("flaky-test", "quarantine the flaky test with a retry and file a deflake task; do not block on it",
@@ -653,6 +731,9 @@ func decidePR(in Input) Decision {
 	if OwnerOnly(in) {
 		return ownerOnlyDecision(in, "secrets, PATs and org permissions are the owner's alone")
 	}
+	if d, ok := decideHiveSuperseder(in, ref); ok {
+		return d
+	}
 	if in.SentinelAlert {
 		if !in.TrustedAuthor {
 			return recommendOnly("sentinel-untrusted", "a sentinel alert on a PR from an author without write access is a human review", "review the sentinel finding on "+ref+" and remove the sentinel label if intended")
@@ -722,12 +803,7 @@ func decidePR(in Input) Decision {
 		return d
 	}
 	if fix := fixList(in); len(fix) > 0 {
-		text := strings.Join(fix, ", ") + "; keep the smallest reversible change, then it merges"
-		return Decision{
-			Verdict: VerdictDirection, Rule: "fix-then-merge", Text: text,
-			Rationale: "the head is not mergeable yet; the direction names the fix and nothing else",
-			Actions:   []Action{decisionComment(text)},
-		}
+		return fixThenMerge(fix)
 	}
 	if in.IsSmall() || in.LowRiskPaths {
 		return releasePR("small-low-risk", "approve "+ref+": small, necessary, low-risk change on a green head", "small low-risk changes (CI pins, read-only RBAC, warning text, workflow hygiene) are approved once checked")
@@ -743,6 +819,9 @@ func decidePR(in Input) Decision {
 const (
 	RuleAdoptedFixer           = "adopted-fixer"
 	RuleAdoptedSecurityFinding = "adopted-security-finding"
+	// RuleAdoptedPushRefused: the hive adopted the PR but cannot push its
+	// branch and the author is offline, so a person pushes or closes it.
+	RuleAdoptedPushRefused = "adopted-push-refused"
 )
 
 // decideAdoptedByHive is the adopted-in-place branch of decidePR. The hive
@@ -777,12 +856,66 @@ func decideAdoptedByHive(in Input, ref string) (Decision, bool) {
 	if len(fix) == 0 {
 		return Decision{}, false
 	}
+	if why := strings.TrimSpace(in.AdoptedPushRefused); why != "" {
+		return decideAdoptedPushRefused(in, ref, why, fix), true
+	}
 	text := "hive's fixer: " + strings.Join(fix, ", ") + " on " + ref + "; then it merges"
 	return Decision{
 		Verdict: VerdictDirection, Rule: RuleAdoptedFixer, Text: text,
 		Rationale: "the hive adopted " + ref + " in place and owns its branch, so the reviewer's finding is the hive's own fixer's to address — not the contributor's and not a person's (hivecommons/hive#15722)",
 		Actions:   []Action{decisionComment(text)},
 	}, true
+}
+
+// decideAdoptedPushRefused answers an adopted PR whose branch the hive
+// cannot push. A connected author can push it, so it goes back to them with
+// the fix list; otherwise only a person can, so the park stays with the one
+// who asked, with the reason.
+func decideAdoptedPushRefused(in Input, ref, why string, fix []string) Decision {
+	if in.ContributorOnline || in.ReworkPickedUp {
+		who := in.AuthorWord()
+		text := who + " is connected and the hive cannot push " + ref + " (" + why + "): " + strings.Join(fix, ", ") + " on " + ref + "; then it merges"
+		return Decision{
+			Verdict: VerdictDirection, Rule: RuleReturnToContributor, Text: text,
+			Rationale: "the hive adopted " + ref + " but cannot push its branch — " + why + " — and " + who + " is connected, so the fix list goes back to them",
+			Actions:   []Action{decisionComment(text)},
+		}
+	}
+	return recommendOnly(RuleAdoptedPushRefused,
+		"the hive adopted "+ref+" but cannot push its branch — "+why+" — so its fixer cannot carry out a direction, and "+in.OfflineWording(),
+		"a maintainer pushes the fix to "+ref+" ("+strings.Join(fix, ", ")+") or closes it; the hive cannot")
+}
+
+// RuleHiveSuperseder is the owner's superseder rule: "if a pr is superseded
+// by a pr that a hive agent creates, it should auto merge" — the only
+// exception being the sentinel or some other emergent problem with the PR.
+const RuleHiveSuperseder = "hive-superseder-automerge"
+
+// decideHiveSuperseder applies RuleHiveSuperseder to the hive's own
+// superseding PR. Without a hard stop or a recorded sign-off question the
+// PR is released (the lane merges it once CI/review are clean; an ordinary
+// reviewer finding is the fixer's, not a decision). A hard stop or a
+// sign-off question keeps the park and is named in the recommendation.
+func decideHiveSuperseder(in Input, ref string) (Decision, bool) {
+	if in.Kind != KindPR || !in.HiveSuperseding {
+		return Decision{}, false
+	}
+	if stop := strings.TrimSpace(in.HiveSupersederHardStop); stop != "" {
+		return recommendOnly(RuleHiveSuperseder,
+			"the hive's superseding PR auto-merges by the owner's rule, except for the sentinel or an emergent problem — and this one has one: "+stop,
+			"look at "+ref+" ("+stop+"): clear the stop (acknowledge the sentinel finding, release the hold, or fix the head) and the lane merges it; else close it"), true
+	}
+	if question := strings.TrimSpace(in.Question); in.SignOffQuestion && question != "" {
+		return recommendOnly(RuleHiveSuperseder,
+			"the hive's superseding PR has a recorded reviewer sign-off question; sign-off is still required even without a hard stop",
+			"answer the reviewer's question on "+ref+": "+question), true
+	}
+	if in.SentinelAlert {
+		return Decision{}, false
+	}
+	return releasePR(RuleHiveSuperseder,
+		"approve "+ref+": hive-authored superseding PR — auto-merging once CI/review are clean (owner rule: a PR the hive creates to supersede another auto-merges; reviewer findings go to the fixer)",
+		"the owner's rule: a PR the hive creates to supersede another auto-merges with no operator decision; only the sentinel or an emergent problem (hold, exhausted fixes, red CI, unresolvable conflict) parks it"), true
 }
 
 // RuleOnePRPerIssue: the merge queue carries one PR per issue; the one it
@@ -815,8 +948,9 @@ func decideClaimConflict(in Input, ref string) (Decision, bool) {
 }
 
 // decideTrainDuplicate resolves a same-issue pair the merge queue split
-// (hivecommons/hive#15395). The queue's pick stands: a green head beats a
-// red one, the earlier-opened wins among equals. Deciding on the held PR
+// (hivecommons/hive#15395). The queue's pick stands: it picks between
+// heads at the merge gate and keeps the pick until the kept PR closes or
+// is blocked for good (hivecommons/hive#17439). Deciding on the held PR
 // closes it as superseded by the kept one, with a comment; deciding on
 // the kept PR releases it and names the duplicate the queue holds. A
 // paused repo only gets the recommendation.
@@ -849,7 +983,7 @@ func decideTrainDuplicate(in Input, ref string) (Decision, bool) {
 		held := fmt.Sprintf("#%d", other.Number)
 		if in.Conflicting || in.CIRed() || in.DCOMissing {
 			return recommendOnly(RuleOnePRPerIssue,
-				fmt.Sprintf("the merge queue kept %s over %s%s, but %s is not mergeable now (%s); the queue re-picks on its next pass", ref, held, issue, ref, mergeBlockers(in)),
+				fmt.Sprintf("the merge queue kept %s over %s%s, but %s is not mergeable now (%s); the queue keeps it until it closes or is blocked for good", ref, held, issue, ref, mergeBlockers(in)),
 				"fix "+ref+" ("+mergeBlockers(in)+"), or decide on "+held+" to let it supersede this one"), true
 		}
 		return releasePR(RuleOnePRPerIssue,
@@ -926,6 +1060,17 @@ func decideReturnToAuthor(in Input, ref string) (Decision, bool) {
 		Rationale: "a person pushed this PR themselves, so the hive asks that person instead of adopting the work (hivecommons/hive#15202)",
 		Actions:   []Action{decisionComment(text)},
 	}, true
+}
+
+// fixThenMerge is the direction for a head that is not mergeable yet: it
+// names the fix and nothing else.
+func fixThenMerge(fix []string) Decision {
+	text := strings.Join(fix, ", ") + "; keep the smallest reversible change, then it merges"
+	return Decision{
+		Verdict: VerdictDirection, Rule: "fix-then-merge", Text: text,
+		Rationale: "the head is not mergeable yet; the direction names the fix and nothing else",
+		Actions:   []Action{decisionComment(text)},
+	}
 }
 
 func releasePR(rule, text, rationale string) Decision {

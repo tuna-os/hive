@@ -28,13 +28,18 @@ func TestStageTrackerMergeTrainPayload(t *testing.T) {
 	}
 	store.Observe(stagelabels.Key("acme/console", 15074), stagelabels.AwaitingMergeAdmission, "")
 	store.Observe(stagelabels.Key("acme/console", 15085), stagelabels.AwaitingMergeAdmission, queued(2))
-	store.Observe(stagelabels.Key("acme/console", 15087), stagelabels.AwaitingMergeAdmission, prstage.MergeTrain{State: prstage.MergeTrainStateRebasing, Front: 15074, Position: 3, Size: 4, Attempt: 1, MaxAttempts: 2, OverlapFiles: overlap}.Reason())
+	// hivecommons/hive#15825: the stage engine files a member the train is
+	// rebasing at 070 — its pushed head has no CI or verdicts yet.
+	store.Observe(stagelabels.Key("acme/console", 15087), stagelabels.Fixing, prstage.MergeTrain{State: prstage.MergeTrainStateRebasing, Front: 15074, Position: 3, Size: 4, Attempt: 1, MaxAttempts: 2, OverlapFiles: overlap}.Reason())
 	store.Observe(stagelabels.Key("acme/console", 15097), stagelabels.NeedsDecision, prstage.MergeTrain{State: prstage.MergeTrainStateRebaseExhausted, Front: 15074, Position: 4, Size: 4, Attempt: 2, MaxAttempts: 2, OverlapFiles: overlap}.Reason())
 	s.statusMu.Lock()
 	for _, n := range []int{15074, 15085, 15087, 15097} {
 		stage := "stage/080-awaiting-merge-admission"
 		if n == 15097 {
 			stage = "stage/085-needs-decision"
+		}
+		if n == 15087 {
+			stage = "stage/070-fixing"
 		}
 		labels := []string{stage, "author/hive"}
 		if n != 15074 {
@@ -47,10 +52,10 @@ func TestStageTrackerMergeTrainPayload(t *testing.T) {
 	resp := s.buildStageTracker(s.status, store, now)
 
 	front := trackerItem(t, resp, "pr", 15074)
-	if front.MergeTrain == nil || front.MergeTrain.State != MergeGateStateTrainFront || front.MergeTrain.Position != 1 || front.MergeTrain.Size != 4 || front.MergeTrain.ID != "v5#15074" {
+	if front.MergeTrain == nil || front.MergeTrain.State != MergeGateStateTrainFront || front.MergeTrain.Position != 1 || front.MergeTrain.Size != 3 || front.MergeTrain.ID != "v5#15074" {
 		t.Fatalf("front merge_train = %+v", front.MergeTrain)
 	}
-	if front.MergeGate == nil || front.MergeGate.State != MergeGateStateTrainFront || !strings.Contains(front.Caption, "1st in a merge queue of 4 PRs") {
+	if front.MergeGate == nil || front.MergeGate.State != MergeGateStateTrainFront || !strings.Contains(front.Caption, "1st in a merge queue of 3 PRs") {
 		t.Fatalf("front gate %+v caption %q", front.MergeGate, front.Caption)
 	}
 	if hasMod(front, modNeedsRebase) || len(front.MergeTrain.Ahead) != 0 {
@@ -61,7 +66,7 @@ func TestStageTrackerMergeTrainPayload(t *testing.T) {
 	if sib.Stage != 80 || sib.MergeTrain == nil || sib.MergeTrain.State != MergeGateStateQueuedBehind || sib.MergeTrain.Position != 2 || sib.MergeTrain.Front != 15074 {
 		t.Fatalf("sibling = stage %d train %+v", sib.Stage, sib.MergeTrain)
 	}
-	if sib.MergeGate == nil || sib.MergeGate.State != "queued-behind" || sib.MergeGate.Reason != "behind #15074 in merge train (2nd of 4, overlapping files: stage_tracker.go, index.html)" {
+	if sib.MergeGate == nil || sib.MergeGate.State != "queued-behind" || sib.MergeGate.Reason != "behind #15074 in merge train (2nd of 3, overlapping files: stage_tracker.go, index.html)" {
 		t.Fatalf("sibling merge_gate = %+v", sib.MergeGate)
 	}
 	if hasMod(sib, modNeedsRebase) || hasMod(sib, modNeedsHuman) || !hasStale(sib, modNeedsRebase) {
@@ -77,17 +82,19 @@ func TestStageTrackerMergeTrainPayload(t *testing.T) {
 		t.Fatalf("a queued sibling owes no decision: %+v", sib.DecisionNeeded)
 	}
 
+	// The member being rebased rides no train and sits in the CI / Review
+	// column with the rebase pill as its chevron word (hivecommons/hive#15825).
 	rebasing := trackerItem(t, resp, "pr", 15087)
-	if rebasing.MergeTrain.State != MergeGateStateRebasing || rebasing.MergeTrain.Attempt != 1 || rebasing.MergeTrain.MaxAttempts != 2 || !strings.Contains(rebasing.Caption, "rebasing this PR (attempt 1 of 2)") {
-		t.Fatalf("rebasing = %+v caption %q", rebasing.MergeTrain, rebasing.Caption)
+	if rebasing.Stage != 70 || rebasing.MergeTrain != nil || !strings.Contains(rebasing.Caption, "rebasing this PR (attempt 1 of 2)") {
+		t.Fatalf("rebasing = stage %d train %+v caption %q", rebasing.Stage, rebasing.MergeTrain, rebasing.Caption)
 	}
-	if got := rebasing.MergeTrain.Ahead; len(got) != 2 || got[0] != 15074 || got[1] != 15085 {
-		t.Fatalf("rebasing ahead = %v", got)
+	if rebasing.Rebase == nil || rebasing.Rebase.Text != "Rebasing · attempt 1/2" || rebasing.LeftTrain == nil || rebasing.LeftTrain.Why != "rebasing" || rebasing.LeftTrain.Reason != "merge-train:ejected:rebasing" {
+		t.Fatalf("rebasing pill %+v left %+v", rebasing.Rebase, rebasing.LeftTrain)
 	}
 	// Every member carries the whole roster in merge order, so a view that
 	// draws only some of them can name the rest in the train header.
-	for _, it := range []StageTrackerItem{front, sib, rebasing} {
-		if got := it.MergeTrain.Members; fmt.Sprint(got) != fmt.Sprint([]int{15074, 15085, 15087, 15097}) {
+	for _, it := range []StageTrackerItem{front, sib} {
+		if got := it.MergeTrain.Members; fmt.Sprint(got) != fmt.Sprint([]int{15074, 15085, 15097}) {
 			t.Fatalf("#%d members = %v", it.Number, got)
 		}
 	}
@@ -114,8 +121,8 @@ func TestStageTrackerMergeTrainPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"merge_gate":{"state":"queued-behind","reason":"behind #15074 in merge train (2nd of 4, overlapping files: stage_tracker.go, index.html)"`,
-		`"merge_train":{"id":"v5#15074","state":"queued-behind","front":15074,"position":2,"size":4,"overlap_files":["stage_tracker.go","index.html"],"ahead":[15074],"members":[15074,15085,15087,15097],"length":4,"head_number":15074,"head_state":"ready","head_reason":"approved and green; merges on hive's next pass","head_since":"2026-10-27T14:00:00Z","eta_s":300,"eta_at":"2026-10-27T14:05:00Z","eta_basis":"1 ahead"}`} {
+	for _, want := range []string{`"merge_gate":{"state":"queued-behind","reason":"behind #15074 in merge train (2nd of 3, overlapping files: stage_tracker.go, index.html)"`,
+		`"merge_train":{"id":"v5#15074","state":"queued-behind","front":15074,"position":2,"size":3,"overlap_files":["stage_tracker.go","index.html"],"ahead":[15074],"members":[15074,15085,15097],"length":3,"head_number":15074,"head_state":"ready","head_reason":"approved and green; merges on hive's next pass","head_since":"2026-10-27T14:00:00Z","eta_s":300,"eta_at":"2026-10-27T14:05:00Z","eta_basis":"1 ahead"}`} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("payload lacks %s:\n%s", want, raw)
 		}
@@ -124,12 +131,23 @@ func TestStageTrackerMergeTrainPayload(t *testing.T) {
 	if plain := trackerItem(t, resp, "pr", 102); plain.MergeTrain != nil {
 		t.Fatalf("PR 102 is not in a train: %+v", plain.MergeTrain)
 	}
-	// A dirty front the train is rebasing carries its own reason and is not
-	// re-marked.
-	store.Observe(stagelabels.Key("acme/console", 15074), stagelabels.AwaitingMergeAdmission, prstage.MergeTrain{State: prstage.MergeTrainStateRebasing, Front: 15074, Position: 1, Size: 4, Attempt: 1, MaxAttempts: 2, OverlapFiles: overlap}.Reason())
+	// A dirty front the train is rebasing (filed at 070 by the stage
+	// engine) leaves the train too; the rest close ranks behind #15085.
+	store.Observe(stagelabels.Key("acme/console", 15074), stagelabels.Fixing, prstage.MergeTrain{State: prstage.MergeTrainStateRebasing, Front: 15074, Position: 1, Size: 4, Attempt: 1, MaxAttempts: 2, OverlapFiles: overlap}.Reason())
+	s.statusMu.Lock()
+	for i, raw := range s.status.Repos[0].OpenPrs {
+		if fp, ok := raw.(FrontendPR); ok && fp.Number == 15074 {
+			fp.Labels = []string{"stage/070-fixing", "author/hive"}
+			s.status.Repos[0].OpenPrs[i] = fp
+		}
+	}
+	s.statusMu.Unlock()
 	resp = s.buildStageTracker(s.status, store, now)
-	if f := trackerItem(t, resp, "pr", 15074); f.MergeTrain.State != MergeGateStateRebasing || f.MergeTrain.Position != 1 {
-		t.Fatalf("rebasing front = %+v", f.MergeTrain)
+	if f := trackerItem(t, resp, "pr", 15074); f.Stage != 70 || f.MergeTrain != nil || f.Rebase == nil || f.Rebase.Text != "Rebasing · attempt 1/2" {
+		t.Fatalf("rebasing front = stage %d train %+v rebase %+v", f.Stage, f.MergeTrain, f.Rebase)
+	}
+	if n := trackerItem(t, resp, "pr", 15085); n.MergeTrain == nil || n.MergeTrain.State != MergeGateStateTrainFront || n.MergeTrain.Size != 2 {
+		t.Fatalf("new front = %+v", n.MergeTrain)
 	}
 }
 
@@ -198,6 +216,7 @@ func TestStageTrackerMergeTrainSPA(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED"),
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS"),
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION"),
 		jsConstLine(t, html, "STAGE_TRACKER_PRE_MERGE_SOAK"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTIVE_WORD"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTOR"),
@@ -284,19 +303,19 @@ const other = { repo: 'hivecommons/hive', number: 15100, kind: 'pr', title: 'Doc
 
 // Pill wording per state: the place in the owner's words (#15395 —
 // "'front' should be 'merge queued - 1st' and so on").
-assert.strictEqual(stageTrackerTrainWord(front), 'Merge queued · 1st of 4');
-assert.strictEqual(stageTrackerTrainWord(second), 'Merge queued · 2nd of 4');
+assert.strictEqual(stageTrackerTrainWord(front), 'Queued for merge · 1st of 4');
+assert.strictEqual(stageTrackerTrainWord(second), 'Queued for merge · 2nd of 4');
 assert.strictEqual(stageTrackerTrainWord(third), 'Rebasing · attempt 1/2');
 assert.strictEqual(stageTrackerTrainWord(fourth), 'Needs human decision · rebase failed twice');
 assert.strictEqual(stageTrackerTrainWord(other), '');
 for (const [n, w] of [[1, '1st'], [2, '2nd'], [3, '3rd'], [4, '4th'], [11, '11th'], [12, '12th'], [13, '13th'], [21, '21st'], [22, '22nd'], [111, '111th']]) assert.strictEqual(stageTrackerOrdinal(n), w, 'ordinal ' + n);
 // The lit chevron carries the word: 080 for the members, the 085 detour for the exhausted one.
 const lit = it => stageTrackerSegments(it, stages, now).find(s => s.state === 'active');
-assert.strictEqual(lit(front).short, 'Merge queued · 1st of 4');
-assert.strictEqual(lit(second).short, 'Merge queued · 2nd of 4');
+assert.strictEqual(lit(front).short, 'Queued for merge · 1st of 4');
+assert.strictEqual(lit(second).short, 'Queued for merge · 2nd of 4');
 assert.strictEqual(lit(third).short, 'Rebasing · attempt 1/2');
 assert.strictEqual(lit(fourth).detour.text, 'Needs human decision · rebase failed twice');
-assert.strictEqual(lit(other).short, 'Ready for auto merge');
+assert.strictEqual(lit(other).short, 'Queued for merge');
 
 // Tooltip: the queue ahead and the overlapping files.
 const tip = stageTrackerTooltip(third, now);
@@ -316,12 +335,12 @@ const sorted = [fourth, other, third, { repo: 'x/y', number: 1, kind: 'issue', s
 // Queue facts (#15395): the chip is the position, never the slug; the
 // hover sentence names the head, what it waits on and the estimate.
 const queued = mk(15319, 80, { state: 'queued-behind', position: 2, ahead: [15315], length: 3, head_number: 15315, head_state: 'soaking', head_reason: 'soaking, 12m left', eta_s: 1500 });
-assert.strictEqual(stageTrackerTrainWord(queued), 'Merge queued · 2nd of 3');
+assert.strictEqual(stageTrackerTrainWord(queued), 'Queued for merge · 2nd of 3');
 assert.strictEqual(stageTrackerTrainQueueTip(queued.merge_train), '2nd of 3 in the merge queue · behind #15315 (soaking, 12m left) · ETA ~25m. Hive merges one at a time, in order.');
 const firstQ = mk(15315, 80, { state: 'front', position: 1, length: 3, head_number: 15315, head_state: 'soaking', head_reason: 'soaking, 12m left', eta_s: 780 });
 assert.strictEqual(stageTrackerTrainQueueTip(firstQ.merge_train), '1st of 3 in the merge queue · merges next (soaking, 12m left) · ETA ~13m. Hive merges one at a time, in order.');
 const thirdQ = mk(15374, 80, { state: 'queued-behind', position: 3, ahead: [15315, 15319], length: 3, head_number: 15315, head_state: 'needs-human', head_reason: 'waiting for a maintainer (untrusted author)', eta_s: 0 });
-assert.strictEqual(stageTrackerTrainWord(thirdQ), 'Merge queued · 3rd of 3');
+assert.strictEqual(stageTrackerTrainWord(thirdQ), 'Queued for merge · 3rd of 3');
 assert.strictEqual(stageTrackerTrainQueueTip(thirdQ.merge_train), '3rd of 3 in the merge queue · behind #15315 (waiting for a maintainer (untrusted author)) · no estimate until #15315 moves. Hive merges one at a time, in order.');
 const stalledQ = mk(15374, 80, { state: 'queued-behind', position: 3, ahead: [15315, 15319], length: 3, head_number: 15315, head_state: 'ci', head_reason: 'waiting for CI', stalled: true, stalled_s: 3 * 3600 });
 assert.strictEqual(stageTrackerTrainWord(stalledQ), 'Merge queue · stalled — waiting on #15315 (waiting for CI) · 3h');
@@ -334,14 +353,14 @@ for (const it of [queued, firstQ, thirdQ, stalledQ, front, second, third, fourth
   assert.ok(!/front|queued-behind|rebase-exhausted/i.test(seen), 'no slug or "front" for #' + it.number + ': ' + seen);
 }
 // Ordinal places beyond the first few.
-for (const [pos, w] of [[11, '11th'], [12, '12th'], [13, '13th'], [21, '21st'], [22, '22nd'], [23, '23rd']]) assert.strictEqual(stageTrackerTrainWord(mk(1, 80, { state: 'queued-behind', position: pos, length: 30 })), 'Merge queued · ' + w + ' of 30');
+for (const [pos, w] of [[11, '11th'], [12, '12th'], [13, '13th'], [21, '21st'], [22, '22nd'], [23, '23rd']]) assert.strictEqual(stageTrackerTrainWord(mk(1, 80, { state: 'queued-behind', position: pos, length: 30 })), 'Queued for merge · ' + w + ' of 30');
 // Every train state — the 1st included — lights the Merge queue column,
 // whatever stage the lane holds the head at (hive #15400 at 050 lit CI / Review).
 for (const st of ['front', 'queued-behind', 'rebasing', 'rebase-exhausted']) for (const stage of [50, 60, 70, 74, 80, 95]) assert.strictEqual(stageTrackerAnchor(stage, stages, 'pr', mk(2, stage, { state: st, position: 1 })), 80, st + ' at ' + stage);
 assert.strictEqual(stageTrackerAnchor(50, stages, 'pr', other), 50, 'no train: stage rules as before');
 // The 1st-in-train head at 050 lights the Merge queue column, but its
 // word leads with the stage's blocker — the slot is provisional until
-// CI and the verdict are in (hive #15577 read "Merge queued · 1st" over
+// CI and the verdict are in (hive #15577 read "Queued for merge · 1st" over
 // a caption saying build-and-test was still running).
 const headAt50 = mk(15400, 50, { state: 'front', position: 1 });
 assert.strictEqual(lit(headAt50).number, 80);
@@ -359,7 +378,9 @@ assert.strictEqual(stageTrackerTrainHeaderText(front.merge_train), 'merge train 
 const ico = stageTrackerTrainIconHtml('ham-train-icon');
 assert.ok(ico.startsWith('<svg class="ham-train-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"'), ico);
 assert.ok(ico.includes('<title>Merge queue</title>') && ico.includes('aria-label="Merge queue"'), ico);
-assert.ok(ico.includes(STAGE_TRACKER_TRAIN_ICON_PATH) && (ico.match(/<circle/g) || []).length === 2, 'two wheels: ' + ico);
+// A merge sign (hivecommons/hive#17459): one path, an arrow shaft (V3), its
+// head (l3-3 3 3) and a lane curving in from the lower right (c…); no railcar.
+assert.ok(ico.includes(STAGE_TRACKER_TRAIN_ICON_PATH) && /<path [^>]*d="M6 14\.5V3M3 6l3-3 3 3M13 14\.5c/.test(ico) && !ico.includes('<circle') && !ico.includes('<rect'), 'merge sign: ' + ico);
 assert.strictEqual(STAGE_TRACKER_ICONS[80], STAGE_TRACKER_TRAIN_ICON_PATH);
 assert.ok(rows[0].html.includes(ico), rows[0].html);
 assert.strictEqual(stageTrackerTrainRowClass(front, null, second), ' ham-train ham-train-front');

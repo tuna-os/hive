@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	gh "github.com/google/go-github/v72/github"
+	"github.com/hivecommons/hive/pkg/prstatus"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
@@ -224,6 +225,12 @@ func (c *Client) decomposedChildren(ctx context.Context, owner, repoName string,
 		sort.Ints(children)
 		return children, open, len(children) > 0, nil
 	}
+	return c.splitLedgerChildren(ctx, owner, repoName, parent)
+}
+
+// splitLedgerChildren is the ledger half of decomposedChildren: each child
+// the split-parents ledger records under parent, read by number.
+func (c *Client) splitLedgerChildren(ctx context.Context, owner, repoName string, parent int) (children []int, open int, ok bool, err error) {
 	ledger, lerr := LoadSplitParents("")
 	if lerr != nil {
 		return nil, 0, false, nil
@@ -296,7 +303,10 @@ func (c *Client) closeDecomposedParent(ctx context.Context, in IssueStageInput, 
 	if store != nil {
 		store.Forget(key)
 	}
-	if err := c.CreateIssueCommentBudgeted(ctx, in.Repo, in.Number, decomposedParentCloseComment(children, closers)); err != nil && logger != nil {
+	note := decomposedParentCloseComment(children, closers)
+	if _, err := c.PostIssueNote(ctx, in.Repo, in.Number, prstatus.KeyIssueClose, note, func(ctx context.Context) error {
+		return c.CreateIssueCommentBudgeted(ctx, in.Repo, in.Number, note)
+	}); err != nil && logger != nil {
 		logger.Warn("issue stage labels: decomposed parent close comment failed", "repo", in.Repo, "issue", in.Number, "error", err)
 	}
 	if logger != nil {

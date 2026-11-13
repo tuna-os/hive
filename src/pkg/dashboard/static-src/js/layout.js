@@ -28,7 +28,7 @@
     var DASHBOARD_LAYOUT_KEY='hive.dashboard.layout';
     var DASHBOARD_LAYOUT_VERSION=1;
     var DASHBOARD_LAYOUT_REGIONS=['main'];
-    var DASHBOARD_LAYOUT_TEMPLATE={main:['overview-section','governor','runs-section','pr-throughput-section','repos-section','activity-monitor-section','knowledge-section','search-section','review-queue-section','contributors-section','advisory-section','token-panel','cost-panel','inception-section','acmm-eval-section','debug-section','audit-section','approvals-section','nous-section','logs-section','agents-section','agent-activity-section','faq-section']};
+    var DASHBOARD_LAYOUT_TEMPLATE={main:['overview-section','governor','runs-section','pr-throughput-section','repos-section','activity-monitor-section','knowledge-section','search-section','inbox-section','review-queue-section','contributors-section','advisory-section','token-panel','cost-panel','inception-section','acmm-eval-section','debug-section','audit-section','approvals-section','nous-section','logs-section','agents-section','agent-activity-section','faq-section']};
     var DASHBOARD_LAYOUT_GRIP_SELECTOR='[data-dashboard-grip]';
     var DASHBOARD_LAYOUT_CARD_SELECTOR='[data-dashboard-section]';
     var DASHBOARD_LAYOUT_ANCHOR_ID='dash-notices';
@@ -82,7 +82,7 @@
     function dashboardMarkAppliedLayout(kind,name,id,state){var applied={kind:kind||'custom',name:name||'',id:id||'',state:dashboardNormalizeSnapshot(state||dashboardLayoutSnapshot())};try{localStorage.setItem(DASHBOARD_LAYOUT_APPLIED_KEY,JSON.stringify(applied));}catch(e){}dashboardUpdateLayoutMenuState();}
     function dashboardUpdateLayoutMenuState(){var status=document.getElementById('oc-gh-menu-layout-status'),wrap=document.getElementById('oc-gh-avatar-wrap');var current=dashboardLayoutSnapshot(),applied=dashboardReadAppliedLayout(),base=applied&&applied.state?applied:{kind:'default',name:'',state:dashboardLayoutDefaultSnapshot()};var same=dashboardSnapshotEquals(current,base.state);var label='Layout: ';if(base.kind==='default')label+=same?'default':'custom (unsaved)';else label+=(base.name||'custom')+(same?'':' (modified)');if(status)status.textContent=label;if(wrap)wrap.classList.toggle('layout-unsaved',!same);if(typeof dashboardRenderLayoutPresets==='function')dashboardRenderLayoutPresets();}
     function dashboardUpdateResetButton(){dashboardUpdateLayoutMenuState();}
-    function dashboardLayoutWrite(){try{localStorage.setItem(DASHBOARD_LAYOUT_KEY,JSON.stringify(dashboardLayoutCurrent()));}catch(e){}dashboardUpdateResetButton();dashboardSortSidebar();}
+    function dashboardLayoutWrite(){if(window.hiveDisplayMode&&window.hiveDisplayMode())return;try{localStorage.setItem(DASHBOARD_LAYOUT_KEY,JSON.stringify(dashboardLayoutCurrent()));}catch(e){}dashboardUpdateResetButton();dashboardSortSidebar();}
     function dashboardApplySnapshotState(state){state=dashboardNormalizeSnapshot(state);try{localStorage.setItem(DASHBOARD_LAYOUT_KEY,JSON.stringify(state.layout));dashboardLayoutAllIds().forEach(function(id){writeSectionCollapsedKey(id,!!state.collapsed[id]);});dashboardHiddenSectionsWrite(Object.keys(state.hidden||{}));var keep=state.extras||{};dashboardLayoutExtraKeys().forEach(function(k){if(!Object.prototype.hasOwnProperty.call(keep,k))localStorage.removeItem(k);});Object.keys(keep).forEach(function(k){localStorage.setItem(k,keep[k]);});}catch(e){}dashboardApplyLayout(state.layout);dashboardLayoutAllIds().forEach(applySectionCollapse);dashboardApplyHiddenSections();if(typeof repaintReposForWidth==='function')repaintReposForWidth();if(typeof renderAgents==='function')renderAgents(((window._lastStatus||{}).agents)||[]);if(typeof ocUpdateSidebarAgents==='function')ocUpdateSidebarAgents();dashboardUpdateLayoutMenuState();}
     function dashboardRenderLayoutPresets(){var list=document.getElementById('oc-gh-menu-layout-list');if(!list)return;var presets=dashboardReadLayoutPresets();if(!presets.length){list.innerHTML='<div class="avatar-menu-layout-empty">No saved layouts yet.</div>';return;}list.innerHTML=presets.map(function(p){return '<div class="avatar-menu-layout-snapshot"><span class="avatar-menu-layout-name" title="'+esc(p.name||DASHBOARD_LAYOUT_DEFAULT_NAME)+'">'+esc(p.name||DASHBOARD_LAYOUT_DEFAULT_NAME)+'</span><button type="button" class="avatar-menu-layout-action" data-action="applyDashboardLayoutPreset" data-arg0="'+esc(p.id)+'">Apply</button><button type="button" class="avatar-menu-layout-action" data-action="renameDashboardLayoutPreset" data-arg0="'+esc(p.id)+'">Rename</button><button type="button" class="avatar-menu-layout-action" data-action="deleteDashboardLayoutPreset" data-arg0="'+esc(p.id)+'">Delete</button></div>';}).join('');}
     function toggleDashboardLayoutPresets(){var list=document.getElementById('oc-gh-menu-layout-list'),btn=document.getElementById('oc-gh-menu-layout-saved');if(!list)return;list.hidden=!list.hidden;if(btn){btn.setAttribute('aria-expanded',String(!list.hidden));btn.textContent=list.hidden?'Saved layouts ▸':'Saved layouts ▾';}dashboardRenderLayoutPresets();}
@@ -256,7 +256,9 @@
       if (stored === 'classic') { stored = 'dark'; setLayout(stored); }
       return LAYOUT_MODES.includes(stored) ? stored : 'light';
     }
-    function setLayout(mode) { localStorage.setItem(LAYOUT_KEY, mode); }
+    // Display mode (#15925) is a shared wall screen: a theme flip there
+    // applies to the page only and never becomes the profile's preference.
+    function setLayout(mode) { if (window.hiveDisplayMode && window.hiveDisplayMode()) return; localStorage.setItem(LAYOUT_KEY, mode); }
     function applyLayout(mode) {
       document.body.classList.toggle('light-mode', mode === 'light');
       const customStyleRoot = document.getElementById('hive-dashboard-root');
@@ -346,7 +348,7 @@
       }
       if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', start);
-      } else { start(); }
+      } else { queueMicrotask(start); }
     })();
 
     const OC_TOPBAR_HEIGHT = 64;

@@ -256,8 +256,8 @@
     // The RUNNING tile rotates its cost window — this hour → today → this
     // week → this month — one phrase at a time (#15614). The agent count
     // stays put; only the amount + window phrase crossfades. All four
-    // phrases are rendered into the same grid cell so the tile is always as
-    // wide as its widest phrase and never shifts or wraps. The rotation
+    // phrases share a grid cell below the count, reserving room for the
+    // tallest wrapped phrase without shifting on rotation. The rotation
     // index is module state so a status repaint keeps the current phrase.
     // The hour window keeps cents (it is small and moves fast); the longer
     // windows round to whole dollars (fmtUSDWhole) so the figure stays short.
@@ -339,13 +339,13 @@
       const f = window._lastStatus?.fleetRun;
       if (!f) return '';
       fleetCostRotorStart();
-      return `<div class="gov-stat fleet-run-stat" data-fleet-cost-host title="RUNNING — agents mid-kick right now · estimated spend accrued by the whole fleet (token × list price; $– when a running agent's model is unpriced).&#10;&#10;${esc(fleetCostTooltipLines(f))}&#10;&#10;${FLEET_COST_WINDOWS_HELP}&#10;&#10;Updates with every status poll; the per-agent breakdown is on each card's run line in Agents."><div class="label">running</div><div class="val" id="gov-fleet-run"><span class="fleet-run-count">${f.running || 0} · </span>${fleetCostRotorHtml(f)}</div></div>`;
+      return `<div class="gov-stat fleet-run-stat" data-fleet-cost-host title="RUNNING — agents mid-kick right now · estimated spend accrued by the whole fleet (token × list price; $– when a running agent's model is unpriced).&#10;&#10;${esc(fleetCostTooltipLines(f))}&#10;&#10;${FLEET_COST_WINDOWS_HELP}&#10;&#10;Updates with every status poll; the per-agent breakdown is on each card's run line in Agents."><div class="label">running</div><div class="val" id="gov-fleet-run"><span class="fleet-run-count">${f.running || 0}</span>${fleetCostRotorHtml(f)}</div></div>`;
     }
     function fleetRunStripHtml() {
       const f = window._lastStatus?.fleetRun;
       if (!f) return '';
       fleetCostRotorStart();
-      return `<div class="gov-metric fleet-run-stat" data-fleet-cost-host title="Agents mid-kick right now · estimated spend accrued by the whole fleet (token × list price)&#10;&#10;${esc(fleetCostTooltipLines(f))}&#10;&#10;${FLEET_COST_WINDOWS_HELP}"><span class="gm-label">running</span><span class="gm-val" id="oc-fleet-run"><span class="fleet-run-count">${f.running || 0} · </span>${fleetCostRotorHtml(f)}</span></div>`;
+      return `<div class="gov-metric fleet-run-stat" data-fleet-cost-host title="Agents mid-kick right now · estimated spend accrued by the whole fleet (token × list price)&#10;&#10;${esc(fleetCostTooltipLines(f))}&#10;&#10;${FLEET_COST_WINDOWS_HELP}"><span class="gm-label">running</span><span class="gm-val" id="oc-fleet-run"><span class="fleet-run-count">${f.running || 0}</span>${fleetCostRotorHtml(f)}</span></div>`;
     }
 
     // Repaints every "Now:" line in place so "ago" keeps counting up (and
@@ -486,7 +486,7 @@
     // "workflow-files" / "untrusted-author" / "branch-protection", falling
     // back to "policy"); the tooltip carries the payload's one-sentence
     // human_merge_reason_text (hivecommons/hive#14658).
-    const STAGE_TRACKER_HUMAN_MERGE_REASON_WORD = { 'workflow-files': 'workflow files', 'tests-removed': 'tests removed', 'manual-merge-policy': 'manual-merge policy', 'branch-protection': 'branch protection', 'merge-method': 'merge method', 'auto-merge-off': 'auto-merge off', 'untrusted-author': 'untrusted author', 'unauthorized': 'unauthorized', 'reviewer-deferred': 'reviewer deferred', 'breaking-change': 'human merge', 'policy': 'policy' };
+    const STAGE_TRACKER_HUMAN_MERGE_REASON_WORD = { 'workflow-files': 'workflow files', 'tests-removed': 'tests removed', 'manual-merge-policy': 'manual-merge policy', 'branch-protection': 'branch protection', 'merge-method': 'merge method', 'auto-merge-off': 'auto-merge off', 'untrusted-author': 'untrusted author', 'unauthorized': 'hive bot lacks permission', 'reviewer-deferred': 'reviewer deferred', 'breaking-change': 'human merge', 'policy': 'policy' };
     // 090 under the breaking-change rule (human_merge_reason
     // "breaking-change": a ⚠️ title or needs-owner-merge label,
     // hivecommons/hive#15442): no approval lets the hive merge it, so the

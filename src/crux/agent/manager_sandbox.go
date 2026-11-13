@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hivecommons/hive/crux"
@@ -14,6 +16,28 @@ import (
 	"github.com/hivecommons/hive/crux/pushbroker"
 	"github.com/hivecommons/hive/crux/sandbox"
 )
+
+func init() {
+	config.SetOpenShellPreflight(openShellPreflightWarnings)
+	config.SetSubstratePreflight(substratePreflightWarnings)
+}
+
+// openShellPreflightWarnings checks each distinct gateway the openshell
+// agents resolve to, once.
+func openShellPreflightWarnings(blocks []config.SandboxOpenShellConfig) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, b := range blocks {
+		opts := OpenShellOptionsFromConfig(b)
+		key := opts.GatewayURL + "\x00" + opts.Token
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, sandbox.DefaultOpenShellPreflighter.Check(context.Background(), opts)...)
+	}
+	return out
+}
 
 // SetSandboxConfig wires the disabled-by-default sandbox kick executor gate.
 func (m *Manager) SetSandboxConfig(cfg config.AgentSandboxConfig) {
@@ -90,12 +114,36 @@ func (m *Manager) validateSandboxKickLocked(agent *AgentProcess) (string, error)
 	// does, instead of failing it after the state machine has moved.
 	runtime := agent.Config.SandboxRuntime(m.sandboxConfig)
 	if !config.ValidSandboxRuntimes[runtime] {
-		return "", fmt.Errorf("agent %s sandbox runtime %q is not one hive has (%s or %s)", agent.Name, runtime, config.SandboxRuntimePodman, config.SandboxRuntimeJob)
+		return "", fmt.Errorf("agent %s sandbox runtime %q is not one hive has (%s, %s, %s or %s)", agent.Name, runtime, config.SandboxRuntimePodman, config.SandboxRuntimeJob, config.SandboxRuntimeOpenShell, config.SandboxRuntimeSubstrate)
 	}
-	if runtime == config.SandboxRuntimeJob {
+	switch runtime {
+	case config.SandboxRuntimeJob:
 		job := agent.Config.SandboxJob(m.sandboxConfig)
 		if strings.TrimSpace(job.WorkspaceClaim) == "" {
 			return "", fmt.Errorf("agent %s sandbox job runtime requires job.workspace_claim — the PVC hive's sandbox workspace root lives on, mounted RWX so the Job can see it from another node", agent.Name)
+		}
+	case config.SandboxRuntimeOpenShell:
+		// ADR-0026: the OpenShell runtime is inert unless selected, and a
+		// selected one refuses the kick before the state machine moves.
+		if err := OpenShellOptionsFromConfig(agent.Config.SandboxOpenShell(m.sandboxConfig)).Validate(); err != nil {
+			return "", fmt.Errorf("agent %s sandbox openshell runtime: %w", agent.Name, err)
+		}
+		if effectiveBackend(agent) == "cline" {
+			return "", fmt.Errorf("agent %s: the Cline backend is not supported on the openshell sandbox runtime (no credential path into the sandbox); use podman or job", agent.Name)
+		}
+	case config.SandboxRuntimeSubstrate:
+		// ADR-0026 phase 2: same contract as openshell — inert unless
+		// selected, refused before the state machine moves.
+		if err := SubstrateOptionsFromConfig(agent.Config.SandboxSubstrate(m.sandboxConfig)).Validate(); err != nil {
+			return "", fmt.Errorf("agent %s sandbox substrate runtime: %w", agent.Name, err)
+		}
+		if effectiveBackend(agent) == "cline" {
+			return "", fmt.Errorf("agent %s: the Cline backend is not supported on the substrate sandbox runtime (no credential path into the sandbox); use podman or job", agent.Name)
+		}
+	}
+	if effectiveBackend(agent) == "cline" {
+		if err := validateClineSandbox(agent, runtime, agent.Config.SandboxJob(m.sandboxConfig), m.project.TaskMCPURL); err != nil {
+			return "", err
 		}
 	}
 	return runtime, nil
@@ -108,13 +156,22 @@ func (m *Manager) startSandboxKickLocked(agent *AgentProcess, message, source st
 	}
 	repo := m.project.PrimaryRepo()
 	launcher := m.sandboxLauncher
-	if runtime == config.SandboxRuntimeJob {
-		job := agent.Config.SandboxJob(m.sandboxConfig)
-		launcher = m.jobLauncherLocked(job)
+	switch runtime {
+	case config.SandboxRuntimeJob:
+		launcher = m.jobLauncherLocked(agent.Config.SandboxJob(m.sandboxConfig))
+	case config.SandboxRuntimeOpenShell:
+		launcher = m.openshellLauncherLocked(agent.Config.SandboxOpenShell(m.sandboxConfig))
+	case config.SandboxRuntimeSubstrate:
+		launcher = m.substrateLauncherLocked(agent.Config.SandboxSubstrate(m.sandboxConfig))
 	}
 	now := time.Now()
 	agent.State = StateRunning
 	agent.StartedAt = &now
+	// Each sandbox kick is a launch: the generation lets the run goroutine
+	// detect that a later kick or restart superseded it (manager_kick.go uses
+	// the same token for stale startup kicks).
+	agent.launchGen++
+	gen := agent.launchGen
 	agent.LastKick = &now
 	agent.LastKickMessage = message
 	agent.LastKickSource = source
@@ -141,15 +198,17 @@ func (m *Manager) startSandboxKickLocked(agent *AgentProcess, message, source st
 	spec := SandboxKickSpec{
 		Agent: agent.Name,
 		AgentConfig: configSnapshot{
-			Backend:   effectiveBackend(agent),
-			Model:     agent.Config.Model,
-			LaunchCmd: agent.Config.LaunchCmd,
+			Backend:         effectiveBackend(agent),
+			Model:           agent.Config.Model,
+			LaunchCmd:       agent.Config.LaunchCmd,
+			ReasoningEffort: agent.Config.ReasoningEffort,
 		},
 		Message:       message,
 		Org:           m.project.Org,
 		Repo:          repo,
 		WorkspaceDir:  m.sandboxWorkspaceDirLocked(),
 		Image:         agent.Config.SandboxImage(m.sandboxConfig),
+		Runtime:       runtime,
 		EnvAllowlist:  agent.Config.SandboxEnvAllowlist(m.sandboxConfig),
 		NetworkMode:   agent.Config.SandboxNetworkMode(m.sandboxConfig),
 		Timeout:       time.Duration(agent.Config.SandboxTimeoutS(m.sandboxConfig)) * time.Second,
@@ -158,6 +217,9 @@ func (m *Manager) startSandboxKickLocked(agent *AgentProcess, message, source st
 		// Every sandbox kick gets a review spool (hivecommons/hive#14986);
 		// whether the agent may post through it is the relay's decision.
 		ReviewSpoolDir: crux.SandboxReviewSpoolsDir(m.workDir),
+	}
+	if spec.AgentConfig.Backend == "cline" {
+		spec.AgentConfig.Model = agent.effectiveModel()
 	}
 	// The verify list comes from config only. A kick message is not a trusted
 	// source for commands: by the time it reaches the manager it carries
@@ -180,8 +242,7 @@ func (m *Manager) startSandboxKickLocked(agent *AgentProcess, message, source st
 		prClient = m.sandboxPRClient
 		pushEnabled = true
 	}
-	go m.runSandboxKick(runCtx, agent.Name, runtime, spec, launcher, runner, cloneMinter, pushMinter, pushEnabled, prClient, mutationBoundary)
-	m.notifyKickObserver(agent.Name, KickObserverEventDelivered, source)
+	go m.runSandboxKick(runCtx, agent, gen, runtime, spec, launcher, runner, cloneMinter, pushMinter, pushEnabled, prClient, mutationBoundary)
 	return nil
 }
 
@@ -206,8 +267,10 @@ func (m *Manager) tieredSandboxMinterLocked(tier string) pushbroker.TokenMinter 
 	}
 }
 
-func (m *Manager) runSandboxKick(ctx context.Context, name, runtime string, spec SandboxKickSpec, launcher sandbox.Launcher, runner sandboxCommandRunner, cloneMinter, minter pushbroker.TokenMinter, pushEnabled bool, prClient PRCreator, mutationBoundary effects.Boundary) {
+func (m *Manager) runSandboxKick(ctx context.Context, agent *AgentProcess, gen int, runtime string, spec SandboxKickSpec, launcher sandbox.Launcher, runner sandboxCommandRunner, cloneMinter, minter pushbroker.TokenMinter, pushEnabled bool, prClient PRCreator, mutationBoundary effects.Boundary) {
+	name := agent.Name
 	started := time.Now()
+	var accepted atomic.Bool
 	exec := &SandboxExecutor{
 		Launcher:    launcher,
 		Runner:      runner,
@@ -217,6 +280,16 @@ func (m *Manager) runSandboxKick(ctx context.Context, name, runtime string, spec
 		PRClient:    prClient,
 		Mutation:    mutationBoundary,
 		Logger:      m.logger,
+		onStarted: func() {
+			accepted.Store(true)
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if m.agents[name] == agent && agent.launchGen == gen {
+				agent.ConsecutiveKickFailures = 0
+				agent.LastKickError = ""
+				m.notifyKickObserver(name, KickObserverEventDelivered, agent.LastKickSource)
+			}
+		},
 	}
 	res, err := exec.Run(ctx, spec)
 	ended := time.Now()
@@ -241,9 +314,12 @@ func (m *Manager) runSandboxKick(ctx context.Context, name, runtime string, spec
 	}()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	agent, ok := m.agents[name]
-	if !ok {
+	current, ok := m.agents[name]
+	if !ok || current != agent || agent.launchGen != gen {
 		return
+	}
+	if err != nil && !accepted.Load() {
+		recordKickFailureLocked(agent, err)
 	}
 	agent.cancel = nil
 	kickSource := agent.LastKickSource
@@ -342,6 +418,48 @@ func (m *Manager) jobLauncherLocked(job config.SandboxJobConfig) sandbox.Launche
 		return m.sandboxJobLauncherFactory(job)
 	}
 	return &kubejob.Launcher{Options: JobOptionsFromConfig(job)}
+}
+
+func (m *Manager) setSandboxOpenShellLauncherFactoryForTest(f func(config.SandboxOpenShellConfig) sandbox.Launcher) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sandboxOpenShellLauncherFactory = f
+}
+
+// openshellLauncherLocked returns the launcher for a sandbox.runtime:
+// openshell kick: the injected factory's, or a real gateway-backed
+// sandbox.OpenShellLauncher (ADR-0026).
+func (m *Manager) openshellLauncherLocked(cfg config.SandboxOpenShellConfig) sandbox.Launcher {
+	if m.sandboxOpenShellLauncherFactory != nil {
+		return m.sandboxOpenShellLauncherFactory(cfg)
+	}
+	return &sandbox.OpenShellLauncher{Options: OpenShellOptionsFromConfig(cfg)}
+}
+
+// OpenShellOptionsFromConfig converts the operator's openshell block into
+// the launcher's options. The gateway token is read from the environment
+// variable the block names, so the token itself never sits in hive.yaml.
+func OpenShellOptionsFromConfig(cfg config.SandboxOpenShellConfig) sandbox.OpenShellOptions {
+	opts := sandbox.OpenShellOptions{
+		GatewayURL:          cfg.GatewayURL,
+		Workspace:           cfg.Namespace,
+		PolicyProfile:       cfg.PolicyProfile,
+		InsecureTLS:         cfg.InsecureTLS,
+		Timeout:             time.Duration(cfg.TimeoutS) * time.Second,
+		WorkspaceClaim:      cfg.WorkspaceClaim,
+		WorkspaceClaimMount: cfg.WorkspaceClaimMount,
+		AllowHosts:          append([]string(nil), cfg.AllowHosts...),
+		Binaries:            append([]string(nil), cfg.Binaries...),
+		RuntimeClassName:    cfg.RuntimeClassName,
+		NodeSelector:        cfg.NodeSelector,
+	}
+	if env := strings.TrimSpace(cfg.TokenEnv); env != "" {
+		opts.Token = os.Getenv(env)
+	}
+	for _, t := range cfg.Tolerations {
+		opts.Tolerations = append(opts.Tolerations, sandbox.OpenShellToleration{Key: t.Key, Operator: t.Operator, Value: t.Value, Effect: t.Effect})
+	}
+	return opts
 }
 
 // JobOptionsFromConfig converts the operator's job block into the launcher's

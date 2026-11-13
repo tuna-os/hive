@@ -90,7 +90,12 @@ control character, and rerun.
 the body actually references each declared issue — `Fixes #N`, or `Refs #N`
 when part of the issue deliberately stays open — and rejects the request
 otherwise. Pass it whenever the run started from an issue, so a truncated or
-replaced body cannot open a PR that orphans its issue.
+replaced body cannot open a PR that orphans its issue. Issue numbers start at
+1: `--issues 0` is the `<N>` placeholder left unsubstituted and is refused by
+the script, and a request that still carries a `0` is rejected by the watcher
+as a placeholder rather than as a body that "never references" it — no body
+can reference `#0`, so the usual re-run-with-the-full-body remedy would only
+loop ([#16162](https://github.com/hivecommons/hive/issues/16162)).
 
 When the PR body resolves an issue (`Fixes #N`, `Closes #N`, or
 `Resolves #N`), add the issue-author trailer before the first push with
@@ -169,11 +174,21 @@ possible fields are `agent`, `backend`, `model`, `effort`, `<tool>=<version>`,
 `session`, and `requested_by`. The trailer is gated by
 `governor.attribution_trailer` (default ON), but the matching audit entry
 (`agent_pr_created` in `audit.jsonl`, same key=value pairs — see
-[audit-log.md](audit-log.md)) is written regardless of the toggle. The `— hive:`
-prefix doubles as the stacking guard: a request the watcher retries after a
-partial failure will not gain a second trailer. Do not write a `— hive:` line
-into your own body — the watcher will treat it as an existing trailer and skip
-its own.
+[audit-log.md](audit-log.md)) is written regardless of the toggle. A line that
+starts with `— hive:` doubles as the stacking guard: a request the watcher
+retries after a partial failure will not gain a second trailer. Do not start a
+line of your own body with `— hive:` — the watcher will treat it as an existing
+trailer and skip its own. Mentioning the prefix inside a sentence is fine: only
+a line that begins with it counts, which is also how the repositories' monthly
+agent audit reads it.
+
+A later `gh pr edit <n> --body …` (or `--body-file`, or `-F -`) on a PR the hive
+opened keeps the trailer. gh replaces the whole body, so the `gh` wrapper
+re-appends the PR's current `— hive:` line to the new text when no line of
+that text starts with `— hive:`. A PR another account opened is edited exactly as written, and
+a PR whose body has no trailer gets none. An edit made any other way, such as
+`gh api` against the pulls endpoint, bypasses the wrapper and can still drop
+the line.
 
 ### `requested_by` credits the human who asked
 
@@ -250,6 +265,26 @@ so a maintainer reading the PR can tell a watcher rewrite from a deliberate
 rewritten without the note. The hive log carries the same reason under
 `pr-request watcher: downgraded closing reference to Refs`, but that log has a
 retention window and the PR body does not.
+
+### `Closes #N` on an issue someone else is working is rejected
+
+Before the request books a start on any issue, the watcher checks every issue
+your title or body closes ([#17298](https://github.com/hivecommons/hive/issues/17298)).
+The request is rejected (gate `claim`) when the issue has a live claim held by
+anyone other than you — a contributor, a person, or another agent — or is
+covered by an open PR from an author outside the hive. Your own claim and the
+hive's own PR pass. This applies whether the work was dispatched from the issue
+or arrived through an epic. The hive posts one notice on the issue (marker
+`<!-- hive:pr-request-claim-target -->`, edited in place on repeat refusals)
+saying who holds it; the owner decides whether to proceed. If the claim or the
+covering PR cannot be read, the request is not opened and is retried later.
+
+The same check runs on the start path: a `hive-open-issue claim`, or a relay
+comment that announces a start on an issue, is denied with the same reason
+before anything is written and before the start is booked; the notice on the
+issue then says a claim or a start was asked for, not a PR, so
+epic-driven work that never claimed its target is caught when it starts, not
+only when it opens the PR.
 
 ### Base drift: a branch cut from the wrong line is rejected
 
@@ -367,26 +402,37 @@ recognise it.
 The branch is not implicated at all. Fix the App installation — see
 [GitHub App setup](github-app-setup.md).
 
-**2. The repository is visible but the head ref is genuinely absent.** This is
-the push-authentication case, and the error says so:
+**2. The repository is visible but the head ref is genuinely absent.** The
+branch is not where the watcher looked, and the error says what it checked:
 
-> branch `<branch>` was never pushed to `<owner>/<repo>` — the commits exist only in the agent's working copy. This is almost always a PUSH AUTHENTICATION failure, not a branch-creation problem
+> branch `<branch>` is not on `<owner>/<repo>` — the commits exist only in the agent's working copy, or were pushed under another name or to another remote
 
-It names the two causes to check, in order:
+It names the three things to check, in order:
 
-1. **The git credential helper is not reachable from the agent's UID.**
+1. **The push's own outcome.** A `hive-push-branch` relay push leaves
+   `<request>.result.json` under `/var/run/hive-metrics/push-requests`; a
+   direct `git push` printed its result in the agent's pane. The watcher's
+   log line (below) already carries the relay's record as `push_outcome`.
+2. **The git credential helper is not reachable from the agent's UID.**
    `su -s /bin/sh hive-<agent> -c 'git config --get-regexp credential'` must
    list `/usr/local/bin/git-credential-hive.sh`. It is wired system-wide in
    `/etc/gitconfig` precisely because agents do not share the dev user's
    `$HOME`.
-2. **The agent's scoped token file is absent or unreadable by that UID.** The
+3. **The agent's scoped token file is absent or unreadable by that UID.** The
    path is in `$HIVE_AGENT_TOKEN_CACHE`. Check readability only — never print
    its contents.
 
 This stays a **retryable** error rather than a policy rejection: once the agent
 pushes the branch, the same request becomes valid and succeeds on retry. That
-is exactly what the bounded retry is for, so fix the credential problem and let
-the queued request land — you do not need to re-issue it.
+is exactly what the bounded retry is for, so fix the push problem and let the
+queued request land — you do not need to re-issue it.
+
+`hive-open-pr` itself warns at request time when the head is not known to be
+on the remote ([#16969](https://github.com/hivecommons/hive/issues/16969)): it
+checks the checkout's remote-tracking ref and, failing that, one
+`git ls-remote` of the exact ref. The warning names the branch, the remote and
+the push step; the request is still written, because a relay push may be in
+flight. Set `HIVE_OPEN_PR_SKIP_REMOTE_CHECK=1` to silence it.
 
 **3. The head ref exists, so the 404 was about something else.** Usually the
 base:
@@ -408,8 +454,16 @@ since the agent's session ended healthy:
 kubectl -n hive logs deploy/hive | grep 'pr-request watcher'
 ```
 
-Look for `head branch is not on the remote — the agent's push did not
-authenticate`, which carries `repo`, `head`, `agent`, and the full `diagnosis`.
+Look for `head branch is not on the remote`, which carries `repo`, `head`,
+`checked` (the exact ref and repository the watcher asked GitHub for),
+`push_outcome` (what the push relay recorded for that branch — queued, pushed
+as `<sha>`, failed with the git error, or no record because the agent pushed
+directly), `attempt`, `agent`, and the full `diagnosis`. It is logged **once
+per request**: retries of the same request log `head branch still not on the
+remote, retrying` at INFO, and the eventual success logs `request succeeded
+on retry` ([#16969](https://github.com/hivecommons/hive/issues/16969) — a
+single unpushed branch used to re-log at ERROR every retry and file a fleet
+self-report before the branch arrived).
 
 For the broader symptom — an agent that completed a session with no branch and
 no PR, and how to tell a credential-helper failure from a mid-task token

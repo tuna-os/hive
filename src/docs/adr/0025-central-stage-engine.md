@@ -52,14 +52,14 @@ hub read that store and nothing else (`stageStoreOrShared`,
    `SyncIssueStageLabels` (`src/pkg/github/issue_stage_labels.go:205`,
    `src/pkg/github/issue_stage_labels.go:337`) from the enumeration bucket. PRs
    are staged by the automerge engine: each lane calls `recordStage`
-   (`src/pkg/github/automerge/automerge_stage_labels.go:365`), observations are
+   (`src/pkg/github/automerge/automerge_stage_labels.go:555`), observations are
    sorted by `stageLanePrecedence` (self 3 > trusted 2 > contributor 1,
-   `src/pkg/github/automerge/automerge_stage_labels.go:177`), each is classified
-   by `ClassifyStage` (`src/pkg/stageengine/derive_pr_classify.go:261`)
+   `src/pkg/github/automerge/automerge_stage_labels.go:245`), each is classified
+   by `ClassifyStage` (`src/pkg/stageengine/derive_pr_classify.go:344`)
    into a ranked opinion (`prstage.RankNone..prstage.RankOwned`,
-   `src/pkg/stageengine/prstage/types.go:145-148`), and
+   `src/pkg/stageengine/prstage/types.go:216-219`), and
    `ResolveStage` picks the winner
-   (`src/pkg/stageengine/derive_pr_classify.go:454`). These PR helpers now
+   (`src/pkg/stageengine/derive_pr_classify.go:720`). These PR helpers now
    live in the engine (#13779); automerge keeps only gathering-side previews. Shared concepts —
    parking (045/085, `needs-human`, hold labels), author kind (070/071/072),
    adoption (074), terminal states, `origin/*` — are modelled twice with
@@ -424,6 +424,15 @@ issue-level hard suppress; `DeriveIssue` reproduces it from the label (or the
 enumerator's filtered-reason) the way it reproduces 045 from `needs-spec`,
 and the resume sweep removes it on `/hive decision proceed` / `exists`.
 Leaving 017 for 010 or closed is never a regression.
+
+**Open for discussion (`stage/018-open-for-discussion`, #17150).** Added
+after the epic: an issue-only stage between 017 and 020 with no dwell.
+Unlike 017 it is derived, not written by a gate: `DeriveIssue` returns it
+for an open issue labelled `proposal` or `kind/design` with no live claim
+(`IssueFacts.DiscussionLabel`, resolved in `pkg/github`), reason
+`open for discussion: <label>`. It is not a suppress: the claim gate is
+unchanged and a claim stages 020/030. `040 → 018` under
+`hive/partially-addressed` is progress; leaving 018 is never a regression.
 
 ## Consequences
 

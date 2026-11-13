@@ -287,7 +287,7 @@ confirming counter is `oom_kill` in `/sys/fs/cgroup/memory.events`
 
 Agents run in tmux sessions named `hive-<agent>` managed by Hive's agent manager. There is no v1 `AGENT_READY_MARKER` or `bin/supervisor.sh` loop: the manager drives each agent by delivering a *kick* (its next work prompt) directly into the session and, once running, auto-dismisses the CLI's own startup consent screens.
 
-The login detector (`scanForLoginRequired` in `src/cmd/hive/main.go`) scans recent tmux pane output for the regexes in `governor.sensing.login_patterns`. On a match it logs `login required detected`, pauses the agent, and sends a high-priority notification telling you to attach to `hive-<agent>` and run that backend's login command.
+The login detector (`scanForLoginRequired` in `src/cmd/hive/main.go`) scans recent tmux pane output for the regexes in `governor.sensing.login_patterns`. On a match it logs `login required detected`, pauses the agent, and sends a high-priority notification telling you to attach to `hive-<agent>` and run that backend's login command. For a `claude` agent running on the operator's long-lived token (`HIVE_CLAUDE_OAUTH_TOKEN` or its `_FILE` source) the notification is titled `Claude token rejected: <agent>` instead and omits the login command, since `/login` cannot fix a rejected token; follow [Replace a Claude operator token](backend-auth-recovery-runbook.md#replace-a-claude-operator-token) in the runbook.
 
 Useful checks from inside the Hive container/pod:
 
@@ -303,6 +303,8 @@ To recover a paused agent:
 
 1. Complete the CLI login for that backend outside the pause. Attach to the session (`tmux attach -t hive-<agent>`) and run the login command shown in the notification: `claude login`, `copilot auth login`, `gemini auth login`, or the backend-specific command. The picker expects an interactive OAuth/browser flow, so complete it from a terminal you control rather than leaving the unattended session blocked on it.
 2. Resume the agent from the dashboard, or `POST /api/resume/{agent}`. If the pause outlived its session, the card offers a single `▶ start & resume` instead — see [Start on the agent card, not in tmux](#start-on-the-agent-card-not-in-tmux).
+
+For `claude` agents you rarely need step 2. A successful dashboard Claude sign-in (the agent card's **Sign in Claude for all agents** button, which is one fleet-wide sign-in, not a per-agent login) resumes every claude agent that the login detector paused. It resumes only those: a pause with any other trigger, such as an operator's (`dashboard-api`), the fleet breaker's or a hook's, stays as it is. Each resume is in the Audit Log as `resume` with `trigger=claude-sign-in`, and the sign-in's `claude_auth_complete` entry lists the agents it resumed. The sign-in also re-links any agent whose credential link a token refresh had broken; such an agent's card says **credential bridge broken (private stale file)** until then (see [the agent watchdog notes](agent-watchdog.md#some-claude-agents-stay-on-login-expired-after-a-sign-in)).
 
 If an agent returns to "needs login" immediately after resuming, the credentials themselves are the problem (expired token, revoked API key, or an account-level sign-out). Re-authenticate that backend's CLI as the agent user, then resume again so the fresh session is picked up.
 
@@ -572,6 +574,24 @@ a login prompt: it badged the agent 🔑, and — because a valid token was on d
 auto-restarted it straight back into the same 403, which looked like the agent
 crash-looping. Hive no longer treats a 403 as a login signal; a 401 still is.
 
+## An agent shows "model … rejected by the CLI"
+
+```
+● There's an issue with the selected model (claude-sonnet-5.5). It may not exist or you may not have access to it. Run /model to pick a different model.
+```
+
+That is Claude Code refusing the model id the agent was launched with. The agent's login is fine, which is why its AUTH badge still says logged in; the model id is the problem. Usually it is a typo, such as `claude-sonnet-5.5` where the id is `claude-sonnet-5-5`, or a model this account cannot use.
+
+What hive does about it:
+
+- The agent card shows **blocked: inference (model_rejected): model `<id>` rejected by the CLI: …**, and `/api/status` carries the same text in the agent's status evidence and `lastError`.
+- Kicks back off instead of re-sending work into the same refusal. The first wait is 2 minutes and it doubles after each refusal, using the same backoff as other provider errors (`HIVE_PROVIDER_ERROR_BACKOFF_BASE` and `HIVE_PROVIDER_ERROR_BACKOFF_MAX` in [env-vars.md](env-vars.md)). Automatic restarts are held for the same window, because a restart relaunches with the same `--model` and cannot fix it.
+- After **3 refusals of the same id in a row** (one per kicked turn), the agent is paused with trigger `model-rejected` and the reason `model <id> rejected by the CLI 3 times in a row; set a valid model for this agent (the change resumes it)`.
+
+To fix it, set a valid model for the agent (the model picker on its dashboard card or its settings dialog, `PUT /api/config/agent/{name}/models`, or `hivectl agent model-set`). Changing the model or the backend resumes an agent with the `model-rejected` pause and restarts it on the new model, so you do not need to resume it as well; the audit log records the resume with trigger `model-change`. A change does not lift any other pause: an agent you paused yourself stays paused. Picking a different model also clears the backoff at once. If you resume without changing the model, the agent gets three fresh tries and is paused again if the CLI still refuses it, and the same happens if the new model is refused too.
+
+Before this, nothing classified the refusal. Each relaunch cleared the agent's last error, the card showed a healthy, logged-in agent, and the agent kept cycling between kicks and restarts (502 restarts in 24 hours on one hive).
+
 ## Every Copilot agent says "You are not licensed to use Copilot"
 
 ```
@@ -743,7 +763,7 @@ Or from the dashboard (which calls `POST /api/model/{agent}/{model}`). Both pers
 
 Two gotchas:
 
-- **Slug spelling is backend-specific.** The Claude CLI expects hyphens (`claude-opus-4-8`); Copilot uses dots (`claude-opus-4.8`). A mis-normalized slug is rejected by that backend. The dashboard offers candidate ids from live `/v1/models` discovery, with a static fallback list in `src/pkg/dashboard/cli_models.go`.
+- **Slug spelling is backend-specific.** The Claude CLI expects hyphens (`claude-opus-4-8`); Copilot uses dots (`claude-opus-4.8`). A mis-normalized slug is rejected by that backend. The dashboard offers candidate ids from live `/v1/models` discovery, with a static fallback list in `src/pkg/dashboard/cli_models.go`. On the `claude` backend a dotted `claude-…` id is refused when you save it (`400`, with the dashed spelling suggested); see [Model ids are checked when you save them](agent-configuration.md#model-ids-are-checked-when-you-save-them).
 - **A change that is not operator-owned reverts on restart.** If the model appears to "come back" to the pack default, it was set through a path that did not mark it operator-owned. The `hivectl` and dashboard routes above set operator ownership precisely to prevent that reconciliation.
 
 ## Dashboard auth and access problems
@@ -802,7 +822,9 @@ when self-reporting is enabled, as a `[selfreport]` issue.
   mutation journal (`/data/convergence/mutation/journal.json` in the pod). Check whether the effect
   exists on GitHub; the owning call site reconciles it on its next pass, or
   the op resolves once the request behind it is removed. A watcher retrying
-  a doomed request keeps the op pinned, so fix the request first.
+  a doomed request keeps the op pinned, so fix the request first. An
+  `issue_create` op still refused after 1h is expired to NotApplied by the
+  boundary itself and the report clears.
 - **`unclassified_error_repeated`** — any WARN/ERROR line repeated five times
   in ten minutes. The report's message is the normalised line; grep the log
   for it (`kubectl -n hive logs deploy/hive | grep -F "<message>"`) to find

@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	wfstore "github.com/hivecommons/hive/pkg/workflowmodel/store"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,9 +24,11 @@ import (
 	"github.com/hivecommons/hive/pkg/dashboard/collect"
 	"github.com/hivecommons/hive/pkg/delegatedecision"
 	ghpkg "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/github/automerge"
 	"github.com/hivecommons/hive/pkg/governor"
 	"github.com/hivecommons/hive/pkg/hivestate"
 	"github.com/hivecommons/hive/pkg/hooks"
+	"github.com/hivecommons/hive/pkg/inbox"
 	"github.com/hivecommons/hive/pkg/knowledge"
 	"github.com/hivecommons/hive/pkg/mention"
 	"github.com/hivecommons/hive/pkg/nous"
@@ -35,6 +38,7 @@ import (
 	"github.com/hivecommons/hive/pkg/scheduler"
 	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/workflowmodel/ingest/cluster"
 )
 
 type ChatOutbound struct {
@@ -56,6 +60,35 @@ type ChatPoll struct {
 
 type Dependencies struct {
 	Config *config.Config
+	// WorkflowStore serves the workflow-model library (hivecommons/hive#17620).
+	// Nil disables the /api/workflows endpoints.
+	WorkflowStore *wfstore.Store
+	// WorkflowRepoFiles fetches a repository's default-branch CI definition
+	// files (repo-relative slash path -> contents) and the ref read, for
+	// POST /api/workflows/ingest. Nil disables ingest from a repository.
+	WorkflowRepoFiles func(ctx context.Context, repo string) (files map[string][]byte, ref string, err error)
+	// WorkflowItemSnapshot reads one issue or PR head-level for
+	// POST /api/workflows/{name}/{version}/simulate (RFC #17620 phase 3c)
+	// so the operator can simulate a real item. Nil disables the fetch; the
+	// handler then answers 422 and the form still accepts hand-set facts.
+	WorkflowItemSnapshot func(ctx context.Context, repo string, number int) (ghpkg.WorkflowItemSnapshot, error)
+	// WorkflowRepoFile fetches one default-branch file (a written process
+	// spec) for POST /api/workflows/ingest/spec {repo, path}. Nil disables
+	// repo-path spec ingest.
+	WorkflowRepoFile func(ctx context.Context, repo, path string) (string, error)
+	// WorkflowProvisionLabels creates (or recolours) one bound repository's
+	// stage and model labels now, for PUT /api/workflows/enabled turning
+	// derivation on. Nil leaves provisioning to the next sweep pass.
+	WorkflowProvisionLabels func(ctx context.Context, repo string) error
+	// WorkflowClusterRunner runs kubectl for POST /api/workflows/ingest/cluster
+	// (RFC #17620 phase 6). Nil means no kube access is configured on this
+	// spoke and the route answers 422.
+	WorkflowClusterRunner cluster.Runner
+	// WorkflowSpecLLM is the reviewer-gateway turn behind the optional LLM
+	// refinement of POST /api/workflows/ingest/spec. It is the only LLM use
+	// in the workflow-model stack; nil or an unconfigured gateway disables
+	// it and the route reports spec.llm=false in capabilities.
+	WorkflowSpecLLM delegatedecision.TurnRunner
 	// AgentMgr is the agent runtime (hivecommons/hive#13536). The dashboard
 	// programs against the crux.Runtime surface, not *agent.Manager; tests that
 	// need manager-only seams unwrap it with agentManager.
@@ -101,6 +134,9 @@ type Dependencies struct {
 	// KnowledgePublish is the running knowledge.publish mirror; nil when
 	// publishing is not configured or failed to start.
 	KnowledgePublish KnowledgePublishRuntime
+	// Inbox is the voice-source triage service; nil when no voice
+	// connector is configured.
+	Inbox *inbox.Service
 	// RotationMgr is the provider-rotation headroom reporter (RFC #3958). Nil
 	// when rotation is disabled; the headroom endpoint then reports
 	// enabled=false.
@@ -168,6 +204,11 @@ type Dependencies struct {
 	// OnACMMLevelChanged is called after an in-process runtime level change
 	// has been persisted/applied. Nil means no live component needs to react.
 	OnACMMLevelChanged func(prev, next int)
+	// IoscanConfigApplied is called after PUT /api/config/governor/security
+	// has changed an ioscan setting, so the owner of the scheduler can rebuild
+	// the semantic classifier from the new values without a restart. Nil means
+	// nothing caches.
+	IoscanConfigApplied func()
 	// ReviewConfigApplied is called after PUT /api/config/review has mutated
 	// Config.Review, so the owner of any component that caches review
 	// settings at boot (the GitHub client's revise allowlist and perspective
@@ -326,6 +367,8 @@ type Dependencies struct {
 	// durable mark for the sweep (Adopt now) call it so the pass runs now
 	// rather than on cadence. Nil leaves the mark for the next sweep.
 	SweepNudge func(repo string, number int)
+	// BasePreparation reads durable preparation tickets, never merge readiness.
+	BasePreparation func(repo, base string) (automerge.BasePreparationSnapshot, error)
 	// ApplyWebhookItems hands the targeted re-reads a webhook delivery
 	// caused (webhook_tracker_refresh.go) to the governor so its cached
 	// actionable snapshot is patched for those items only; the wake cycle
@@ -380,6 +423,11 @@ type EvalLoopStatus struct {
 	// counts items webhook re-reads upserted into that snapshot.
 	CachedCycles   int `json:"cachedCycles,omitempty"`
 	WebhookPatches int `json:"webhookPatches,omitempty"`
+	// APIBudgetPacing is the API budget pacing state
+	// (governor.api_budget_pacing): whether the loop interval is being
+	// stretched to make the GitHub budget last until the reset, by how much,
+	// and why. IntervalS above is already the paced interval.
+	APIBudgetPacing *ghpkg.APIBudgetPacing `json:"api_budget_pacing,omitempty"`
 }
 
 // NousScopeRepo is the only experiment scope the Experiment Lab supports.
@@ -655,6 +703,12 @@ func pruneNousSnapshots(dir string, entries []os.DirEntry, keep int) int {
 type SchedulerControl interface {
 	BuildAgentMessage(agentName string, issues []ghpkg.Issue, actionable *ghpkg.ActionableResult) string
 	BuildAgentMessageFromLastActionable(agentName string) string
+	// BuildAgentGuidanceForTask is the role's guidance without the resident
+	// agent's work lists or session steps, for a contributor working one
+	// assigned task in that role: knowledge primed from that issue, and the
+	// AGENTS.md of the task's repository. It reads no queue, classifies
+	// nothing and records no kick summary.
+	BuildAgentGuidanceForTask(agentName string, task ghpkg.Issue) string
 	FirstScanDone() bool
 	DeferKickUntilFirstScan(agentName string, deliver func(msg string))
 	GetLastActionable() *ghpkg.ActionableResult

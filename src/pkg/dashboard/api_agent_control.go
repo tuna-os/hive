@@ -241,6 +241,12 @@ func (s *Server) claimAgentFieldOwnership(name, model, backend string) {
 		ac.Backend = backend
 		ac.BackendOwner = config.FieldOwnerOperator
 		s.reconcileLaunchCmdForBackend(name, &ac)
+		// A backend-only switch keeps the saved model: re-spell it for the
+		// new backend (or clear one the backend cannot run), the same as
+		// PUT .../models and the runtime's own override.
+		if model == "" && ac.Model != "" {
+			ac.Model, _ = crux.ModelForBackend(ac.Model, backend)
+		}
 	}
 	s.deps.Config.Agents[name] = ac
 	_ = s.deps.AgentMgr.UpdateConfig(name, ac)
@@ -352,6 +358,11 @@ func (s *Server) validateModelForAgent(name, model string) error {
 	if proc.BackendOverride != "" {
 		backend = proc.BackendOverride
 	}
+	// Shape check first: it needs no catalogue, so it also holds when the
+	// list below cannot be enumerated and the value would otherwise pass.
+	if err := malformedModelIDError(backend, model); err != nil {
+		return err
+	}
 
 	known := s.modelIDsForBackend(backend)
 	if len(known) == 0 {
@@ -394,7 +405,9 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	s.auditFromRequest(r, "switch_backend", auditDetail("backend", backend), name)
 
 	// Restart the agent session so the new backend takes effect immediately.
-	if err := s.deps.AgentMgr.Restart(s.deps.Ctx, name); err != nil {
+	// A pause the CLI's model rejection caused is lifted first; any other
+	// pause stays.
+	if err := s.deps.AgentMgr.RestartAfterModelChange(s.deps.Ctx, name, requestUser(r)); err != nil {
 		s.deps.Logger.Warn("restart after backend switch failed", "agent", name, "error", err)
 	}
 
@@ -433,7 +446,9 @@ func (s *Server) handleModelSet(w http.ResponseWriter, r *http.Request) {
 	s.auditFromRequest(r, "set_model", auditDetail("model", model), name)
 
 	// Restart the agent session so the new model takes effect immediately.
-	if err := s.deps.AgentMgr.Restart(s.deps.Ctx, name); err != nil {
+	// A pause the CLI's model rejection caused is lifted first; any other
+	// pause stays.
+	if err := s.deps.AgentMgr.RestartAfterModelChange(s.deps.Ctx, name, requestUser(r)); err != nil {
 		s.deps.Logger.Warn("restart after model switch failed", "agent", name, "error", err)
 	}
 
@@ -485,7 +500,7 @@ func (s *Server) handleEffortSet(w http.ResponseWriter, r *http.Request) {
 	s.deps.Config.Agents[name] = agentCfg
 
 	// Sync into the agent process and persist, mirroring handleAgentConfigModels.
-	if err := s.deps.AgentMgr.UpdateConfig(name, agentCfg); err != nil {
+	if err := s.updateAgentProcessConfig(name, agentCfg); err != nil {
 		s.logger.Warn("failed to sync agent config to process", "agent", name, "error", err)
 	}
 	if err := s.saveConfig(); err != nil {

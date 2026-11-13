@@ -76,7 +76,7 @@ changed_files() {
   local base=$1 ref=$2
   local mb
   mb=$(git merge-base "origin/${base}" "$ref")
-  git diff --name-only "${mb}...${ref}" | sort -u
+  git diff --no-renames --name-only "${mb}...${ref}" | sort -u
 }
 
 join_files() {
@@ -99,6 +99,21 @@ intersect_files() {
       [[ "$f" == "$g" ]] && printf '%s\n' "$f"
     done
   done | sort -u
+}
+
+# Lists the union of conflicted and shared paths, marking the conflicted ones,
+# so a CONFLICT row never hides shared paths that merged cleanly.
+join_shared_files() {
+  local -n conflicts=$1
+  local -n shared=$2
+  local f out='' item
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    item=$(join_files '' "$f")
+    if printf '%s\n' "${conflicts[@]}" | grep -qxF -- "$f"; then item+=' (conflict)'; fi
+    if [[ -z "$out" ]]; then out=$item; else out+="<br>${item}"; fi
+  done < <(printf '%s\n' "${conflicts[@]}" "${shared[@]}" | sort -u)
+  [[ -n "$out" ]] && printf '%s' "$out" || printf '—'
 }
 
 # Prints the paths `git merge-tree` reports as conflicted when merging $a and
@@ -177,17 +192,17 @@ make_report_for_pr() {
         mapfile -t conflict_files < <(merge_conflicts "$target_on_base" "$other_on_base")
       fi
     fi
+    # shellcheck disable=SC2034 # consumed by intersect_files via nameref
+    mapfile -t other_files < <(changed_files "$base" "$other_ref")
+    mapfile -t overlap_files < <(intersect_files target_files other_files)
     if ((${#conflict_files[@]})); then
       relation='CONFLICT'
       report_has_conflicts=1
       report_has_any=1
-      files_md=$(join_files '<br>' "${conflict_files[@]}")
+      files_md=$(join_shared_files conflict_files overlap_files)
       report_rows+="| #${number} | ${title//'|'/'\|'} | ${relation} | ${files_md} |"$'\n'
       continue
     fi
-    # shellcheck disable=SC2034 # consumed by intersect_files via nameref
-    mapfile -t other_files < <(changed_files "$base" "$other_ref")
-    mapfile -t overlap_files < <(intersect_files target_files other_files)
     if ((${#overlap_files[@]})); then
       relation='same files'
       report_has_any=1
@@ -225,10 +240,19 @@ report_body() {
   }
 }
 
+# One-line body the existing marker comment is edited to once a PR that had
+# overlaps no longer has any. A PR that never had a finding gets no comment
+# at all: the full clean report goes to the step summary only (#17863).
+resolved_body() {
+  local base=$1
+  # shellcheck disable=SC2016 # backticks are literal Markdown
+  printf '%s\n\n### Open PR overlap check\n\n✅ Resolved: no conflicting open PRs or same-file overlaps remain against `%s`.\n' "$MARKER" "$base"
+}
+
 upsert_comment_and_label() {
-  local pr=$1 body=$2 has_conflicts=$3
+  local pr=$1 body=$2 has_conflicts=$3 has_any=${4:-1} base=${5:-}
   if ((DRY_RUN)); then
-    printf 'DRY RUN: would update PR #%s comment and label=%s\n' "$pr" "$has_conflicts"
+    printf 'DRY RUN: would update PR #%s comment and label=%s findings=%s\n' "$pr" "$has_conflicts" "$has_any"
     printf '%s\n' "$body"
     return 0
   fi
@@ -236,7 +260,13 @@ upsert_comment_and_label() {
   local comment_id
   comment_id=$(api "repos/${REPO}/issues/${pr}/comments?per_page=100" --paginate \
     --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n1)
-  if [[ -n "$comment_id" ]]; then
+  if [[ "$has_any" != '1' ]]; then
+    if [[ -n "$comment_id" ]]; then
+      api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" -f body="$(resolved_body "$base")" >/dev/null
+    else
+      printf 'PR #%s: no overlap findings and no earlier comment; not posting\n' "$pr"
+    fi
+  elif [[ -n "$comment_id" ]]; then
     api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" -f body="$body" >/dev/null
   else
     api -X POST "repos/${REPO}/issues/${pr}/comments" -f body="$body" >/dev/null
@@ -261,12 +291,12 @@ write_summary() {
 
 run_for_one_pr() {
   local pr=$1 base=$2 writable=$3 truncated=${4:-0}
-  local rows has_conflicts _has_any base_conflict body
-  make_report_for_pr "$pr" "$base" rows has_conflicts _has_any base_conflict
+  local rows has_conflicts has_any base_conflict body
+  make_report_for_pr "$pr" "$base" rows has_conflicts has_any base_conflict
   body=$(report_body "$pr" "$base" "$rows" "$truncated" "$base_conflict")
   write_summary "$body"
   if [[ "$writable" == '1' ]]; then
-    upsert_comment_and_label "$pr" "$body" "$has_conflicts"
+    upsert_comment_and_label "$pr" "$body" "$has_conflicts" "$has_any" "$base"
   fi
 }
 

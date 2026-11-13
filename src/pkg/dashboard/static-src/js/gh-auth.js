@@ -47,7 +47,23 @@
       return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
     }
 
+    /* The viewer's identity is known once showGHAuthState has run on either
+       path (or checkGHAuth gave up). Until then the stage tracker treats the
+       viewer as unknown rather than 'read' (stageTrackerAuthPending), so a
+       hard reload does not flash the decision pills disabled; when the
+       answer lands, repaint the tracker once — only if something changed. */
+    function hiveAuthResolved() {
+      const before = (window._hiveAuthKnown ? 'k' : '') + '|' + String(window._hiveUser || '') + '|' + String(window._hiveRole || '');
+      window._hiveAuthKnown = true;
+      return function() {
+        const after = 'k|' + String(window._hiveUser || '') + '|' + String(window._hiveRole || '');
+        if (after === before) return;
+        if (typeof renderStageTracker === 'function' && typeof _stageTracker !== 'undefined' && _stageTracker) renderStageTracker();
+      };
+    }
+
     function showGHAuthState(loggedIn, username, avatarURL, role, displayName) {
+      const repaintTracker = hiveAuthResolved();
       if (username) window._hiveUser = username;
       if (role) window._hiveRole = role;
       const banner = document.getElementById('gh-auth-banner');
@@ -111,6 +127,7 @@
         if (avatarWrap) avatarWrap.hidden = true;
       }
       if (typeof renderPublicKnowledgeControls === 'function') renderPublicKnowledgeControls();
+      repaintTracker();
     }
 
     /* renderMyHivesMenuItem (#9696): point the user menu's "My hives" entry at
@@ -262,7 +279,11 @@
         const resp = await fetch('/api/gh-user-auth/status');
         const data = await resp.json();
         showGHAuthState(data.logged_in, data.username, data.avatar_url);
-      } catch (e) {}
+      } catch (e) {
+        /* Neither endpoint answered: the viewer is anonymous as far as the
+           page can tell. Say so, or the tracker waits on auth forever. */
+        hiveAuthResolved()();
+      }
     }
 
     function showSetupDetails(which) {
@@ -783,7 +804,8 @@
       overlay.className = 'gh-auth-overlay cred-dialog-overlay';
       var countdownSec = CLAUDE_AUTH_TAB_DELAY_MS / 1000;
       overlay.innerHTML = '<div class="gh-auth-modal" style="max-width:560px;text-align:left">' +
-        '<h3 style="color:#d97706;text-align:center">Login Claude Code</h3>' +
+        '<h3 style="color:#d97706;text-align:center">Sign in Claude for all agents</h3>' +
+        '<p style="color:var(--muted);font-size:0.85rem;text-align:center;margin:var(--sp-2) var(--sp-0)">This is the fleet-wide sign-in: it replaces the one shared Claude login every claude agent uses, then resumes the agents the login detector paused.</p>' +
         '<div id="claude-countdown" style="text-align:center;color:#d97706;font-weight:600;font-size:0.9rem;margin:var(--sp-4) var(--sp-0)">' +
           'Opening Claude login in ' + countdownSec + 's…</div>' +
         '<ol style="color:var(--muted);font-size:0.85rem;line-height:1.8;padding-left:1.5em;margin:var(--sp-5) var(--sp-0)">' +

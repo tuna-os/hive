@@ -32,8 +32,10 @@ type protectionCollector struct {
 }
 
 type requiredSet struct {
-	set   map[string]bool
-	known bool
+	set      map[string]bool
+	known    bool
+	bindings []PRRequiredCheck
+	source   string
 }
 
 // prReviewState is GitHub's review verdict for one PR, plus the display-only
@@ -91,51 +93,69 @@ func (pc *protectionCollector) attach(ctx context.Context, pr *PullRequest, repo
 
 	if reported != nil {
 		req := pc.requiredChecks(ctx, pr.Repo, pr.BaseRef)
+		if pr.CIActivity != nil {
+			pr.CIActivity.setRequired(req.set, req.known)
+			pr.CIActivity.RequiredChecks = req.bindings
+			pr.CIActivity.RequiredSource = req.source
+			pr.CIActivity.RequiredKnown = req.known && req.source != "config" && observedRequiredBindings(req.set, req.bindings)
+		}
 		if req.known {
 			f.RequiredChecksKnown = true
+			needsStatuses := false
+			if pr.CIActivity != nil {
+				needsStatuses = pr.CIActivity.NeedsCommitStatusEvidence()
+			}
+			for name := range req.set {
+				present := reported[name]
+				if pr.CIActivity != nil && len(req.bindings) > 0 {
+					present = len(pr.CIActivity.ChecksForRequired(name)) > 0
+				}
+				needsStatuses = needsStatuses || !present
+			}
+			statusesKnown := false
+			statuses := map[string]string{}
+			if needsStatuses {
+				collected, known := pc.c.commitStatuses(ctx, pr.Repo, pr.HeadSHA)
+				statusesKnown = known
+				if known {
+					for _, status := range collected {
+						statuses[status.GetContext()] = status.GetState()
+					}
+					if pr.CIActivity != nil {
+						pr.CIActivity.addCommitStatuses(collected, time.Now().UTC())
+					}
+				}
+			}
 			failing := make(map[string]bool, len(pr.FailingChecks))
 			for _, n := range pr.FailingChecks {
 				failing[n] = true
 			}
-			// observedRequired proves this repository reports its required
-			// contexts as CHECK RUNS. Without that proof a required context
-			// absent from the check-run listing may simply be a commit
-			// status, which this pass does not fetch; claiming it "has not
-			// reported" would be confidently wrong for every required
-			// context on such a repo.
+			// A check-run listing alone cannot prove a context is missing:
+			// legacy commit statuses may provide it. Failed status reads
+			// leave absence unknown, including for App-bound policy.
 			observedRequired := 0
 			var missing, red []string
 			for name := range req.set {
+				// Canonical facts retain their name-set contract. App-aware
+				// display ambiguity must not become a new merge policy.
+				_, statusReported := statuses[name]
 				switch {
-				case failing[name]:
+				case failing[name] || statuses[name] == "failure" || statuses[name] == "error":
 					observedRequired++
 					red = append(red, name)
-				case reported[name]:
+				case reported[name] || statusReported:
 					observedRequired++
 				default:
-					missing = append(missing, name)
+					if statusesKnown {
+						missing = append(missing, name)
+					}
 				}
 			}
 			f.FailingRequiredChecks = red
-			f.RequiredChecksAllReported = len(req.set) > 0 && len(missing) == 0
-			switch {
-			case observedRequired > 0:
+			f.RequiredChecksAllReported = len(req.set) > 0 && observedRequired == len(req.set)
+			if observedRequired > 0 || strings.EqualFold(pr.MergeableState, "blocked") {
+				sort.Strings(missing)
 				f.MissingRequiredChecks = missing
-			case len(missing) > 0 && strings.EqualFold(pr.MergeableState, "blocked"):
-				// Nothing proves check-run reporting, but GitHub says the head is
-				// blocked: look at commit statuses before deciding. A context
-				// absent from both listings was never created, and must not be
-				// reported as merge-eligible (#11892).
-				if statuses, ok := pc.c.commitStatusContexts(ctx, pr.Repo, pr.HeadSHA); ok {
-					var never []string
-					for _, name := range missing {
-						if !statuses[name] {
-							never = append(never, name)
-						}
-					}
-					sort.Strings(never)
-					f.MissingRequiredChecks = never
-				}
 			}
 		}
 	}
@@ -161,25 +181,60 @@ func (pc *protectionCollector) attach(ctx context.Context, pr *PullRequest, repo
 	pr.Protection = &f
 }
 
-// commitStatusContexts returns the contexts of every commit status on sha, or
-// ok=false when the listing could not be obtained.
-func (c *Client) commitStatusContexts(ctx context.Context, repo, sha string) (map[string]bool, bool) {
+// attachRequiredChecks stamps the base branch's required-check policy onto
+// pr.CIActivity exactly as attach does, plus the commit statuses an any-App
+// or unreported required context needs, without the protection facts: it
+// is the webhook CI re-read's half (webhook_ci_evidence.go), where no
+// mergeability or review decision is being collected.
+func (pc *protectionCollector) attachRequiredChecks(ctx context.Context, pr *PullRequest) {
+	if pc == nil || pc.c == nil || pr == nil || pr.CIActivity == nil || pr.BaseRef == "" {
+		return
+	}
+	req := pc.requiredChecks(ctx, pr.Repo, pr.BaseRef)
+	a := pr.CIActivity
+	a.setRequired(req.set, req.known)
+	a.RequiredChecks = req.bindings
+	a.RequiredSource = req.source
+	a.RequiredKnown = req.known && req.source != "config" && observedRequiredBindings(req.set, req.bindings)
+	if !req.known {
+		return
+	}
+	needsStatuses := a.NeedsCommitStatusEvidence()
+	for name := range req.set {
+		if len(a.ChecksForRequired(name)) == 0 {
+			needsStatuses = true
+		}
+	}
+	if !needsStatuses {
+		return
+	}
+	if collected, known := pc.c.commitStatuses(ctx, pr.Repo, pr.HeadSHA); known {
+		a.addCommitStatuses(collected, time.Now().UTC())
+	}
+}
+
+// commitStatuses retains state and identity, not just context presence.
+// A failed, incomplete or explicitly wrong-head listing is unknown.
+func (c *Client) commitStatuses(ctx context.Context, repo, sha string) ([]*gh.RepoStatus, bool) {
 	if sha == "" {
 		return nil, false
 	}
 	owner, name := c.splitRepo(repo)
-	contexts := map[string]bool{}
+	var statuses []*gh.RepoStatus
 	opts := &gh.ListOptions{PerPage: 100}
 	for {
 		status, resp, err := c.client.Repositories.GetCombinedStatus(ctx, owner, name, sha, opts)
-		if err != nil {
+		if err != nil || status == nil || status.Statuses == nil || (status.GetSHA() != "" && !strings.EqualFold(status.GetSHA(), sha)) {
 			return nil, false
 		}
 		for _, st := range status.Statuses {
-			contexts[st.GetContext()] = true
+			if st == nil || strings.TrimSpace(st.GetContext()) == "" {
+				return nil, false
+			}
+			statuses = append(statuses, st)
 		}
 		if resp == nil || resp.NextPage == 0 {
-			return contexts, true
+			return statuses, true
 		}
 		opts.Page = resp.NextPage
 	}
@@ -191,8 +246,9 @@ func (pc *protectionCollector) requiredChecks(ctx context.Context, repo, branch 
 		return rs
 	}
 	owner, name := pc.c.splitRepo(repo)
-	set, known := pc.c.requiredStatusCheckContexts(ctx, owner, name, branch)
-	rs := requiredSet{set: set, known: known}
+	configSet, configKnown := pc.c.configRequiredChecksForRepo(owner + "/" + name)
+	set, known, _, _, source, bindings := RequiredStatusCheckPolicy(ctx, pc.c.client, owner, name, branch, configSet, configKnown)
+	rs := requiredSet{set: set, known: known, bindings: bindings, source: source}
 	pc.required[key] = rs
 	return rs
 }
@@ -269,41 +325,43 @@ type reviewDecisionResponse struct {
 				HasNextPage bool   `json:"hasNextPage"`
 				EndCursor   string `json:"endCursor"`
 			} `json:"pageInfo"`
-			Nodes []struct {
-				Number                   int    `json:"number"`
-				ReviewDecision           string `json:"reviewDecision"`
-				LatestOpinionatedReviews struct {
-					Nodes []struct {
-						State             string    `json:"state"`
-						SubmittedAt       time.Time `json:"submittedAt"`
-						AuthorAssociation string    `json:"authorAssociation"`
-						Author            *struct {
-							Typename string `json:"__typename"`
-							Login    string `json:"login"`
-						} `json:"author"`
-					} `json:"nodes"`
-				} `json:"latestOpinionatedReviews"`
-				Comments struct {
-					TotalCount int `json:"totalCount"`
-				} `json:"comments"`
-				ReviewThreads struct {
-					TotalCount int `json:"totalCount"`
-				} `json:"reviewThreads"`
-				ClosingIssuesReferences struct {
-					Nodes []struct {
-						Number      int    `json:"number"`
-						Title       string `json:"title"`
-						State       string `json:"state"`
-						StateReason string `json:"stateReason"`
-						URL         string `json:"url"`
-						Repository  struct {
-							NameWithOwner string `json:"nameWithOwner"`
-						} `json:"repository"`
-					} `json:"nodes"`
-				} `json:"closingIssuesReferences"`
-			} `json:"nodes"`
+			Nodes []reviewDecisionNode `json:"nodes"`
 		} `json:"pullRequests"`
 	} `json:"repository"`
+}
+
+type reviewDecisionNode struct {
+	Number                   int    `json:"number"`
+	ReviewDecision           string `json:"reviewDecision"`
+	LatestOpinionatedReviews struct {
+		Nodes []struct {
+			State             string    `json:"state"`
+			SubmittedAt       time.Time `json:"submittedAt"`
+			AuthorAssociation string    `json:"authorAssociation"`
+			Author            *struct {
+				Typename string `json:"__typename"`
+				Login    string `json:"login"`
+			} `json:"author"`
+		} `json:"nodes"`
+	} `json:"latestOpinionatedReviews"`
+	Comments struct {
+		TotalCount int `json:"totalCount"`
+	} `json:"comments"`
+	ReviewThreads struct {
+		TotalCount int `json:"totalCount"`
+	} `json:"reviewThreads"`
+	ClosingIssuesReferences struct {
+		Nodes []struct {
+			Number      int    `json:"number"`
+			Title       string `json:"title"`
+			State       string `json:"state"`
+			StateReason string `json:"stateReason"`
+			URL         string `json:"url"`
+			Repository  struct {
+				NameWithOwner string `json:"nameWithOwner"`
+			} `json:"repository"`
+		} `json:"nodes"`
+	} `json:"closingIssuesReferences"`
 }
 
 // fetchReviewDecisions returns GitHub's review verdict for every open PR in
@@ -350,47 +408,7 @@ func (c *Client) fetchReviewDecisions(ctx context.Context, repo string) map[int]
 			return nil
 		}
 		for _, n := range resp.Repository.PullRequests.Nodes {
-			st := prReviewState{
-				decision:      ReviewDecision(strings.ToUpper(strings.TrimSpace(n.ReviewDecision))),
-				comments:      n.Comments.TotalCount,
-				reviewThreads: n.ReviewThreads.TotalCount,
-			}
-			for _, li := range n.ClosingIssuesReferences.Nodes {
-				if li.Number <= 0 {
-					continue
-				}
-				st.linkedIssues = append(st.linkedIssues, PRLinkedIssue{
-					Number:      li.Number,
-					Title:       li.Title,
-					Repo:        li.Repository.NameWithOwner,
-					State:       strings.ToLower(strings.TrimSpace(li.State)),
-					StateReason: strings.ToLower(strings.TrimSpace(li.StateReason)),
-					URL:         li.URL,
-				})
-			}
-			for _, r := range n.LatestOpinionatedReviews.Nodes {
-				login := ""
-				typename := ""
-				if r.Author != nil {
-					login = r.Author.Login
-					typename = r.Author.Typename
-				}
-				state := ReviewDecision(strings.ToUpper(strings.TrimSpace(r.State)))
-				switch state {
-				case ReviewDecisionApproved:
-					st.approvals++
-				case ReviewDecisionChangesRequested:
-					if login != "" {
-						st.changesRequestedBy = append(st.changesRequestedBy, login)
-					}
-				}
-				if c.isTrustedHumanReviewAuthor(login, typename, r.AuthorAssociation) && (state == ReviewDecisionApproved || state == ReviewDecisionChangesRequested) && r.SubmittedAt.After(st.latestHumanAt) {
-					st.latestHumanState = state
-					st.latestHumanBy = login
-					st.latestHumanAt = r.SubmittedAt
-				}
-			}
-			out[n.Number] = st
+			out[n.Number] = c.reviewStateFromNode(n)
 		}
 		if !resp.Repository.PullRequests.PageInfo.HasNextPage || resp.Repository.PullRequests.PageInfo.EndCursor == "" {
 			break
@@ -398,6 +416,46 @@ func (c *Client) fetchReviewDecisions(ctx context.Context, repo string) map[int]
 		vars["cursor"] = resp.Repository.PullRequests.PageInfo.EndCursor
 	}
 	return out
+}
+
+// reviewStateFromNode keeps the batch and standalone review queries consistent.
+func (c *Client) reviewStateFromNode(n reviewDecisionNode) prReviewState {
+	st := prReviewState{
+		decision:      ReviewDecision(strings.ToUpper(strings.TrimSpace(n.ReviewDecision))),
+		comments:      n.Comments.TotalCount,
+		reviewThreads: n.ReviewThreads.TotalCount,
+	}
+	for _, li := range n.ClosingIssuesReferences.Nodes {
+		if li.Number <= 0 {
+			continue
+		}
+		st.linkedIssues = append(st.linkedIssues, PRLinkedIssue{
+			Number: li.Number, Title: li.Title, Repo: li.Repository.NameWithOwner,
+			State:       strings.ToLower(strings.TrimSpace(li.State)),
+			StateReason: strings.ToLower(strings.TrimSpace(li.StateReason)), URL: li.URL,
+		})
+	}
+	for _, r := range n.LatestOpinionatedReviews.Nodes {
+		login, typename := "", ""
+		if r.Author != nil {
+			login, typename = r.Author.Login, r.Author.Typename
+		}
+		state := ReviewDecision(strings.ToUpper(strings.TrimSpace(r.State)))
+		switch state {
+		case ReviewDecisionApproved:
+			st.approvals++
+		case ReviewDecisionChangesRequested:
+			if login != "" {
+				st.changesRequestedBy = append(st.changesRequestedBy, login)
+			}
+		}
+		if c.isTrustedHumanReviewAuthor(login, typename, r.AuthorAssociation) && (state == ReviewDecisionApproved || state == ReviewDecisionChangesRequested) && r.SubmittedAt.After(st.latestHumanAt) {
+			st.latestHumanState = state
+			st.latestHumanBy = login
+			st.latestHumanAt = r.SubmittedAt
+		}
+	}
+	return st
 }
 
 func (c *Client) isTrustedHumanReviewAuthor(login, typename, association string) bool {

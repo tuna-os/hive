@@ -2,7 +2,7 @@
     // 'openrouter' is a first-class inference method (an OpenAI-compatible gateway
     // preset), so it appears in every backend/method picker even before a matching
     // Model Gateway is configured — the user picks it, then funds/configures it.
-    const KNOWN_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'omp', 'codex', 'goose', 'aider', 'vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
+    const KNOWN_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'omp', 'codex', 'goose', 'aider', 'cline', 'vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
     const FREE_BACKENDS = ['copilot', 'goose'];
     const INFERENCE_BACKENDS = ['vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
     let CONFIG_BACKEND_OPTIONS = [];
@@ -104,8 +104,8 @@
     // using Codex with a ChatGPT account"), so codex must NOT fall through to
     // the copilot list. The server discovers the live catalog via
     // `codex app-server` model/list (per-CLI-version, baked into the binary);
-    // this is only the pre-discovery fallback. Snapshot of codex 0.165.0
-    // (live model/list capture, 2026-10-27; the 0.159.0 capture was #9804):
+    // this is only the pre-discovery fallback. Snapshot of codex 0.166.0 and
+    // 0.167.0 (live model/list captures, 2026-11-07; the 0.159.0 capture was #9804):
     // visible ids in picker order (GPT-6.1 Sol is the default; GPT-6.1 Terra
     // arrived in 0.165.0; GPT-6 Sol and Luna arrived in 0.156.1, #8417), then
     // hidden ids — hidden entries are still valid --model values. gpt-5.2 and
@@ -173,7 +173,7 @@
     // BACKEND_MODELS. Every CLI with a server-served inventory must appear
     // here; otherwise its entry is dropped and modelsForBackend falls back to
     // the pre-discovery catalog (or, for an omitted unknown CLI, Copilot's).
-    const CLI_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'omp', 'goose', 'codex'];
+    const CLI_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'omp', 'goose', 'codex', 'cline'];
     // BACKEND_MODELS holds the live-discovered model list for every backend
     // (inference AND cli), keyed by backend id. INFERENCE_MODELS is kept as
     // an alias to the same object for backward compatibility with existing
@@ -185,6 +185,7 @@
     // Hardcoded fallbacks per CLI backend, used only until /api/config/backends
     // responds for the first time (so a dropdown is never empty on paint).
     const CLI_FALLBACK_MODELS = {
+      cline: [],
       claude: CLAUDE_CLI_MODELS,
       copilot: COPILOT_CLI_MODELS,
       bob: BOB_CLI_MODELS,
@@ -391,11 +392,11 @@
         return INFERENCE_MODELS[backend] || [];
       }
     }
-    function refreshBackendDiscovery(force) {
-      INFERENCE_BACKENDS.forEach(b => fetchInferenceModels(b, force));
+    async function refreshBackendDiscovery(force) {
+      for (const backend of INFERENCE_BACKENDS) await fetchInferenceModels(backend, force);
       // Load configured gateway names so the backend/method pickers list them
       // (e.g. openrouter) alongside KNOWN_BACKENDS after the first paint.
-      fetchConfiguredGateways();
+      await fetchConfiguredGateways();
     }
 
     const CLI_MODEL_CACHE_TTL_MS = 30000;
@@ -1287,4 +1288,3 @@ function burnAreaChart() {
         detailsEl.addEventListener('toggle', () => { localStorage.setItem('hive-sessions-open', detailsEl.open ? '1' : '0'); });
       }
     }
-

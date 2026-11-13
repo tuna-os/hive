@@ -153,8 +153,9 @@ func TestStageTrackerDecisionPopoverTriggersInRow(t *testing.T) {
 	html := indexHTML(t)
 	for _, want := range []string{
 		`typeof stageTrackerDecisionOf === 'function' ? stageTrackerDecisionOf(item) : null`,
-		`stageTrackerDecisionTriggerHtml(decision, word, tip)`,
-		`stageTrackerDecisionTriggerHtml(decision, inner, tip, 'ham-badge ham-badge-mod ' + cls)`,
+		`stageTrackerDecisionTriggerHtml(decision, caption, fullTip)`,
+		`if (typeof hideConfigTooltip === 'function') hideConfigTooltip();`,
+		`stageTrackerDecisionTriggerHtml(decision, askIco ? askIco + ` + "`<span class=\"ham-mod-word\">${inner}</span>`" + ` : inner, tip, 'ham-badge ham-badge-mod ' + cls + (askIco ? ' ham-mod-ask' : ''))`,
 		`${decision ? '' : ` + "` title=\"${esc(tip)}\"`" + `}`,
 		`if (typeof stageTrackerWireDecisionPop === 'function') stageTrackerWireDecisionPop(el);`,
 		`decision_needed: lp.decision_needed || null`,

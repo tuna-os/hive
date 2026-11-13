@@ -24,8 +24,8 @@ func TestStageTrackerNumbersPinned(t *testing.T) {
 	pins := map[stagelabels.Stage]int{
 		stagelabels.Actionable: trackerNumberActionable, stagelabels.TriageNeeded: trackerNumberTriageNeeded, stagelabels.Claimed: trackerNumberClaimed,
 		stagelabels.PRInProgress: trackerNumberPRInProgress, stagelabels.CoveredByPR: trackerNumberCoveredByPR,
-		stagelabels.IssueNeedsDecision: trackerNumberIssueDecision,
-		stagelabels.ReviewPending:      trackerNumberReviewPending, stagelabels.Reviewed: trackerNumberReviewed,
+		stagelabels.IssueNeedsDecision: trackerNumberIssueDecision, stagelabels.OpenForDiscussion: trackerNumberOpenForDiscussion,
+		stagelabels.ReviewPending: trackerNumberReviewPending, stagelabels.Reviewed: trackerNumberReviewed,
 		stagelabels.Fixing: trackerNumberFixing, stagelabels.NeedsAuthor: trackerNumberNeedsAuthor, stagelabels.ReturnedToContributor: trackerNumberReturned,
 		stagelabels.AdoptedByHive: trackerNumberAdopted, stagelabels.AwaitingMergeAdmission: trackerNumberAwaitingMerge,
 		stagelabels.NeedsDecision: trackerNumberNeedsDecision, stagelabels.ReadyForHumanMerge: trackerNumberReadyForHuman,
@@ -51,8 +51,8 @@ func TestStageTrackerNumbersPinned(t *testing.T) {
 			t.Errorf("detour %s branches from %d", st.Slug, st.BranchFrom)
 		}
 	}
-	if mains != 12 || detours != 6 {
-		t.Fatalf("mains=%d detours=%d, want 12 main segments (015 and 017 share the Actionable column; 045 is the issue parking bay; 095 shares the merge gate column) and 6 detours", mains, detours)
+	if mains != 13 || detours != 6 {
+		t.Fatalf("mains=%d detours=%d, want 13 main segments (015, 017 and 018 share the Actionable column; 045 is the issue parking bay; 095 shares the merge gate column) and 6 detours", mains, detours)
 	}
 }
 
@@ -72,6 +72,8 @@ func TestStageTrackerStagesFallsTo(t *testing.T) {
 	}{
 		{trackerNumberTriageNeeded, trackerNumberActionable, false},
 		{trackerNumberPossiblyExists, trackerNumberActionable, false},
+		{trackerNumberOpenForDiscussion, trackerNumberActionable, false},
+		{trackerNumberCoveredByPR, trackerNumberOpenForDiscussion, true},
 		{trackerNumberIssueDecision, trackerNumberActionable, false},
 		{trackerNumberNeedsDecision, trackerNumberAwaitingMerge, false},
 		{trackerNumberReturned, trackerNumberFixing, false},
@@ -95,13 +97,19 @@ func TestStageTrackerStagesFallsTo(t *testing.T) {
 // returned-to-contributor (clanker) are both review-side detours with their
 // own chevron word and an author-must-act caption.
 func TestStageTrackerNeedsAuthorAndReturnedWords(t *testing.T) {
+	for _, stage := range stageTrackerStages(nil) {
+		if stage.Number == stagelabels.Fixing.Number() &&
+			(stage.Label != stagelabels.Fixing.Label() || stage.Short != "Remediating" || stage.Description != "CI failed or review changes requested; remediation needed") {
+			t.Fatalf("remediation display wording changed the native identity or lost its waiting-safe description: %+v", stage)
+		}
+	}
 	for _, tc := range []struct {
 		stage             stagelabels.Stage
 		word, captionHead string
 	}{
 		{stagelabels.NeedsAuthor, "Needs author", "Needs @sam"},
 		{stagelabels.ReturnedToContributor, "Returned to contributor", "Returned to @sam"},
-		{stagelabels.Fixing, "Fixing", "Red or changes requested; a hive agent is fixing it"},
+		{stagelabels.Fixing, "Remediating", "CI failed or review changes requested; remediation needed"},
 	} {
 		if got := stageTrackerShort(tc.stage); got != tc.word {
 			t.Errorf("%v: short = %q, want %q", tc.stage, got, tc.word)
@@ -531,8 +539,11 @@ func TestStageTrackerEndpoint(t *testing.T) {
 		t.Fatalf("pr103 history = %+v, want the second hop marked as the 100 → 050 fall", h)
 	}
 
+	// A label-only 085 PR with no merge-ready evidence on its head lights
+	// its real stage (CI / Review), so the ask rides as the needs-decision
+	// pill (hivecommons/hive#17453).
 	pr104 := trackerItem(t, resp, "pr", 104)
-	if pr104.Stage != 85 || pr104.StageSince != nil || len(pr104.History) != 0 || hasMod(pr104, modNeedsDecision) || pr104.Actor != "maintainer" {
+	if pr104.Stage != 85 || pr104.StageSince != nil || len(pr104.History) != 0 || !hasMod(pr104, modNeedsDecision) || pr104.Actor != "maintainer" {
 		t.Fatalf("label-only pr104 = %+v", pr104)
 	}
 
@@ -1212,5 +1223,65 @@ func TestStageTrackerEnrichSoftLinks(t *testing.T) {
 	s.stageTrackerEnrichSoftLinks([]StageTrackerItem{{Repo: "hive", Number: 14598, Kind: "pr", LinkedIssues: many}}, qualify, now)
 	if n := gets.Load() - before; n != stageTrackerLinkLookups {
 		t.Fatalf("issues GETs in one rebuild = %d, want the cap %d", n, stageTrackerLinkLookups)
+	}
+}
+
+// hivecommons/hive#16015: the row's author kind and its claimant come from
+// one source of truth. A login with a contributor-hub profile is a clanker
+// owner (pkg/authorkind rule "registry", the one the stage engine applies
+// when it adopts), so the tracker must not read it as a person just because
+// the PR carries no author/<kind> label or hive marker.
+func TestStageTrackerRegistryAuthorKind(t *testing.T) {
+	owner := func(login string) bool { return strings.EqualFold(login, "karibhou") }
+	cases := []struct {
+		kind, src, author string
+		owner             func(string) bool
+		wantKind, wantSrc string
+	}{
+		{authorKindHuman, authorKindSrcInfer, "Karibhou", owner, authorKindClanker, authorKindSrcRegistry},
+		{authorKindHuman, authorKindSrcInfer, "pat", owner, authorKindHuman, authorKindSrcInfer},
+		{authorKindHuman, authorKindSrcLabel, "karibhou", owner, authorKindHuman, authorKindSrcLabel},
+		{authorKindHive, authorKindSrcInfer, "karibhou", owner, authorKindHive, authorKindSrcInfer},
+		{"", "", "karibhou", owner, authorKindClanker, authorKindSrcRegistry},
+		{authorKindHuman, authorKindSrcInfer, "karibhou", nil, authorKindHuman, authorKindSrcInfer},
+		{authorKindHuman, authorKindSrcInfer, "", owner, authorKindHuman, authorKindSrcInfer},
+	}
+	for _, c := range cases {
+		k, src := stageTrackerRegistryAuthorKind(c.kind, c.src, c.author, c.owner)
+		if k != c.wantKind || src != c.wantSrc {
+			t.Errorf("%q/%q/%q: got %q/%q want %q/%q", c.kind, c.src, c.author, k, src, c.wantKind, c.wantSrc)
+		}
+	}
+}
+
+func TestStageTrackerRegisteredContributorIsClanker(t *testing.T) {
+	setupContributeEnv(t)
+	if err := saveContributorProfile(&ContributorProfile{GitHubUsername: "Karibhou", ContributorID: "c-karibhou", TrustTier: "trusted"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 21, 18, 49, 0, 0, time.UTC)
+	s, store := stageTrackerFixture(t, now)
+	s.statusMu.RLock()
+	status := s.status
+	s.statusMu.RUnlock()
+	resp := s.buildStageTracker(status, store, now)
+
+	pr101 := trackerItem(t, resp, "pr", 101)
+	if pr101.AuthorKind != authorKindClanker || pr101.AuthorKindSource != authorKindSrcRegistry {
+		t.Fatalf("pr101 by registered contributor: kind=%q src=%q, want clanker/registry", pr101.AuthorKind, pr101.AuthorKindSource)
+	}
+	if pr101.Claimant == nil || pr101.Claimant.Kind != claimantKindClanker || pr101.Claimant.Login != "karibhou" {
+		t.Fatalf("pr101 claimant = %+v, want the contributor's clanker", pr101.Claimant)
+	}
+	if issue7 := trackerItem(t, resp, "issue", 7); issue7.AuthorKind != authorKindClanker || issue7.AuthorKindSource != authorKindSrcRegistry {
+		t.Fatalf("issue7 by registered contributor: kind=%q src=%q", issue7.AuthorKind, issue7.AuthorKindSource)
+	}
+	// Labels and the App's own login outrank the registry.
+	if pr102 := trackerItem(t, resp, "pr", 102); pr102.AuthorKind != authorKindHive || pr102.AuthorKindSource != authorKindSrcLabel {
+		t.Fatalf("pr102: kind=%q src=%q", pr102.AuthorKind, pr102.AuthorKindSource)
+	}
+	// A hive-attributed relay PR keeps its marker-inferred source.
+	if pr103 := trackerItem(t, resp, "pr", 103); pr103.AuthorKind != authorKindClanker || pr103.AuthorKindSource != authorKindSrcInfer {
+		t.Fatalf("pr103: kind=%q src=%q", pr103.AuthorKind, pr103.AuthorKindSource)
 	}
 }

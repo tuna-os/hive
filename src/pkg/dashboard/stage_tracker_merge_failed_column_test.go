@@ -10,9 +10,10 @@ import (
 // back to 060 after the automerge lane's merge call drew GitHub's 405 "4
 // of 4 required status checks are expected", and the tracker drew the amber
 // "⟳ Merge failed · retrying ⬡" chip in CI / Review with the raw
-// "PUT https://api.github.com/…" error spilling out of it. A merge outcome
-// always lights the Merge gate column; the chip is a fixed short phrase
-// (no URL, no verb, ≤ 5 words) with GitHub's words in the tooltip's
+// "PUT https://api.github.com/…" error spilling out of it. An actual queue
+// outcome lights the Merge gate; a premature call waiting for head checks
+// does not admit a 050/060 PR. The chip is a fixed short phrase
+// (no URL, no verb, ≤ 6 words) with GitHub's words in the tooltip's
 // Details line; pending CI is "CI running", never "red"; and the cue
 // names the stage in plain words, not "stage/060-reviewed".
 func TestStageTrackerMergeFailedColumnNode(t *testing.T) {
@@ -22,7 +23,8 @@ func TestStageTrackerMergeFailedColumnNode(t *testing.T) {
 		`const anchor = stageTrackerAnchor(cur, stages, item.via_pr ? 'pr' : item.kind, item);`,
 		`stageTrackerAnchor(item.stage, stages, item.via_pr ? 'pr' : item.kind, item);`,
 		`label: (typeof stageTrackerStageName === 'function' && (stageTrackerStageName(tipStage) || stageTrackerStageName(st))) || tipStage.label || st.label || String(n)`,
-		`.ham-gate-detail { font-weight: normal; opacity: 0.85; white-space: nowrap; font-variant-numeric: tabular-nums; display: inline-block; vertical-align: bottom; max-width: 12em; overflow: hidden; text-overflow: ellipsis; }`,
+		`.ham-gate-detail { font-weight: normal; opacity: 0.85; font-variant-numeric: tabular-nums; }`,
+		`.ham-chevron-copy { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: var(--ham-chevron-text-lines);`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("index.html missing merge-outcome column wiring %q", want)
@@ -39,6 +41,7 @@ func TestStageTrackerMergeFailedColumnNode(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN")+"\n"+
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED")+"\n"+
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS")+"\n"+
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION")+"\n"+
 		jsConstLine(t, html, "STAGE_TRACKER_MERGE_GATE_WORD")+"\n"+
 		jsConstBlock(t, html, "STAGE_TRACKER_GATE_REASON_WORDS")+"\n"+
 		jsConstBlock(t, html, "STAGE_TRACKER_EVENT_MOD_WORDS")+"\n"+
@@ -65,37 +68,43 @@ const words = s => s.trim().split(/\s+/).filter(w => w !== '·');
 const plain = s => !/http|\bPUT\b|api\.github\.com/i.test(s);
 
 // 1. Column: the merge outcome lights Merge gate (80), whatever stage the
-//    lane fell back to; the same stage without a merge call stays in CI /
-//    Review (50); a merged / open row is unaffected.
-assert.strictEqual(stageTrackerAnchor(60, stages, 'pr', row(gate())), STAGE_TRACKER_MERGE_COLUMN, 'merge-failed at 060 → Merge gate');
+//    lane fell back to, except an early refusal waiting for head checks:
+//    that head is still in CI / Review, not admitted by the failed call.
+assert.strictEqual(stageTrackerAnchor(60, stages, 'pr', row(gate())), 50, 'pending head checks at 060 → CI / Review');
 assert.strictEqual(stageTrackerAnchor(60, stages, 'pr', row(gate({ state: 'merging', merge_failed: '' }))), STAGE_TRACKER_MERGE_COLUMN, 'merging at 060 → Merge gate');
-assert.strictEqual(stageTrackerAnchor(50, stages, 'pr', row(gate())), STAGE_TRACKER_MERGE_COLUMN, 'merge-failed at 050 → Merge gate');
+assert.strictEqual(stageTrackerAnchor(50, stages, 'pr', row(gate())), 50, 'pending head checks at 050 → CI / Review');
 assert.strictEqual(stageTrackerAnchor(60, stages, 'pr', row({ state: 'gate-pending', reason: 'check-pending' })), 50, 'no merge call: 060 stays in CI / Review');
 assert.strictEqual(stageTrackerAnchor(60, stages, 'pr'), 50, 'no item: unchanged');
 assert.strictEqual(stageTrackerAnchor(STAGE_TRACKER_TERMINAL, stages, 'pr', row(gate())), STAGE_TRACKER_TERMINAL);
 assert.strictEqual(stageTrackerAnchor(30, stages, 'pr', row(gate())), 30, 'a stale gate on a PR back in progress does not jump it forward');
+const prepared = Object.assign(row(gate({ merge_failed_kind: 'checks-pending', merge_failed_checks: 1 })), {
+  stage: 50, preparation: { role: 'waiting', state: 'current', number: 16014, behind: 16007 },
+});
+assert.strictEqual(stageTrackerAnchor(50, stages, 'pr', prepared), 50, 'preparation is not queue admission');
+assert.strictEqual(stageTrackerAnchor(100, stages, 'pr', prepared), STAGE_TRACKER_MERGE_COLUMN, 'an actual queue-stage outcome stays at the gate');
 
 // 2. The chip for this exact payload (Go translated the 405): the sweep
-//    called too early, so it is "Waiting for CI · 4 checks", not a failure.
+//    called too early, so it is "Queued for merge · after CI", not a failure.
 let info = stageTrackerMergeGateInfo(row(gate({ merge_failed_kind: 'checks-pending', merge_failed_text: "4 required checks haven't finished", merge_failed_checks: 4 })), now);
-assert.strictEqual(info.word, 'Waiting for CI');
-assert.strictEqual(info.detail, '4 checks');
+assert.strictEqual(info.word, 'Queued for merge');
+assert.strictEqual(info.detail, 'after CI', 'the check count rides the hover, not the chip');
 assert.strictEqual(info.cue, 'running', 'the sweep is on it');
 assert.ok(info.tip.includes("before its required checks had reported — 4 required checks haven't finished"), info.tip);
 assert.ok(info.tip.includes('Details: ' + raw), 'raw error only after Details: ' + info.tip);
 assert.ok(!info.tip.startsWith('stage/'), info.tip);
 // Older payload without the translated fields: the SPA classifies the raw text itself.
 info = stageTrackerMergeGateInfo(row(gate()), now);
-assert.strictEqual(info.word + ' · ' + info.detail, 'Waiting for CI · 4 checks', 'raw-only payload');
+assert.strictEqual(info.word + ' · ' + info.detail, 'Queued for merge · after CI', 'raw-only payload');
 assert.ok(info.tip.includes("4 required checks haven't finished"), info.tip);
 
-// 3. Every merge-failed chip is a fixed short phrase: no URL, no verb, ≤ 5 words.
+// 3. Every merge-failed chip is a fixed short phrase: no URL, no verb, ≤ 6 words
+//    (the three-word queue word plus a qualifier of at most three, #16653).
 const cases = [
-  [gate(), 'Waiting for CI · 4 checks'],
-  [gate({ sweep_running: false }), 'Waiting for CI · 4 checks'],
+  [gate(), 'Queued for merge · after CI'],
+  [gate({ sweep_running: false }), 'Queued for merge · after CI'],
   [gate({ merge_failed: '405 Pull Request is not mergeable' }), 'Merge failed · retrying'],
-  [gate({ merge_failed: '405 Pull Request is not mergeable', sweep_running: false }), 'Merge failed · branch protection'],
-  [gate({ merge_failed: '409 Head branch was modified. Review and try the merge again.', sweep_running: false }), 'Merge failed · needs rebase'],
+  [gate({ merge_failed: '405 Pull Request is not mergeable', sweep_running: false }), 'Queued for merge · branch protection pending'],
+  [gate({ merge_failed: '409 Head branch was modified. Review and try the merge again.', sweep_running: false }), 'Queued for merge · needs rebase'],
   [gate({ merge_failed: '403 Resource not accessible by integration', sweep_running: false }), 'Merge failed · not allowed'],
   [gate({ merge_failed: 'context deadline exceeded', sweep_running: false }), 'Merge failed · GitHub refused'],
   [gate({ merge_failed: 'context deadline exceeded', merge_failed_kind: 'refused', merge_failed_text: 'GitHub refused the merge', sweep_running: false }), 'Merge failed · GitHub refused'],
@@ -107,7 +116,7 @@ for (const [mg, want] of cases) {
   const label = i.word + (i.detail ? ' · ' + i.detail : '');
   assert.strictEqual(label, want);
   assert.ok(plain(label), 'no raw error in the chip: ' + label);
-  assert.ok(words(label).length <= 5, 'chip ≤ 5 words: ' + label);
+  assert.ok(words(label).length <= 6, 'chip ≤ 6 words: ' + label);
   const html = stageTrackerMergeGateWordHtml(row(mg), now);
   assert.ok(html.includes('<span class="ham-seg-t">') && plain(html), html);
   if (mg.merge_failed) assert.ok(i.tip.includes('Details: ' + mg.merge_failed), 'raw text rides the tooltip: ' + i.tip);

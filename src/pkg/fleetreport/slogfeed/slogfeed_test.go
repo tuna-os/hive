@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -61,6 +62,138 @@ func TestHandlerSkipsBenignAndExplicitClasses(t *testing.T) {
 	logger.Warn("")
 	if len(*seen) != 0 {
 		t.Fatalf("observed = %+v, want none", *seen)
+	}
+}
+
+func TestSignedCommitOwnershipSkipStaysInLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const msg = "signed-commit reconciler: skipped; the PR keeps an unsigned commit"
+	for range 6 {
+		logger.Warn(msg, "repo", "o/r", "pr", 1403, "reason", "commit is authored by another account")
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("expected ownership skips produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), msg); n != 6 || !strings.Contains(out.String(), "another account") {
+		t.Fatalf("local logs lost the warning or its reason: %s", out.String())
+	}
+	logger.Warn("signed-commit reconciler: listing PR commits failed", "err", "unexpected failure")
+	logger.Error(msg, "reason", "unexpected failure")
+	if len(*seen) != 2 || (*seen)[0].class != fleetreport.ClassUnclassifiedRepeated || (*seen)[1].class != fleetreport.ClassUnclassifiedRepeated {
+		t.Fatalf("other failures must remain reportable: %+v", *seen)
+	}
+}
+
+func TestCanceledStageDigestStaysLocal(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const msg = "stage labels: check digest failed"
+	for range 6 {
+		logger.Warn(msg, "repo", "utah", "pr", 1194, "error", context.Canceled)
+	}
+	logger.Warn(msg, "error", errors.New("GET checks: context canceled"))
+	if len(*seen) != 0 {
+		t.Fatalf("canceled reads produced fleet observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 7 {
+		t.Fatalf("local log records = %d, want 7", n)
+	}
+	logger.Warn(msg, "error", errors.New("context deadline exceeded"))
+	logger.Warn(msg, "error", errors.New("permission denied"))
+	logger.Warn("another failure", "error", context.Canceled)
+	if len(*seen) != 2 {
+		t.Fatalf("unexpected errors must remain reportable: %+v", *seen)
+	}
+}
+
+func TestCanceledAdoptionReadStaysInLog(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const msg = "stage labels: could not read maintainer_can_modify; keeping in-place adoption this sweep"
+	for range 8 {
+		logger.Warn(msg, "repo", "server", "pr", 649, "error", &url.Error{Op: "GET", URL: "https://api.github.com", Err: context.Canceled})
+	}
+	logger.Warn(msg, "error", "context canceled")
+	if len(*seen) != 0 || strings.Count(out.String(), "\n") != 9 {
+		t.Fatalf("canceled reads: observations=%+v, log=%s", *seen, out.String())
+	}
+	logger.Warn(msg, "error", errors.New("permission denied"))
+	logger.Warn(msg, "error", context.DeadlineExceeded)
+	logger.Warn("another operation failed", "error", context.Canceled)
+	if len(*seen) != 2 {
+		t.Fatalf("other failures must remain reportable: %+v", *seen)
+	}
+}
+
+func TestStructuredCancellationDoesNotCreateFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const msg = "stage labels reconcile failed"
+	for range 10 {
+		logger.Warn(msg, "error", context.Canceled, "items", 6, "writes", 0)
+	}
+	logger.With("error", context.Canceled).Warn(msg)
+	logger.Warn("stage labels: check digest failed", "error", fmt.Errorf("GET checks: %w", context.Canceled))
+	logger.Warn("stage labels: check digest failed", "error", "GET checks: context canceled")
+	logger.With("error", fmt.Errorf("listing PRs: %w", context.Canceled)).Warn(msg, "error", context.Canceled)
+	logger.Warn(msg, "error", &url.Error{Op: "GET", URL: "https://api.github.com", Err: context.Canceled})
+	if len(*seen) != 0 || strings.Count(out.String(), "\n") != 15 {
+		t.Fatalf("observed=%+v logs=%s", *seen, out.String())
+	}
+	logger.Warn(msg, "error", context.DeadlineExceeded)
+	logger.Warn(msg, "error", "permission denied")
+	logger.With("error", context.Canceled).Warn(msg, "error", "permission denied")
+	logger.With("error", fmt.Errorf("listing PRs: %w", context.Canceled)).Warn(msg, "error", "permission denied")
+	logger.Warn(msg, "error", "context canceled: permission denied")
+	logger.Warn(msg, "error", fmt.Errorf("request: %w", context.DeadlineExceeded))
+	if len(*seen) != 6 {
+		t.Fatalf("other failures must remain reportable: %+v", *seen)
+	}
+}
+
+// #16510: polling an exhausted rebase episode must keep warning locally
+// without turning the intentional handoff into a repeated runtime defect.
+func TestRebaseAttemptsExhaustedLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const msg = "rebase attempts exhausted; leaving the conflict to a person"
+	for i := 0; i < 10; i++ {
+		logger.Warn(msg, "repo", "projectbluefin/fsdk-containers", "number", 491,
+			"head", "c0ad5df0927de888c373ccf9b5caead751ef9a6f", "attempts", 2,
+			"max", 2, "timed_out", 2, "mergeable_state", "dirty")
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("expected rebase handoff produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 10 {
+		t.Fatalf("wrapped handler saw %d records, want 10", n)
+	}
+	if !strings.Contains(out.String(), msg) || !strings.Contains(out.String(), `"timed_out":2`) {
+		t.Fatal("local logs lost the warning or its diagnostics")
+	}
+	logger.Warn("rebase failed", "error", "unexpected failure")
+	if len(*seen) != 1 || (*seen)[0].class != fleetreport.ClassUnclassifiedRepeated {
+		t.Fatalf("rebase failure must remain reportable: %+v", *seen)
+	}
+}
+
+// #16795: a routine prose-only recovery notice must remain visible locally
+// without feeding the generic repeated-error tracker, even across many kicks.
+func TestActionNudgeLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const msg = "inference agent answered kick with prose only, sending action nudge"
+	for i := 1; i <= 10; i++ {
+		logger.Warn(msg, "name", "reviewer", "minutes_since_kick", 7,
+			"total_action_nudges", i)
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("routine action nudges produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 10 {
+		t.Fatalf("wrapped handler saw %d records, want 10", n)
+	}
+	if !strings.Contains(out.String(), msg) || !strings.Contains(out.String(), `"total_action_nudges":10`) {
+		t.Fatal("local logs lost the warning or its diagnostics")
+	}
+	logger.Error("inference action nudge delivery failed", "error", "unexpected failure")
+	if len(*seen) != 1 || (*seen)[0].class != fleetreport.ClassUnclassifiedRepeated {
+		t.Fatalf("action nudge failure must remain reportable: %+v", *seen)
 	}
 }
 
@@ -310,6 +443,26 @@ func TestRequiredChecksOverrideMismatchLogsWithoutFleetReport(t *testing.T) {
 	}
 }
 
+func TestMissingAlertsPermissionReportsOperatorCondition(t *testing.T) {
+	now := time.Date(2026, 11, 12, 15, 40, 0, 0, time.UTC)
+	tr := fleetreport.NewRuntimeTracker(func() time.Time { return now })
+	var out bytes.Buffer
+	logger := slog.New(NewWithObserver(slog.NewJSONHandler(&out, nil), tr.Observe))
+	const msg = "scoped token mint with vulnerability_alerts:read failed; retrying without it — the sec-check Dependabot alerts call will 403 until the App grants Dependabot alerts read-only and the installation re-accepts it; see docs/github-app-setup.md"
+	for range 5 {
+		logger.Warn(msg, "tier", "sec-check", "error", "permissions requested are not granted")
+		now = now.Add(time.Minute)
+	}
+	ev := tr.Evidence()
+	if len(ev) != 1 || ev[0].Class != fleetreport.ClassGitHubAppAlertsPermission || ev[0].Count != 5 {
+		t.Fatalf("missing permission evidence = %+v", ev)
+	}
+	now = now.Add(21 * time.Minute)
+	if ev := tr.Evidence(); len(ev) != 0 {
+		t.Fatalf("quiet condition did not clear: %+v", ev)
+	}
+}
+
 func TestFeedLogFedPath(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -463,7 +616,7 @@ func TestPostRestartKickHoldLogsWithoutFleetReport(t *testing.T) {
 	}
 	// Other kick send failures must remain reportable.
 	logger.Warn("failed to send kick", "agent", "reviewer-2", "error", "tmux send-keys exit 1")
-	if len(*seen) != 1 || (*seen)[0].class != fleetreport.ClassUnclassifiedRepeated {
+	if len(*seen) != 1 || (*seen)[0].class != fleetreport.ClassAgentLifecycleRepeated {
 		t.Fatalf("other kick failures must remain reportable: %+v", *seen)
 	}
 }
@@ -499,6 +652,37 @@ func TestMergeCIRefusalLogsWithoutFleetReport(t *testing.T) {
 	}
 	if ev := tr.Evidence(); len(ev) != 1 || ev[0].Class != fleetreport.ClassUnclassifiedRepeated || ev[0].Message != failure || ev[0].Count != 5 {
 		t.Fatalf("watcher failure should still produce fleet evidence: %+v", ev)
+	}
+}
+
+func TestAgentsMdInjectionCapLogsWithoutFleetReport(t *testing.T) {
+	now := time.Date(2026, 11, 8, 20, 0, 0, 0, time.UTC)
+	tr := fleetreport.NewRuntimeTracker(func() time.Time { return now })
+	var out bytes.Buffer
+	logger := slog.New(NewWithObserver(slog.NewJSONHandler(&out, nil), tr.Observe))
+	for i := 0; i < 6; i++ {
+		logger.Warn("agentsmd: AGENTS.md exceeded the injection cap; sections dropped whole",
+			"root", "/data/agentsmd-cache/projectbluefin/utah-packages", "cap_bytes", 16384,
+			"whole_file", false,
+			"omitted_sections", []string{"Conventions worth not rediscovering", "Sibling repository", "Canonical sources"},
+			"omitted_bytes", 5031)
+		now = now.Add(time.Minute)
+	}
+	if ev := tr.Evidence(); len(ev) != 0 {
+		t.Fatalf("AGENTS.md injection cap produced fleet evidence: %+v", ev)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 6 {
+		t.Fatalf("wrapped handler saw %d records, want 6: %s", n, out.String())
+	}
+	if !strings.Contains(out.String(), `"omitted_bytes":5031`) {
+		t.Fatalf("cap warning lost its diagnostics: %s", out.String())
+	}
+	const failure = "agentsmd: parse failed, skipping injection"
+	for i := 0; i < 5; i++ {
+		logger.Warn(failure)
+	}
+	if ev := tr.Evidence(); len(ev) != 1 || ev[0].Class != fleetreport.ClassUnclassifiedRepeated || ev[0].Message != failure || ev[0].Count != 5 {
+		t.Fatalf("parse failure should still produce fleet evidence: %+v", ev)
 	}
 }
 
@@ -607,6 +791,8 @@ func TestGitHubRateLimitStormLogsWithoutFleetReport(t *testing.T) {
 		{15109, "advisory: path existence check failed", []any{"path", "a/b.sh", "repo", "common", "error", `checking o/common/a/b.sh@abc: Get "https://api.github.com/repos/o/common/contents/a/b.sh?ref=abc"` + shed}},
 		{0, "failed to fetch check runs", []any{"error", "GET https://api.github.com/repos/o/r/commits/abc/check-runs: 429 Too Many Requests"}},
 		{0, "failed to fetch check runs", []any{"error", "GET https://api.github.com/repos/o/r/commits/abc/check-runs: 403 API rate limit of 5000 still exceeded until 2026-10-28 17:42:28 -0400 EDT, not making remote request."}},
+		{16784, "issue activity fetch skipped", []any{"repo", "xfce-linux", "error", "github REST budget below reserve 500; skipping issue activity for xfce-linux"}},
+		{16784, "CI trail fetch skipped", []any{"error", "github REST budget below reserve 500; skipping CI trail for org/repo#1"}},
 	}
 	for _, tc := range cases {
 		logger, seen, out := newFeed(t)
@@ -625,8 +811,9 @@ func TestGitHubRateLimitStormLogsWithoutFleetReport(t *testing.T) {
 	// including a plain 403 permission refusal.
 	logger, seen, _ := newFeed(t)
 	logger.Warn("failed to fetch check runs", "error", "GET https://api.github.com/repos/o/r/commits/abc/check-runs: 403 Resource not accessible by integration")
-	logger.Warn("stage labels: check digest failed", "error", "GET https://api.github.com/repos/o/r/commits/abc/status: 500 Internal Server Error")
-	if len(*seen) != 2 {
+	logger.Warn("stage labels: check digest failed", "error", "GET https://api.github.com/repos/o/r/commits/abc/status: 403 Resource not accessible by integration")
+	logger.Warn("issue activity fetch skipped", "repo", "xfce-linux", "error", "listing issues: 403 Resource not accessible by integration")
+	if len(*seen) != 3 {
 		t.Fatalf("non-rate-limit failures must remain reportable: %+v", *seen)
 	}
 }
@@ -664,6 +851,249 @@ func TestGitHubUpstreamUnavailableLogsWithoutFleetReport(t *testing.T) {
 	logger.Warn("fetch failed: GET https://api.github.com/repos/o/r: 500 Internal Server Error")
 	if len(*seen) != 4 {
 		t.Fatalf("non-gateway failures must remain reportable: %+v", *seen)
+	}
+}
+
+// #15785, #15786, #16778: fail-closed gates hitting a GitHub 500 on the status read
+// are expected and retried, so they are not reported as unclassified.
+func TestFailClosedStatus500LogsWithoutFleetReport(t *testing.T) {
+	const statusErr = "GET https://api.github.com/repos/o/r/commits/abc/status?per_page=100: 500  []"
+	cases := []struct {
+		msg  string
+		args []any
+	}{
+		{"merge-eligible lane gate could not evaluate PR; leaving it listed", []any{"repo", "o/r", "number", 3929, "error", "o/r#3929 lane evidence unavailable (status-check; fail closed): " + statusErr}},
+		{"trusted-author automerge sweep skipped PR", []any{"repo", "hive", "pr", 15763, "reason", "release-hold-check", "error", statusErr}},
+		{"contributor-lane automerge sweep skipped PR", []any{"repo", "flatpak-index", "pr", 216, "reason", "status-check", "error", statusErr}},
+		{"stage labels: check digest failed", []any{"repo", "hive", "pr", 797, "error", statusErr}},
+	}
+	for _, tc := range cases {
+		logger, seen, out := newFeed(t)
+		for i := 0; i < 8; i++ {
+			logger.Warn(tc.msg, tc.args...)
+		}
+		if len(*seen) != 0 {
+			t.Errorf("%q: produced observations: %+v", tc.msg, *seen)
+		}
+		if n := strings.Count(out.String(), "\n"); n != 8 {
+			t.Errorf("%q: wrapped handler saw %d records, want 8", tc.msg, n)
+		}
+	}
+
+	logger, seen, _ := newFeed(t)
+	logger.Warn("trusted-author automerge sweep skipped PR", "error", "GET https://api.github.com/repos/o/r/pulls/1: 404 Not Found")
+	logger.Warn("merge-eligible lane gate could not evaluate PR; leaving it listed", "error", "boom")
+	logger.Warn("contributor-lane automerge sweep skipped PR", "reason", "status-check", "error", "GET https://api.github.com/repos/o/r/commits/abc/status: 403 Forbidden")
+	logger.Warn("contributor-lane automerge sweep skipped PR", "reason", "fetch-pr", "error", "GET https://api.github.com/repos/o/r/pulls/216: 500 Internal Server Error")
+	if len(*seen) != 4 {
+		t.Fatalf("other failures must remain reportable: %+v", *seen)
+	}
+}
+
+// #16520, #17400: the base-refresh merge guard is a self-limiting skip, not a defect.
+func TestAutomergeMergeGuardSkipLogsWithoutFleetReport(t *testing.T) {
+	guard := []any{"repo", "hive", "pr", 16511, "reason", "base-refresh:merge-guard", "error", "destination merge already in progress"}
+	cases := []struct {
+		name string
+		msg  string
+		args []any
+		want int
+	}{
+		{"merge guard", "automerge sweep skipped PR", guard, 0},
+		{"self-authored lane merge guard", "self-authored automerge sweep skipped PR", []any{"start", "6b1dd23f", "repo", "console", "pr", 24909, "reason", "base-refresh:merge-guard", "error", errors.New("destination merge already in progress")}, 0},
+		{"trusted lane merge guard", "trusted-author automerge sweep skipped PR", guard, 0},
+		{"contributor lane merge guard", "contributor-lane automerge sweep skipped PR", guard, 0},
+		{"other reason", "automerge sweep skipped PR", []any{"repo", "hive", "pr", 16511, "reason", "base-refresh", "error", "update branch: 422 conflict"}, 8},
+		{"guard reason other error", "automerge sweep skipped PR", []any{"repo", "hive", "pr", 16511, "reason", "base-refresh:merge-guard", "error", "boom"}, 8},
+		{"self-authored other reason", "self-authored automerge sweep skipped PR", []any{"reason", "base-refresh", "error", "destination merge already in progress"}, 8},
+		{"self-authored guard other error", "self-authored automerge sweep skipped PR", []any{"reason", "base-refresh:merge-guard", "error", "merge destination changed under lease"}, 8},
+		{"self-authored missing reason", "self-authored automerge sweep skipped PR", []any{"error", "destination merge already in progress"}, 8},
+		{"self-authored missing error", "self-authored automerge sweep skipped PR", []any{"reason", "base-refresh:merge-guard"}, 8},
+		{"other message", "unrelated sweep skipped PR", guard, 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, seen, out := newFeed(t)
+			for i := 0; i < 8; i++ {
+				logger.Warn(tc.msg, tc.args...)
+			}
+			if len(*seen) != tc.want {
+				t.Errorf("produced %d observations, want %d: %+v", len(*seen), tc.want, *seen)
+			}
+			if n := strings.Count(out.String(), "\n"); n != 8 {
+				t.Errorf("wrapped handler saw %d records, want 8", n)
+			}
+		})
+	}
+}
+
+// #15789: a hub that is restarting answers the heartbeat 5xx and the spoke
+// retries on the next beat; auth rejections stay reportable.
+func TestHubHeartbeatUnavailableLogsWithoutFleetReport(t *testing.T) {
+	body := `{"ok":false,"error":"hive unavailable"}`
+	for _, status := range []int{502, 503, 504} {
+		logger, seen, out := newFeed(t)
+		for i := 0; i < 8; i++ {
+			logger.Warn("hub heartbeat rejected", "status", status, "body", body)
+		}
+		if len(*seen) != 0 {
+			t.Errorf("status %d: produced observations: %+v", status, *seen)
+		}
+		if n := strings.Count(out.String(), "\n"); n != 8 {
+			t.Errorf("status %d: wrapped handler saw %d records, want 8", status, n)
+		}
+	}
+
+	for _, status := range []int{401, 403} {
+		logger, seen, _ := newFeed(t)
+		logger.Warn("hub heartbeat rejected", "status", status, "body", "unauthorized")
+		if len(*seen) != 1 {
+			t.Errorf("status %d must remain reportable: %+v", status, *seen)
+		}
+	}
+}
+
+// #16507: using last-good stats after a bounded collect timeout is the
+// liveness safeguard working, not another defect distinct from the timeout.
+func TestHubHeartbeatCachedFallbackLogsWithoutFleetReport(t *testing.T) {
+	for _, msg := range []string{
+		"hub heartbeat collect timed out — sending LAST-GOOD cached stats (marked stale) so the hub keeps this hive online; loop keeps ticking so liveness stays green",
+		"hub heartbeat collect timed out with no cached payload — sending MINIMAL liveness beat (identity only, no stats) so the hub keeps this hive online; loop keeps ticking so liveness stays green",
+		"hub heartbeat collect timed out and hive identity not yet known — skipping this beat; loop keeps ticking so liveness stays green",
+		"hub heartbeat fresh stats collect timed out; sending stale cached stats without fresh agent overlay",
+	} {
+		t.Run(msg, func(t *testing.T) {
+			logger, seen, out := newFeed(t)
+			for i := 0; i < 8; i++ {
+				logger.Warn(msg)
+			}
+			if len(*seen) != 0 {
+				t.Fatalf("outcome notice produced observations: %+v", *seen)
+			}
+			if n := strings.Count(out.String(), "\n"); n != 8 {
+				t.Errorf("wrapped handler saw %d records, want 8", n)
+			}
+			if !strings.Contains(out.String(), msg) {
+				t.Error("outcome notice missing from local logs")
+			}
+		})
+	}
+
+	// Preserve the underlying timeout diagnostics and actual heartbeat failures.
+	for _, failure := range []string{
+		"hub heartbeat collect timed out; loop keeps ticking so liveness stays green",
+		"hub heartbeat collect budget exceeded — slowest collectors (in-flight = still running at timeout)",
+		"hub heartbeat collect panicked",
+		"hub heartbeat fresh stats collect panicked",
+		"hub heartbeat fresh stats collect timed out",
+		"hub heartbeat failed",
+		"hub heartbeat rejected",
+	} {
+		t.Run(failure, func(t *testing.T) {
+			logger, seen, _ := newFeed(t)
+			logger.Warn(failure)
+			if len(*seen) != 1 || (*seen)[0].message != failure {
+				t.Fatalf("heartbeat failure must remain reportable: %+v", *seen)
+			}
+		})
+	}
+}
+
+// #16100: branch drift is an expected safety refusal, even when an own-only
+// write-back gate leaves the snapshot in place and it repeats every poll.
+func TestHoldGuardDriftLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const msg = "hold guard: branch moved while hold-gated — blocking auto-merge, requiring fresh review"
+	for i := 0; i < 20; i++ {
+		logger.Warn(msg, "repo", "o/r", "pr", 509,
+			"recorded_head", "49cef2e430cdd0b83fabe235c84fce35a6a7c35e",
+			"current_head", "2e709797e6a28d874e0b94413a9b3f712304fb9b",
+			"new_commits", 1, "new_authors", "contributor")
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("expected safety refusal produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 20 {
+		t.Errorf("wrapped handler saw %d records, want 20", n)
+	}
+	if !strings.Contains(out.String(), msg) {
+		t.Error("hold guard warning missing from local logs")
+	}
+
+	// Do not blanket-suppress the guard: failures to verify provenance or
+	// explain/reapply the hold still need fleet visibility.
+	for _, failure := range []string{
+		"hold guard: could not read gate-lift provenance; treating moved head as drift",
+		"hold guard: drift comment failed; will retry next pass",
+		"hold guard: re-applying hold label failed; will retry next pass",
+	} {
+		logger.Warn(failure, "error", "unexpected failure")
+	}
+	if len(*seen) != 3 {
+		t.Fatalf("hold guard failures must remain reportable: %+v", *seen)
+	}
+}
+
+// #16112: a sentinel finding on a PR is the sweep working as designed (it
+// flags the PR for a human), not a hive runtime defect, even when several
+// PRs or sweeps cross the repeat threshold in one window.
+func TestSentinelAlertLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	for i := 0; i < 10; i++ {
+		logger.Warn("sentinel alert", "repo", "server", "pr", 583+i,
+			"author", "contributor", "rules", "sensitive_path,security_policy_edit")
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("sentinel findings produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 10 {
+		t.Errorf("wrapped handler saw %d records, want 10", n)
+	}
+	if !strings.Contains(out.String(), "sentinel alert") {
+		t.Error("sentinel alert warning missing from local logs")
+	}
+
+	// Do not blanket-suppress the sentinel: a failing sweep or a PR it could
+	// not evaluate still needs fleet visibility.
+	logger.Warn("sentinel sweep failed", "error", "unexpected failure")
+	logger.Warn("sentinel sweep: PR skipped", "detail", "o/r#1: unexpected failure")
+	if len(*seen) != 2 {
+		t.Fatalf("sentinel sweep failures must remain reportable: %+v", *seen)
+	}
+}
+
+func TestSentinelPacingSkipLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	const detail = `website: list PRs: listing open PRs for supersession sweep in projectbluefin/website: Get "https://api.github.com/repos/projectbluefin/website/pulls?per_page=100&state=open": github pacing: slot would miss request deadline: context deadline exceeded`
+	for range 16 {
+		logger.Warn("sentinel sweep: PR skipped", "detail", detail)
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("pacing skips produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 16 {
+		t.Fatalf("wrapped handler saw %d records, want 16", n)
+	}
+	logger.Warn("sentinel sweep: PR skipped", "detail", "website: permission denied")
+	logger.Warn("another warning", "detail", detail)
+	if len(*seen) != 2 {
+		t.Fatalf("other failures must remain reportable: %+v", *seen)
+	}
+}
+
+// #15906: the per-head review cap suppressing a duplicate comment is expected.
+func TestReviewCommentCappedLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	for i := 0; i < 8; i++ {
+		logger.Warn("review-request watcher: comment suppressed by per-head cap, verdict recorded",
+			"agent", "reviewer", "repo", "hivecommons/hive", "number", 15895,
+			"reason", "head 20854a8 already carries 1 hive review(s) (limit 1)")
+	}
+	if len(*seen) != 0 {
+		t.Errorf("produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 8 {
+		t.Errorf("wrapped handler saw %d records, want 8", n)
 	}
 }
 
@@ -710,7 +1140,96 @@ func TestInferenceCallerUnidentifiedFeedThresholdAndClear(t *testing.T) {
 	logger2, seen, _ := newFeed(t)
 	logger2.Warn("inference upstream failed")
 	logger2.Warn("inference no route", "agent", "scanner")
-	if len(*seen) != 2 || (*seen)[0].class != fleetreport.ClassInferenceUpstreamError || (*seen)[1].class != fleetreport.ClassUnclassifiedRepeated {
+	if len(*seen) != 2 || (*seen)[0].class != fleetreport.ClassInferenceUpstreamError || (*seen)[1].class != fleetreport.ClassInferenceNoRoute {
 		t.Fatalf("unrelated inference failures = %+v", *seen)
+	}
+}
+
+// #15986: a watchdog stall caused by a provider inference block (429
+// budget_exceeded) is upstream backpressure, not an unclassified defect.
+func TestInferenceBlockedStallLogsWithoutFleetReport(t *testing.T) {
+	logger, seen, out := newFeed(t)
+	for i := 0; i < 10; i++ {
+		logger.Warn("watchdog: agent not producing", "agent", "dedupe",
+			"detail", `blocked: inference (rate_limit): API Error: Request rejected (429) {"error":{"type":"budget_exceeded"}}`)
+	}
+	if len(*seen) != 0 {
+		t.Errorf("produced observations: %+v", *seen)
+	}
+	if n := strings.Count(out.String(), "\n"); n != 10 {
+		t.Errorf("wrapped handler saw %d records, want 10", n)
+	}
+
+	logger, seen, _ = newFeed(t)
+	logger.Warn("watchdog: agent not producing", "agent", "dedupe", "detail", "no production evidence for 2h0m0s")
+	if len(*seen) != 1 {
+		t.Fatalf("other stalls must remain reportable: %+v", *seen)
+	}
+}
+
+// #16844: a GitHub 5xx on the review POST is retried with backoff by design.
+func TestReviewRetryServerErrorLogsWithoutFleetReport(t *testing.T) {
+	const msg = "review-request watcher: review failed, will retry with backoff"
+	errOf := func(code string) string {
+		return "effect outcome uncertain, reconciliation required: POST https://api.github.com/repos/hivecommons/hive/pulls/16830/reviews: " + code + "  []"
+	}
+	cases := []struct {
+		name string
+		msg  string
+		err  string
+		want int
+	}{
+		{"500", msg, errOf("500"), 0},
+		{"502", msg, errOf("502"), 0},
+		{"503", msg, errOf("503"), 0},
+		{"403", msg, errOf("403"), 8},
+		{"422", msg, errOf("422"), 8},
+		{"non-http error", msg, "boom", 8},
+		{"other message", "review-request watcher: review quarantined", errOf("500"), 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, seen, out := newFeed(t)
+			for i := 0; i < 8; i++ {
+				logger.Warn(tc.msg, "repo", "hivecommons/hive", "number", 16830, "error", tc.err)
+			}
+			if tc.want == 0 && len(*seen) != 0 {
+				t.Errorf("produced observations: %+v", *seen)
+			}
+			if tc.want != 0 && len(*seen) == 0 {
+				t.Errorf("must remain reportable")
+			}
+			if n := strings.Count(out.String(), "\n"); n != 8 {
+				t.Errorf("wrapped handler saw %d records, want 8", n)
+			}
+		})
+	}
+}
+
+// #17103 / #17142: the stage dampener and the stage engine's reversal guard
+// suppressing a flap are designed behaviour.
+func TestStageDampenerSuppressionLogsWithoutFleetReport(t *testing.T) {
+	cases := []struct {
+		msg   string
+		attrs []any
+	}{
+		{"stage transition suppressed by dampener", []any{"key", "hivecommons/hive#17073", "head", "abc",
+			"from", "071-needs-author", "to", "050-review-pending", "reason", "base-refresh:queued-behind#17048"}},
+		{"stage flap suppressed", []any{"ref", "hivecommons/hive#17139", "head", "16a0c0c",
+			"from", "060-reviewed", "to", "050-review-pending", "reason", "base-refresh:queued-behind#17109"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.msg, func(t *testing.T) {
+			logger, seen, out := newFeed(t)
+			for range 12 {
+				logger.Warn(tc.msg, tc.attrs...)
+			}
+			if len(*seen) != 0 {
+				t.Errorf("produced observations: %+v", *seen)
+			}
+			if n := strings.Count(out.String(), "\n"); n != 12 {
+				t.Errorf("wrapped handler saw %d records, want 12", n)
+			}
+		})
 	}
 }

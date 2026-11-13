@@ -14,6 +14,7 @@ package slogfeed
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 
@@ -114,7 +115,7 @@ func Key(msg string) string {
 }
 
 func (h *Handler) feed(r slog.Record) {
-	if expectedKickHold(r) || rateLimitedError(r) || upstreamUnavailableError(r) {
+	if canceledError(r, h.attrs) || expectedKickHold(r) || rateLimitedError(r) || sentinelPacingSkip(r) || upstreamUnavailableError(r) || failClosedStatus500(r) || hubHeartbeatUnavailable(r) || hubHeartbeatCachedFallback(r) || reviewCommentCapped(r) || inferenceBlockedStall(r) || automergeMergeGuardSkip(r) || reviewRetryServerError(r) || stageDampenerSuppression(r) || signedCommitOwnershipSkip(r) {
 		return
 	}
 	class := fleetreport.ClassUnclassifiedRepeated
@@ -133,6 +134,38 @@ func (h *Handler) feed(r slog.Record) {
 		}
 	}
 	h.observe(class, key, r.Message, diagnostics(r, h.attrs))
+}
+
+// signedCommitOwnershipSkip is the reconciler's deliberate refusal to rewrite
+// a foreign or merge commit. The warning and PR remedy remain visible; repeated
+// skips across PRs are not a runtime defect.
+func signedCommitOwnershipSkip(r slog.Record) bool {
+	return r.Level == slog.LevelWarn && strings.TrimSpace(r.Message) == "signed-commit reconciler: skipped; the PR keeps an unsigned commit"
+}
+
+// canceledError applies the existing cancellation exclusion to structured
+// errors too. An accompanying different error must remain reportable.
+func canceledError(r slog.Record, bound []slog.Attr) bool {
+	found, other := false, false
+	check := func(a slog.Attr) bool {
+		if a.Key == "error" {
+			value := a.Value.Resolve()
+			err, ok := value.Any().(error)
+			if ok && errors.Is(err, context.Canceled) {
+				found = true
+			} else if text := value.String(); text == context.Canceled.Error() || strings.HasSuffix(text, ": "+context.Canceled.Error()) {
+				found = true
+			} else {
+				other = true
+			}
+		}
+		return true
+	}
+	for _, a := range bound {
+		check(a)
+	}
+	r.Attrs(check)
+	return found && !other
 }
 
 // expectedKickHold reports whether a "failed to send kick" record carries the
@@ -173,6 +206,23 @@ func rateLimitedError(r slog.Record) bool {
 	return limited
 }
 
+// sentinelPacingSkip handles the sentinel's per-item errors, which are logged
+// as detail rather than error. Other skipped PRs remain reportable.
+func sentinelPacingSkip(r slog.Record) bool {
+	if r.Message != "sentinel sweep: PR skipped" {
+		return false
+	}
+	limited := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "detail" && fleetreport.IsGitHubRateLimited(a.Value.String()) {
+			limited = true
+			return false
+		}
+		return true
+	})
+	return limited
+}
+
 // upstreamUnavailableError reports whether the record's error attribute is a
 // GitHub 502/503/504 (fleetreport.IsGitHubUpstreamUnavailable). Callers such
 // as the self-authored automerge sweep ("fetch-pr") log a per-site message and
@@ -188,6 +238,166 @@ func upstreamUnavailableError(r slog.Record) bool {
 		return true
 	})
 	return unavailable
+}
+
+// inferenceBlockedStall reports whether r is the watchdog's "agent not
+// producing" warning raised because the provider refused inference
+// ("blocked: inference (<class>)": 429 rate limit, budget_exceeded, ...). The
+// cause is upstream and already shown as a blocked agent on the dashboard, so
+// the stall is not a hive defect to file as unclassified_error_repeated
+// (hivecommons/hive#15986). A stall with any other detail stays reportable.
+func inferenceBlockedStall(r slog.Record) bool {
+	if strings.TrimSpace(r.Message) != "watchdog: agent not producing" {
+		return false
+	}
+	blocked := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "detail" {
+			blocked = strings.HasPrefix(a.Value.String(), "blocked: inference (")
+			return false
+		}
+		return true
+	})
+	return blocked
+}
+
+// stageDampenerSuppression reports whether r is a stage guard refusing a
+// flapping transition: the stage-label store's dampener ("stage transition
+// suppressed by dampener", hivecommons/hive#17103) or the stage engine's
+// same-head reversal guard ("stage flap suppressed", hivecommons/hive#17142).
+// Both are the guard working as designed, not a runtime error; the WARN stays
+// in local logs.
+func stageDampenerSuppression(r slog.Record) bool {
+	switch strings.TrimSpace(r.Message) {
+	case "stage transition suppressed by dampener", "stage flap suppressed":
+		return true
+	}
+	return false
+}
+
+// automergeMergeGuardSkip reports whether r is an automerge sweep lane
+// (queued, self-authored, trusted-author or contributor) declining to refresh
+// a PR's base while a merge to that destination is already in flight (reason
+// base-refresh:merge-guard). The guard is self-limiting and the PR is retried
+// next tick (hivecommons/hive#16520). Any other sweep skip stays reportable.
+func automergeMergeGuardSkip(r slog.Record) bool {
+	switch strings.TrimSpace(r.Message) {
+	case "automerge sweep skipped PR",
+		"self-authored automerge sweep skipped PR",
+		"trusted-author automerge sweep skipped PR",
+		"contributor-lane automerge sweep skipped PR":
+	default:
+		return false
+	}
+	reason, err := "", ""
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "reason":
+			reason = a.Value.String()
+		case "error":
+			err = a.Value.String()
+		}
+		return true
+	})
+	return reason == "base-refresh:merge-guard" && strings.Contains(err, "destination merge already in progress")
+}
+
+// failClosedStatus500 reports whether r is one of the callers that fail closed
+// when GitHub answers the combined-status read with a 500: the merge-eligible
+// lane gate, the trusted-author and contributor-lane automerge sweep skips and
+// the stage-label check digest. The PR is retried next tick, so the transient
+// 5xx is expected behaviour (hivecommons/hive#15785, #15786, #16778, #16779).
+// A 500 elsewhere stays reportable.
+func failClosedStatus500(r slog.Record) bool {
+	switch strings.TrimSpace(r.Message) {
+	case "merge-eligible lane gate could not evaluate PR; leaving it listed",
+		"trusted-author automerge sweep skipped PR",
+		"contributor-lane automerge sweep skipped PR",
+		"stage labels: check digest failed":
+	default:
+		return false
+	}
+	match := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "error" {
+			e := a.Value.String() + " "
+			match = strings.Contains(e, "/status") && strings.Contains(e, ": 500 ")
+			return false
+		}
+		return true
+	})
+	return match
+}
+
+// reviewRetryServerError reports whether r is the review-request watcher's
+// "review failed, will retry with backoff" warning caused by a GitHub 5xx on
+// the review POST. The retry with backoff is the designed behaviour and the
+// request is quarantined with an Error at the horizon, so a transient upstream
+// 5xx on the write is not a hive defect (hivecommons/hive#16844). 4xx and
+// non-5xx errors, and the quarantine Error, stay reportable.
+func reviewRetryServerError(r slog.Record) bool {
+	if strings.TrimSpace(r.Message) != "review-request watcher: review failed, will retry with backoff" {
+		return false
+	}
+	match := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "error" {
+			e := a.Value.String() + " "
+			match = (strings.Contains(e, "/reviews") || strings.Contains(e, "/pulls/")) &&
+				(strings.Contains(e, ": 500 ") || fleetreport.IsGitHubUpstreamUnavailable(e))
+			return false
+		}
+		return true
+	})
+	return match
+}
+
+// hubHeartbeatUnavailable reports whether r is a spoke heartbeat the hub
+// answered with 502/503/504 (restarting or temporarily unreachable). The
+// heartbeat retries on the next beat, so this is expected transient behaviour
+// (hivecommons/hive#15789). 401/403 (bad HIVE_HUB_SECRET) stay reportable.
+func hubHeartbeatUnavailable(r slog.Record) bool {
+	if strings.TrimSpace(r.Message) != "hub heartbeat rejected" {
+		return false
+	}
+	match := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "status" {
+			switch a.Value.String() {
+			case "502", "503", "504":
+				match = true
+			}
+			return false
+		}
+		return true
+	})
+	return match
+}
+
+// hubHeartbeatCachedFallback is the outcome notice for a bounded collector
+// timeout: sending stale stats, a minimal liveness beat, skipping a beat before
+// identity is known, or dropping the fresh agent overlay is the liveness
+// safeguard working as designed (#16507, #16516). Keep the WARN in local logs,
+// but do not file a second defect for the fallback itself. The collector
+// timeout and its slow-section breakdown, collector panics, and heartbeat send
+// failures remain reportable.
+func hubHeartbeatCachedFallback(r slog.Record) bool {
+	switch strings.TrimSpace(r.Message) {
+	case "hub heartbeat collect timed out — sending LAST-GOOD cached stats (marked stale) so the hub keeps this hive online; loop keeps ticking so liveness stays green",
+		"hub heartbeat collect timed out with no cached payload — sending MINIMAL liveness beat (identity only, no stats) so the hub keeps this hive online; loop keeps ticking so liveness stays green",
+		"hub heartbeat collect timed out and hive identity not yet known — skipping this beat; loop keeps ticking so liveness stays green",
+		"hub heartbeat fresh stats collect timed out; sending stale cached stats without fresh agent overlay":
+		return true
+	}
+	return false
+}
+
+// reviewCommentCapped reports whether r is the review-request watcher noting
+// that the per-head review cap suppressed a duplicate comment while the
+// verdict was still recorded. That is the cap working as designed, not a
+// runtime defect (hivecommons/hive#15906); the WARN stays in local logs.
+func reviewCommentCapped(r slog.Record) bool {
+	return strings.TrimSpace(r.Message) == "review-request watcher: comment suppressed by per-head cap, verdict recorded"
 }
 
 // Classifier errors stay in local logs only: transport errors can expose the

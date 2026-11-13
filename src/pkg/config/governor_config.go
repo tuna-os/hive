@@ -11,6 +11,8 @@ import (
 )
 
 type GovernorConfig struct {
+	// CI is governor.ci (hivecommons/hive#16603); see GovernorCIConfig.
+	CI                   GovernorCIConfig      `yaml:"ci,omitempty" json:"ci,omitempty"`
 	Modes                map[string]ModeConfig `yaml:"modes"`
 	EvalIntervalS        int                   `yaml:"eval_interval_s"`
 	EvalIntervalMaxS     int                   `yaml:"eval_interval_max_s,omitempty"`
@@ -27,10 +29,21 @@ type GovernorConfig struct {
 	// for a sweep. Cooldown bounds kicks per PR head (default 600 seconds).
 	CIFailureWebhookKick   *bool `yaml:"ci_failure_webhook_kick,omitempty"`
 	CIFailureKickCooldownS int   `yaml:"ci_failure_kick_cooldown_s,omitempty"`
-	// MergeTrainStallWarnS is the stalled-train warning threshold in seconds.
-	MergeTrainStallWarnS       int `yaml:"merge_train_stall_warn_s,omitempty"`
-	ConserveIntervalMultiplier int `yaml:"conserve_interval_multiplier,omitempty"`
-	OptionalSweepEveryNCycles  int `yaml:"optional_sweep_every_n_cycles,omitempty"`
+	// DependencyBotRebaseAfterS is how long a dependency-bot PR may sit
+	// behind or conflicting with its base before the dependency-bot sweep
+	// treats a bot that stopped rebasing it as stranded: it asks the bot to
+	// rebase (write-back kind bot_rebase_request) and, one more window later
+	// with the head unchanged, hands the PR to a person. Seconds; 0 or unset
+	// means DefaultDependencyBotRebaseAfterS (4 hours).
+	DependencyBotRebaseAfterS int `yaml:"dependency_bot_rebase_after_s,omitempty" json:"dependency_bot_rebase_after_s,omitempty"`
+	// MergeTrainStallWarnS is the stalled-train warning threshold in seconds
+	// (default DefaultMergeTrainStallWarnS; explicit zero disables warnings;
+	// hivecommons/hive#15395).
+	MergeTrainStallWarnS       int  `yaml:"merge_train_stall_warn_s,omitempty"`
+	mergeTrainStallWarnSet     bool `yaml:"-" json:"-"`
+	ConserveIntervalMultiplier int  `yaml:"conserve_interval_multiplier,omitempty"`
+	OptionalSweepEveryNCycles  int  `yaml:"optional_sweep_every_n_cycles,omitempty"`
+	APIBudgetPacing            bool `yaml:"api_budget_pacing,omitempty" json:"api_budget_pacing,omitempty"` // spread GitHub calls over the rate-limit window; off by default
 	// ExplainMode is the hive-wide default explain mode for agents that leave
 	// their own explain_mode unset. "" means "no hive default configured", in
 	// which case ExplainModeEnvVar is consulted and then off — see
@@ -141,6 +154,15 @@ type GovernorConfig struct {
 	// AutoCloseSuperseded closes only hive-authored PRs superseded by a
 	// different merged PR. A person's PR still needs their decision.
 	AutoCloseSuperseded *bool `yaml:"auto_close_superseded,omitempty" json:"auto_close_superseded,omitempty"`
+
+	// Review tunes what the governor does with the review swarm's verdicts
+	// on the hive's own PRs. See GovernorReviewConfig.
+	Review GovernorReviewConfig `yaml:"review,omitempty" json:"review,omitempty"`
+
+	// ReviewerBackend picks how the one-shot reviewer turns (Let hive decide
+	// and grounded chat) reach a model: auto (default), http or claude-cli.
+	// See ResolveReviewerTurn in reviewer_backend.go.
+	ReviewerBackend string `yaml:"reviewer_backend,omitempty" json:"reviewer_backend,omitempty"`
 
 	// Hotspot* tune the merge-hotspot advisor. Zero values use the defaults;
 	// disabling issues keeps reporting enabled without filing on GitHub.
@@ -514,6 +536,13 @@ type StageAdoptionConfig struct {
 	// OfflineGrace retries a failed adoption replay once the author's
 	// clanker remains offline for this duration (default 30m).
 	OfflineGrace string `yaml:"offline_grace,omitempty"`
+	// RebaseAttemptTimeout is how long one fixer rebase attempt on an
+	// adopted (or otherwise hive-owned) conflicting PR may wait for the
+	// fixer's push before it counts as failed and the next attempt is
+	// dispatched; past the attempt cap an in-place adoption re-homes to a
+	// hive-owned superseding PR at once (default 15m;
+	// hivecommons/hive#16023).
+	RebaseAttemptTimeout string `yaml:"rebase_attempt_timeout,omitempty"`
 	// InPlace lets the hive adopt by pushing to the PR's own branch when
 	// GitHub allows it (same-repo head or maintainer_can_modify) instead of
 	// opening a superseding App PR. nil = true.
@@ -659,9 +688,23 @@ type ContributorNudgeConfig struct {
 	// Enabled turns the nudge on. nil = true.
 	Enabled *bool `yaml:"enabled"`
 	// RenudgeInterval is how long after the first nudge the hive nudges once
-	// more (the documented cap is 2 nudges per head). Default: the stage's
-	// dwell (24h), i.e. the re-nudge coincides with stage/stalled.
+	// more (the documented cap is 2 nudges per PR and reason class). Unset
+	// defers to auto_merge.nudge_repeat_after (default 72h).
 	RenudgeInterval string `yaml:"renudge_interval,omitempty"`
+	// CIFailureCooldown is how long after a CI-failure nudge a changed
+	// failing-check set on a new head is folded into the PR's one nudge
+	// comment instead of counting as a fresh nudge
+	// (hivecommons/hive#17328). Default DefaultContributorNudgeCIFailureCooldown (6h).
+	CIFailureCooldown string `yaml:"ci_failure_cooldown,omitempty"`
+}
+
+// DefaultContributorNudgeCIFailureCooldown is
+// governor.labels.stage.contributor_nudge.ci_failure_cooldown's default.
+const DefaultContributorNudgeCIFailureCooldown = 6 * time.Hour
+
+// EffectiveCIFailureCooldown parses CIFailureCooldown with the 6h default.
+func (c ContributorNudgeConfig) EffectiveCIFailureCooldown() time.Duration {
+	return parseDurationOr(c.CIFailureCooldown, DefaultContributorNudgeCIFailureCooldown)
 }
 
 // IsEnabled reports whether the contributor nudge runs (default on).
@@ -671,7 +714,7 @@ func (c ContributorNudgeConfig) IsEnabled() bool { return c.Enabled == nil || *c
 const DefaultPresenceWindow = 15 * time.Minute
 
 // EffectiveRenudgeInterval parses RenudgeInterval; unset/invalid returns 0
-// (the caller falls back to the stage dwell).
+// (the caller falls back to auto_merge.nudge_repeat_after).
 func (c ContributorNudgeConfig) EffectiveRenudgeInterval() time.Duration {
 	return parseDurationOr(c.RenudgeInterval, 0)
 }
@@ -1033,4 +1076,25 @@ func (c StageAdoptionConfig) EffectiveCloseSuperseded() string {
 		}
 	}
 	return DefaultAdoptionCloseSuperseded
+}
+
+// GovernorReviewConfig is governor.review: how the governor treats the
+// review swarm's verdicts on hive-authored PRs.
+type GovernorReviewConfig struct {
+	// AutoDecideQuestions lets the hive answer a reviewer's scope or
+	// follow-up QUESTION on its own green, finding-free PR through the
+	// delegated-decision path instead of parking the PR at stage/085 for a
+	// person (hivecommons/docs#618: "this is auto-merge material, not
+	// needs-human"). Policy sign-off asks — workflow edits from a fork,
+	// secrets / permissions / OWNERS / security paths, auto_merge or
+	// human_merge_paths changes, an explicit owner-only guard in the ask —
+	// still park. At most one auto-decision per head; a new push re-asks.
+	// Default on. See review.ClassifyDecisionQuestion for the two classes.
+	AutoDecideQuestions *bool `yaml:"auto_decide_questions,omitempty" json:"auto_decide_questions,omitempty"`
+}
+
+// AutoDecideQuestionsEnabled resolves GovernorReviewConfig.AutoDecideQuestions
+// with its default (on).
+func (r GovernorReviewConfig) AutoDecideQuestionsEnabled() bool {
+	return r.AutoDecideQuestions == nil || *r.AutoDecideQuestions
 }

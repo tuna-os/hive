@@ -93,7 +93,7 @@ func retryClaimEffect(ctx context.Context, logger *slog.Logger, what, key string
 			return n
 		}
 		if logger != nil {
-			logger.Warn("issue-claims: retrying GitHub side effect", "what", what, "issue", key, "attempt", n, "retry_in", backoff.String(), "error", err)
+			logger.Info("issue-claims: retrying GitHub side effect", "what", what, "issue", key, "attempt", n, "retry_in", backoff.String(), "error", err)
 		}
 		if !wait(ctx, backoff) {
 			if logger != nil {
@@ -194,11 +194,20 @@ func buildClaimsLedger(cfg *config.Config, logger *slog.Logger) *claims.Ledger {
 // installClaimAdmissionCheck gates every automated ledger producer on current
 // labels, including renewals and forced takeovers. Resolve the client per call
 // because App setup can finish after boot.
-func installClaimAdmissionCheck(ctx context.Context, ledger *claims.Ledger, client func() *github.Client) {
+func installClaimAdmissionCheck(ctx context.Context, ledger *claims.Ledger, client func() *github.Client, integrationCheck ...func(string, int) string) {
 	if ledger == nil || client == nil {
 		return
 	}
 	ledger.SetAdmissionCheck(func(req claims.Request) (string, error) {
+		if _, held := ledger.Lookup(req.Repo, req.Issue); !held && !req.PRStarted {
+			for _, check := range integrationCheck {
+				if check != nil {
+					if reason := check(req.Repo, req.Issue); reason != "" {
+						return reason, nil
+					}
+				}
+			}
+		}
 		ctx, cancel := context.WithTimeout(ctx, claimsGitHubTimeout)
 		defer cancel()
 		gh := client()
@@ -208,8 +217,13 @@ func installClaimAdmissionCheck(ctx context.Context, ledger *claims.Ledger, clie
 		// A fresh claim with no PR behind it is a dispatch: it also asks
 		// whether an open PR already fixes the issue (#14799). A renewal,
 		// a PR-backed start signal and the release tick's recheck of live
-		// claims do not — the holder's own PR is the open PR.
+		// claims do not — the holder's own PR is the open PR. A hive
+		// agent's own dispatch (Holder is the agent name) also refuses an
+		// issue that agent filed for outside help (hivecommons/hive#17299).
 		if _, held := ledger.Lookup(req.Repo, req.Issue); !held && !req.PRStarted {
+			if req.Kind == claims.KindAgent {
+				return gh.IssueStartBlockReason(ctx, req.Repo, req.Issue, req.Holder)
+			}
 			return gh.IssueDispatchBlockReason(ctx, req.Repo, req.Issue)
 		}
 		return gh.IssueClaimBlockReason(ctx, req.Repo, req.Issue)
@@ -237,6 +251,9 @@ func githubClaimHooksOn(queue *claimEffectQueue, ctx context.Context, cfg *confi
 	}
 	comment := cfg.Governor.Claims.CommentEnabled()
 	label := cfg.Governor.Claims.LabelEnabled()
+	// The ledger folds every transition into one edited comment per issue
+	// (hivecommons/hive#16433); off, each transition is its own comment.
+	ledgerMode := cfg.GitHub.Notifications.ClaimLedgerEnabled()
 	attempt := func(fn func(ctx context.Context, gh *github.Client) error, gh *github.Client) error {
 		cctx, cancel := context.WithTimeout(ctx, claimsGitHubTimeout)
 		defer cancel()
@@ -261,13 +278,44 @@ func githubClaimHooksOn(queue *claimEffectQueue, ctx context.Context, cfg *confi
 			logger.Warn("issue-claims: GitHub side effect failed", "what", what, "issue", c.Key(), "attempts", 1, "error", err)
 		}
 	}
+	// ledger edits the issue's claim ledger comment for event, posting the
+	// one notifying comment a human owed one gets. The edit is retried: a
+	// PATCH that lands twice is the same body, unlike a POST.
+	ledger := func(what string, event claims.LedgerEvent, notice func(previous string) string) {
+		run(what, event.Claim, func(ctx context.Context, gh *github.Client) error {
+			res, err := gh.EditIssueMarkerComment(ctx, event.Claim.Repo, event.Claim.Issue, claims.LedgerMarker, func(previous string) string {
+				return claims.LedgerComment(previous, event)
+			})
+			if err != nil {
+				return err
+			}
+			if notice == nil || !res.Found {
+				// A freshly created ledger already notified: it carries the
+				// same @-mention the standalone comment did.
+				return nil
+			}
+			if body := notice(res.Previous); body != "" {
+				return gh.CreateIssueCommentBudgeted(ctx, event.Claim.Repo, event.Claim.Issue, body)
+			}
+			return nil
+		})
+	}
 	return claims.Hooks{
 		OnClaimed: func(c claims.Claim, outcome claims.Outcome) {
 			queue.run(c.Key(), func() {
 				if comment && outcome == claims.OutcomeClaimed {
-					runOnce("claim comment", c, func(ctx context.Context, gh *github.Client) error {
-						return gh.CreateIssueCommentBudgeted(ctx, c.Repo, c.Issue, claims.ClaimComment(c))
-					})
+					if ledgerMode {
+						ledger("claim ledger", claims.LedgerEvent{Claim: c, At: c.ClaimedAt}, func(previous string) string {
+							if claims.LedgerNotifiesHuman(previous, c) {
+								return claims.LedgerNoticeComment(c)
+							}
+							return ""
+						})
+					} else {
+						runOnce("claim comment", c, func(ctx context.Context, gh *github.Client) error {
+							return gh.CreateIssueCommentBudgeted(ctx, c.Repo, c.Issue, claims.ClaimComment(c))
+						})
+					}
 				}
 				if label {
 					// The stage is a fact for the engine (ADR-0025): a live
@@ -292,9 +340,17 @@ func githubClaimHooksOn(queue *claimEffectQueue, ctx context.Context, cfg *confi
 		OnTakenOver: func(now, previous claims.Claim) {
 			queue.run(now.Key(), func() {
 				if comment {
-					runOnce("takeover comment", now, func(ctx context.Context, gh *github.Client) error {
-						return gh.CreateIssueComment(ctx, now.Repo, now.Issue, claims.TakeoverComment(now, previous))
-					})
+					if ledgerMode {
+						ledger("takeover ledger", claims.LedgerEvent{Claim: now, Previous: previous, At: now.ClaimedAt}, func(string) string {
+							// The displaced person must hear it; an edit
+							// tells them nothing.
+							return claims.LedgerDisplacedNotice(now, previous)
+						})
+					} else {
+						runOnce("takeover comment", now, func(ctx context.Context, gh *github.Client) error {
+							return gh.CreateIssueComment(ctx, now.Repo, now.Issue, claims.TakeoverComment(now, previous))
+						})
+					}
 				}
 				if label {
 					run("claimed stage", now, func(ctx context.Context, gh *github.Client) error {
@@ -341,8 +397,9 @@ func githubClaimHooksOn(queue *claimEffectQueue, ctx context.Context, cfg *confi
 					})
 				}
 				// Every early release needs a marker: the 🔒 comment is
-				// never edited, and issueclaim.Latest otherwise reads the
-				// hold as live until until=. This includes relay disconnect,
+				// never edited (the ledger rewrites it to carry the release
+				// marker instead), and issueclaim.Latest otherwise reads
+				// the hold as live until until=. This includes relay disconnect,
 				// revoke and lease-expiry releases: omitting them starved
 				// hive agents while relays flapped (hivecommons/hive#13579).
 				// TTL expiry needs no marker: until= has already lapsed.
@@ -352,9 +409,13 @@ func githubClaimHooksOn(queue *claimEffectQueue, ctx context.Context, cfg *confi
 				// SetIssueClaimLedgerHive still prevents this hive from
 				// believing its own stale hold.
 				if comment && reason != claims.ReasonExpired {
-					runOnce("release comment", c, func(ctx context.Context, gh *github.Client) error {
-						return gh.CreateIssueCommentBudgeted(ctx, c.Repo, c.Issue, claims.ReleaseComment(c, reason))
-					})
+					if ledgerMode {
+						ledger("release ledger", claims.LedgerEvent{Claim: c, Released: true, Reason: reason, At: time.Now()}, nil)
+					} else {
+						runOnce("release comment", c, func(ctx context.Context, gh *github.Client) error {
+							return gh.CreateIssueCommentBudgeted(ctx, c.Repo, c.Issue, claims.ReleaseComment(c, reason))
+						})
+					}
 				}
 			})
 		},
@@ -458,12 +519,22 @@ func recordAgentKickListings(dashSrv *dashboard.Server, org, agentName string, i
 // comment or a label request; see pkg/github/agent_start_hook.go). The first such signal on an issue a kick
 // listed to the agent records the agent claim (comment and label included)
 // that the escalation gate counts; a later one renews it. A signal on an
-// issue no kick listed to the agent records nothing.
+// issue no kick listed to the agent records nothing — except the filed-claim
+// signal (hivecommons/hive#17299): the agent filed that issue itself as its
+// own next step and claimed it in the same request, so no kick could have
+// listed it; the filing is its listing, and the claim is recorded like a
+// kicked issue's first start (admission check included).
 func recordAgentStart(ledger *claims.Ledger, org, agentName, repo string, issue int, signal string, logger *slog.Logger) {
 	if ledger == nil || agentName == "" || issue <= 0 {
 		return
 	}
-	res, started, err := ledger.ClaimOnStart(qualifyClaimRepo(org, repo), issue, agentName, github.StartSignalIsPREvidence(signal))
+	qualified := qualifyClaimRepo(org, repo)
+	if signal == github.AgentStartSignalFiledClaim {
+		if _, listed := ledger.MarkListed(qualified, issue, agentName); !listed && logger != nil {
+			logger.Debug("issue-claims: self-filed issue someone else holds; not listed", "agent", agentName, "repo", repo, "issue", issue)
+		}
+	}
+	res, started, err := ledger.ClaimOnStart(qualified, issue, agentName, github.StartSignalIsPREvidence(signal))
 	if logger == nil || !started {
 		return
 	}

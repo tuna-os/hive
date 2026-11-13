@@ -68,6 +68,66 @@ type StageTrackerRework struct {
 	Ahead int `json:"ahead,omitempty"`
 	// Head is the new head on a pushed state.
 	Head string `json:"head,omitempty"`
+	// OwedBy names who owes the next move on a pushed state
+	// (hivecommons/hive#16615): "hive-reviewer" when the new head needs the
+	// hive's re-review and nothing on it is the author's to fix, so the
+	// waiting-on pill names the hive, not the author; "author" when they
+	// still owe something on the pushed head — red CI, changes requested on
+	// it, or a conflict nobody in the hive is rebasing. Empty on the other
+	// states (and from older servers, which the dashboard reads from the
+	// activities instead).
+	OwedBy string `json:"owed_by,omitempty"`
+}
+
+// Who owes the next move on a pushed head.
+const (
+	reworkOwedByHiveReviewer = "hive-reviewer"
+	reworkOwedByAuthor       = "author"
+)
+
+// stageTrackerApplyReworkOwedBy fills Rework.OwedBy once the row's CI and
+// review activity are known (they are derived after the rework field).
+func stageTrackerApplyReworkOwedBy(it *StageTrackerItem) {
+	if it == nil || it.Rework == nil || it.Rework.State != reworkStatePushed {
+		return
+	}
+	it.Rework.OwedBy = stageTrackerReworkOwedBy(*it)
+}
+
+// stageTrackerReworkOwedBy answers "who owes the next move on the pushed
+// head?" The author owes it only when the head itself asks them for
+// something: CI failing on it, review findings against it, or a merge
+// conflict the hive is not rebasing. Otherwise the re-review of the new
+// head is the hive reviewer's to deliver.
+func stageTrackerReworkOwedBy(it StageTrackerItem) string {
+	onHead := func(a *StageTrackerActivity) bool {
+		return a != nil && (a.Head == "" || it.Head == "" || strings.EqualFold(a.Head, it.Head))
+	}
+	if onHead(it.CIActivity) && it.CIActivity.State == "failing" {
+		return reworkOwedByAuthor
+	}
+	if onHead(it.ReviewActivity) && it.ReviewActivity.State == "changes_requested" {
+		return reworkOwedByAuthor
+	}
+	if strings.Contains(strings.ToLower(it.Reason), "conflict") && it.Rebase == nil {
+		return reworkOwedByAuthor
+	}
+	// A DCO ask parks the head on the author's sign-off; no re-review is
+	// queued for it (hivecommons/hive#17789).
+	if stageTrackerAuthorDCOReason(it.Reason) {
+		return reworkOwedByAuthor
+	}
+	return reworkOwedByHiveReviewer
+}
+
+// stageTrackerAuthorDCOReason reports a lane reason that asks the author to
+// fix their commits' sign-off.
+func stageTrackerAuthorDCOReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case stagelabels.LaneReasonDCOMissing, stagelabels.LaneReasonHiveSignoffAttribution:
+		return true
+	}
+	return false
 }
 
 // StageTrackerFixWork is the hub's fix-queue standing for one PR and one
@@ -111,6 +171,13 @@ func stageTrackerReworkFor(it StageTrackerItem, login string, stage stagelabels.
 	if requested.IsZero() {
 		requested = rec.EnteredAt
 	}
+	// A re-ask on the head the author pushed restarts the nudge clock and
+	// the stage entry; the ask the operator cares about is the original
+	// one (hivecommons/hive#16021).
+	pushedHead, pushedAt, pushed := stageTrackerReworkPushed(it, stage, rec)
+	if pushed && !rec.ReworkAskedAt.IsZero() && rec.ReworkAskedAt.Before(requested) {
+		requested = rec.ReworkAskedAt
+	}
 	if requested.IsZero() {
 		return nil
 	}
@@ -125,11 +192,15 @@ func stageTrackerReworkFor(it StageTrackerItem, login string, stage stagelabels.
 	}
 	// Pushed: the head the request named is gone. The stage engine routes
 	// the row back to 050 on its next sweep; until then the row says so.
-	if rec.NudgeHead != "" && it.Head != "" && it.Head != rec.NudgeHead {
-		out.State, out.Evidence, out.Head = reworkStatePushed, reworkEvidenceCommit, it.Head
-		if it.UpdatedAt != nil && it.UpdatedAt.After(requested) {
-			u := *it.UpdatedAt
-			out.Since = &u
+	// Or the engine already did, found the pushed head red again and asked
+	// once more for it: the author answered the ask all the same.
+	if pushed {
+		out.State, out.Evidence, out.Head = reworkStatePushed, reworkEvidenceCommit, pushedHead
+		if !pushedAt.IsZero() {
+			if pushedAt.After(now) {
+				pushedAt = now
+			}
+			out.Since = &pushedAt
 		}
 		return out
 	}
@@ -182,4 +253,37 @@ func stageTrackerReworkFor(it StageTrackerItem, login string, stage stagelabels.
 		out.Since = out.RequestedAt
 	}
 	return out
+}
+
+// stageTrackerReworkPushed reports the author's head pushed after the ask,
+// and when it landed when the record knows: the row's head is no longer
+// the one the nudge named (the sweep has not re-staged the row yet; the
+// push instant is the booked one when the webhook saw it), or the record
+// remembers the push across the re-ask on that head
+// (hivecommons/hive#16021) — unless the re-ask is a review verdict on it,
+// which means the re-review the push queued has happened and the new ask
+// stands on its own.
+func stageTrackerReworkPushed(it StageTrackerItem, stage stagelabels.Stage, rec stagelabels.Record) (head string, at time.Time, ok bool) {
+	if stageTrackerAuthorPushSatisfied(it, stage, rec) {
+		if strings.EqualFold(rec.LastPushSha, it.Head) {
+			at = rec.LastPushAt
+		}
+		return it.Head, at, true
+	}
+	head, at, ok = rec.ReworkPushed()
+	if !ok || (it.Head != "" && !strings.EqualFold(it.Head, head)) {
+		return "", time.Time{}, false
+	}
+	if stageTrackerReworkAnswered(rec.Reason) {
+		return "", time.Time{}, false
+	}
+	return head, at, true
+}
+
+// stageTrackerReworkAnswered reports whether the standing ask's reason is
+// a review verdict — a reviewer or the swarm looked at the pushed head and
+// asked for more — rather than a gate the hive reads off the head (CI,
+// conflict, sign-off).
+func stageTrackerReworkAnswered(reason string) bool {
+	return stageTrackerPushNext(stagelabels.NeedsAuthor, reason) == pushNextReReview
 }

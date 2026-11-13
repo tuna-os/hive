@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"net/url"
 	"regexp"
 	"sort"
@@ -83,6 +84,9 @@ func hostAllowedByHTTPList(host string, allowlist []string) bool {
 }
 
 func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
+	if err := c.IntegrationOrchestration.Validate(); err != nil {
+		return err
+	}
 	if c.Project.Org == "" {
 		return fmt.Errorf("project.org is required")
 	}
@@ -91,6 +95,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 		return fmt.Errorf("at least one agent must be configured")
 	}
 	if err := ValidateWritingGuide(c.Project.WritingGuide); err != nil {
+		return err
+	}
+	if err := validateWorkflowBindings(c.Project.WorkflowBindings); err != nil {
 		return err
 	}
 	for _, rp := range c.Project.RepoPolicies {
@@ -104,6 +111,12 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 			return err
 		}
 		if err := ValidateMaxOpenHeldPRs(fmt.Sprintf("project.repo_policies: repo %q", rp.Repo), rp.MaxOpenHeldPRs); err != nil {
+			return err
+		}
+		if err := ValidateRepoSentinelSensitivePaths(fmt.Sprintf("project.repo_policies: repo %q", rp.Repo), rp.SentinelSensitivePaths); err != nil {
+			return err
+		}
+		if err := ValidateRepoWorkflowFenceScope(fmt.Sprintf("project.repo_policies: repo %q", rp.Repo), rp.WorkflowFenceScope); err != nil {
 			return err
 		}
 	}
@@ -155,6 +168,15 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 	if c.GitHub.GraphQLPRBatchPageSize < 0 || c.GitHub.GraphQLPRBatchPageSize > 100 {
 		return fmt.Errorf("github.graphql_pr_batch_page_size must be between 1 and 100, or 0 for the default")
 	}
+	if err := ValidateETagCacheLimits(c.GitHub.ETagCacheMaxMB, c.GitHub.ETagCacheMaxEntries); err != nil {
+		return err
+	}
+	if !c.GitHub.Notifications.Valid() {
+		return fmt.Errorf("github.notifications.mode must be %q or %q", NotificationsModeQuiet, NotificationsModeNormal)
+	}
+	if c.Notifications.Discord != nil && !c.Notifications.Discord.RFCFormatValid() {
+		return fmt.Errorf("notifications.discord.rfc_format must be %q or %q", RFCFormatLine, RFCFormatCard)
+	}
 	if _, err := HeartbeatOmitClasses(c.Hub.HeartbeatOmit); err != nil {
 		return err
 	}
@@ -162,6 +184,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 		return err
 	}
 	if err := c.Classifier.Validate(); err != nil {
+		return err
+	}
+	if err := c.GitHub.Attention.Validate(); err != nil {
 		return err
 	}
 	if err := c.Writeback.Validate(); err != nil {
@@ -194,6 +219,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 	if err := c.Hub.ValidateNPS(); err != nil {
 		return err
 	}
+	if err := c.Review.ValidateFixerFallback(); err != nil {
+		return err
+	}
 	if err := c.Review.ValidateReviewEventDispatch(); err != nil {
 		return err
 	}
@@ -207,6 +235,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 		return err
 	}
 	if err := c.Review.ValidatePendingFixTTL(); err != nil {
+		return err
+	}
+	if err := c.Governor.validateReviewerBackend(); err != nil {
 		return err
 	}
 	if err := c.validateReviewPerspectiveModels(); err != nil {
@@ -227,10 +258,23 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 	if err := c.validateUpstreamWatch(); err != nil {
 		return err
 	}
+	if err := c.validateCodeScanning(); err != nil {
+		return err
+	}
 	if err := c.ValidateRecheckDiscovery(); err != nil {
 		return err
 	}
 	if err := c.validateRepoForges(); err != nil {
+		return err
+	}
+	advisorWarnings, err := c.validateKnowledgeAdvisorLLM()
+	if err != nil {
+		return err
+	}
+	for _, w := range advisorWarnings {
+		log.Printf("WARNING: %s", w)
+	}
+	if err := ValidateInbox(c.Inbox); err != nil {
 		return err
 	}
 	if err := ValidateKnowledgeConnectors(c.Knowledge.Connectors); err != nil {
@@ -240,6 +284,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 		return err
 	}
 	if err := ValidateKnowledgeAgentScopes(c.Knowledge.AgentScopes); err != nil {
+		return err
+	}
+	if err := c.AutoMerge.ValidateHumanMergePinOnly(); err != nil {
 		return err
 	}
 	if err := c.AutoMerge.TrustedAuthors.Validate(); err != nil {
@@ -275,6 +322,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 		c.Dashboard.SnapshotFrameAncestors = normalized
 	}
 
+	if err := c.Dashboard.Matrix.Validate(); err != nil {
+		return err
+	}
 	if normalized, err := ValidateDashboardPublicURL(c.Dashboard.PublicURL); err != nil {
 		return err
 	} else {
@@ -341,6 +391,9 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 	}
 	if c.Governor.CIFailureKickCooldownS < 0 {
 		return fmt.Errorf("governor.ci_failure_kick_cooldown_s must be at least 0")
+	}
+	if c.Governor.DependencyBotRebaseAfterS < 0 {
+		return fmt.Errorf("governor.dependency_bot_rebase_after_s must be at least 0")
 	}
 	if c.Governor.MergeTrainStallWarnS < 0 {
 		return fmt.Errorf("governor.merge_train_stall_warn_s must be at least 0")
@@ -542,6 +595,11 @@ func (c *Config) ValidateWithOptions(opts ValidateOptions) error {
 	// list; the tier map must not contradict itself) are relations between the
 	// agent and the hub blocks, not properties of a single agent.
 	if err := c.validateStandby(); err != nil {
+		return err
+	}
+	// Contributor-first lanes: the role must be one contributors may act as,
+	// or the flag can never do anything (contributor_first.go).
+	if err := c.validateContributorFirst(); err != nil {
 		return err
 	}
 	return nil

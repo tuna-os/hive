@@ -7,6 +7,7 @@ type (
 	AgentConfig                = cruxconfig.AgentConfig
 	AgentRuntimeConfig         = cruxconfig.AgentRuntimeConfig
 	SessionRecycleConfig       = cruxconfig.SessionRecycleConfig
+	CLIMemoryConfig            = cruxconfig.CLIMemoryConfig
 	AgentRuntimeGovernorConfig = cruxconfig.AgentRuntimeGovernorConfig
 	AgentSandboxConfig         = cruxconfig.AgentSandboxConfig
 	AgentSandboxOverride       = cruxconfig.AgentSandboxOverride
@@ -37,6 +38,8 @@ type (
 	SandboxJobResources        = cruxconfig.SandboxJobResources
 	SandboxJobToleration       = cruxconfig.SandboxJobToleration
 	SandboxJobVolume           = cruxconfig.SandboxJobVolume
+	SandboxOpenShellConfig     = cruxconfig.SandboxOpenShellConfig
+	SandboxSubstrateConfig     = cruxconfig.SandboxSubstrateConfig
 	StatsDisplayEntry          = cruxconfig.StatsDisplayEntry
 	ToolApprovalConfig         = cruxconfig.ToolApprovalConfig
 	ToolApprovalRule           = cruxconfig.ToolApprovalRule
@@ -144,6 +147,8 @@ const (
 	RotationHeadroomSourceBuiltin       = cruxconfig.RotationHeadroomSourceBuiltin
 	RotationHeadroomSourceCCLeft        = cruxconfig.RotationHeadroomSourceCCLeft
 	SandboxRuntimeJob                   = cruxconfig.SandboxRuntimeJob
+	SandboxRuntimeOpenShell             = cruxconfig.SandboxRuntimeOpenShell
+	SandboxRuntimeSubstrate             = cruxconfig.SandboxRuntimeSubstrate
 	SandboxRuntimePodman                = cruxconfig.SandboxRuntimePodman
 	SelfMergeMinACMMLevel               = cruxconfig.SelfMergeMinACMMLevel
 	WritableBobAPIKeyFile               = cruxconfig.WritableBobAPIKeyFile
@@ -166,10 +171,13 @@ var (
 var (
 	APIKeySHA256              = cruxconfig.APIKeySHA256
 	AllowSecretFileRoot       = cruxconfig.AllowSecretFileRoot
+	DropDanglingModelFlag     = cruxconfig.DropDanglingModelFlag
 	IsCLIBackend              = cruxconfig.IsCLIBackend
 	IsInferenceBackend        = cruxconfig.IsInferenceBackend
 	LiteLLMChatCompletionsURL = cruxconfig.LiteLLMChatCompletionsURL
 	LocalLiteLLMProxyURL      = cruxconfig.LocalLiteLLMProxyURL
+	ModelArgs                 = cruxconfig.ModelArgs
+	ModelFlag                 = cruxconfig.ModelFlag
 	NormalizeKickLogSource    = cruxconfig.NormalizeKickLogSource
 	ProxyInjectGHAuth         = cruxconfig.ProxyInjectGHAuth
 	QualifyRepo               = cruxconfig.QualifyRepo
@@ -230,15 +238,16 @@ type (
 )
 
 const (
-	ChannelTypeMention      = cruxconfig.ChannelTypeMention
-	DefaultExperimentEngine = cruxconfig.DefaultExperimentEngine
-	ExperimentEngineNous    = cruxconfig.ExperimentEngineNous
-	RoleExperimenter        = cruxconfig.RoleExperimenter
-	StandbyDefaultFloor     = cruxconfig.StandbyDefaultFloor
-	StandbyTierT1           = cruxconfig.StandbyTierT1
-	StandbyTierT2           = cruxconfig.StandbyTierT2
-	StandbyTierT3           = cruxconfig.StandbyTierT3
-	StandbyTierUnknown      = cruxconfig.StandbyTierUnknown
+	ChannelTypeMention           = cruxconfig.ChannelTypeMention
+	DefaultContributorFirstGrace = cruxconfig.DefaultContributorFirstGrace
+	DefaultExperimentEngine      = cruxconfig.DefaultExperimentEngine
+	ExperimentEngineNous         = cruxconfig.ExperimentEngineNous
+	RoleExperimenter             = cruxconfig.RoleExperimenter
+	StandbyDefaultFloor          = cruxconfig.StandbyDefaultFloor
+	StandbyTierT1                = cruxconfig.StandbyTierT1
+	StandbyTierT2                = cruxconfig.StandbyTierT2
+	StandbyTierT3                = cruxconfig.StandbyTierT3
+	StandbyTierUnknown           = cruxconfig.StandbyTierUnknown
 )
 
 var NormalizeStandbyTier = cruxconfig.NormalizeStandbyTier

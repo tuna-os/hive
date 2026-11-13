@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	gh "github.com/google/go-github/v72/github"
+	"github.com/hivecommons/hive/pkg/authorkind"
+	hgithub "github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
@@ -50,6 +52,24 @@ func dcoCommitStatsDetailed(commits []*gh.RepositoryCommit, appLogin string) dco
 }
 
 func dcoCommitStatsDetailedForAuthor(commits []*gh.RepositoryCommit, appLogin, prAuthor string) dcoStats {
+	return dcoCommitStatsForSquashAuthor(commits, appLogin, prAuthor, botSquashAuthor(prAuthor))
+}
+
+// dcoCommitStatsForSquashAuthor is dcoCommitStatsDetailedForAuthor with the
+// squash-attribution verdict on the PR author made explicit: selfSquash means
+// a squash under prAuthor attributes the hive's commits to the hive itself
+// (a bot author, or one of this hive's own identities: project.ai_author,
+// the App bot), so no signed hive commit is squash-unsafe. Unsigned commits
+// are still counted and rejected.
+func dcoCommitStatsForSquashAuthor(commits []*gh.RepositoryCommit, appLogin, prAuthor string, selfSquash bool) dcoStats {
+	return dcoCommitStatsForHive(commits, appLogin, prAuthor, selfSquash, nil)
+}
+
+// dcoCommitStatsForHive is dcoCommitStatsForSquashAuthor with the hive's own
+// identities (isHive, StageLabelPolicy.HiveAuthor) counted as the hive's, both
+// when splitting unsigned commits and when counting squash-unsafe signed ones
+// (hivecommons/hive#16703); a nil isHive counts only the App bot.
+func dcoCommitStatsForHive(commits []*gh.RepositoryCommit, appLogin, prAuthor string, selfSquash bool, isHive func(login string) bool) dcoStats {
 	var stats dcoStats
 	for _, rc := range commits {
 		if rc == nil || len(rc.Parents) > 1 {
@@ -59,12 +79,12 @@ func dcoCommitStatsDetailedForAuthor(commits []*gh.RepositoryCommit, appLogin, p
 		msg := rc.GetCommit().GetMessage()
 		if !signedOffByRE.MatchString(msg) {
 			stats.unsigned++
-			if dcoCommitByHive(rc, appLogin) {
+			if dcoCommitOwnedByHive(rc, appLogin, isHive) {
 				stats.unsignedHive++
 			} else {
 				stats.unsignedOther++
 			}
-		} else if dcoCommitByHive(rc, appLogin) && !messageHasPRAuthorSignoff(msg, prAuthor) {
+		} else if !selfSquash && dcoCommitOwnedByHive(rc, appLogin, isHive) && !commitHasPRAuthorSignoff(rc, prAuthor) {
 			stats.squashUnsafeHive++
 		}
 	}
@@ -80,40 +100,123 @@ func dcoCommitByHive(commit *gh.RepositoryCommit, appLogin string) bool {
 	return commitByApp(commit, appLogin)
 }
 
+// dcoCommitOwnedByHive is dcoCommitByHive that also counts a commit GitHub
+// links (by author login) to one of the hive's own identities (isHive:
+// project.ai_author, the login the hive's agents push as). Only GitHub's
+// linkage counts here too, never the git author name, so a collaborator's
+// unsigned commit under their own email stays "other" and is never signed by
+// the App (hivecommons/hive#16685).
+//
+// Trust assumption (hivecommons/hive#16702): GitHub derives the login from
+// the git author email and the hive's agents push plain, unsigned git
+// commits (app_signed_commits re-authors only the PR's opening head), so
+// neither Commit.Verification nor the committer can tell an agent's commit
+// from one a pusher authored with project.ai_author's email. Requiring
+// either would stop the hive re-signing its own fix commits. The in-place
+// path that acts on this split needs a base-repo head the App can push
+// (adoptionDCORepairMode), so only collaborators with push access can
+// present such a commit, and they are trusted not to. commitByApp has the
+// same property for the App bot login.
+func dcoCommitOwnedByHive(commit *gh.RepositoryCommit, appLogin string, isHive func(login string) bool) bool {
+	if dcoCommitByHive(commit, appLogin) {
+		return true
+	}
+	if commit == nil || isHive == nil {
+		return false
+	}
+	login := strings.TrimSpace(commit.GetAuthor().GetLogin())
+	return login != "" && isHive(login)
+}
+
 // stageDCO returns the commit check for the observation's head, reading the
 // commits only when the store has no result for this head (the caller
 // caches the result, including how many unsigned commits are the App's own,
 // with Store.NoteDCO once the record exists). A read
 // failure leaves the state unknown (labels untouched, stage unchanged) and
 // is reported, never fatal.
-func (c *Engine) stageDCO(ctx context.Context, store *stagelabels.Store, key string, obs stageObservation) (dcoStats, error) {
+func (c *Engine) stageDCO(ctx context.Context, store *stagelabels.Store, key string, obs stageObservation, policy StageLabelPolicy) (dcoStats, error) {
 	if obs.HeadSHA == "" {
 		return dcoStats{}, nil
 	}
-	if rec, ok := store.Get(key); ok {
+	appLogin := c.transport.AppBotLogin()
+	selfSquash := botSquashAuthor(obs.Author) || hiveAuthoredPR(obs, policy, appLogin)
+	// A split cached before hive identities counted (hivecommons/hive#16701) filed
+	// project.ai_author commits as "other"; read the commits once more so
+	// a hive-authored head is re-signed rather than left waiting.
+	if rec, ok := store.Get(key); ok && (policy.HiveAuthor == nil || rec.DCOSplitHiveIdentity) {
 		if t, u, cached := rec.DCOFor(obs.HeadSHA); cached {
 			// Records cached before the ownership split existed carry
 			// none; an in-place adoption decides repair-vs-rehome on it,
 			// so read the commits once more for that case only.
 			if (u > 0 || rec.DCOSquashUnsafeKnown) && (u == 0 || rec.DCOSplitKnown(obs.HeadSHA) || !rec.AdoptedInPlace()) {
-				return dcoStats{total: t, unsigned: u, unsignedHive: rec.DCOUnsignedHive, unsignedOther: u - rec.DCOUnsignedHive, squashUnsafeHive: rec.DCOSquashUnsafeHive}, nil
+				unsafe := rec.DCOSquashUnsafeHive
+				if selfSquash {
+					unsafe = 0
+				}
+				return dcoStats{total: t, unsigned: u, unsignedHive: rec.DCOUnsignedHive, unsignedOther: u - rec.DCOUnsignedHive, squashUnsafeHive: unsafe}, nil
 			}
 		}
 	}
-	opts := &gh.ListOptions{PerPage: 100}
-	var all []*gh.RepositoryCommit
-	for page := 0; page < stageDCOMaxPages; page++ {
-		commits, resp, err := c.gh.PullRequests.ListCommits(ctx, obs.Owner, obs.Repo, obs.Number, opts)
-		if err != nil {
-			return dcoStats{}, fmt.Errorf("listing commits for %s#%d: %w", obs.Display, obs.Number, err)
-		}
-		all = append(all, commits...)
-		if resp == nil || resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
+	// A list cut off at GitHub's cap is judged as read, as before.
+	all, _, err := hgithub.ListPRRepositoryCommits(ctx, c.gh, obs.Owner, obs.Repo, obs.Number)
+	if err != nil {
+		return dcoStats{}, err
 	}
-	return dcoCommitStatsDetailedForAuthor(all, c.transport.AppBotLogin(), obs.Author), nil
+	return dcoCommitStatsForHive(all, appLogin, obs.Author, selfSquash, policy.HiveAuthor), nil
+}
+
+// hiveAuthoredPR reports whether the PR is the hive's own: author/hive by
+// kind, observed under the self-authored lane, authored by the App bot, or
+// authored by one of the identities the policy names as this hive's
+// (project.ai_author — the clanker login the hive's agents open PRs as).
+// Such a PR is never re-homed for sign-off attribution: a squash under its
+// author attributes the hive's commits to the hive (hivecommons/hive#16619).
+func hiveAuthoredPR(obs stageObservation, policy StageLabelPolicy, appLogin string) bool {
+	if obs.AuthorKind == authorkind.Hive || obs.Lane == stageLaneSelf {
+		return true
+	}
+	author := strings.TrimSpace(obs.Author)
+	if author == "" {
+		return false
+	}
+	if appLogin != "" && strings.EqualFold(author, appLogin) {
+		return true
+	}
+	return policy.HiveAuthor != nil && policy.HiveAuthor(author)
+}
+
+// Matches the bot-PR policy in check-squash-signoff-attribution.sh: a squash
+// remains bot-authored. Unsigned commits are still counted and rejected.
+func botSquashAuthor(login string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(login)), "[bot]")
+}
+
+// commitHasPRAuthorSignoff mirrors signoff_is_pr_author in
+// check-squash-signoff-attribution.sh: a sign-off certifies the PR author
+// when it is that account's GitHub noreply, or when GitHub links the commit
+// AUTHOR to the PR author and the sign-off is that author's own git email
+// (or noreply). The committer is not consulted, so a hive rebase that makes
+// the App the committer of the author's own signed commit does not file it
+// as the hive's to re-sign (hivecommons/hive#17789).
+func commitHasPRAuthorSignoff(commit *gh.RepositoryCommit, prAuthor string) bool {
+	msg := commit.GetCommit().GetMessage()
+	if messageHasPRAuthorSignoff(msg, prAuthor) {
+		return true
+	}
+	want := normalizeBotLogin(prAuthor)
+	if want == "" || normalizeBotLogin(commit.GetAuthor().GetLogin()) != want {
+		return false
+	}
+	authorEmail := strings.ToLower(strings.TrimSpace(commit.GetCommit().GetAuthor().GetEmail()))
+	for _, line := range strings.Split(msg, "\n") {
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "signed-off-by:") {
+			continue
+		}
+		if email := signedOffEmail(line); email != "" && email == authorEmail {
+			return true
+		}
+	}
+	return false
 }
 
 func messageHasPRAuthorSignoff(message, prAuthor string) bool {

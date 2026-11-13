@@ -29,6 +29,7 @@ import (
 	"github.com/hivecommons/hive/pkg/github/automerge"
 	"github.com/hivecommons/hive/pkg/governor"
 	"github.com/hivecommons/hive/pkg/hub/spoke"
+	"github.com/hivecommons/hive/pkg/inbox"
 	"github.com/hivecommons/hive/pkg/knowledge"
 	"github.com/hivecommons/hive/pkg/knowledge/connector"
 	"github.com/hivecommons/hive/pkg/mention"
@@ -80,7 +81,31 @@ type boot struct {
 	// the governor loop's tick bodies that read cfg. Without it, a reload
 	// racing the fast agent-status tick crashed the process with "concurrent
 	// map read and map write" in buildConfiguredAgents.
+	//
+	// The governor loop holds it for a whole tick, so the watcher callback
+	// never waits for it: submitConfigReload parks the reload in
+	// pendingReload and the holder applies it at its next safe point via
+	// lockCfg/unlockCfg (hivecommons/hive#17467).
 	cfgReloadMu sync.Mutex
+	// reloadApply swaps a reloaded config into cfg and re-syncs the
+	// subsystems that cache it. Caller holds cfgReloadMu; it returns the
+	// ACMM level transition to fire once the lock is released.
+	reloadApply func(*config.Config) (prevACMMLevel, nextACMMLevel int)
+	// pendingACMM holds ACMM transitions applied under cfgReloadMu that
+	// unlockCfg fires after releasing it; guarded by cfgReloadMu.
+	pendingACMM [][2]int
+	// pendingReloadMu guards pendingReload, the newest reload the watcher
+	// delivered that has not been applied yet, and parkedSaveSeq, the
+	// config.SaveSeq() seen when the oldest of those reloads was parked.
+	pendingReloadMu sync.Mutex
+	pendingReload   *config.Config
+	parkedSaveSeq   uint64
+	// configSaveSeq and saveConfig default to config.SaveSeq and cfg.Save;
+	// tests replace them.
+	configSaveSeq func() uint64
+	saveConfig    func() error
+	// sweepConfig is an immutable copy published outside long-running eval IO.
+	sweepConfig atomic.Pointer[config.Config]
 
 	// ghClientLive is the GitHub client provider that long-lived consumers
 	// (collectors, the scheduler's triage commenter) read on every use, and
@@ -102,9 +127,11 @@ type boot struct {
 	// rebuilt client after that; forgeStateOnce guards the build. Held in
 	// an atomic because the dashboard's count wiring reads it late, from
 	// the metrics collector goroutine (#13376).
-	forgeState     atomic.Pointer[forgestate.Store]
-	forgeStateOnce sync.Once
-	requestRelays  *requestRelaySupervisor
+	forgeState                        atomic.Pointer[forgestate.Store]
+	forgeStateOnce                    sync.Once
+	requestRelays                     *requestRelaySupervisor
+	integrationEligibility            automerge.IntegrationEligibilityGate
+	integrationPreparationEligibility automerge.IntegrationEligibilityGate
 
 	// bootConfig
 	startTime time.Time
@@ -120,6 +147,7 @@ type boot struct {
 	ghAuth                        githubAuth
 	ghClient                      *github.Client
 	appAuth                       *github.AppAuth
+	ciFailureKicker               *ciFailureKicker
 	gov                           *governor.Governor
 	sched                         *scheduler.Scheduler
 	notifier                      *notify.Notifier
@@ -210,6 +238,7 @@ type boot struct {
 	// bootKnowledge
 	gitSyncer            *knowledge.GitSyncer
 	knowledgeConnectors  *connector.Syncer
+	inboxSvc             *inbox.Service
 	knowledgePublish     *connector.Mirror
 	promotionScheduler   *knowledge.PromotionScheduler
 	quotaAccount         string
@@ -247,31 +276,16 @@ type boot struct {
 	trajLane   *trajectory.Lane
 	replanLane *planning.ReplanLane
 	retroLane  *retro.Lane
+	// advisorDecisions is the knowledge-advisor decision store (#17211),
+	// written by the ranking decorator and read by the retro lane; opened
+	// once by knowledgeAdvisorDecisions.
+	advisorDecisions     *retro.AdvisorDecisionStore
+	advisorDecisionsOnce sync.Once
 
-	// runLoop
-	lastAutoMergeSweep     time.Time
-	lastTaskListSweep      time.Time
-	lastDuplicateSweep     time.Time
-	lastSupersessionSweep  time.Time
-	lastDuplicateFixSweep  time.Time
-	lastSharedCIRerunSweep time.Time
-	lastRedMainSweep       time.Time
-	// lastRevertSheriffSweep gates runRevertSheriffSweepIfDue (tuna-os pilot).
-	lastRevertSheriffSweep time.Time
-	lastBlockedIssuesSweep time.Time
-	lastIssueUnparkSweep   time.Time
-	lastClosedIssueSweep   time.Time
-	// lastClarityResumeSweep gates runClarityGateResumeSweepIfDue
-	// (hivecommons/hive#13588).
-	lastClarityResumeSweep time.Time
-	// lastPriorArtResumeSweep gates runPriorArtGateResumeSweepIfDue
-	// (hivecommons/hive#13575).
-	lastPriorArtResumeSweep time.Time
-	lastSentinelSweep       time.Time
-	lastGFISweep            time.Time
-	// lastLegacyFleetReportSweep gates runLegacyFleetReportSweepIfDue
-	// (hivecommons/hive#13470).
-	lastLegacyFleetReportSweep time.Time
+	// matrixIngestSt gates the incremental Matrix ingest pass (#16276),
+	// owned by its independent ticker goroutine.
+	matrixIngestSt      *matrixIngestState
+	matrixIngestStarted bool
 	// gfi is good-first-issue curation state (good_first_issue.*).
 	gfi *gfiState
 	// firstTimer is first-time contributor welcome state

@@ -21,28 +21,30 @@
     }
     // Pure: the DCO caveat the merge confirmations print BEFORE acting
     // when the stage record counted unsigned commits on the head (#15136):
-    // merging as-is then fails where DCO is required; re-authoring is the
-    // separate choice.
+    // merging as-is then fails where DCO is required; adopting as a hive
+    // PR is the separate choice.
     function stageTrackerDCOCaveat(items) {
       const rows = (Array.isArray(items) ? items : [items]).filter(it => it && Number(it.dco_unsigned) > 0);
       if (!rows.length) return '';
       const it = rows[0];
       const total = Number(it.dco_total) || 0;
       const of = total > 0 ? ' of ' + total + ' commit' + (total === 1 ? '' : 's') : ' commit' + (Number(it.dco_unsigned) === 1 ? '' : 's');
-      return ' Before you do: ' + Number(it.dco_unsigned) + of + ' on ' + (rows.length > 1 ? 'the first of these' : 'this head') + ' lack a Signed-off-by (DCO). "Re-author as hive PR" is the separate choice for that; approving does not re-author.';
+      return ' Before you do: ' + Number(it.dco_unsigned) + of + ' on ' + (rows.length > 1 ? 'the first of these' : 'this head') + ' lack a Signed-off-by (DCO). "Adopt as hive PR" is the separate choice for that; approving does not adopt.';
     }
     const STAGE_TRACKER_ACTION_LABELS = {
       'decide:delegate': 'Let hive decide', 'decide:delegate-all': 'Let hive decide — all PRs', 'decide:delegate:rerun': 'Re-run decision', 'decide:approve': 'Approve', 'decide:direction': 'Give direction',
       'decide:close-superseded': 'Close as superseded by', 'decide:close-wontfix': "Close as won't-fix",
-      'decide:close-read': 'Close now',
+      'decide:close-read': 'Close now', 'decide:close-deferred': 'Close now',
+      'decide:close-issue': 'Close issue',
       'decide:adopt': 'Adopt (hive takes over)',
       'decide:queue-merge': 'Approve and let hive merge', 'decide:merge-now': 'Merge now as maintainer',
-      'decide:re-author': 'Re-author as hive PR',
       'decide:adopt-now': 'Adopt now — hive takes it over', 'decide:reroute': 'Reroute to another clanker',
       hold: 'Hold', release: 'Release hold', retry: 'Re-evaluate now', 'accept-triage': 'Accept triage', 'needs-human': 'Mark needs-human',
       open: 'Open on GitHub', copy: 'Copy link',
       'open:app-settings': 'Grant the App permission', 'blocker:recheck': 'Re-check permissions', 'blocker:patch': 'Prepare the patch for a person to push',
-      'blocker:close-partial': 'Mark partially-addressed and close', 'blocker:wait': 'Keep waiting',
+      'blocker:handoff': 'Hand to workflows lane', 'blocker:close-partial': 'Mark partially-addressed and close', 'blocker:wait': 'Keep waiting',
+      // The human-gate pill's reason-bound verbs (hivecommons/hive#17470).
+      'gate:decide': 'Decide', 'gate:request-changes': 'Request changes', 'gate:confirm-sentinel': 'Confirm safe',
     };
     // Actions that end with a commit on the base branch — the lead
     // "Approve and let hive merge" (the hive's sweep merges on its next
@@ -50,8 +52,12 @@
     // merger or owner only, like POST .../queue-automerge.
     const STAGE_TRACKER_MERGE_ACTIONS = ['decide:queue-merge', 'decide:merge-now'];
     // Generic items every row has; a server-named decision option with one
-    // of these ids is not repeated at the top of the menu.
-    const STAGE_TRACKER_GENERIC_ACTIONS = ['hold', 'release', 'retry', 'needs-human', 'accept-triage', 'open', 'copy', 'decide:delegate', 'decide:delegate-all', 'decide:adopt'];
+    // of these ids is not repeated at the top of the menu. `decide:adopt`
+    // is not generic: a row offers it either from the nudge (`adoption`)
+    // or as a server decision option (a contributor PR's DCO / fixer
+    // exhaustion, where it replaced "re-author"), never both.
+    const STAGE_TRACKER_GENERIC_ACTIONS = ['hold', 'release', 'retry', 'needs-human', 'accept-triage', 'open', 'copy', 'decide:delegate', 'decide:delegate-all', 'decide:close-issue'];
+    const _stageTrackerCloseIssueBusy = new Set();
     // Accept triage shows on an issue the chevron calls "Triage needed":
     // stage 015, or the needs-triage pill on a pre-claim stage (010 / 017 /
     // 045). A needs-triage left on a claimed or covered issue is reported
@@ -160,6 +166,10 @@
       if (!d || !Array.isArray(d.items)) return null;
       for (const it of d.items) if (stageTrackerItemKey(it) === key) return it;
       for (const it of d.items) {
+        for (const li of (Array.isArray(it.linked_issues) ? it.linked_issues : [])) {
+          const issue = { repo: it.repo, number: li.number, kind: 'issue', title: li.title || '', url: li.url || '', state: li.state || '' };
+          if (stageTrackerItemKey(issue) === key) return issue;
+        }
         for (const lp of (Array.isArray(it.linked_prs) ? it.linked_prs : [])) {
           const pr = stageTrackerLinkedPRItem(it, lp);
           if (stageTrackerItemKey(pr) === key) return pr;
@@ -167,19 +177,43 @@
       }
       return null;
     }
+    // Linked issues in a PR-only view still have their own exact target.
+    function stageTrackerLinkedIssueToolsHtml(item) {
+      return (Array.isArray(item.linked_issues) ? item.linked_issues : []).filter(li => li && Number(li.number) > 0 && li.state === 'open').map(li => {
+        const issue = { repo: item.repo, number: li.number, kind: 'issue' };
+        const ref = stageTrackerRefOf(issue);
+        return `<span class="ham-badge" data-ham-sub-key="${esc(stageTrackerItemKey(issue))}">Issue #${Number(li.number)} <button type="button" class="ham-kebab" aria-label="Actions for ${esc(ref)}" aria-haspopup="menu" data-action="hamRowMenu" data-arg-types="e,t" data-stop="1" data-prevent="1">⋯</button></span>`;
+      }).join('');
+    }
     function stageTrackerItemsForKeys(keys) {
-      return keys.map(k => stageTrackerItemByKey(_stageTracker, k)).filter(Boolean);
+      const data = typeof stageTrackerTerminalView === 'function' ? stageTrackerTerminalView(_stageTracker, Date.now()) : _stageTracker;
+      return keys.map(k => stageTrackerItemByKey(data, k)).filter(Boolean);
+    }
+    // Pure: whether the viewer's identity is still loading — the auth
+    // fetch (showGHAuthState) has not answered yet and nothing else has
+    // named a user or role. Unknown is not "read": on a hard reload the
+    // tracker's first paint lands before auth resolves, and gating the
+    // pills on 'read' here made them flash disabled for a poll interval
+    // (hivecommons/hive#16754).
+    function stageTrackerAuthPending() {
+      if (typeof window === 'undefined') return false;
+      return !window._hiveAuthKnown && window._hiveRole === undefined && !window._hiveUser;
     }
     // What the signed-in viewer may do on this repo. Hold permission is
     // looked up lazily (the server answers 403 either way); needs-human is
-    // merger/owner only.
+    // merger/owner only. While the viewer's identity is still loading the
+    // ctx is optimistic — like canHold === null, unknown renders enabled
+    // and the server's 403 is the answer to a click that beat auth; the
+    // repaint showGHAuthState schedules settles the pills within the tick.
     function stageTrackerActionCtx(repo) {
+      const governor = (window._lastStatus && window._lastStatus.governor) || null;
+      if (stageTrackerAuthPending()) return { user: true, canHold: null, canHuman: true, authPending: true, login: '', governor };
       const role = window._hiveRole || 'read';
       const owner = dashboardRoleAtLeast(role, 'owner');
       const user = !!window._hiveUser || owner;
       if (typeof ensureRepoHoldPermission === 'function') ensureRepoHoldPermission(repo);
       const canHold = owner || (typeof repoHoldPermissionKnown === 'function' && repoHoldPermissionKnown(repo)) ? true : (user ? null : false);
-      return { user, canHold, canHuman: user && dashboardRoleAtLeast(role, 'merger'), login: String(window._hiveUser || ''), governor: (window._lastStatus && window._lastStatus.governor) || null };
+      return { user, canHold, canHuman: user && dashboardRoleAtLeast(role, 'merger'), login: String(window._hiveUser || ''), governor };
     }
     // Pure: the item a row's "Decide…" acts on. A PR parked at 085 (the
     // "Needs human decision" pill on the Merge queue column) decides itself;
@@ -244,7 +278,11 @@
       const out = [];
       // First: the hive decides as the owner's delegate (policy + rails on
       // the server; recorded as a human decision with an audit marker).
-      out.push({ id: 'decide:delegate', label: 'Let hive decide', hint: 'delegate', enabled, why });
+      // The server may rule delegation out for this row (a capability gap
+      // no decision closes — hivecommons/docs#612); its reason wins.
+      const served = stageTrackerServerDelegate(item);
+      const delegateOff = !!served && served.enabled === false;
+      out.push({ id: 'decide:delegate', label: 'Let hive decide', hint: 'delegate', enabled: enabled && !delegateOff, why: delegateOff ? (served.reason_if_disabled || 'The hive cannot decide this one') : why });
       if (item.kind === 'pr') {
         out.push({ id: 'decide:approve', label: 'Approve (/lgtm + /approve)', enabled, why });
         out.push({ id: 'decide:close-superseded', label: 'Close as superseded by…', enabled, why, danger: true });
@@ -258,6 +296,11 @@
       out.push({ id: 'decide:close-wontfix', label: "Close as won't-fix…", enabled, why, danger: true });
       return out;
     }
+    // Pure: the server's decide:delegate option on the row, or null.
+    function stageTrackerServerDelegate(item) {
+      const opts = item && item.decision_needed && Array.isArray(item.decision_needed.options) ? item.decision_needed.options : [];
+      return opts.find(o => o && o.action === 'decide:delegate') || null;
+    }
     // Pure: the operator note for labels the row's stage has outrun
     // (stale_labels: a needs-triage still on a claimed issue, which the
     // reconciler removes on its next pass — hivecommons/hive#14586). '' when none.
@@ -265,6 +308,14 @@
       const stale = item && Array.isArray(item.stale_labels) ? item.stale_labels.filter(Boolean) : [];
       if (!stale.length) return '';
       return 'Stale label' + (stale.length > 1 ? 's' : '') + ': ' + stale.join(', ') + ' (stage has moved on; the hive removes it on its next pass)';
+    }
+    // Pure: the operator note for a stage the write-back gate kept off
+    // GitHub (labels_suppressed: the gate's reason). The row's stage is the
+    // hive's record; the item carries no such label. '' when none.
+    function stageTrackerLabelsSuppressedText(item) {
+      const why = item && typeof item.labels_suppressed === 'string' ? item.labels_suppressed.trim() : '';
+      if (!why) return '';
+      return 'Stage label not on GitHub: the write-back gate refused it (' + why + '). The hive tracks this stage itself.';
     }
     // Pure: whether a row is an issue waiting on a maintainer's triage.
     function stageTrackerTriageNeeded(item) {
@@ -395,6 +446,13 @@
     }
     function stageTrackerRowActions(item, ctx) {
       ctx = ctx || {};
+      if (typeof stageTrackerMergedPRKnown === 'function' && stageTrackerMergedPRKnown(item)) {
+        return [
+          { id: 'open', label: 'Open on GitHub', enabled: !!item.url, why: item.url ? '' : 'No GitHub link' },
+          { id: 'copy', label: 'Copy link', enabled: !!item.url, why: item.url ? '' : 'No GitHub link' },
+          ...(ctx.user && typeof stageTrackerNotesMenuItem === 'function' ? [stageTrackerNotesMenuItem(item)] : []),
+        ];
+      }
       const mods = Array.isArray(item.modifiers) ? item.modifiers : [];
       const has = m => mods.indexOf(m) >= 0;
       const write = ctx.canHold !== false;
@@ -426,6 +484,11 @@
       // (hivecommons/hive#15754).
       const advisory = typeof stageTrackerAdvisoryOf === 'function' ? stageTrackerAdvisoryOf(item) : null;
       if (advisory) out.push(Object.assign({ id: 'decide:close-read', label: STAGE_TRACKER_ACTION_LABELS['decide:close-read'], hint: stageTrackerAdvisoryCloseHint(advisory), lead: true }, stageTrackerActionAllowed('decide:close-read', ctx)));
+      // A PR the hive deferred whose deferral says a maintainer may close
+      // it now (hivecommons/hive#17347): "Close now" leads, the decision
+      // close path with the won't-fix verdict on the PR row itself.
+      const deferral = typeof stageTrackerDeferralOf === 'function' ? stageTrackerDeferralOf(item) : null;
+      if (deferral && deferral.close_ok) out.push(Object.assign({ id: 'decide:close-deferred', label: STAGE_TRACKER_ACTION_LABELS['decide:close-deferred'], hint: stageTrackerDeferralCloseHint(deferral), danger: true, lead: true }, stageTrackerActionAllowed('decide:close-deferred', ctx)));
       for (const a of lead) out.push(a);
       if (target) {
         const on = target === item ? '' : ' PR #' + (Number(target.number) || 0);
@@ -434,7 +497,7 @@
       // A nudged contributor PR the engine would adopt but for the owner's
       // say-so (maintainer_policy: ask) offers Adopt (hivecommons/hive#14524).
       if (typeof stageTrackerBlockerActions === 'function') for (const a of stageTrackerBlockerActions(item, ctx)) out.push(a);
-      if (typeof stageTrackerAdoptOffered === 'function' && stageTrackerAdoptOffered(item)) out.push({ id: 'decide:adopt', label: STAGE_TRACKER_ACTION_LABELS['decide:adopt'] + '…', hint: 'adoption', enabled: write && !!ctx.user, why: write && ctx.user ? '' : STAGE_TRACKER_WHY_WRITE });
+      if (typeof stageTrackerAdoptOffered === 'function' && stageTrackerAdoptOffered(item) && !out.some(a => a.id === 'decide:adopt')) out.push({ id: 'decide:adopt', label: STAGE_TRACKER_ACTION_LABELS['decide:adopt'] + '…', hint: 'adoption', enabled: write && !!ctx.user, why: write && ctx.user ? '' : STAGE_TRACKER_WHY_WRITE });
       // A PR waiting on a contributor's clanker offers Adopt now and Reroute
       // (hivecommons/hive#15038); each disabled with the server's reason.
       if (typeof stageTrackerTakeoverActions === 'function') for (const a of stageTrackerTakeoverActions(item, ctx, ctx.nowMs)) out.push(a);
@@ -443,8 +506,10 @@
         : { id: 'hold', label: 'Hold', enabled: write, why: write ? '' : STAGE_TRACKER_WHY_WRITE, sep: triage && !target });
       out.push({ id: 'retry', label: 'Re-evaluate now', hint: 'rescan', enabled: true, why: '' });
       if (!has('needs-human')) out.push({ id: 'needs-human', label: 'Mark needs-human…', enabled: !!ctx.canHuman, why: ctx.canHuman ? '' : STAGE_TRACKER_WHY_ROLE });
+      if (item.kind === 'issue' && String(item.state || '').toLowerCase() !== 'closed') out.push(Object.assign({ id: 'decide:close-issue', label: 'Close issue…', danger: true, hint: 'only this issue · completed' }, stageTrackerActionAllowed('decide:close-issue', ctx)));
       out.push({ id: 'open', label: 'Open on GitHub', enabled: !!item.url, why: item.url ? '' : 'No GitHub link', sep: true });
       out.push({ id: 'copy', label: 'Copy link', enabled: !!item.url, why: item.url ? '' : 'No GitHub link' });
+      if (ctx.user && typeof stageTrackerNotesMenuItem === 'function') out.push(stageTrackerNotesMenuItem(item));
       return out;
     }
     // Pure: the one action a row leads with, rendered inline on the row
@@ -463,6 +528,15 @@
       if (lead) return lead;
       const decide = actions.find(a => a.id === 'decide');
       const safe = decide && Array.isArray(decide.submenu) ? decide.submenu.filter(x => x && !x.danger) : [];
+      // The server ruled delegation out (a capability gap): the first
+      // enabled, non-destructive blocker option leads instead — the
+      // person's actual move (open App settings, re-check permissions),
+      // not a greyed "Let hive decide" (hivecommons/docs#612).
+      const served = stageTrackerServerDelegate(item);
+      if (served && served.enabled === false) {
+        const b = stageTrackerBlockerActions(item, ctx).find(x => x.enabled && !x.danger);
+        if (b) return Object.assign({}, b, { target: (decide && decide.target) || { kind: item.kind, number: item.number, repo: item.repo } });
+      }
       if (safe.length) {
         const o = safe.find(x => x.enabled) || safe[0];
         const enabled = !!decide.enabled && !!o.enabled;
@@ -490,8 +564,43 @@
     // button — "Let hive decide" showed twice per item (hive#15320 →
     // #15647, hive#15338 → #15648). The ⋯ menu's "Decide PR #N…" stays on
     // the parent. subRows: the linked PRs drawn as sub-rows, or none.
+    // Pure: is the covering PR also a row of its own among rows, the rows
+    // the render draws (a top-level row, not a sub-row)? Then only that row
+    // carries the button. rows is ctx.rows at the call site — the drawn
+    // page (tracker-filter-render.js _stageTrackerRows), not the payload's
+    // items: a PR nested_under a listed issue is in items but is never its
+    // own row outside the Pull requests view (tracker-filter.js
+    // stageTrackerVisible), and a filter or the page may hide the PR while
+    // it shows the issue. With no rows given nothing is drawn, so nothing
+    // is "listed" and the chip is not shown.
+    function stageTrackerPRListedOwnRow(issue, t, rows) {
+      if (!Array.isArray(rows)) return false;
+      const key = stageTrackerItemKey({ repo: t.repo || issue.repo, kind: 'pr', number: t.number });
+      return rows.some(it => it && stageTrackerItemKey(it) === key);
+    }
+    // Pure: the number of the other listed issue whose row draws the
+    // covering PR, or 0. The server nests a PR that closes several issues
+    // under the lowest one (stage_tracker_links.go NestedUnder → each
+    // issue's linked_prs[].drawn_under); the PR is then never a row of its
+    // own and the secondary issue draws no sub-row either (hivecommons/hive
+    // #15503 under #15502), so the decision button belongs to the row that
+    // draws the PR and this issue chips to it.
+    function stageTrackerPRDrawnUnderOther(issue, t, rows) {
+      if (!Array.isArray(rows) || !issue || !Array.isArray(issue.linked_prs)) return 0;
+      const lp = issue.linked_prs.find(x => x && Number(x.number) === Number(t.number) && (!x.repo || !t.repo || x.repo === t.repo));
+      const under = Number(lp && lp.drawn_under) || 0;
+      if (!under || under === (Number(issue.number) || 0)) return 0;
+      const key = stageTrackerItemKey({ repo: t.repo || issue.repo, kind: 'issue', number: under });
+      return rows.some(it => it && stageTrackerItemKey(it) === key) ? under : 0;
+    }
     function stageTrackerLeadActionOnRow(item, ctx, subRows) {
       const a = stageTrackerLeadAction(item, ctx);
+      if (a && a.target && item.kind === 'issue' && a.target.kind === 'pr') {
+        const rows = ctx && ctx.rows;
+        if (stageTrackerPRListedOwnRow(item, a.target, rows)) return Object.assign({}, a, { passive: a.target.number });
+        const under = stageTrackerPRDrawnUnderOther(item, a.target, rows);
+        if (under) return Object.assign({}, a, { passive: a.target.number, passiveUnder: under });
+      }
       if (!a || !a.target || !Array.isArray(subRows) || !subRows.length || item.kind !== 'issue') return a;
       const t = a.target;
       if (t.kind !== 'pr') return a;
@@ -500,25 +609,76 @@
       const sub = typeof stageTrackerLinkedPRItem === 'function' ? stageTrackerLinkedPRItem(item, lp) : null;
       return sub && stageTrackerLeadAction(sub, ctx) ? null : a;
     }
-    // The inline lead button for a row: a real <button> carrying the same
-    // id, hint and enable/disable reason as the ⋯ menu entry it mirrors;
+    // Pure: the second inline pill of a row parked on a human decision —
+    // the Decide… submenu's "Let hive decide" (decide:delegate), carrying
+    // the decide target and enable reason the way stageTrackerLeadAction's
+    // fallback does — when the server's lead is another verb (Re-author,
+    // Merge now…). A row saw only "Re-author" and asked where "Let hive
+    // decide" went (hivecommons/hive#16265 / #16456): the ⋯ menu is
+    // invisible, so both stand on the row. null when the lead already is
+    // delegate, the row has no human decision, or the lead is a passive chip.
+    function stageTrackerLeadCompanion(item, ctx, lead) {
+      if (!item || !lead || lead.passive || lead.id === 'decide:delegate') return null;
+      const dec = typeof stageTrackerDecisionOf === 'function' ? stageTrackerDecisionOf(item) : null;
+      const human = !!(dec && dec.item && dec.item.decision_needed) || !!item.decision_needed || (item.stage_actor && item.stage_actor.kind === 'human') || (Number(item.stage) || 0) === 85;
+      if (!human) return null;
+      const decide = stageTrackerRowActions(item, ctx).find(a => a.id === 'decide');
+      const o = decide && Array.isArray(decide.submenu) ? decide.submenu.find(x => x && x.id === 'decide:delegate') : null;
+      if (!o) return null;
+      const enabled = !!decide.enabled && !!o.enabled;
+      return Object.assign({}, o, { target: decide.target, enabled, why: enabled ? '' : (decide.enabled ? o.why : decide.why), hint: STAGE_TRACKER_ACTION_CONSEQUENCES['decide:delegate'], companion: true });
+    }
+    // Pure: the inline pills a row renders — its lead, then (a row parked
+    // on a human decision whose lead is not delegate) "Let hive decide".
+    function stageTrackerLeadActionsOnRow(item, ctx, subRows) {
+      const a = stageTrackerLeadActionOnRow(item, ctx, subRows);
+      if (!a) return [];
+      const companion = stageTrackerLeadCompanion(item, ctx, a);
+      return companion ? [a, companion] : [a];
+    }
+    // The inline lead button(s) for a row: real <button>s carrying the same
+    // id, hint and enable/disable reason as the ⋯ menu entries they mirror;
     // '' when the row has no lead. Click handling is delegated in
     // stageTrackerWireRowActions and runs runRowAction, the menu's path.
     function stageTrackerLeadActionHtml(item, ctx, subRows) {
-      const a = stageTrackerLeadActionOnRow(item, ctx, subRows);
+      return stageTrackerLeadActionsOnRow(item, ctx, subRows).map(a => stageTrackerLeadPillHtml(item, a)).join('');
+    }
+    // The hover text of an inline pill when the server sent no
+    // `consequence`: what happens when it is pressed, in one clause.
+    const STAGE_TRACKER_ACTION_CONSEQUENCES = { 'decide:delegate': 'The hive decides for you under its policy and rails; recorded as your decision with an audit marker.', 'decide:adopt': 'The hive takes the PR over: a hive copy on its own branch; the original is closed as superseded.', 'accept-triage': 'Marks the issue accepted; the hive takes it on its next pass.' };
+    // A row's inline pills are buttons and must read as buttons beside the
+    // record pills they share a slot with ("adopted from #N", the base
+    // branch): a filled chip — ham-act-primary (the lead), ham-act-secondary
+    // ("Let hive decide" beside it) or ham-menu-danger — with a trailing
+    // glyph (tracker.css ::after). Owner on #16456: "Re-author" in the
+    // outlined pill read as a record of what happened, not a verb.
+    function stageTrackerLeadPillHtml(item, a) {
       if (!a) return '';
+      // The covering PR has its own row (or is drawn under another listed
+      // issue): the decision — whatever its lead (Let hive decide, Merge
+      // now, Adopt…) — is taken there, so this row shows a passive chip
+      // that names that lead rather than a second button.
+      // Clicking it scrolls to the row that carries the button.
+      if (a.passive) {
+        const where = a.passiveUnder ? 'the row of #' + Number(a.passiveUnder) + ', which draws the PR' : 'its row';
+        const repo = (a.target && a.target.repo) || item.repo;
+        const to = stageTrackerItemKey({ repo, kind: 'pr', number: a.passive });
+        const via = a.passiveUnder ? ` data-ham-scroll-row="${esc(stageTrackerItemKey({ repo, kind: 'issue', number: a.passiveUnder }))}"` : '';
+        return `<button type="button" class="ham-badge ham-decision-pending" data-ham-scroll-to="${esc(to)}"${via} title="${esc('The decision is on PR #' + a.passive + ' — ' + String(a.label || a.id) + ' lives on ' + where + '. Click to go there.')}">decision pending on #${Number(a.passive) || 0}</button>`;
+      }
       const label = String(a.label || a.id);
-      const tip = a.enabled ? String(a.hint || a.note || a.consequence || '') : String(a.why || '');
+      const tip = a.enabled ? String(a.hint || a.note || a.consequence || STAGE_TRACKER_ACTION_CONSEQUENCES[a.id] || '') : String(a.why || '');
       const ref = typeof stageTrackerRefOf === 'function' ? stageTrackerRefOf(item) : '';
       const state = a.enabled ? (tip ? ` title="${esc(tip)}"` : '') : ` aria-disabled="true" title="${esc(tip)}"`;
-      return `<button type="button" class="ham-lead-act${a.danger ? ' ham-menu-danger' : ''}" data-ham-act="${esc(a.id)}"${state} aria-label="${esc(label + (ref ? ' — ' + ref : ''))}">${esc(label)}</button>`;
+      const tone = a.danger ? ' ham-menu-danger' : (a.companion ? ' ham-act-secondary' : ' ham-act-primary');
+      return `<button type="button" class="ham-lead-act${tone}" data-ham-act="${esc(a.id)}"${state} aria-label="${esc(label + (ref ? ' — ' + ref : ''))}">${esc(label)}</button>`;
     }
     // Pure: the actions for a row parked on a blocker (hivecommons/hive#15099):
     // the server lists them in decision_needed.options (a capability gap
     // offers the App settings link, a permission re-check and the disabled
     // patch hand-off; every blocker offers close-as-partial and wait). The
     // link opens for anyone; the rest need write access.
-    const STAGE_TRACKER_BLOCKER_ACTIONS = ['open:app-settings', 'blocker:recheck', 'blocker:patch', 'blocker:close-partial', 'blocker:wait'];
+    const STAGE_TRACKER_BLOCKER_ACTIONS = ['blocker:handoff', 'open:app-settings', 'blocker:recheck', 'blocker:patch', 'blocker:close-partial', 'blocker:wait'];
     function stageTrackerBlockerActions(item, ctx) {
       ctx = ctx || {};
       if (!item || !item.blocker || !item.decision_needed) return [];
@@ -664,26 +824,67 @@
       document.removeEventListener('keydown', m.onKey, true);
       window.removeEventListener('resize', m.onAway);
       window.removeEventListener('scroll', m.onAway, true);
-      if (m.el.parentNode) m.el.parentNode.removeChild(m.el);
+      const host = m.host || m.el;
+      if (host.hiveDialogClose) host.hiveDialogClose(); else if (host.parentNode) host.parentNode.removeChild(host);
       if (refocus && m.restore && typeof m.restore.focus === 'function' && document.contains(m.restore)) m.restore.focus();
+    }
+    // The phone tier of the dashboard's .modal-sheet (responsive.css): on a
+    // phone the row menu and the Merged / queue popovers open as full-screen
+    // sheets instead of anchored popovers. One query, shared with the CSS.
+    const STAGE_TRACKER_SHEET_QUERY = '(max-width: 640px), ((pointer: coarse) and (max-width: 820px))';
+    function stageTrackerIsPhoneSheet() {
+      return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && !!window.matchMedia(STAGE_TRACKER_SHEET_QUERY).matches;
+    }
+    // Wrap `body` in a .hive-dialog.modal-sheet overlay (Esc / ✕ / backdrop
+    // close via hiveWireDialog; safe-area pad from the shared sheet CSS) and
+    // return the overlay. `onClose` runs once, however the sheet was closed;
+    // `onEnter` runs for Enter on a focused control inside the body.
+    function stageTrackerOpenSheet(title, body, cls, onClose, onEnter) {
+      const overlay = document.createElement('div');
+      overlay.className = 'hive-dialog-overlay';
+      if (typeof hiveRememberModalOpen === 'function') hiveRememberModalOpen(overlay);
+      const id = 'ham-sheet-' + Math.random().toString(36).slice(2);
+      overlay.innerHTML = `<div class="hive-dialog ham-sheet ${esc(cls || '')}" role="dialog" aria-modal="true" aria-labelledby="${id}"><div id="${id}" class="hive-dialog-title">${esc(title)}</div><div class="modal-scroll ham-sheet-body"></div></div>`;
+      overlay.querySelector('.ham-sheet-body').appendChild(body);
+      document.body.appendChild(overlay);
+      hiveWireDialog(overlay, () => { if (typeof onClose === 'function') onClose(); }, null, null, null, () => { if (typeof onEnter === 'function') onEnter(); });
+      return overlay;
     }
     // Open the menu for `items` at (x, y) — or below `anchor` — and run the
     // picked action on them.
+    // Pure: does the menu (or one of its submenus) offer an enabled Let hive decide.
+    function stageTrackerMenuOffersDelegate(actions) {
+      return (actions || []).some(a => a && ((a.id === 'decide:delegate' && a.enabled !== false) || stageTrackerMenuOffersDelegate(a.submenu)));
+    }
     function stageTrackerOpenMenu(items, at) {
       stageTrackerCloseMenu(false);
       if (!items.length) return;
       const actions = items.length === 1 ? stageTrackerRowActions(items[0], stageTrackerActionCtx(items[0].repo)) : stageTrackerSelectionActions(items, stageTrackerActionCtx);
+      if (items.length === 1 && stageTrackerMenuOffersDelegate(actions)) stageTrackerPrefetchDelegatePlan(items[0]);
       const head = items.length === 1 ? stageTrackerRefOf(items[0]) + (items[0].title ? ' · ' + items[0].title : '') : items.length + ' selected';
       const tpl = document.createElement('template');
       tpl.innerHTML = stageTrackerMenuHtml(actions, head);
       const el = tpl.content.firstElementChild;
-      document.body.appendChild(el);
-      let x = at.x, y = at.y;
-      if (at.anchor && typeof at.anchor.getBoundingClientRect === 'function') { const r = at.anchor.getBoundingClientRect(); x = r.left; y = r.bottom; }
-      const pos = stageTrackerMenuPosition(x, y, el.offsetWidth, el.offsetHeight, window.innerWidth, window.innerHeight);
-      el.style.setProperty('left', pos.left + 'px');
-      el.style.setProperty('top', pos.top + 'px');
+      // On a phone the menu is a full-screen sheet (#17163): the fixed
+      // popover's ~30px items are too small to tap and it can land under
+      // the thumb. Same markup, roles and keyboard model; the sheet adds ✕,
+      // backdrop and Esc via the shared dialog wiring.
+      const sheet = stageTrackerIsPhoneSheet();
       const m = { el, items, restore: at.restore || at.anchor || null };
+      if (sheet) {
+        el.classList.add('ham-menu-sheet');
+        m.host = stageTrackerOpenSheet(head, el, 'ham-menu-dialog', () => stageTrackerCloseMenu(true), () => {
+          const b = document.activeElement && document.activeElement.closest ? document.activeElement.closest('[role="menuitem"]') : null;
+          if (b && el.contains(b)) b.click();
+        });
+      } else {
+        document.body.appendChild(el);
+        let x = at.x, y = at.y;
+        if (at.anchor && typeof at.anchor.getBoundingClientRect === 'function') { const r = at.anchor.getBoundingClientRect(); x = r.left; y = r.bottom; }
+        const pos = stageTrackerMenuPosition(x, y, el.offsetWidth, el.offsetHeight, window.innerWidth, window.innerHeight);
+        el.style.setProperty('left', pos.left + 'px');
+        el.style.setProperty('top', pos.top + 'px');
+      }
       m.onAway = e => { if (e.type !== 'pointerdown' || !el.contains(e.target)) stageTrackerCloseMenu(false); };
       m.onKey = e => {
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); stageTrackerCloseMenu(true); return; }
@@ -696,7 +897,7 @@
           case 'End': e.preventDefault(); stageTrackerMenuFocus(el, 'last'); break;
           case 'ArrowRight': if (b && b.getAttribute('aria-haspopup') === 'menu' && b.getAttribute('aria-disabled') !== 'true') { e.preventDefault(); b.setAttribute('aria-expanded', 'true'); stageTrackerMenuFocus(el, 1, b); } break;
           case 'ArrowLeft': { const sub = b && b.closest('.ham-submenu'); if (sub && sub.previousElementSibling) { e.preventDefault(); sub.previousElementSibling.setAttribute('aria-expanded', 'false'); sub.previousElementSibling.focus(); } break; }
-          case 'Tab': stageTrackerCloseMenu(true); break;
+          case 'Tab': if (!sheet) stageTrackerCloseMenu(true); break;
         }
       };
       el.addEventListener('click', e => {
@@ -713,10 +914,12 @@
         stageTrackerCloseMenu(true);
         stageTrackerDoAction(m.items, act);
       });
-      document.addEventListener('pointerdown', m.onAway, true);
+      if (!sheet) {
+        document.addEventListener('pointerdown', m.onAway, true);
+        window.addEventListener('resize', m.onAway);
+        window.addEventListener('scroll', m.onAway, true);
+      }
       document.addEventListener('keydown', m.onKey, true);
-      window.addEventListener('resize', m.onAway);
-      window.addEventListener('scroll', m.onAway, true);
       _stageTrackerMenu = m;
       stageTrackerSetMenuOpen(document.getElementById('activity-monitor-panel'), true);
       if (at.expandDecide) { const d = el.querySelector('[data-ham-act="decide"]'); if (d && d.getAttribute('aria-disabled') !== 'true') d.setAttribute('aria-expanded', 'true'); }
@@ -725,10 +928,10 @@
     // The row (or nested PR) an event happened on, as the items a menu acts
     // on: a selected row with company stands for the whole selection.
     function stageTrackerMenuTargets(target) {
-      const sub = target && target.closest ? target.closest('[data-ham-sub-key]') : null;
+      const sub = target && target.closest ? target.closest('[data-ham-sub-key], [data-ham-target-key]') : null;
       const row = target && target.closest ? target.closest('.ham-row[data-ham-key]') : null;
       if (!row && !sub) return null;
-      const key = sub ? sub.dataset.hamSubKey : row.dataset.hamKey;
+      const key = sub ? (sub.dataset.hamTargetKey || sub.dataset.hamSubKey) : row.dataset.hamKey;
       const list = row ? row.parentNode : sub.closest('#activity-monitor-panel');
       const keys = _stageTrackerSel.has(key) && _stageTrackerSel.size > 1 && list ? stageTrackerRowKeys(list).filter(k => _stageTrackerSel.has(k)) : [key];
       return { items: stageTrackerItemsForKeys(keys), restore: sub ? (sub.querySelector('.ham-kebab') || row) : row };
@@ -758,6 +961,26 @@
           stageTrackerSelect(row.dataset.hamKey, { shift: e.shiftKey, meta: e.metaKey || e.ctrlKey });
         }
       });
+      // The covered issue's "decision pending on #N" chip goes to the row
+      // that carries the decision.
+      el.addEventListener('click', e => {
+        const c = e.target.closest ? e.target.closest('[data-ham-scroll-to]') : null;
+        if (!c) return;
+        e.preventDefault(); e.stopPropagation();
+        stageTrackerScrollToRow(el, c.getAttribute('data-ham-scroll-to'), c.getAttribute('data-ham-scroll-row'));
+      });
+      // Revealing a row's Let hive decide (hover or focus) prefetches its plan.
+      const prefetchLead = e => {
+        const b = e.target.closest ? e.target.closest('.ham-lead-act[data-ham-act="decide:delegate"]') : null;
+        if (!b || b.getAttribute('aria-disabled') === 'true') return;
+        const sub = b.closest('[data-ham-sub-key]');
+        const row = b.closest('.ham-row[data-ham-key]');
+        const key = sub ? sub.dataset.hamSubKey : (row ? row.dataset.hamKey : '');
+        const item = key ? stageTrackerItemByKey(_stageTracker, key) : null;
+        if (item) stageTrackerPrefetchDelegatePlan(item);
+      };
+      el.addEventListener('pointerover', prefetchLead);
+      el.addEventListener('focusin', prefetchLead);
       // The row's inline lead button runs the same path as its ⋯ entry.
       el.addEventListener('click', e => {
         const b = e.target.closest ? e.target.closest('.ham-lead-act[data-ham-act]') : null;
@@ -770,8 +993,14 @@
         const key = sub ? sub.dataset.hamSubKey : (row ? row.dataset.hamKey : '');
         const item = key ? stageTrackerItemByKey(_stageTracker, key) : null;
         if (!item) return;
-        stageTrackerDecisionRun(item, b.dataset.hamAct);
+        const run = stageTrackerDecisionRun(item, b.dataset.hamAct);
+        // A human-gate verb that went through reads "settling…" on its pill
+        // until the next snapshot re-renders the row (hivecommons/hive#17470).
+        if (b.classList.contains('ham-gate-act') && run && typeof run.then === 'function' && typeof stageTrackerHumanGateSettling === 'function') {
+          run.then(r => { if (r && !r.cancelled && Array.isArray(r.results) && r.results.length && r.results.every(x => x && x.ok)) stageTrackerHumanGateSettling(b); }, () => {});
+        }
       });
+      if (typeof stageTrackerWireHumanGate === 'function') stageTrackerWireHumanGate(el);
       // Cmd/Ctrl- or Shift-click anywhere on a row (not on its links or
       // buttons) selects it too.
       el.addEventListener('click', e => {
@@ -811,6 +1040,13 @@
       if (asking.length !== 1) return null;
       const pr = stageTrackerLinkedPRItem(item, asking[0]);
       return { key: stageTrackerItemKey(pr), item: pr };
+    }
+    // Pure: whether the row's decision card (its own or its one parked
+    // PR's) offers the server option `action`.
+    function stageTrackerServerOption(item, action) {
+      const dec = stageTrackerDecisionOf(item);
+      const d = dec && dec.item && dec.item.decision_needed;
+      return !!(d && Array.isArray(d.options) && d.options.some(o => o && o.action === action));
     }
     // Pure: the trigger — the chevron word or the pill, as a button that
     // owns the popover. No native title: the popover is the hover text.
@@ -890,6 +1126,19 @@
       </div>`;
     }
     // Run a popover action down the row context menu's path.
+    // Scroll the tracker row (or nested PR sub-row) with key into view and
+    // focus it; fallbackKey names the row that draws it when it is not a
+    // row of its own. False when neither is on the board.
+    function stageTrackerScrollToRow(el, key, fallbackKey) {
+      if (!el || typeof el.querySelector !== 'function' || !key) return false;
+      const sel = k => `[data-ham-key="${CSS.escape(k)}"], [data-ham-sub-key="${CSS.escape(k)}"]`;
+      const row = el.querySelector(sel(key)) || (fallbackKey ? el.querySelector(sel(fallbackKey)) : null);
+      if (!row) return false;
+      const reduced = typeof stageTrackerReducedMotion === 'function' && stageTrackerReducedMotion();
+      if (typeof row.scrollIntoView === 'function') row.scrollIntoView({ block: 'center', behavior: reduced ? 'auto' : 'smooth' });
+      if (typeof row.focus === 'function') row.focus({ preventScroll: true });
+      return true;
+    }
     function stageTrackerDecisionRun(item, act) {
       if (typeof runRowAction === 'function') return runRowAction(act, item);
       return stageTrackerDoAction([item], act);
@@ -920,9 +1169,14 @@
     function stageTrackerOpenDecisionPop(trigger, pin) {
       const key = trigger && trigger.dataset ? trigger.dataset.hamDecision : '';
       if (!key) return;
+      if (typeof hideConfigTooltip === 'function') hideConfigTooltip();
       if (_stageTrackerDecisionPop && _stageTrackerDecisionPop.key === key) {
         if (pin) _stageTrackerDecisionPop.pinned = true;
         clearTimeout(_stageTrackerDecisionPop.timer);
+        if (pin && pin.focus) {
+          const first = _stageTrackerDecisionPop.el.querySelector('.ham-decision-act:not([aria-disabled="true"])');
+          (first || _stageTrackerDecisionPop.el).focus({ preventScroll: true });
+        }
         return;
       }
       stageTrackerCloseDecisionPop(false);
@@ -930,6 +1184,7 @@
       const item = stageTrackerItemByKey(_stageTracker, key);
       if (!item || !item.decision_needed) return;
       const options = stageTrackerDecisionOptions(item, stageTrackerActionCtx(item.repo));
+      if (options.some(o => o && o.id === 'decide:delegate' && o.enabled)) stageTrackerPrefetchDelegatePlan(item);
       const tpl = document.createElement('template');
       tpl.innerHTML = stageTrackerDecisionPopHtml(item, options, Date.now(), trigger.dataset.hamTip || '');
       const el = tpl.content.firstElementChild;
@@ -974,7 +1229,7 @@
       window.addEventListener('resize', p.onAway);
       window.addEventListener('scroll', p.onAway, true);
       _stageTrackerDecisionPop = p;
-      if (pin && pin.focus) { const first = el.querySelector('.ham-decision-act:not([aria-disabled="true"])'); (first || el).focus(); }
+      if (pin && pin.focus) { const first = el.querySelector('.ham-decision-act:not([aria-disabled="true"])'); (first || el).focus({ preventScroll: true }); }
     }
     // The pointer left the trigger or the popover: close after a beat unless
     // it is pinned or the pointer is back over either (rows re-render, so
@@ -1071,12 +1326,23 @@
       if (bar.innerHTML !== html) bar.innerHTML = html;
     }
     function stageTrackerActionLabel(id) {
+      const modelVerb = typeof stageTrackerModelReplyVerb === 'function' ? stageTrackerModelReplyVerb(id) : '';
+      if (modelVerb) return typeof stageTrackerWorkflowReplyLabel === 'function' ? stageTrackerWorkflowReplyLabel(modelVerb) : modelVerb;
       const base = typeof stageTrackerActionBase === 'function' ? stageTrackerActionBase(id) : id;
       return STAGE_TRACKER_ACTION_LABELS[base] || id;
+    }
+    // Pure: the model verb a `wf:<verb>` human-gate action carries
+    // (hivecommons/hive#17620, RFC phase 4), '' for any other id.
+    function stageTrackerModelReplyVerb(id) {
+      return String(id || '').indexOf('wf:') === 0 ? String(id).slice(3).trim() : '';
     }
     // Pure: which endpoint an action hits for one item. `once` marks a
     // hive-wide call made one time per batch.
     function stageTrackerActionRequest(item, id, payload) {
+      if (typeof stageTrackerTerminalView === 'function') {
+        item = stageTrackerTerminalView({ items: [item] }, Date.now()).items[0];
+        if (!item || (typeof stageTrackerMergedPRKnown === 'function' && stageTrackerMergedPRKnown(item))) return null;
+      }
       payload = payload || {};
       const p = repoParts(item.repo);
       const n = Number(item.number) || 0;
@@ -1089,14 +1355,19 @@
         case 'retry': return { url: '/api/repos/rescan', body: {}, once: true };
         case 'needs-human': return { url: '/api/review/pipeline/' + seg + '/' + n + '/send-to-human', body: { reason: payload.comment || ('flagged from the activity monitor for ' + stageTrackerRefOf(item)) } };
         case 'accept-triage': return item.kind === 'pr' ? null : { url: '/api/repos/' + seg + '/items/' + n + '/accept-triage', body: {} };
+        case 'blocker:handoff': return item.kind === 'pr' ? null : { url: '/api/repos/' + seg + '/items/' + n + '/blocker/handoff', body: {} };
         case 'blocker:recheck': return item.kind === 'pr' ? null : { url: '/api/repos/' + seg + '/items/' + n + '/blocker/recheck', body: {} };
         case 'blocker:close-partial': return item.kind === 'pr' ? null : { url: '/api/repos/' + seg + '/items/' + n + '/blocker/close-partial', body: { comment: payload.comment || '' } };
+        case 'decide:close-deferred': return item.kind !== 'pr' ? null : { url: '/api/repos/' + seg + '/items/' + n + '/decision', body: { decision: 'close-wontfix', comment: payload.comment || '', type: 'pr' } };
+        case 'decide:close-issue': return item.kind !== 'issue' || String(item.state || '').toLowerCase() === 'closed' ? null : { url: '/api/repos/' + seg + '/items/' + n + '/decision', body: { decision: 'close-issue', comment: payload.comment || '', type: 'issue' } };
       }
       if (id === 'decide:delegate' || id === 'decide:delegate:rerun') {
         const body = { type, reason: item.reason || '', caption: item.caption || '', sentinel_reason: item.sentinel_reason || '' };
         // Re-run skips the "already recorded" dedup on a stuck decision.
         if (id === 'decide:delegate:rerun') body.force = true;
         if (payload.chosen) body.chosen = payload.chosen;
+        // The head keys the server's plan cache: a push is a fresh plan.
+        if (item.head) body.head = String(item.head);
         return { url: '/api/repos/' + seg + '/items/' + n + '/decide-delegated', body, poll: true };
       }
       if (id === 'decide:delegate-all') {
@@ -1112,6 +1383,21 @@
       if (stageTrackerActionBase(id) === 'decide:reroute') {
         const to = payload.to || stageTrackerRerouteTargetOf(id) || STAGE_TRACKER_REROUTE_ANY;
         return { url: '/api/repos/' + seg + '/items/' + n + '/decision', body: { decision: 'reroute', to, comment: payload.comment || '', type } };
+      }
+      // The human-gate verbs: Decide… and Request changes… are directions
+      // (the "/hive decision …" carrier); Confirm safe clears the sentinel.
+      if (id === 'gate:decide' || id === 'gate:request-changes') {
+        return { url: '/api/repos/' + seg + '/items/' + n + '/decision', body: { decision: 'direction', comment: payload.comment || '', type } };
+      }
+      if (id === 'gate:confirm-sentinel') {
+        return { url: '/api/repos/' + seg + '/items/' + n + '/sentinel-confirm', body: { comment: payload.comment || '', type } };
+      }
+      // A workflow model's reply verb: recorded as "/hive <verb>" on the
+      // parked issue; the server checks the verb against the bound model.
+      const modelVerb = typeof stageTrackerModelReplyVerb === 'function' ? stageTrackerModelReplyVerb(id) : '';
+      if (modelVerb) {
+        if (type !== 'issue') return null;
+        return { url: '/api/repos/' + seg + '/items/' + n + '/decision', body: { decision: 'model-reply', reply: modelVerb, comment: payload.comment || '', type } };
       }
       if (id.indexOf('decide:') === 0) {
         const body = { decision: id.slice('decide:'.length), comment: payload.comment || '', type };
@@ -1220,6 +1506,22 @@
       fetchStageTracker();
       fetch('/api/status').then(r => r.json()).then(render).catch(() => {});
     }
+    // The body the hosted gateway substitutes for a 502/503 it intercepted
+    // (deploy/k8s/error-pages.yaml): it never came from the hive.
+    const STAGE_TRACKER_PLAN_GATEWAY_ERROR = 'hive unavailable';
+    // Pure: the message a failed row action reports. The hive's own error
+    // when it answered (the body of a 4xx — 403 "write permission
+    // required", 424 "GitHub add hold label failed: … 422 …"), the bare
+    // status when the body carried none. A 502–504 whose body is the
+    // gateway's placeholder (or no JSON at all) is named as such: the hive
+    // may well be up and its real reply was replaced on the way
+    // (hivecommons/hive#17037), so "hive unavailable" alone misled.
+    function stageTrackerActionError(status, data) {
+      data = data || {};
+      const gateway = status >= 502 && status <= 504 && (!data.error || data.error === STAGE_TRACKER_PLAN_GATEWAY_ERROR);
+      if (gateway) return 'HTTP ' + status + ' from the gateway — the hive\'s reply was replaced (it may be restarting, or the gateway hid an upstream error); retry, and check the hive log if it persists';
+      return data.error || ('HTTP ' + status);
+    }
     // Run one action over the items in order, one request each (a hive-wide
     // one once), reporting progress and the per-row outcome.
     async function stageTrackerRunActions(items, id, payload, rows) {
@@ -1244,7 +1546,9 @@
         try {
           const r = await fetch(req.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body) });
           let data = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+          if (!r.ok) throw new Error(stageTrackerActionError(r.status, data));
+          if (id === 'accept-triage' && data.ok !== true) throw new Error(data.error || 'The server did not confirm the triage handoff');
+          if (id === 'decide:close-issue' && data.status !== 'closed' && data.status !== 'refused') throw new Error(data.error || 'The server did not confirm that the issue closed');
           if (data.minStatusSeq != null) _statusSeqFloor = Math.max(_statusSeqFloor || 0, Number(data.minStatusSeq) || 0);
           if (req.poll && !stageTrackerDelegatedDone(data)) {
             showToast('Hive is deciding ' + stageTrackerRefOf(it) + '…', 'info');
@@ -1354,7 +1658,7 @@
     // flagged PR, so the operator reads the security reason before
     // choosing Approve; '' when nothing in items is flagged.
     function stageTrackerSentinelPreface(items) {
-      return (items || []).filter(it => it && it.sentinel_alert).map(it => '⚠ ' + stageTrackerRefOf(it) + ' — ' + stageTrackerSentinelTip(it)).join('\n');
+      return (items || []).filter(it => it && it.sentinel_alert && !it.sentinel_notice).map(it => '⚠ ' + stageTrackerRefOf(it) + ' — ' + stageTrackerSentinelTipWithPaths(it)).join('\n');
     }
     // Every confirm a row action raises can be opted out of per browser,
     // per action id (the dialog's "Don't ask again for this action" box;
@@ -1442,8 +1746,11 @@
     }
     // Pure: one view model for every decision the preview can show — a
     // PR or an issue; direction, adopt, close, approve, recommend-only.
-    //   { title, subject, finding, decisions: [{ ref, sentence, why, next[] }],
+    //   { title, subject, finding, decisions: [{ ref, sentence, why, next[], saw[], rule, rationale }],
     //     ruledOut[], rails, mergeable, mergeWhy, mergeAction, mergeLabel, danger }
+    // saw is the plan's "What hive saw" facts ({label, value, state}); rule
+    // and rationale are the rule that decided and its whole reason. All three
+    // sit under Details, so the visible budget is unchanged.
     function stageTrackerDelegatePlanView(plans, sentinel) {
       plans = plans || [];
       // One item: "repo#N · title"; a batch names each item on its own
@@ -1458,8 +1765,16 @@
         sentence: stageTrackerPlanSentence(pl),
         why: pl.why ? String(pl.why).trim() : '',
         next: (pl.consequences || []).slice(0, STAGE_TRACKER_PLAN_NEXT_MAX).map(String),
+        saw: (pl.saw || []).filter(f => f && f.label).map(f => ({ label: String(f.label), value: String(f.value || ''), state: f.state === 'ok' || f.state === 'blocks' ? f.state : 'info' })),
+        rule: pl.rule_plain ? String(pl.rule_plain).trim() : '',
+        rationale: pl.rationale ? String(pl.rationale).trim() : '',
       }));
-      const ruledOut = [].concat(...plans.map(pl => (pl.ladder && pl.ladder.ruled_out) || []));
+      // Each ruled-out option with the fact that ruled it out ("Approve as
+      // it is — CI not green"); the ladder's raw "rung: reason" when the
+      // plan predates why_not.
+      const ruledOut = [].concat(...plans.map(pl => (pl.why_not && pl.why_not.length)
+        ? pl.why_not.map(w => w.because ? w.option + ' — ' + w.because : w.option)
+        : ((pl.ladder && pl.ladder.ruled_out) || [])));
       const mergeable = stageTrackerDelegatePlanMergeable(plans);
       return {
         title: STAGE_TRACKER_PLAN_TITLE,
@@ -1491,8 +1806,23 @@
           + (d.next.length ? '<div class="ham-plan-label">Then</div><ol class="ham-plan-next">' + d.next.map(n => '<li>' + esc(n) + '</li>').join('') + '</ol>' : '')
           + '</div>';
       }).join('');
+      // What hive saw: every fact the rules read, marked ✓ (does not hold it
+      // back), ✗ (holds it back) or • (steers the decision); then the rule
+      // that decided and its whole reason.
+      const marks = { ok: ['✓', 'fine'], blocks: ['✗', 'holds it back'], info: ['•', ''] };
+      const saw = view.decisions.map(d => {
+        if (!d.saw.length && !d.rule && !d.rationale) return '';
+        const multi = view.decisions.length > 1;
+        return '<div class="ham-plan-saw-block">'
+          + '<div class="ham-plan-label">What hive saw' + (multi ? ' · ' + esc(d.ref) : '') + '</div>'
+          + (d.saw.length ? '<ul class="ham-plan-saw">' + d.saw.map(f => '<li class="ham-plan-fact" data-state="' + f.state + '"><span class="ham-plan-fact-mark" aria-hidden="true">' + marks[f.state][0] + '</span> <span class="ham-plan-fact-label">' + esc(f.label) + '</span> ' + esc(f.value) + (marks[f.state][1] ? '<span class="ham-plan-sr"> (' + marks[f.state][1] + ')</span>' : '') + '</li>').join('') + '</ul>' : '')
+          + (d.rule ? '<p class="ham-plan-rule"><span class="ham-plan-label">Rule</span> ' + esc(d.rule) + '</p>' : '')
+          + (d.rationale ? '<p class="ham-plan-rationale">' + esc(d.rationale) + '</p>' : '')
+          + '</div>';
+      }).filter(Boolean);
       const details = []
         .concat(view.finding ? ['<p class="ham-plan-finding">' + esc(view.finding) + '</p>'] : [])
+        .concat(saw)
         .concat(view.ruledOut.length ? ['<div class="ham-plan-label">Why not the others</div><ul class="ham-plan-ruled-out">' + view.ruledOut.map(r => '<li>' + esc(r) + '</li>').join('') + '</ul>'] : [])
         .concat(['<p class="ham-plan-rails">' + esc(view.rails) + '</p>']);
       return '<div id="hive-dialog-title" class="hive-dialog-title">' + esc(view.title) + '</div>'
@@ -1544,41 +1874,285 @@
       for (const pl of plans || []) for (const a of pl.alternatives || []) if (a.action === action && a.enabled === false && a.reason_if_disabled) return a.reason_if_disabled;
       return '';
     }
+    // The plan gathers the PR live from GitHub (seconds). Revealing a
+    // row's decision options (the decision popover, the ⋯ menu, hovering or
+    // focusing its Let hive decide button) prefetches it; the click takes
+    // the prefetched answer when it is younger than the server's plan cache
+    // TTL (api_repo_item_decide_delegated_plan.go), else asks again — which
+    // the server's cache then answers at once (hivecommons/hive#15773).
+    const STAGE_TRACKER_PLAN_PREFETCH_MS = 30000;
+    const _stageTrackerPlanPrefetch = new Map();
+    function stageTrackerPlanRequestKey(req) { return req.url + '/plan ' + JSON.stringify(req.body); }
+    // Pure: why a plan failed, in the server's words. A 429 is GitHub's
+    // rate limit and says when to retry: the server's message names the
+    // time, else Retry-After does. 502/503 on a hosted hive are the
+    // Ingress's own "hive unavailable" page, which may not be JSON.
+    function stageTrackerDelegatePlanErrorText(status, data, retryAfter, nowMs) {
+      const msg = data && typeof data.error === 'string' ? data.error.trim() : '';
+      if (status === 429 && !/\d\d:\d\dZ/.test(msg)) {
+        const secs = Number(retryAfter);
+        const at = secs > 0 ? nowMs + secs * 1000 : Date.parse(retryAfter || '');
+        const when = at > 0 ? '; retry after ' + new Date(Math.ceil(at / 60000) * 60000).toISOString().slice(11, 16) + 'Z' : '; retry in a minute';
+        return (msg || 'GitHub rate limit reached') + when;
+      }
+      if (msg) return msg;
+      return status === 502 || status === 503 ? 'hive unavailable' : 'HTTP ' + status;
+    }
+    async function stageTrackerPostDelegatePlan(item, req, prefetch) {
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (prefetch) headers['X-Hive-Prefetch'] = '1';
+        const r = await fetch(req.url + '/plan', { method: 'POST', headers, body: JSON.stringify(req.body) });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          // The server's structured failure, with the message the status
+          // itself explains (a 429's retry time, the gateway's 502 page).
+          const retryAfter = r.headers && r.headers.get ? r.headers.get('Retry-After') : '';
+          return stageTrackerDelegatePlanFailure(item, r.status, Object.assign({}, data, { error: stageTrackerDelegatePlanErrorText(r.status, data, retryAfter, Date.now()) }));
+        }
+        return Object.assign({ ref: stageTrackerRefOf(item) + (typeof stageTrackerLineageClause === 'function' ? stageTrackerLineageClause(item) : '') }, data);
+      } catch (e) { return stageTrackerDelegatePlanFailure(item, 0, { error: String(e && e.message || e), reason: 'network', retryable: true }); }
+    }
+    // Pure: one failed plan — the server's structured failure (reason,
+    // hint, retryable, hive, attempts, elapsed_ms; delegatedPlanFailure in
+    // api_repo_item_decide_delegated_plan.go) when it answered, else what
+    // the transport said. A 502/503 whose body is the hosted gateway's
+    // generic "hive unavailable" page (STAGE_TRACKER_PLAN_GATEWAY_ERROR)
+    // never came from the hive at all.
+    function stageTrackerDelegatePlanFailure(item, status, data) {
+      data = data || {};
+      const gateway = status >= 502 && status <= 504 && (!data.reason || data.error === STAGE_TRACKER_PLAN_GATEWAY_ERROR);
+      return {
+        ref: stageTrackerRefOf(item), number: item.number,
+        error: data.error || ('HTTP ' + status),
+        status,
+        reason: gateway ? 'gateway' : (data.reason || (status ? 'http' : 'network')),
+        retryable: gateway || data.retryable === true || (!data.reason && status === 0),
+        hint: data.hint || '',
+        hive: data.hive || '',
+        attempts: data.attempts || 0,
+        elapsed_ms: data.elapsed_ms || 0,
+      };
+    }
+    // Fire-and-forget: one plan request per Let hive decide target of the
+    // row, at most once per STAGE_TRACKER_PLAN_PREFETCH_MS. Returns how many
+    // requests it started.
+    function stageTrackerPrefetchDelegatePlan(item, nowMs) {
+      if (!item) return 0;
+      const now = typeof nowMs === 'number' ? nowMs : Date.now();
+      for (const [k, v] of _stageTrackerPlanPrefetch) if (now - v.at >= STAGE_TRACKER_PLAN_PREFETCH_MS) _stageTrackerPlanPrefetch.delete(k);
+      let n = 0;
+      for (const t of stageTrackerDelegateTargets(item)) {
+        const req = stageTrackerActionRequest(t, 'decide:delegate', {});
+        if (!req) continue;
+        const k = stageTrackerPlanRequestKey(req);
+        if (_stageTrackerPlanPrefetch.has(k)) continue;
+        _stageTrackerPlanPrefetch.set(k, { at: now, promise: stageTrackerPostDelegatePlan(t, req, true) });
+        n++;
+      }
+      return n;
+    }
     async function stageTrackerFetchDelegatePlan(item) {
       const req = stageTrackerActionRequest(item, 'decide:delegate', {});
       if (!req) return { ref: stageTrackerRefOf(item), number: item.number, error: 'no route' };
-      try {
-        const r = await fetch(req.url + '/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body) });
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) return { ref: stageTrackerRefOf(item), number: item.number, error: data.error || ('HTTP ' + r.status) };
-        return Object.assign({ ref: stageTrackerRefOf(item) + (typeof stageTrackerLineageClause === 'function' ? stageTrackerLineageClause(item) : '') }, data);
-      } catch (e) { return { ref: stageTrackerRefOf(item), number: item.number, error: String(e && e.message || e) }; }
+      // A prefetched answer serves one click; Retry always asks again.
+      const k = stageTrackerPlanRequestKey(req);
+      const hit = _stageTrackerPlanPrefetch.get(k);
+      _stageTrackerPlanPrefetch.delete(k);
+      if (hit && Date.now() - hit.at < STAGE_TRACKER_PLAN_PREFETCH_MS) {
+        const pl = await hit.promise;
+        if (pl && !pl.error) return pl;
+      }
+      return stageTrackerPostDelegatePlan(item, req, false);
+    }
+    // The preview opens at once as a skeleton (hivecommons/hive#15773):
+    // the title, the subject the row already knows, "Asking the hive…" and
+    // placeholder lines; Cancel works, Let hive do that waits for the plan.
+    // The skeleton lines do not move under prefers-reduced-motion
+    // (tracker.css). A failed plan reads inline with Retry, never a toast
+    // over a dialog that already opened.
+    const STAGE_TRACKER_PLAN_SKELETON_LINES = 3;
+    const STAGE_TRACKER_PLAN_RETRY = 'Retry';
+    const STAGE_TRACKER_PLAN_BUTTONS_OPEN = '<div class="hive-dialog-buttons">';
+    // Pure: the title + subject + "Asking the hive…" skeleton body.
+    function stageTrackerDelegatePlanSkeletonContent(subject, sentinel, caption) {
+      const esc = hiveDialogEscape;
+      const lines = Array.from({ length: STAGE_TRACKER_PLAN_SKELETON_LINES }, () => '<span class="ham-plan-skeleton-line" aria-hidden="true"></span>').join('');
+      return '<div id="hive-dialog-title" class="hive-dialog-title">' + esc(STAGE_TRACKER_PLAN_TITLE) + '</div>'
+        + '<div class="ham-plan-subject">' + esc(subject) + (sentinel ? ' <span class="ham-plan-chip" title="' + esc(sentinel) + '">⚠ Sentinel</span>' : '') + '</div>'
+        + '<div class="hive-dialog-body ham-plan-body ham-plan-skeleton" role="status" aria-live="polite">'
+        + '<div class="ham-plan-eyebrow">' + esc(STAGE_TRACKER_PLAN_EYEBROW) + '</div>'
+        + '<p class="ham-plan-loading"><span class="toast-spinner cue-acting-spin" aria-hidden="true"></span> ' + esc(caption || 'Asking the hive…') + '</p>'
+        + lines + '</div>';
+    }
+    // Pure: the whole skeleton dialog — the content plus the buttons the
+    // filled preview keeps: Cancel (focused, enabled), the merge button
+    // (hidden until a plan offers it) and Let hive do that (disabled).
+    function stageTrackerDelegatePlanSkeletonHtml(subject, sentinel, caption) {
+      const esc = hiveDialogEscape;
+      return '<div class="ham-plan-content">' + stageTrackerDelegatePlanSkeletonContent(subject, sentinel, caption) + '</div>'
+        + STAGE_TRACKER_PLAN_BUTTONS_OPEN
+        + '<button type="button" class="hv-btn btn-secondary hive-dialog-btn cancel" data-initial-focus>Cancel</button>'
+        + '<button type="button" class="hv-btn btn-secondary hive-dialog-btn ham-plan-merge" hidden>' + esc(STAGE_TRACKER_PLAN_BUTTON_MERGE) + '</button>'
+        + '<button type="button" class="hv-btn ' + (sentinel ? 'btn-danger' : 'btn-primary') + ' hive-dialog-btn primary" disabled aria-disabled="true">' + esc(STAGE_TRACKER_PLAN_BUTTON_DELEGATE) + '</button>'
+        + '</div>';
+    }
+    // Pure: the inline error that replaces the skeleton, with Retry. The
+    // old one-liner — "Could not preview o/r#N (hive unavailable)" — told
+    // the owner nothing (hivecommons/hive#16776: that message was a merged
+    // PR once and a GitHub 500 the next time). Each failure now names the
+    // hive that answered, says why in its own words, and the last line
+    // says plainly that Let hive do that stays off until a preview loads —
+    // the hive never records a decision it could not preview.
+    const STAGE_TRACKER_PLAN_NO_PREVIEW_NO_DECISION = 'Let hive do that stays off until a preview loads — the hive never decides what it could not preview.';
+    // Pure: which hive the failure came from, for the message — the
+    // server's own name when it answered, else the host the page is on.
+    function stageTrackerDelegatePlanHiveLabel(failed, host) {
+      for (const pl of failed || []) if (pl && pl.hive) return String(pl.hive);
+      host = host || (typeof location !== 'undefined' && location.host) || '';
+      return host ? 'the hive at ' + host : 'the hive';
+    }
+    // Pure: the explanation lines for one failed plan: [what, why/do].
+    function stageTrackerDelegatePlanFailureLines(pl, hive) {
+      pl = pl || {};
+      const ref = pl.ref || ('#' + pl.number);
+      const err = String(pl.error || 'no plan');
+      const tries = pl.attempts > 1 ? ' after ' + pl.attempts + ' attempts' + (pl.elapsed_ms ? ' over ' + Math.round(pl.elapsed_ms / 1000) + 's' : '') : '';
+      switch (pl.reason) {
+        case 'gateway':
+          return ['Could not preview ' + ref + ': ' + hive + ' did not answer (HTTP ' + pl.status + ' from the gateway in front of it).', 'The hive is restarting or its API was briefly unreachable; the gateway replaced its reply with a generic page. Retry in a few seconds.'];
+        case 'not-open':
+          return ['Could not preview ' + ref + ': ' + hive + ' reports it is no longer open.', pl.hint || (ref + ' was merged or closed after this row loaded, so there is nothing left to decide. Refresh the activity monitor.')];
+        case 'github':
+          return ['Could not preview ' + ref + ': ' + hive + ' could not read it from GitHub' + tries + '.', (pl.hint || err) + (pl.hint ? ' (' + err + ')' : '')];
+        case 'config':
+          return ['Could not preview ' + ref + ': ' + hive + ' has no GitHub client configured.', pl.hint || err];
+        case 'network':
+          return ['Could not preview ' + ref + ': could not reach ' + hive + ' (' + err + ').', 'Check your connection, then Retry.'];
+        default:
+          return ['Could not preview ' + ref + ': ' + hive + ' answered' + (pl.status ? ' HTTP ' + pl.status : '') + tries + ' — ' + err + '.', pl.hint || 'Retry once; report it if it persists.'];
+      }
+    }
+    // Pure: does Retry stand a chance — any failure the server or the
+    // transport marked retryable, or one with no word either way.
+    function stageTrackerDelegatePlanRetryable(failed) {
+      return (failed || []).some(pl => !pl || (pl.retryable !== false && pl.reason !== 'not-open' && pl.reason !== 'config'));
+    }
+    function stageTrackerDelegatePlanErrorContent(subject, failed, host) {
+      const esc = hiveDialogEscape;
+      failed = (failed || []).map(pl => pl || { error: 'no plan' });
+      const hive = stageTrackerDelegatePlanHiveLabel(failed, host);
+      const blocks = failed.map(pl => {
+        const lines = stageTrackerDelegatePlanFailureLines(pl, hive);
+        return '<p class="ham-plan-error" role="alert">' + esc(lines[0]) + '</p>' + (lines[1] ? '<p class="ham-plan-error-why">' + esc(lines[1]) + '</p>' : '');
+      }).join('');
+      const retry = stageTrackerDelegatePlanRetryable(failed);
+      return '<div id="hive-dialog-title" class="hive-dialog-title">' + esc(STAGE_TRACKER_PLAN_TITLE) + '</div>'
+        + '<div class="ham-plan-subject">' + esc(subject) + '</div>'
+        + '<div class="hive-dialog-body ham-plan-body">'
+        + blocks
+        + '<p class="ham-plan-error-rails">' + esc(STAGE_TRACKER_PLAN_NO_PREVIEW_NO_DECISION) + '</p>'
+        + (retry ? '<button type="button" class="hv-btn btn-secondary hive-dialog-btn ham-plan-retry">' + esc(STAGE_TRACKER_PLAN_RETRY) + '</button>' : '')
+        + '</div>';
+    }
+    // Pure: the subject line the skeleton shows before the plan names it.
+    function stageTrackerDelegatePlanSubject(items) {
+      items = items || [];
+      if (items.length !== 1) return items.length + ' items';
+      return stageTrackerRefOf(items[0]) + (items[0].title ? ' · ' + stageTrackerPlanTruncate(items[0].title, STAGE_TRACKER_PLAN_TITLE_MAX) : '');
     }
     // The preview: resolves { chosen } for Let hive do that, { chosen,
-    // merge: <action id> } for the merge button, null on Cancel.
-    function stageTrackerDelegatePlanDialog(plans, sentinel) {
-      const view = stageTrackerDelegatePlanView(plans, sentinel);
+    // merge: <action id> } for the merge button, null on Cancel. load()
+    // resolves the plans (one per item); it runs again on Retry. opts:
+    // { subject, caption, onSettled } — onSettled runs each time a load ends.
+    function stageTrackerDelegatePlanDialog(load, sentinel, opts) {
+      opts = opts || {};
       return new Promise(resolve => {
         const overlay = document.createElement('div');
         overlay.className = 'hive-dialog-overlay';
         hiveRememberModalOpen(overlay);
-        overlay.innerHTML = '<div class="hive-dialog ham-plan-dialog" role="dialog" aria-modal="true" aria-labelledby="hive-dialog-title">' + stageTrackerDelegatePlanHtml(view) + '</div>';
+        overlay.innerHTML = '<div class="hive-dialog ham-plan-dialog" role="dialog" aria-modal="true" aria-labelledby="hive-dialog-title" aria-busy="true">' + stageTrackerDelegatePlanSkeletonHtml(opts.subject || '', sentinel, opts.caption) + '</div>';
         document.body.appendChild(overlay);
-        const would = plans.map(pl => pl.would || '?').filter((v, i, a) => a.indexOf(v) === i).join('/');
-        hiveWireDialog(overlay, resolve, null, '.primary', '.cancel', close => close({ chosen: STAGE_TRACKER_PLAN_BUTTON_DELEGATE + ' · previewed ' + would }));
+        const dlg = overlay.querySelector('.ham-plan-dialog');
+        const content = overlay.querySelector('.ham-plan-content');
+        const primary = overlay.querySelector('.primary');
         const merge = overlay.querySelector('.ham-plan-merge');
-        if (merge && view.mergeable) merge.addEventListener('click', () => { overlay.hiveDialogClose = null; overlay.remove(); resolve({ chosen: view.mergeLabel + ' · previewed ' + would, merge: view.mergeAction }); });
+        let view = null, would = '', loading = false;
+        const close = hiveWireDialog(overlay, resolve, null, '.primary', '.cancel', done => {
+          // Enter: Retry or Cancel when focused; Let hive do that only once the plan is in.
+          const at = document.activeElement;
+          if (at && at.classList && at.classList.contains('ham-plan-retry')) { run(); return; }
+          if (at && at.classList && at.classList.contains('cancel')) { done(null); return; }
+          if (view) done({ chosen: STAGE_TRACKER_PLAN_BUTTON_DELEGATE + ' · previewed ' + would });
+        });
+        if (merge) merge.addEventListener('click', () => { if (view && view.mergeable) close({ chosen: view.mergeLabel + ' · previewed ' + would, merge: view.mergeAction }); });
+        content.addEventListener('click', e => { if (e.target.closest && e.target.closest('.ham-plan-retry')) { e.preventDefault(); run(); } });
+        async function run() {
+          if (loading || view) return;
+          loading = true;
+          dlg.setAttribute('aria-busy', 'true');
+          content.innerHTML = stageTrackerDelegatePlanSkeletonContent(opts.subject || '', sentinel, opts.caption);
+          let plans;
+          try { plans = await load(); } catch (e) { plans = [{ ref: opts.subject || '', error: String(e && e.message || e) }]; }
+          loading = false;
+          if (typeof opts.onSettled === 'function') opts.onSettled();
+          if (!overlay.parentNode) return;
+          dlg.removeAttribute('aria-busy');
+          const failed = (plans || []).filter(pl => !pl || pl.error);
+          if (failed.length || !plans || !plans.length) {
+            content.innerHTML = stageTrackerDelegatePlanErrorContent(opts.subject || '', failed.length ? failed : [{ ref: opts.subject || '', error: 'no plan' }]);
+            // Retry takes focus when it is offered; else Cancel, the one
+            // button left that does anything.
+            const retry = content.querySelector('.ham-plan-retry') || overlay.querySelector('.cancel');
+            if (retry) retry.focus();
+            return;
+          }
+          view = stageTrackerDelegatePlanView(plans, sentinel);
+          would = plans.map(pl => pl.would || '?').filter((v, i, a) => a.indexOf(v) === i).join('/');
+          const html = stageTrackerDelegatePlanHtml(view);
+          const cut = html.indexOf(STAGE_TRACKER_PLAN_BUTTONS_OPEN);
+          content.innerHTML = cut >= 0 ? html.slice(0, cut) : html;
+          if (merge && view.showMerge) {
+            merge.hidden = false;
+            merge.textContent = view.mergeLabel || STAGE_TRACKER_PLAN_BUTTON_MERGE;
+            if (!view.mergeable) { merge.disabled = true; merge.setAttribute('aria-disabled', 'true'); merge.setAttribute('title', view.mergeWhy); }
+          }
+          primary.classList.toggle('btn-danger', !!view.danger);
+          primary.classList.toggle('btn-primary', !view.danger);
+          primary.disabled = false;
+          primary.removeAttribute('aria-disabled');
+          primary.focus();
+        }
+        run();
       });
     }
     // Let hive decide → plan → preview → act. Returns the delegate payload,
     // or null when cancelled or when the operator took the merge
     // alternative (which runs as its own row action with the chosen button
     // recorded on the ledger).
-    async function stageTrackerDelegatePreview(items) {
-      const plans = await Promise.all(items.map(stageTrackerFetchDelegatePlan));
-      const failed = plans.filter(pl => pl.error);
-      if (failed.length) { showToast('Could not preview ' + failed.map(pl => pl.ref + ' (' + pl.error + ')').join(', '), 'error'); return null; }
-      const picked = await stageTrackerDelegatePlanDialog(plans, stageTrackerSentinelPreface(items));
+    // The items whose preview is open or loading: a second click (the
+    // button, the ⋯ entry, the popover) while one is up never opens another.
+    const _stageTrackerDelegatePreviewing = new Set();
+    async function stageTrackerDelegatePreview(items, rows) {
+      const keys = items.map(stageTrackerItemKey);
+      if (keys.some(k => _stageTrackerDelegatePreviewing.has(k))) return null;
+      keys.forEach(k => _stageTrackerDelegatePreviewing.add(k));
+      // The plan gathers the PR live (seconds): the row caption and its Let
+      // hive decide button both read the preview's own caption ("Asking the
+      // hive…", one phrase from STAGE_TRACKER_ACTING_CAPTIONS, distinct from
+      // the confirmed action's "Hive deciding…") until the plan lands in the
+      // skeleton preview, which opens at once. The pend is tagged with the
+      // button it busies: a confirmed action's pend (or any other ⋯ action
+      // on the row) leaves it alone.
+      const caption = stageTrackerActingCaption('decide:delegate:preview');
+      const pend = stageTrackerSetPending([].concat(...items.map(it => stageTrackerPendingKeys(it, rows))).filter((k, i, a) => a.indexOf(k) === i), caption, undefined, 'decide:delegate');
+      let picked;
+      try {
+        picked = await stageTrackerDelegatePlanDialog(() => Promise.all(items.map(stageTrackerFetchDelegatePlan)), stageTrackerSentinelPreface(items), { subject: stageTrackerDelegatePlanSubject(items), caption, onSettled: () => stageTrackerClearPending(pend) });
+      } finally {
+        stageTrackerClearPending(pend);
+        keys.forEach(k => _stageTrackerDelegatePreviewing.delete(k));
+      }
       if (!picked) return null;
       if (picked.merge) {
         await stageTrackerRunActions(items, picked.merge, { comment: '', chosen: picked.chosen }, items);
@@ -1586,7 +2160,7 @@
       }
       return { chosen: picked.chosen };
     }
-    async function stageTrackerActionPayload(items, id) {
+    async function stageTrackerActionPayload(items, id, rows) {
       const refs = items.map(stageTrackerRefOf).join(', ');
       const who = window._hiveUser || 'you';
       const prs = items.length > 0 && items.every(it => it.kind === 'pr');
@@ -1596,7 +2170,7 @@
         case 'decide:delegate':
           // Preview first (hivecommons/hive#15126): nothing is written
           // until the operator picks a button.
-          return stageTrackerDelegatePreview(items);
+          return stageTrackerDelegatePreview(items, rows);
         case 'decide:delegate-all': {
           // Confirms as Let hive decide (same opt-out key), naming each PR.
           const prs = [].concat(...items.map(stageTrackerNestedOpenPRs));
@@ -1606,6 +2180,7 @@
           // Offered only from a "hasn't taken effect" toast the operator
           // has already read; no second confirmation.
           return {};
+        case 'blocker:handoff':
         case 'blocker:recheck':
           return {};
         case 'blocker:close-partial':
@@ -1615,6 +2190,21 @@
             return (await stageTrackerAsk(id, 'confirm', { title: 'Approve pull request' + (items.length > 1 ? 's' : ''), message: preface + 'Post "/lgtm" and "/approve" on ' + refs + ' as ' + who + '? The merge queue takes it from there — the dashboard does not merge.', confirmLabel: 'Post /lgtm + /approve', danger: !!sentinel })) ? {} : null;
           }
           return (await stageTrackerAsk(id, 'confirm', { title: 'Approve direction', message: 'Record "/hive approve" on ' + refs + ' as ' + who + '? The hive un-parks the issue' + (items.length > 1 ? 's' : '') + ' and carries on; nothing is merged.', confirmLabel: 'Approve' })) ? {} : null;
+        case 'gate:decide': {
+          // The reviewer's question leads the modal, pre-filled; the answer is required.
+          const dec = typeof stageTrackerDecisionOf === 'function' ? stageTrackerDecisionOf(items[0]) : null;
+          const q = (dec && dec.item && dec.item.decision_needed && dec.item.decision_needed.question) || (items[0] && items[0].human_attention && items[0].human_attention.reason) || '';
+          const v = await hivePrompt({ title: 'Decide — ' + refs, label: preface + (q ? 'Question: ' + q + '\n\n' : '') + 'Your decision (posted as "/hive decision …"; the hive carries on with it)', placeholder: 'e.g. take option B and keep the API as is', validate: s => s ? true : 'A decision is required', confirmLabel: 'Send' });
+          return v == null ? null : { comment: v };
+        }
+        case 'gate:request-changes': {
+          const v = await hivePrompt({ title: 'Request changes — ' + refs, label: preface + 'What should change on ' + refs + '? (posted as "/hive decision …"; ' + stageTrackerDirectionCarrier(items) + ' pushes a new head)', placeholder: 'e.g. drop the retry loop and keep the flag', validate: s => s ? true : 'The requested change is required', confirmLabel: 'Send' });
+          return v == null ? null : { comment: v };
+        }
+        case 'gate:confirm-sentinel': {
+          const v = await stageTrackerAsk(id, 'prompt', { title: 'Confirm safe — ' + refs, label: preface + 'Confirm the sentinel finding is intended: this comments your confirmation on ' + refs + ' and removes the sentinel label so the lane may continue. Note (optional)', placeholder: 'e.g. the workflow edit is the point of this PR', confirmLabel: 'Confirm safe', danger: true });
+          return v == null ? null : { comment: v };
+        }
         case 'decide:direction': {
           // The direction is required, so this prompt is never skipped.
           const v = await hivePrompt(prs
@@ -1636,6 +2226,16 @@
         }
         case 'decide:close-read':
           return (await stageTrackerAsk(id, 'confirm', { title: 'Close advisory', message: stageTrackerAdvisoryCloseMessage(items, refs, who), confirmLabel: 'Close' })) ? {} : null;
+        case 'decide:close-deferred': {
+          const v = await stageTrackerAsk(id, 'prompt', { title: 'Close deferred PR', label: stageTrackerDeferralCloseMessage(items, refs, who) + ' Comment (optional):', placeholder: 'Why this is closed', confirmLabel: 'Close', danger: true });
+          return v == null ? null : { comment: v };
+        }
+        case 'decide:close-issue': {
+          const item = items[0];
+          // This destructive exact-issue action always asks; no confirmation opt-out.
+          const v = await hivePrompt({ title: 'Close issue', label: 'Close ' + refs + ' — ' + (item.title || 'Untitled issue') + ' as completed, as ' + who + '? Only this issue closes; linked pull requests and other issues stay unchanged. An attributed closing note is posted. Additional comment (optional):', placeholder: 'Optional closing comment', confirmLabel: 'Close issue', danger: true });
+          return v == null ? null : { comment: v };
+        }
         case 'decide:merge-now': {
           const base = items.map(it => it.base_ref || '').filter(Boolean)[0] || 'its base branch';
           if (items.some(stageTrackerNeedsRebase)) {
@@ -1645,10 +2245,6 @@
         }
         case 'decide:queue-merge':
           return (await stageTrackerAsk(id, 'confirm', { title: 'Approve and let hive merge', message: preface + 'Approve ' + refs + ' as ' + who + '? Your approval stands in for the author\'s trust on this version: hive merges it as-is through its own App on the next tick once CI is green, and will not adopt or re-author it.' + stageTrackerDCOCaveat(items), confirmLabel: 'Approve' })) ? {} : null;
-        case 'decide:re-author': {
-          const caveat = stageTrackerDCOCaveat(items);
-          return (await stageTrackerAsk(id, 'confirm', { title: 'Re-author as hive PR', message: preface + 'Have the hive re-author ' + refs + ' as ' + who + '?' + (caveat || ' Its head cannot merge as-is.') + ' The hive re-homes the commits on a hive-owned, signed-off branch and opens a superseding PR; this one is closed when that merges. Nothing is merged as-is, and the author\'s commits stay attributed.', confirmLabel: 'Re-author', danger: true })) ? {} : null;
-        }
         case 'decide:adopt': {
           const why = items.map(it => stageTrackerAdoptionTip(it)).filter(Boolean).join('\n');
           return (await hiveConfirm({ title: 'Adopt pull request' + (items.length > 1 ? 's' : ''), message: (why ? why + '\n\n' : '') + 'Have the hive adopt ' + refs + ' as ' + who + '? The author\'s commits and sign-off are kept; the hive rebases and fixes CI (in place when GitHub allows, else on a superseding hive PR that closes this one when it merges). Recorded as your decision on the PR.', confirmLabel: 'Adopt' })) ? {} : null;
@@ -1675,6 +2271,11 @@
       if (stageTrackerActionBase(id) === 'decide:reroute') {
         const target = stageTrackerRerouteTargetOf(id) || STAGE_TRACKER_REROUTE_ANY;
         return (await stageTrackerAsk('decide:reroute', 'confirm', stageTrackerRerouteConfirm(refs, who, target, stageTrackerTakeoverOf(items[0])))) ? { to: target } : null;
+      }
+      const verb = typeof stageTrackerModelReplyVerb === 'function' ? stageTrackerModelReplyVerb(id) : '';
+      if (verb) {
+        const v = await stageTrackerAsk(id, 'prompt', { title: stageTrackerActionLabel(id) + ' — ' + refs, label: 'Record "/hive ' + verb + '" on ' + refs + ' as ' + who + '? The hive un-parks the issue and applies the label the workflow model maps to this reply, if any. Note (optional)', placeholder: 'e.g. keep the shorter outline', confirmLabel: 'Send' });
+        return v == null ? null : { comment: v };
       }
       return {};
     }
@@ -1754,15 +2355,16 @@
     const STAGE_TRACKER_ACTING_MAX_MS = 180000;
     const STAGE_TRACKER_ACTING_CAPTIONS = {
       'hold': 'Holding…', 'release': 'Releasing hold…', 'retry': 'Re-evaluating…', 'needs-human': 'Marking needs-human…', 'accept-triage': 'Accepting triage…',
-      'blocker:recheck': 'Checking App permissions…', 'blocker:close-partial': 'Closing as partial…',
-      'decide:delegate': 'Hive deciding…', 'decide:delegate-all': 'Hive deciding each PR…', 'decide:delegate:rerun': 'Hive deciding again…', 'decide:approve': 'Approving…', 'decide:direction': 'Recording direction…', 'decide:close-superseded': 'Closing…', 'decide:close-wontfix': 'Closing…', 'decide:close-read': 'Closing…',
-      'decide:merge-now': 'Merging…', 'decide:queue-merge': 'Recording approval…', 'decide:re-author': 'Queuing re-authoring…',
+      'blocker:handoff': 'Handing to workflows lane…', 'blocker:recheck': 'Checking App permissions…', 'blocker:close-partial': 'Closing as partial…',
+      'decide:delegate': 'Hive deciding…', 'decide:delegate:preview': 'Asking the hive…', 'decide:delegate-all': 'Hive deciding each PR…', 'decide:delegate:rerun': 'Hive deciding again…', 'decide:approve': 'Approving…', 'decide:direction': 'Recording direction…', 'decide:close-superseded': 'Closing…', 'decide:close-wontfix': 'Closing…', 'decide:close-read': 'Closing…', 'decide:close-deferred': 'Closing…', 'decide:close-issue': 'Closing…',
+      'decide:merge-now': 'Merging…', 'decide:queue-merge': 'Recording approval…',
       'decide:adopt': 'Adopting…', 'decide:adopt-now': 'Adopting now…', 'decide:reroute': 'Rerouting…',
+      'gate:decide': 'Sending your decision…', 'gate:request-changes': 'Requesting changes…', 'gate:confirm-sentinel': 'Confirming safe…',
     };
     const STAGE_TRACKER_ACTION_WORDS = {
       adopted: 'adopted', approved: 'approved', recommended: 'recommendation only', closed: 'closed', directed: 'direction recorded', refused: 'refused', 'decided-each': 'decided per PR',
-      merged: 'merged', 'queued-for-merge': 'approved — hive will merge on the next tick once CI is green', [STAGE_TRACKER_ACTION_REBASE_QUEUED]: 'rebase queued, merge to follow',
-      held: 'held', released: 'hold released', rescanned: 'rescanned', 'triage-accepted': 'triage accepted', 'needs-human': 'marked needs-human', rerouted: 'rerouted', [STAGE_TRACKER_ACTION_NOOP]: 'no change',
+      merged: 'merged', 'queued-for-merge': 'queued for merge — hive merges it on its next pass once CI is green', [STAGE_TRACKER_ACTION_REBASE_QUEUED]: 'rebase queued, merge to follow',
+      held: 'held', released: 'hold released', 'sentinel-confirmed': 'sentinel confirmed safe', rescanned: 'rescanned', 'triage-accepted': 'triage accepted', 'needs-human': 'marked needs-human', rerouted: 'rerouted', [STAGE_TRACKER_ACTION_NOOP]: 'no change',
       [STAGE_TRACKER_ACTION_NO_EFFECT]: 'no effect yet',
     };
     // Once the server has answered, a terminal action's caption says so
@@ -1775,7 +2377,7 @@
     }
     // The ledger name of a row action id (the inverse of the badge's
     // STAGE_TRACKER_ACTED_OPTION_ID), for a failure noted on the client.
-    const STAGE_TRACKER_ACTION_LEDGER_NAME = { 'decide:delegate': 'let-hive-decide', 'decide:approve': 'approve', 'decide:direction': 'give-direction', 'decide:close-superseded': 'close-superseded', 'decide:close-wontfix': 'wontfix', 'decide:close-read': 'close-read', 'accept-triage': 'accept-triage', hold: 'hold', release: 'release', 'needs-human': 'mark-needs-human', 'decide:merge-now': 'merge-now', 'decide:queue-merge': 'queue-merge', 'decide:re-author': 're-author', 'decide:adopt': 'adopt', 'decide:adopt-now': 'adopt-now', 'decide:reroute': 'reroute' };
+    const STAGE_TRACKER_ACTION_LEDGER_NAME = { 'decide:delegate': 'let-hive-decide', 'decide:approve': 'approve', 'decide:direction': 'give-direction', 'decide:close-superseded': 'close-superseded', 'decide:close-wontfix': 'wontfix', 'decide:close-deferred': 'wontfix', 'decide:close-read': 'close-read', 'decide:close-issue': 'close-issue', 'accept-triage': 'accept-triage', hold: 'hold', release: 'release', 'needs-human': 'mark-needs-human', 'decide:merge-now': 'merge-now', 'decide:queue-merge': 'queue-merge', 'decide:adopt': 'adopt', 'decide:adopt-now': 'adopt-now', 'decide:reroute': 'reroute', 'gate:decide': 'give-direction', 'gate:request-changes': 'give-direction', 'gate:confirm-sentinel': 'confirm-sentinel' };
     // A failed or refused action is noted on the row at once, so the
     // history badge turns red and its hover's first line names the reason
     // — the server's ledger only sees 5xx and refused answers, and a
@@ -1805,7 +2407,7 @@
     // Pure: the state signature a toast / acting row waits to see change.
     function stageTrackerItemState(it) {
       if (!it) return '';
-      return String(Number(it.stage) || 0) + '|' + (it.stage_slug || '') + '|' + (it.caption || '') + '|' + (Array.isArray(it.modifiers) ? it.modifiers.slice().sort().join(',') : '') + (it.rebase_merge && it.rebase_merge.state ? '|rm:' + it.rebase_merge.state : '') + (it.rebase && it.rebase.text ? '|rb:' + it.rebase.text : '');
+      return String(Number(it.stage) || 0) + '|' + (it.stage_slug || '') + '|' + (it.caption || '') + '|' + (Array.isArray(it.modifiers) ? it.modifiers.slice().sort().join(',') : '') + (it.state ? '|state:' + it.state : '') + (it.rebase_merge && it.rebase_merge.state ? '|rm:' + it.rebase_merge.state : '') + (it.rebase && it.rebase.text ? '|rb:' + it.rebase.text : '');
     }
     function stageTrackerTargetKey(target) {
       return target && target.number ? stageTrackerItemKey({ repo: target.repo, kind: target.kind === 'pr' ? 'pr' : 'issue', number: target.number }) : '';
@@ -1971,8 +2573,10 @@
       pend.caption = stageTrackerDecidedActing(result, item);
       stageTrackerPendingSync(document.getElementById('activity-monitor-panel'));
     }
-    function stageTrackerSetPending(keys, caption, now) {
-      const pend = { keys: keys.slice(), caption, key: '', state: null, decided: false, at: typeof now === 'number' ? now : Date.now() };
+    // busy: the data-ham-act of the row's lead button that reads busy while
+    // this entry is pending ('' — the default — busies no button).
+    function stageTrackerSetPending(keys, caption, now, busy) {
+      const pend = { keys: keys.slice(), caption, key: '', state: null, decided: false, at: typeof now === 'number' ? now : Date.now(), busy: busy || '' };
       _stageTrackerPending.push(pend);
       stageTrackerPendingSync(document.getElementById('activity-monitor-panel'));
       return pend;
@@ -1998,16 +2602,43 @@
       });
     }
     function stageTrackerPendingExpire(d, now) { _stageTrackerPending = stageTrackerPendingLive(_stageTrackerPending, d, typeof now === 'number' ? now : Date.now()); }
+    // The row's lead button while a tagged pend (busyAct, its data-ham-act)
+    // waits: busy, spinner, the pend's own caption (the same phrase the row
+    // caption shows), not clickable again. The button's own aria-disabled /
+    // title are kept and put back when the pend clears, so a lead the row
+    // rendered disabled stays disabled.
+    function stageTrackerLeadBusySync(lead, busyAct, caption) {
+      if (!lead) return;
+      const on = !!busyAct && lead.getAttribute('data-ham-act') === busyAct;
+      const isBusy = lead.getAttribute('aria-busy') === 'true';
+      if (on && !isBusy) {
+        lead.setAttribute('data-ham-label', lead.textContent);
+        lead.setAttribute('data-ham-was-disabled', lead.getAttribute('aria-disabled') === 'true' ? 'true' : '');
+        lead.setAttribute('data-ham-title', lead.getAttribute('title') || '');
+        lead.setAttribute('aria-busy', 'true'); lead.setAttribute('aria-disabled', 'true'); lead.removeAttribute('title');
+        lead.textContent = '';
+        const sp = document.createElement('span'); sp.className = 'toast-spinner cue-acting-spin'; lead.appendChild(sp);
+        lead.appendChild(document.createTextNode(' ' + String(caption || 'acting…')));
+      } else if (!on && isBusy) {
+        lead.removeAttribute('aria-busy');
+        if (lead.getAttribute('data-ham-was-disabled') === 'true') lead.setAttribute('aria-disabled', 'true'); else lead.removeAttribute('aria-disabled');
+        const title = lead.getAttribute('data-ham-title');
+        if (title) lead.setAttribute('title', title); else lead.removeAttribute('title');
+        lead.textContent = lead.getAttribute('data-ham-label') || '';
+        lead.removeAttribute('data-ham-label'); lead.removeAttribute('data-ham-was-disabled'); lead.removeAttribute('data-ham-title');
+      }
+    }
     // Mark rows / sub-rows acting; captions are real nodes so a kept row
     // keeps its caption and a re-rendered one gets it back.
     function stageTrackerPendingSync(el) {
       if (!el || typeof el.querySelectorAll !== 'function') return;
-      const want = {};
-      for (const p of _stageTrackerPending) for (const k of p.keys) want[k] = p.caption;
+      const want = {}, busy = {};
+      for (const p of _stageTrackerPending) for (const k of p.keys) { want[k] = p.caption; if (p.busy) busy[k] = p; }
       const nodes = Array.from(el.querySelectorAll('[data-ham-key], [data-ham-sub-key]'));
       for (const n of nodes) {
         const key = n.getAttribute('data-ham-sub-key') || n.getAttribute('data-ham-key');
         const cap = want[key];
+        stageTrackerLeadBusySync(n.querySelector(':scope > .ham-row-head .ham-lead-act[data-ham-act]'), busy[key] ? busy[key].busy : '', busy[key] ? busy[key].caption : '');
         const strip = n.querySelector(':scope > .ham-strip-row');
         // The caption lives inside the lit chevron (the pill), never as a
         // separate element beside the ✓ badge (#15126); a row without a
@@ -2018,7 +2649,7 @@
           n.classList.add('cue-acting');
           if (capEl && capEl.parentNode !== host) { capEl.remove(); capEl = null; }
           if (host && !capEl) { capEl = document.createElement('span'); capEl.className = 'cue-acting-cap'; capEl.setAttribute('role', 'status'); const sp = document.createElement('span'); sp.className = 'toast-spinner cue-acting-spin'; capEl.appendChild(sp); capEl.appendChild(document.createTextNode('')); host.appendChild(capEl); }
-          if (capEl) capEl.lastChild.nodeValue = cap;
+          if (capEl) { capEl.lastChild.nodeValue = cap; capEl.title = cap; capEl.setAttribute('aria-label', cap); capEl.setAttribute('tabindex', '0'); }
         } else {
           n.classList.remove('cue-acting');
           if (capEl) capEl.remove();
@@ -2030,17 +2661,63 @@
     function stageTrackerAdvisoryOf(item) {
       return item && item.kind !== 'pr' && item.advisory && typeof item.advisory === 'object' ? item.advisory : null;
     }
+    // Pure: the hive's standing deferral of a PR row's current head
+    // (stage_tracker_deferral.go) while the PR in progress chevron reads
+    // Deferred, else null.
+    function stageTrackerDeferralOf(item) {
+      if (!item || item.kind !== 'pr' || !item.deferral || typeof item.deferral !== 'object') return null;
+      const code = item.code_activity;
+      const head = String(item.head || '');
+      if (!code || code.state !== 'deferred' || String(code.head || '') !== head || String(item.deferral.head || '') !== head) return null;
+      return item.deferral;
+    }
+    // The Close-now hint and confirm text of a deferred PR row.
+    function stageTrackerDeferralCloseHint(deferral) {
+      const s = deferral && Array.isArray(deferral.successors) ? deferral.successors : [];
+      return (s.length ? 'successor ' + s.join(', ') + ' · ' : '') + "closes as won't-fix";
+    }
+    function stageTrackerDeferralCloseMessage(items, refs, who) {
+      const d = items && items.length === 1 ? stageTrackerDeferralOf(items[0]) : null;
+      const s = d && Array.isArray(d.successors) && d.successors.length ? ' The work continues in ' + d.successors.join(', ') + '.' : '';
+      return 'Close ' + refs + ' now, as ' + who + '? ' + (d && d.actor ? d.actor : 'The hive') + ' deferred it and says a maintainer may close it.' + s + " It closes as won't-fix with an attributed note.";
+    }
     // A row action whose target mapping came up empty says so instead of
     // returning silently (hivecommons/hive#15436).
     function stageTrackerNothingToActOn(id, rows) {
       const refs = (rows || []).map(stageTrackerRefOf).filter(Boolean).join(', ');
       if (typeof showToast === 'function') showToast(stageTrackerActionLabel(id) + ': nothing to act on' + (refs ? ' — ' + refs + ' is not waiting on that decision' : ''), 'warning');
     }
+    // A copy must identify the selected item, not its parent issue or a
+    // decision target. Keep the canonical URL (including its forge host).
+    function stageTrackerCopyLink(item) {
+      if (!item || (item.kind !== 'issue' && item.kind !== 'pr')) return '';
+      const url = String(item.url || '');
+      const m = /^https?:\/\/[^/]+\/[^/]+\/[^/]+\/(issues|pull)\/(\d+)(?:[?#].*)?$/.exec(url);
+      return m && m[1] === (item.kind === 'pr' ? 'pull' : 'issues') && Number(m[2]) === Number(item.number) && Number(item.number) > 0 ? url : '';
+    }
     async function runRowAction(action, row) {
       let items = Array.isArray(row) ? row.slice() : (row ? [row] : []);
       const id = action;
       const rows = items.slice();
       if (!items.length) return { toasts: [], pending: [] };
+      if (id === 'decide:close-issue') {
+        // Never remap an issue close through its covering PR or fan it out.
+        if (items.length !== 1 || !stageTrackerActionRequest(items[0], id)) {
+          stageTrackerNothingToActOn(id, rows);
+          return { toasts: [], pending: [] };
+        }
+        const key = stageTrackerItemKey(items[0]);
+        if (_stageTrackerCloseIssueBusy.has(key) || _stageTrackerPending.some(p => p.keys.indexOf(key) >= 0)) return { toasts: [], pending: [] };
+        _stageTrackerCloseIssueBusy.add(key);
+        try {
+          const payload = await stageTrackerActionPayload(items, id, rows);
+          if (payload == null) return { toasts: [], pending: [], cancelled: true };
+          const results = await stageTrackerRunActions(items, id, payload, rows);
+          return { toast: results.toasts[0] || null, toasts: results.toasts, pending: results.pending, results };
+        } finally {
+          _stageTrackerCloseIssueBusy.delete(key);
+        }
+      }
       if (id === 'open') {
         for (const it of items) if (it.url) window.open(it.url, '_blank', 'noopener');
         return { toasts: [], pending: [] };
@@ -2055,18 +2732,26 @@
         showToast(id === 'blocker:wait' ? 'Left as is — the row stays blocked until the permission is granted or a person acts.' : 'Not available: the hive has no identity that may push workflow files.', 'info');
         return { toasts: [], pending: [] };
       }
+      if (id === 'notes') {
+        // The phone tier's way in (the row's 🗒 only shows there once the
+        // item has notes): open the first selected row's expander.
+        if (items[0]) hamNotesOpenFor(items[0]);
+        return { toasts: [], pending: [] };
+      }
       if (id === 'copy') {
-        const text = items.map(it => it.url).filter(Boolean).join('\n');
         try {
+          const links = items.map(stageTrackerCopyLink);
+          if (links.some(url => !url)) throw new Error('No matching GitHub link for the selected item — refresh the tracker and try again');
           if (!navigator.clipboard) throw new Error('clipboard unavailable');
-          await navigator.clipboard.writeText(text);
+          await navigator.clipboard.writeText(links.join('\n'));
           showToast(items.length > 1 ? 'Copied ' + items.length + ' links' : 'Link copied', 'success');
         } catch (e) { showToast('Could not copy: ' + (e && e.message ? e.message : 'clipboard unavailable'), 'error'); }
         return { toasts: [], pending: [] };
       }
       if (id === 'decide:adopt') {
-        // Adopt acts on the nudged PR row itself (072, not a decision park).
-        items = items.filter(stageTrackerAdoptOffered);
+        // Adopt acts on the nudged PR row itself (072, not a decision park)
+        // or on the row whose decision card offers it.
+        items = items.filter(it => stageTrackerAdoptOffered(it) || stageTrackerServerOption(it, 'decide:adopt'));
         if (!items.length) return { toasts: [], pending: [] };
       } else if (id === 'decide:delegate-all') {
         // The issue row itself is the request; the server fans out per PR.
@@ -2088,6 +2773,24 @@
         // return without a request, a dialog or a toast).
         items = items.filter(stageTrackerAdvisoryOf);
         if (!items.length) { stageTrackerNothingToActOn(id, rows); return { toasts: [], pending: [] }; }
+      } else if (id === 'decide:close-deferred') {
+        // Close now acts on the deferred PR row itself: a deferral is not a
+        // decision park, so it has no decision target.
+        items = items.filter(it => { const d = stageTrackerDeferralOf(it); return !!(d && d.close_ok); });
+        if (!items.length) { stageTrackerNothingToActOn(id, rows); return { toasts: [], pending: [] }; }
+      } else if (id === 'release' || id === 'gate:confirm-sentinel') {
+        // An issue row drawn through its one covering PR shows the PR's hold
+        // or sentinel on its gate pill (stageTrackerHumanGateReasons reads
+        // the PR's): Release hold / Confirm safe act on that PR, as Approve
+        // does, unless the issue carries the hold or sentinel itself
+        // (hivecommons/hive#17564 — the release ran on the issue and no-oped).
+        const carries = x => !!x && (id === 'release' ? (!!x.hold || (Array.isArray(x.modifiers) && x.modifiers.indexOf('hold') >= 0)) : !!x.sentinel_alert);
+        const seen = {};
+        items = items.map(it => {
+          if (!it || it.kind === 'pr' || carries(it)) return it;
+          const here = (Array.isArray(it.linked_prs) ? it.linked_prs : []).filter(lp => lp && (!Number(lp.drawn_under) || Number(lp.drawn_under) === Number(it.number)) && stageTrackerLinkedPROpen(lp, it));
+          return here.length === 1 && carries(here[0]) ? stageTrackerLinkedPRItem(it, here[0]) : it;
+        }).filter(t => t && !seen[stageTrackerItemKey(t)] && (seen[stageTrackerItemKey(t)] = true));
       } else if (id.indexOf('decide:') === 0) {
         // A row decides its parked PR when it has one (the issue's stage is
         // only mirrored from it); dedupe when the PR row is selected too.
@@ -2101,7 +2804,7 @@
           .filter(t => t && !seen[stageTrackerItemKey(t)] && (seen[stageTrackerItemKey(t)] = true));
         if (!items.length) { stageTrackerNothingToActOn(id, rows); return { toasts: [], pending: [] }; }
       }
-      const payload = await stageTrackerActionPayload(items, id);
+      const payload = await stageTrackerActionPayload(items, id, rows);
       if (payload == null) return { toasts: [], pending: [], cancelled: true };
       const results = await stageTrackerRunActions(items, id, payload, rows);
       return { toast: results.toasts[0] || null, toasts: results.toasts, pending: results.pending, results };
@@ -2242,4 +2945,3 @@
     // kind → { name, bytes (ArrayBuffer), buffer (AudioBuffer|null), failed }
     var _stageTrackerClips = { open: null, merge: null };
     var _stageTrackerSettingsReturnFocus = null;
-

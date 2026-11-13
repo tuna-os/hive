@@ -73,6 +73,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The supervisor scripts have no Go test lane; shellcheck them and run
+      # the watchdog decision tests (fake ffmpeg, stubbed Twitch check) here,
+      # the only job that sees src/deploy/stream changes.
+      - name: Shell scripts (shellcheck + watchdog tests)
+        run: |
+          set -euo pipefail
+          cd src/deploy/stream
+          shellcheck -x entrypoint.sh stream-watchdog.sh healthcheck.sh public-safe-gate.sh test-stream-watchdog.sh
+          bash test-stream-watchdog.sh
 
       - name: Resolve tags
         id: ref
@@ -101,7 +113,7 @@ jobs:
 
       - name: Log in to GHCR
         if: steps.ref.outputs.push == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

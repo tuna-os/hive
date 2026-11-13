@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/hivecommons/hive/crux/logscrub"
 )
@@ -28,6 +29,7 @@ const (
 	ToolHiveStatus         = "hive_status"
 	ToolFleetStatus        = "fleet_status"
 	ToolVersionRead        = "version_read"
+	ToolClaudeAuthStatus   = "claude_auth_status"
 	ToolAgentsList         = "agents_list"
 	ToolRunsList           = "runs_list"
 	ToolLeasesList         = "leases_list"
@@ -108,6 +110,7 @@ var exclusions = []Exclusion{
 	{Operation: "POST /api/contribute/invite", Kind: RefusalKindMechanical, Reason: "`handleContributeInvite` resolves the caller's identity server-side via `resolveViewerUsername` and requires *that user's* contributor profile to hold a `trusted`, `merger` or `advisor` tier. Authority here is derived from who the caller is, not from the owner role, and there is no owner override. A credential carrying no personal identity gets 401.", WhatWouldNeedToChange: "Add an owner-authorized invite path that does not depend on per-user contributor identity."},
 	{Operation: "fan-out across hives", Kind: RefusalKindMechanical, Reason: "Exactly one hive is active at a time by design, so an all-hives mode would contradict the surface rather than extend it.", WhatWouldNeedToChange: "Replace the single-active-hive model with an explicit multi-hive design."},
 	{Operation: "POST /api/prs/{owner}/{repo}/{number}/queue-automerge", Kind: RefusalKindCategorical, Reason: "The only available action that directly causes a merge into real code, and the one a preview cannot meaningfully soften.", DoNotApproximate: doNotApproximate, Tracker: judgementTracker},
+	{Operation: "POST /api/repos/{owner}/{repo}/items/{number}/decision with merge-now or queue-merge", Kind: RefusalKindCategorical, Reason: "The Activity monitor's \"Merge now as maintainer\" and \"Approve and let hive merge\" answers are the queue-automerge exclusion in another form: one merges at once, the other queues the merge. repository.item_decision refuses both, and repository.item_delegate sends no_merge so a delegated approval never queues one either.", DoNotApproximate: doNotApproximate, Tracker: judgementTracker},
 	{Operation: "PUT /api/config/agent/{name}/prompt", Kind: RefusalKindCategorical, Reason: "Kick text reaches the CLI once and is confirmed verbatim for that reason. A prompt reaches it on *every* future kick, and Hive does not scan that path either. Verbatim confirmation is a reasonable guard for one string and a weak one for a standing instruction.", DoNotApproximate: doNotApproximate, Tracker: judgementTracker},
 	{Operation: "POST /api/release-channel", Kind: RefusalKindCategorical, Reason: "Changes which code the hive runs at its next upgrade. The effect is deferred and invisible at the moment of the change, so a preview can say nothing useful about it.", DoNotApproximate: doNotApproximate, Tracker: judgementTracker},
 	{Operation: "knowledge writes", Kind: RefusalKindCategorical, Reason: "Agents read knowledge when they are handed work, so a write changes fleet behaviour with nothing in any fleet or agent view showing that it happened. Knowledge **reads** are in scope.", DoNotApproximate: doNotApproximate, Tracker: judgementTracker},
@@ -156,6 +159,10 @@ type Handler struct {
 	// not authenticate. Preview fails fast instead of minting a confirmation
 	// that can never be executed.
 	WritesUnavailableReason string
+	// Actor is the caller the hive verified on this request. A confirmation
+	// records the actor that previewed it and only that actor may confirm
+	// it, so a write runs as the person who saw its preview.
+	Actor string
 }
 
 type HandlerOption func(*Handler)
@@ -179,6 +186,9 @@ func WithConfirmationTTL(ttl time.Duration) HandlerOption {
 	return func(h *Handler) { h.ConfirmationTTL = ttl }
 }
 func WithClock(now func() time.Time) HandlerOption { return func(h *Handler) { h.Now = now } }
+func WithActor(actor string) HandlerOption {
+	return func(h *Handler) { h.Actor = strings.TrimSpace(actor) }
+}
 func WithWritesUnavailable(reason string) HandlerOption {
 	return func(h *Handler) { h.WritesUnavailableReason = strings.TrimSpace(reason) }
 }
@@ -262,13 +272,22 @@ func (h *Handler) dispatch(r *http.Request, req rpcRequest) (any, *rpcError) {
 	switch req.Method {
 	case "initialize":
 		return map[string]any{"protocolVersion": ProtocolVersion, "serverInfo": map[string]string{"name": ServerName, "version": ServerVersion}, "capabilities": map[string]any{"tools": map[string]any{}}}, nil
-	case "notifications/initialized":
+	case "ping":
+		// MCP's liveness check: the receiver answers with an empty result.
 		return map[string]any{}, nil
 	case "tools/list":
 		return map[string]any{"tools": toolDefs(h.writesUsable(), h.WritesUnavailableReason)}, nil
 	case "tools/call":
 		return h.callTool(r.Context(), req.Params)
 	default:
+		// A notification expects no answer, and "method not found" is the
+		// wrong one: a client that sends notifications/cancelled after a
+		// tool call it gave up on would be told its message was an error.
+		// Every notification is acknowledged the way notifications/initialized
+		// always was.
+		if strings.HasPrefix(req.Method, "notifications/") {
+			return map[string]any{}, nil
+		}
 		return nil, &rpcError{Code: -32601, Message: "method not found"}
 	}
 }
@@ -339,7 +358,7 @@ func toolDefs(writesEnabled bool, unavailableReason string) []map[string]any {
 	defs := []struct{ name, desc string }{
 		{ToolHiveStatus, "Read this hive's dashboard status summary."},
 		{ToolFleetStatus, "Read this hive's fleet status, including repo and agent health rollups. systemResources also carries the container's memory limit (memLimit, \"unlimited\" when none is set) and its out-of-memory kill count (oomKillCount); a restart resets that count, and the starts log source keeps the reading taken before the previous run ended."},
-		{ToolVersionRead, "Read the build this hive is running (currentCommit, branch, channel, commitsBehind, behind) through the existing /api/version endpoint."},
+		{ToolVersionRead, "Read the build this hive is running (hash and short for the running commit, branch, channel, commitsBehind, behind) through the existing /api/version endpoint."},
 		{ToolAgentsList, "Read the capped list of agents known to this hive."},
 		{ToolRunsList, "Read the capped list of runs known to this hive."},
 		{ToolLeasesList, "Read active run leases through the existing runs surface."},
@@ -347,8 +366,10 @@ func toolDefs(writesEnabled bool, unavailableReason string) []map[string]any {
 		{ToolPlansList, "Read the capped list of saved plans."},
 		{ToolAuditLog, "Read the capped audit log for this hive."},
 		{ToolSettingsRead, settingsReadDescription()},
+		{ToolClaudeAuthStatus, "Read which Claude auth mode is active through the existing /api/claude-auth/status endpoint: mode is \"long-lived token\" (an operator-supplied claude setup-token token) or \"dashboard sign-in\", with logged_in. Never returns token material. Read-only."},
 		{ToolAutonomyReadiness, "Read autonomy/readiness status through the existing Nous status endpoint."},
 		{ToolSpendRead, "Read spend and budget status through the existing cost endpoint."},
+		{ToolGitHubAPIUsage, gitHubAPIUsageDescription},
 		{ToolContributorsList, "Read the capped list of contributors known to this hive."},
 		{ToolKnowledgeRead, "Read knowledge-system health and statistics."},
 		{ToolHiveAdvisor, "Read hive advisor recommendations."},
@@ -356,6 +377,9 @@ func toolDefs(writesEnabled bool, unavailableReason string) []map[string]any {
 		{ToolAgentNudgeStatus, "Read the asynchronous delivery outcome for the latest nudge sent to one agent."},
 		{ToolIssuesByBand, "Read issues grouped by their Overview band (ready, in-progress, agent-filed, waiting, done), e.g. band=done for issues an agent has labelled hive/already-done, hive/covered-by-pr or hive/likely-done that a human has not verified and closed yet. hive/covered-by-pr only means an agent found an open PR that references the issue — check that the PR merged before closing."},
 		{ToolPrsByBand, "Read PRs grouped by their Overview band (waiting, eligible, blocked, in-review, open, draft)."},
+		{ToolStageTrackerRead, "Read the Activity monitor: every open item on the board with its stage, what it waits on, its decision question and options, linked PRs and issues, blocker, hold and needs-human state, plus stages[] with a count per stage. Filter with repo, kind, number, q (the monitor's search box: a number matches the item or a linked item), stage, needs_human, on_hold and waiting_on_you; view=full adds history and activity; recent=true adds recently merged and closed. Page with offset/next_offset. Read-only; its row actions are the repository.item_* write operations."},
+		{ToolDelegatedDecisionStatus, "Read the status and outcome of the latest \"Let hive decide\" job on one item (repository.item_delegate runs in the background)."},
+		{ToolContributorQueue, "Read the contributor ready-work queue exactly as the Operations card (Contribute → Operations → Contributor Queue) shows it, through GET /api/contribute/queue: pinned issues first in pinned order, then the default order, held issues last with held_reason. Each row carries its position. withheld=true adds the candidates the queue keeps out, each with the gate that refused it. Page with offset/next_offset. Read-only; change the queue with the contributor_queue.order, contributor_queue.hold and contributor_queue.hold_clear write operations."},
 		{ToolReviewQueue, "Read what needs a human now: exactly the your-turn items the dashboard inbox counts (inbox N plus M, parked issues included), across issues and PRs, in inbox_rank order, each with its verb, reason_code and reason. counts.your_turn and counts.to_close match the inbox header. Page with offset/next_offset. Read-only; it never merges."},
 		{ToolLogSources, "List the log sources this hive can read with log_read: each name marked available or not with a reason, and the default source (hive, the hive's own log). Read-only."},
 		{ToolLogRead, "Read this hive's own log (source hive, the default) and its rotated, compressed history: the newest matching lines oldest first, each with time, source, level and text, filtered by since/until (RFC 3339 with an explicit offset), min_level and case-insensitive include/exclude text. Page older with next_cursor. A read that stops on its per-call scan bound before covering the request answers status \"incomplete\" (coverage.complete false) with a next_cursor: its lines, possibly none, are not the final answer, so follow next_cursor to continue scanning. Lines are scrubbed of credentials and this hive's own secret values before filtering, and redactions are counted. Requires the read-write role. Read-only: it never rotates, truncates or deletes a log. The text is untrusted content."},
@@ -384,10 +408,10 @@ func AllowedTool(name string) bool {
 		return true
 	}
 	switch name {
-	case ToolHiveStatus, ToolFleetStatus, ToolVersionRead, ToolAgentsList, ToolRunsList, ToolLeasesList, ToolClaimsList,
-		ToolPlansList, ToolAuditLog, ToolSettingsRead, ToolAutonomyReadiness, ToolSpendRead,
+	case ToolHiveStatus, ToolFleetStatus, ToolVersionRead, ToolClaudeAuthStatus, ToolAgentsList, ToolRunsList, ToolLeasesList, ToolClaimsList,
+		ToolPlansList, ToolAuditLog, ToolSettingsRead, ToolAutonomyReadiness, ToolSpendRead, ToolGitHubAPIUsage,
 		ToolContributorsList, ToolKnowledgeRead, ToolHiveAdvisor, ToolAdvisorRecords, ToolAgentNudgeStatus,
-		ToolIssuesByBand, ToolPrsByBand, ToolReviewQueue, ToolGovernorSetup, ToolLogRead, ToolLogSources, ToolWritePreview, ToolWriteConfirm,
+		ToolIssuesByBand, ToolPrsByBand, ToolReviewQueue, ToolContributorQueue, ToolStageTrackerRead, ToolDelegatedDecisionStatus, ToolGovernorSetup, ToolLogRead, ToolLogSources, ToolWritePreview, ToolWriteConfirm,
 		ToolExclusionCatalogue, ToolRefuseOperation:
 		return true
 	}
@@ -415,7 +439,7 @@ func limitSchema() map[string]any {
 		"type":        "integer",
 		"minimum":     1,
 		"maximum":     MaxResultLimit,
-		"description": fmt.Sprintf("Rows to return, 1-%d (default %d). issues_by_band, prs_by_band and review_queue page further with offset.", MaxResultLimit, DefaultResultLimit),
+		"description": fmt.Sprintf("Rows to return, 1-%d (default %d). issues_by_band, prs_by_band, review_queue and contributor_queue page further with offset.", MaxResultLimit, DefaultResultLimit),
 	}
 }
 
@@ -433,7 +457,7 @@ func inputSchema(name string) map[string]any {
 		props = advisorRecordsSchema()
 	case ToolIssuesByBand:
 		props["repo"] = map[string]any{"type": "string", "description": "owner/name; unset reads every repo this hive tracks."}
-		props["band"] = map[string]any{"type": "string", "enum": issueBandKeys}
+		props["band"] = map[string]any{"type": "string", "enum": issueBandKeys, "description": "A band key from bands[]. outside is the open issues the scanner kept off the agent queues; each such row's bucket says why."}
 		props["stale"] = map[string]any{"type": "boolean"}
 		props["held"] = map[string]any{"type": "boolean", "description": "Filter rows to held (held=true) or unheld (held=false) issues before the limit cap, so held rows are not silently dropped by it; unlike `repo`, this does not change bands[] counts."}
 		props["offset"] = map[string]any{"type": "integer", "minimum": 0, "description": "Rows to skip; pass the previous answer's next_offset to read the next page past the limit cap."}
@@ -445,9 +469,19 @@ func inputSchema(name string) map[string]any {
 		props["offset"] = map[string]any{"type": "integer", "minimum": 0, "description": "Rows to skip; pass the previous answer's next_offset to read the next page past the limit cap."}
 	case ToolReviewQueue:
 		props = reviewQueueSchema()
+	case ToolContributorQueue:
+		props = contributorQueueReadSchema()
+	case ToolGitHubAPIUsage:
+		props = gitHubAPIUsageSchema()
+	case ToolStageTrackerRead:
+		props = stageTrackerReadSchema()
+	case ToolDelegatedDecisionStatus:
+		s := delegatedDecisionStatusSchema()
+		props = s["properties"].(map[string]any)
+		required = s["required"].([]string)
 	case ToolSettingsRead:
 		props = settingsReadSchema()
-	case ToolGovernorSetup, ToolLogSources:
+	case ToolGovernorSetup, ToolLogSources, ToolClaudeAuthStatus:
 		props = map[string]any{}
 	case ToolLogRead:
 		props = logReadSchema()
@@ -468,6 +502,23 @@ func inputSchema(name string) map[string]any {
 // hive state read through the Provider.
 type providerPreviewOp interface {
 	PreviewWithProvider(ctx context.Context, args map[string]any, provider Provider) (WritePreview, error)
+}
+
+// confirmGuardOp is implemented by write ops whose request was built from
+// live hive state read at preview time (auto_merge.update sends whole lists
+// merged into the current settings). ConfirmWrite asks it for that state's
+// fingerprint again and refuses when it no longer matches the preview's
+// StateFingerprint, so a request built from stale state is never sent.
+type confirmGuardOp interface {
+	ConfirmGuard(ctx context.Context, args map[string]any, provider Provider) (string, error)
+}
+
+// confirmResultOp is implemented by write ops whose endpoint answers a write
+// with a bare acknowledgement (review.settings: {"status":"updated"}). After
+// the write succeeds, ConfirmWrite asks the op to read the setting back and
+// returns what it read as "after", so the caller sees what the hive now holds.
+type confirmResultOp interface {
+	ConfirmResult(ctx context.Context, args map[string]any, provider Provider) (any, error)
 }
 
 func (h *Handler) PreviewWrite(ctx context.Context, args map[string]any) (any, error) {
@@ -493,6 +544,9 @@ func (h *Handler) PreviewWrite(ctx context.Context, args map[string]any) (any, e
 	if err != nil {
 		return nil, err
 	}
+	if err := CheckRequestPath(preview.Request.Path); err != nil {
+		return nil, err
+	}
 	if err := rejectUnpersistablePreview(op.Name(), opArgs, preview); err != nil {
 		return nil, err
 	}
@@ -501,7 +555,7 @@ func (h *Handler) PreviewWrite(ctx context.Context, args map[string]any) (any, e
 	if err != nil {
 		return nil, err
 	}
-	pending := PendingConfirmation{ID: id, Operation: op.Name(), Args: scrubPendingMap(opArgs).(map[string]any), Preview: persistedPendingPreview(preview), Hive: h.HiveID, CreatedAt: now, ExpiresAt: now.Add(h.ConfirmationTTL)}
+	pending := PendingConfirmation{ID: id, Operation: op.Name(), Args: scrubPendingMap(opArgs).(map[string]any), Preview: persistedPendingPreview(preview), Hive: h.HiveID, Actor: h.Actor, CreatedAt: now, ExpiresAt: now.Add(h.ConfirmationTTL)}
 	if err := h.PendingStore.Put(ctx, pending); err != nil {
 		return nil, err
 	}
@@ -519,12 +573,28 @@ func (h *Handler) ConfirmWrite(ctx context.Context, args map[string]any) (any, e
 	if id == "" {
 		return nil, fmt.Errorf("confirmation_id is required")
 	}
+	// Refuse another caller's confirmation before taking it, so a mismatched
+	// confirm can neither burn it nor race its owner's confirm.
+	listed, err := h.PendingStore.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range listed {
+		if p.ID == id && p.Actor != h.Actor {
+			return nil, ErrConfirmationActor
+		}
+	}
 	pending, err := h.PendingStore.Take(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if pending.Hive != h.HiveID {
 		return nil, fmt.Errorf("confirmation belongs to hive %q, not %q", pending.Hive, h.HiveID)
+	}
+	if pending.Actor != h.Actor {
+		// Unreachable unless the store changed between List and Take; the
+		// actor never changes, so a confirmation taken here was never ours.
+		return nil, ErrConfirmationActor
 	}
 	if !h.now().Before(pending.ExpiresAt) {
 		return nil, ErrConfirmationExpired
@@ -540,11 +610,35 @@ func (h *Handler) ConfirmWrite(ctx context.Context, args map[string]any) (any, e
 	if preview.Request.Method != pending.Preview.Request.Method || preview.Request.Path != pending.Preview.Request.Path {
 		return nil, fmt.Errorf("write preview changed since confirmation was issued")
 	}
+	// Checked again here: a confirmation stored before this check existed
+	// must not be executed either.
+	if err := CheckRequestPath(pending.Preview.Request.Path); err != nil {
+		return nil, err
+	}
+	if guarded, ok := op.(confirmGuardOp); ok {
+		current, err := guarded.ConfirmGuard(ctx, pending.Args, h.Provider)
+		if err != nil {
+			return nil, err
+		}
+		if pending.Preview.StateFingerprint == "" || current != pending.Preview.StateFingerprint {
+			return nil, ErrConfirmationStale
+		}
+	}
 	result, err := h.WriteClient.ExecuteWrite(ctx, pending.Preview.Request)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"type": "write_result", "confirmation_id": id, "operation": pending.Operation, "hive": pending.Hive, "result": result}, nil
+	out := map[string]any{"type": "write_result", "confirmation_id": id, "operation": pending.Operation, "hive": pending.Hive, "result": result}
+	if reader, ok := op.(confirmResultOp); ok {
+		// The write already happened: a failed read-back is reported next to
+		// the result, never as a failed write.
+		if after, err := reader.ConfirmResult(ctx, pending.Args, h.Provider); err != nil {
+			out["after_error"] = "the write succeeded, but reading the settings back failed: " + err.Error()
+		} else {
+			out["after"] = after
+		}
+	}
+	return out, nil
 }
 
 func (h *Handler) now() time.Time {
@@ -573,7 +667,7 @@ func pendingValueNeedsFreshConfirm(v any) bool {
 // caller of write_preview and would otherwise duplicate the args (up to a
 // 10 000-char nudge prompt) in every stored entry (#9162).
 func persistedPendingPreview(preview WritePreview) WritePreview {
-	return WritePreview{Operation: preview.Operation, Target: scrubOutboundString(preview.Target), Request: scrubPendingPreview(preview).Request}
+	return WritePreview{Operation: preview.Operation, Target: scrubOutboundString(preview.Target), Request: scrubPendingPreview(preview).Request, StateFingerprint: preview.StateFingerprint}
 }
 
 func scrubPendingPreview(preview WritePreview) WritePreview {
@@ -607,6 +701,13 @@ func scrubPendingValue(v any, key string) any {
 		out.Body = scrubPendingValue(out.Body, "body")
 		return out
 	case map[string]any:
+		if x == nil {
+			// Nil stays nil. A preview with no details (budget.reset,
+			// backup.create, the circuit breaker) would otherwise come back
+			// as {} and read as a changed value to
+			// pendingValueNeedsFreshConfirm, which refuses the preview.
+			return x
+		}
 		out := make(map[string]any, len(x))
 		for k, val := range x {
 			if credentialBearingKey(k) && !maskExempt(k, val) {
@@ -617,19 +718,25 @@ func scrubPendingValue(v any, key string) any {
 		}
 		return out
 	case []any:
+		if x == nil {
+			return x
+		}
 		out := make([]any, len(x))
 		for i, val := range x {
 			out[i] = scrubPendingValue(val, key)
 		}
 		return out
 	case []string:
+		if x == nil {
+			return x
+		}
 		out := make([]string, len(x))
 		for i, val := range x {
 			out[i] = scrubOutboundString(val)
 		}
 		return out
 	case string:
-		if credentialBearingKey(key) {
+		if credentialBearingKey(key) && !maskExempt(key, x) {
 			return "[masked:" + maskLabel(key) + "]"
 		}
 		return scrubOutboundString(x)
@@ -715,6 +822,8 @@ func ReadPath(tool string, limit int) (string, bool) {
 		return "/api/status", true
 	case ToolVersionRead:
 		return "/api/version", true
+	case ToolClaudeAuthStatus:
+		return "/api/claude-auth/status", true
 	case ToolAgentsList:
 		return "/api/agents" + suffix, true
 	case ToolRunsList, ToolLeasesList:
@@ -827,7 +936,7 @@ func maskSensitive(b []byte) []byte {
 		case map[string]any:
 			out := map[string]any{}
 			for k, val := range x {
-				if sensitiveKey(k) && !maskExempt(k, val) {
+				if sensitiveKey(k) && !readMaskExempt(k, val) {
 					out[k] = "[masked:" + maskLabel(k) + "]"
 				} else {
 					out[k] = walk(val)
@@ -857,7 +966,111 @@ func maskSensitive(b []byte) []byte {
 
 func sensitiveKey(k string) bool {
 	k = strings.ToLower(k)
-	return strings.Contains(k, "token") || strings.Contains(k, "secret") || strings.Contains(k, "password") || strings.Contains(k, "credential") || strings.Contains(k, "authorization")
+	return strings.Contains(k, "token") || strings.Contains(k, "secret") || strings.Contains(k, "password") || strings.Contains(k, "credential") || authorizationKey(k)
+}
+
+// authorizationKey reports whether a lower-cased key names an Authorization
+// header or its value. The self-authorization hold (selfAuthorizationHold,
+// repoSelfAuthorizationHold, self_authorization_hold) is a merge policy, the
+// rule on whether a hive may approve its own pull requests, and not a header.
+func authorizationKey(lower string) bool {
+	if !strings.Contains(lower, "authorization") {
+		return false
+	}
+	squashed := strings.ReplaceAll(strings.ReplaceAll(lower, "_", ""), "-", "")
+	return !strings.HasSuffix(squashed, "selfauthorizationhold")
+}
+
+// readMaskExempt reports whether a value under a sensitive-looking key can be
+// shown in a read result because it cannot hold a credential. It adds to
+// maskExempt, which the pending-confirmation scrub shares and which stays as
+// strict as it was:
+//
+//   - nothing at all: null, "", {} and []. Masking those made a secret that
+//     is not set look set.
+//   - a timestamp (token_expires_at).
+//   - a token count or rate with its unit after the word (tokens_per_coin).
+//
+// A string kept this way is still scrubbed by shape like any other string.
+func readMaskExempt(k string, v any) bool {
+	if maskExempt(k, v) {
+		return true
+	}
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return x == "" || isTimestamp(x)
+	case []any:
+		return len(x) == 0
+	case map[string]any:
+		return len(x) == 0 || tokenRateKey(k)
+	case float64:
+		return tokenRateKey(k)
+	default:
+		return false
+	}
+}
+
+func isTimestamp(s string) bool {
+	_, err := time.Parse(time.RFC3339Nano, s)
+	return err == nil
+}
+
+// keyWords splits a JSON key into lower-case words at "_", "-", "." and
+// camelCase boundaries: "webhookSecretEnv" is webhook, secret, env.
+func keyWords(k string) []string {
+	var words []string
+	var cur []rune
+	flush := func() {
+		if len(cur) > 0 {
+			words = append(words, strings.ToLower(string(cur)))
+			cur = cur[:0]
+		}
+	}
+	var prev rune
+	for _, r := range k {
+		switch {
+		case r == '_' || r == '-' || r == '.' || r == ' ':
+			flush()
+		case unicode.IsUpper(r) && (unicode.IsLower(prev) || unicode.IsDigit(prev)):
+			flush()
+			cur = append(cur, r)
+		default:
+			cur = append(cur, r)
+		}
+		prev = r
+	}
+	flush()
+	return words
+}
+
+// tokenRateKey reports whether k has "tokens" as a whole word with more after
+// it (tokens_per_coin, tokensIn): a count or rate like the keys tokenCountKey
+// accepts, with the unit after the word. A credential qualifier before the
+// word (access_tokens_revoked) or another sensitive word in the key rules it
+// out.
+func tokenRateKey(k string) bool {
+	lower := strings.ToLower(k)
+	for _, word := range []string{"secret", "password", "credential", "authorization"} {
+		if strings.Contains(lower, word) {
+			return false
+		}
+	}
+	words := keyWords(k)
+	for i, word := range words {
+		if word != "tokens" {
+			continue
+		}
+		stem := strings.Join(words[:i], "")
+		for _, q := range credentialTokenQualifiers {
+			if strings.HasSuffix(stem, q) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // credentialTokenQualifiers mark a plural "*tokens" key as a collection of
@@ -887,10 +1100,15 @@ func tokenCountKey(k string) bool {
 // a credential and must stay visible (#9161). Booleans carry no secret; a
 // token count is numeric, and a token usage block is an object that the
 // caller keeps walking, so its fields are still scrubbed by key and shape.
+// An issue key (owner/repo#number) under a field named exactly "key" is the
+// contributor queue's hold argument and request body, not a key in the
+// credential sense; it is still scrubbed by shape like any other string.
 func maskExempt(k string, v any) bool {
-	switch v.(type) {
+	switch x := v.(type) {
 	case bool:
 		return true
+	case string:
+		return strings.EqualFold(strings.TrimSpace(k), "key") && contributorQueueKeyPattern.MatchString(x)
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number, map[string]any:
 		return tokenCountKey(k)
 	default:

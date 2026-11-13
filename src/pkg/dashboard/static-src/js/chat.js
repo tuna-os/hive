@@ -503,8 +503,8 @@
     chatInput.value = localStorage.getItem(CHAT_DRAFT_KEY) || '';
     renderChatCheatsheet();
     renderChatSuggestions();
-    detectChatCapabilities();
-    refreshChatPresence();
+    dashboardScheduleWork('chat-capabilities', detectChatCapabilities).catch(console.error);
+    dashboardScheduleWork('chat-presence', refreshChatPresence).catch(console.error);
     dashboardSetInterval('chat-presence', refreshChatPresence, 30000);
 
     chatFab.onclick = () => {
@@ -572,7 +572,8 @@
         sidebar.classList.toggle('open', open);
         backdrop.classList.toggle('open', open);
         toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-        toggle.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
+        toggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+        toggle.title = open ? 'Close navigation' : 'Open navigation';
       }
       function closeDrawer() { if (isOpen()) setOpen(false); }
 

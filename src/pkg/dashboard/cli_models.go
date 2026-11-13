@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hivecommons/hive/crux"
 	"github.com/hivecommons/hive/crux/claude"
@@ -406,9 +407,9 @@ var bobStaticModels = []string{bobAutoModel}
 // models — Claude ids are rejected with a ChatGPT account ("model is not
 // supported when using Codex with a ChatGPT account"), so codex must never
 // fall through to the copilot list. The catalog is baked into the CLI binary
-// (per-CLI-version, not per-account); this snapshot matches codex 0.165.0
-// (captured 2026-10-27 from a live `codex app-server` model/list exchange
-// against the 0.165.0 binary; the 0.159.0 capture was #9804): visible ids in
+// (per-CLI-version, not per-account); this snapshot matches codex 0.166.0
+// and 0.167.0 (captured 2026-11-07 from live `codex app-server` model/list
+// exchanges; the 0.159.0 capture was #9804): visible ids in
 // picker order (GPT-6.1 Sol is the default and has been since at least
 // 0.160.0; GPT-6.1 Terra arrived in 0.165.0; GPT-6 Sol and Luna arrived in
 // 0.156.1, #8417), then the hidden ids — hidden entries are still valid
@@ -426,7 +427,7 @@ var codexStaticModels = []string{
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
 	"gpt-5.5",
-	// Hidden in the 0.165.0 picker but still valid --model values.
+	// Hidden in the 0.166.0 and 0.167.0 pickers but still valid --model values.
 	"gpt-daybreak-blue-latest",
 	"gpt-daybreak-red-latest",
 	"codex-auto-review",
@@ -1625,10 +1626,28 @@ func copilotSDKHelperExecErr(ctx context.Context, err error, stderr string) erro
 			errCopilotSDKHelperTimeout, copilotSDKProbeTimeout, filepath.Base(copilotSDKHelperPath))
 	}
 	msg := strings.TrimSpace(stderr)
+	if isBinaryStderr(msg) {
+		return fmt.Errorf("sdk helper: %w (stderr was binary: the kernel refused to exec the Copilot CLI ELF and sh tried to run it as a script — ENOEXEC, see the copilot exec shim; not a model-catalog fault)", err)
+	}
 	if len(msg) > copilotSDKStderrLogLimit {
 		msg = msg[:copilotSDKStderrLogLimit]
 	}
 	return fmt.Errorf("sdk helper: %w (stderr: %s)", err, msg)
+}
+
+// isBinaryStderr reports stderr that is not text: invalid UTF-8 or control
+// bytes other than whitespace and ESC (ANSI colour), as when sh dumps an ELF
+// it could not exec.
+func isBinaryStderr(s string) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for _, r := range s {
+		if r < 0x20 && r != '\n' && r != '\r' && r != '\t' && r != 0x1b {
+			return true
+		}
+	}
+	return false
 }
 
 // copilotSDKModel mirrors one entry of the helper's stdout JSON. The helper

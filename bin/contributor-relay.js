@@ -50,6 +50,7 @@ const {
   redactPiCredentials,
   piReadiness,
 } = require('./pi-backend.js');
+const { checkRuntime: checkMlxRuntime } = require('./mlx-backend.js');
 // Pure pane-classification (kubestellar/hive#6429): readiness/login/onboarding
 // tables, the busy/idle/blocked/error state machine, the blocked-on-human
 // reason breakdown, the modal-dismiss keystroke table, and the pane-tail/
@@ -229,7 +230,7 @@ const MCP_CONFIG_FILE = process.env.HIVE_MCP_CONFIG_FILE || path.join(CONTRIBUTO
 // (#2537) are the explicit follow-ons and are NOT built here.
 const MODE_INTERACTIVE = 'interactive';
 const MODE_HEADLESS = 'headless';
-const CONTRIBUTOR_MODE = process.env.CONTRIBUTOR_MODE === MODE_HEADLESS
+const CONTRIBUTOR_MODE = BACKEND === 'cline' || process.env.CONTRIBUTOR_MODE === MODE_HEADLESS
   ? MODE_HEADLESS
   : MODE_INTERACTIVE;
 // contributor-agent.sh creates and exports this before starting the relay. Pin
@@ -752,11 +753,32 @@ function quotaPublisherMarkerFresh(markerFile, nowMs = Date.now()) {
 // The reset epoch of a normalized window, however the adapter spells it. This
 // is what makes an until-reset override expire MECHANICALLY: the override pins
 // the epoch it was created against, and the moment the window reports a
-// different one the override no longer matches and is inert.
+// different reset (quotaResetEpochsMatch) the override no longer matches and is
+// inert.
 function quotaWindowResetEpoch(window) {
   const raw = window && (window.reset_epoch ?? window.resets_at ?? window.reset_at);
   const n = Number(raw);
   return Number.isFinite(n) ? n : null;
+}
+
+// How far apart two reset epochs (milliseconds, the published reading's unit)
+// may be and still name the SAME reset. Providers restate a window's reset time
+// with jitter between readings: a continue-until-reset pinned to weekly_all at
+// 07:00:00.373Z met a reading five minutes later saying 06:59:59.634Z, and the
+// old exact match dropped the override for 14 minutes until someone used
+// continue-once. A real roll moves the epoch by at least the window's length,
+// and the shortest window any adapter publishes is an hour (agy `session`;
+// Claude and Codex are 5 h and 7 d, agy also has 5 h / daily / weekly, Kiro is
+// monthly). The published reading carries no window length, so the tolerance
+// is fixed rather than relative: five minutes is hundreds of times the jitter
+// seen and a twelfth of the shortest window, so a real roll still expires the
+// override.
+const QUOTA_RESET_EPOCH_TOLERANCE_MS = 5 * 60 * 1000;
+
+function quotaResetEpochsMatch(pinned, current) {
+  const a = Number(pinned);
+  if (current === null || current === undefined || !Number.isFinite(a)) return false;
+  return Math.abs(a - current) <= QUOTA_RESET_EPOCH_TOLERANCE_MS;
 }
 
 // A continue-* override is consent to spend BELOW the configured reserve. It is
@@ -776,14 +798,14 @@ function quotaOverrideApplies(override, guardWindow, reading) {
       // task-admission site, not here (evaluate also runs for `ready`).
       return true;
     case 'continue_until_reset': {
-      // Bound to the EXACT guarded window and the reset epoch it was created
-      // against. A different window, or the same window after its reset epoch
-      // rolls, no longer matches.
+      // Bound to the EXACT guarded window and the reset it was created
+      // against. A different window, or the same window after its reset
+      // rolls, no longer matches; a few seconds of reset-time jitter between
+      // readings is the same reset (QUOTA_RESET_EPOCH_TOLERANCE_MS).
       if (!guardWindow) return false;
       const id = guardWindow.id || guardWindow.kind;
       if (override.window_id !== id) return false;
-      const epoch = quotaWindowResetEpoch(guardWindow);
-      return epoch !== null && override.reset_epoch === epoch;
+      return quotaResetEpochsMatch(override.reset_epoch, quotaWindowResetEpoch(guardWindow));
     }
     default:
       return false;
@@ -793,15 +815,15 @@ function quotaOverrideApplies(override, guardWindow, reading) {
 // A pause-until-reset override forces a hold even when a reading has cleared,
 // until the window it names resets — an explicit pause outranking an automatic
 // resume (#6833). Absent that window from the reading (or a rolled epoch) it has
-// expired and no longer holds.
+// expired and no longer holds. Reset-time jitter is tolerated exactly as for
+// continue-until-reset (quotaResetEpochsMatch).
 function quotaPauseOverrideActive(override, reading) {
   if (!override || override.directive !== 'pause_until_reset') return false;
   const windows = (reading && reading.limits) || [];
   for (const w of windows) {
     const id = w.id || w.kind;
     if (override.window_id !== id) continue;
-    const epoch = quotaWindowResetEpoch(w);
-    if (epoch !== null && override.reset_epoch === epoch) return true;
+    if (quotaResetEpochsMatch(override.reset_epoch, quotaWindowResetEpoch(w))) return true;
   }
   return false;
 }
@@ -1150,6 +1172,42 @@ function armContributorQuotaRetry() {
   if (typeof contributorQuotaRetryTimer.unref === 'function') contributorQuotaRetryTimer.unref();
 }
 
+// The release line names what actually released the hold. It used to say "a
+// fresh reading clears every effective reserve" every time, including when a
+// continue-once override released it with the weekly window still at 11%
+// against a 20% reserve — which reads as the quota having recovered when it had
+// not.
+function quotaGuardReleaseMessage(decision) {
+  const d = decision || {};
+  const pct = v => (Number.isFinite(Number(v)) ? `${Number(v)}%` : '?');
+  const still = d.window_id
+    ? ` Window ${d.window_id} is still at ${pct(d.remaining_pct)} against a ${pct(d.required_reserve_pct)} reserve.`
+    : '';
+  let cause;
+  switch (d.override) {
+    case 'continue_once':
+      cause = `by the continue-once override.${still} It admits one task, then the guard checks again.`;
+      break;
+    case 'continue_until_reset':
+      cause = `by the continue-until-reset override.${still} It stays in force until that window resets.`;
+      break;
+    case 'disable_session':
+      cause = `by the disable-session override.${still} The guard is off for this relay session.`;
+      break;
+    default:
+      if (d.override) {
+        cause = `by the ${d.override} override.${still}`;
+      } else if (d.reason === 'banked_reset_available') {
+        cause = '— a fresh reading clears every reserve except the weekly one, which a banked reset covers.';
+      } else if (d.reason === 'unprovisioned') {
+        cause = '— no quota reading source is configured, so the guard is not guarding anything.';
+      } else {
+        cause = '— a fresh reading clears every effective reserve.';
+      }
+  }
+  return `Contributor quota guard released ${cause} Asking for work again.`;
+}
+
 function retryContributorQuota() {
   if (!contributorQuotaPaused) return;
   // An explicit contributor pause outranks a fresh reading: someone asked for
@@ -1159,7 +1217,7 @@ function retryContributorQuota() {
   if (!decision.admit) { armContributorQuotaRetry(); return; }
   contributorQuotaPaused = false;
   writeRelayStatus();
-  console.log('Contributor quota guard released — a fresh reading clears every effective reserve. Asking for work again.');
+  console.log(quotaGuardReleaseMessage(decision));
   if (!currentTask && !cliReadyFailed && !quotaHoldActive()) {
     requestWork(hubs[activeHubIndex], 'quota_guard_released');
   }
@@ -1561,6 +1619,7 @@ let fetchHubRegistry = (registryURL, cb) => {
 function handleTLSHostMismatch(hub, err) {
   hub.tlsHostMismatch = true;
   hub.authenticated = false;
+  hub.standbyAcked = false;
   const registryURL = hub.relocationAttempted ? null : hubRegistryURLFor(hub.sourceURL || hub.url);
   if (!registryURL) {
     console.error(tlsHostMismatchRemediation(hub, null));
@@ -1710,6 +1769,17 @@ function makeHub(url, token, disabled = false, contributorId = '', repoScope = n
     readyRequestSeq: 0,
     authenticated: false,
     authFailed: false,
+    // #16462/#16463: set by standby_ack, cleared whenever the connection it
+    // was granted on goes away.
+    standbyAcked: false,
+    // What this hub's CURRENT connection was last told about the quota hold
+    // (quota_hold, capability quota_hold_v1). Reset on every auth_ok: a fresh
+    // connection on the hub starts out not held.
+    quotaHoldSent: false,
+    // What this hub's CURRENT connection was last told about this relay
+    // working ANOTHER hive's task (busy_elsewhere, capability
+    // busy_elsewhere_v1). Reset on every auth_ok, like quotaHoldSent.
+    busyElsewhereSent: false,
     // Set by handleTLSHostMismatch when the dialed host is not in the served
     // certificate; parks the hub (no reconnect loop) until contributor.env
     // changes. relocationAttempted bounds the hub-registry re-resolution to
@@ -1847,6 +1917,77 @@ function writeRelayStatus() {
     if (temporary) { try { fs.unlinkSync(temporary); } catch (_) {} }
     console.error(`WARNING: could not write relay status file ${RELAY_STATUS_FILE}: ${e.message}`);
   }
+  // Every quota hold transition already ends here (it changes relayReadiness),
+  // so this is the one place the hub is told — see reportQuotaHold.
+  reportQuotaHoldToHubs();
+  // Every currentTask transition (assign, complete, fail, revoke) ends here
+  // too, so the same holds for busy_elsewhere — see reportBusyElsewhere.
+  reportBusyElsewhereToHubs();
+}
+
+// ── Quota hold report (quota_hold_v1) ────────────────────────────────────────
+// While the quota guard (#6951) or the provider quota hold (#6541) is holding,
+// this relay withholds `ready` and declines pushed work, but its socket stays
+// up and heartbeats. A hub counting connected relays as contributor-first
+// cover (RoleCoverage) could not tell, so it withheld the resident agent's
+// kicks for a lane nobody was working. Tell each hub that advertises
+// quota_hold_v1 when the hold starts and ends; a hub without the token never
+// sees the frame, and keeps today's reading.
+function relayQuotaHeld() {
+  return contributorQuotaPaused || quotaHoldActive();
+}
+
+function relayQuotaHoldReason() {
+  return contributorQuotaPaused ? 'quota_guard' : 'provider_quota';
+}
+
+function reportQuotaHold(hub) {
+  if (!hub || !hub.authenticated || hub.disabled) return;
+  if (!Array.isArray(hub.serverCapabilities) || !hub.serverCapabilities.includes('quota_hold_v1')) return;
+  const held = relayQuotaHeld();
+  if (held === hub.quotaHoldSent) return;
+  if (!hub.ws || hub.ws.readyState !== WebSocket.OPEN) return;
+  hub.quotaHoldSent = held;
+  sendTo(hub, held
+    ? { type: 'quota_hold', seq: nextSeq(), state: 'held', reason: relayQuotaHoldReason() }
+    : { type: 'quota_hold', seq: nextSeq(), state: 'released' });
+}
+
+function reportQuotaHoldToHubs() {
+  for (const hub of hubs) reportQuotaHold(hub);
+}
+
+// ── Busy on another hive (busy_elsewhere_v1) ─────────────────────────────────
+// A relay subscribed to several hives works one primary task at a time. While
+// that task belongs to hive B, hive A still sees a connected relay that
+// heartbeats, holds its "Acting as" role and has been refused nothing, so A's
+// contributor-first gate (RoleCoverage) counted it as covering A's lane and
+// withheld A's resident agent while nobody worked that lane. Tell every OTHER
+// hub that advertises busy_elsewhere_v1 when such a task starts and when it
+// ends; a hub without the token never sees the frame, and keeps today's
+// reading. The frame carries only when the other task started — never which
+// hive, repository or issue — so one hive learns nothing about another's work.
+// The local review cycle belongs to no hub and is not reported.
+function busyElsewhereFor(hub) {
+  if (!currentTask || isLocalOnlyTask(currentTask)) return false;
+  const owner = currentTask._hub;
+  return !!owner && owner !== hub;
+}
+
+function reportBusyElsewhere(hub) {
+  if (!hub || !hub.authenticated || hub.disabled) return;
+  if (!Array.isArray(hub.serverCapabilities) || !hub.serverCapabilities.includes('busy_elsewhere_v1')) return;
+  const busy = busyElsewhereFor(hub);
+  if (busy === hub.busyElsewhereSent) return;
+  if (!hub.ws || hub.ws.readyState !== WebSocket.OPEN) return;
+  hub.busyElsewhereSent = busy;
+  sendTo(hub, busy
+    ? { type: 'busy_elsewhere', seq: nextSeq(), state: 'busy', since: currentTaskStartedAt || new Date().toISOString() }
+    : { type: 'busy_elsewhere', seq: nextSeq(), state: 'clear' });
+}
+
+function reportBusyElsewhereToHubs() {
+  for (const hub of hubs) reportBusyElsewhere(hub);
 }
 
 let progressInterval = null;
@@ -2329,6 +2470,11 @@ function requestWork(hub, trigger, expectedConnectGeneration = null) {
     logSkippedWorkRequest(hub, trigger, 'standby mode');
     return false;
   }
+  // Ahead of startDeferredFix below: a relay that is exiting starts nothing.
+  if (shuttingDown) {
+    logSkippedWorkRequest(hub, trigger, 'the relay is shutting down');
+    return false;
+  }
   if (!hubScopeReady(hub)) return false;
   const conn = readyConnLabel(hub);
   if (expectedConnectGeneration !== null && hub.connectGeneration !== expectedConnectGeneration) {
@@ -2384,6 +2530,71 @@ function scheduleReadyRetry(hub, trigger) {
   }, TASK_UNAVAILABLE_RETRY_MS);
 }
 
+// ── Shutdown with a finished task still on the wire ─────────────────────────
+//
+// Observed live (2026-11-08): a relay logged a task's HIVE_VERDICT and the
+// no_work_needed it implied, a `docker stop` arrived about a second later, and
+// the hub never got task_complete — it booked "abandoned: connection lost" and
+// re-offered the issue, which was worked again 13 minutes later.
+//
+// The relay is synchronous from "Task ... completed" to the send: the label
+// calls are execSync and stopping the agent (quitLiveCLI) sleeps for at least
+// three seconds, all on the event loop. A signal that lands in that window is
+// therefore handled only AFTER the send, but the old handler then called
+// process.exit(0) at once, and process.exit does not wait for a socket write
+// still queued behind it. So a finished task's frame is the thing to wait for:
+// SHUTDOWN_HELD_FRAMES are sent with a write callback and tracked until it
+// fires, and the signal handler holds the exit while any are outstanding.
+//
+// The wait is bounded below the container runtime's default 10 s stop timeout
+// (docker and podman both SIGKILL after it). The handler can only run once the
+// synchronous finish has returned, which already spent about 3 s of that, so
+// 5 s keeps the whole shutdown inside the 10 s; a healthy socket drains in
+// milliseconds, so the deadline only matters for a wedged one.
+const SHUTDOWN_HELD_FRAMES = new Set(['task_complete', 'task_failed']);
+const SHUTDOWN_FLUSH_DEADLINE_MS = Number(process.env.HIVE_RELAY_SHUTDOWN_FLUSH_MS) || 5000;
+let shuttingDown = false;
+const unflushedHeldFrames = new Set();
+
+function sendHeldFrame(hub, msg, payload) {
+  let settle;
+  const entry = {
+    type: msg.type,
+    taskID: msg.task_id,
+    hubURL: hub.url,
+    flushed: new Promise(resolve => { settle = resolve; }),
+  };
+  // Added BEFORE the send, so a callback that fires synchronously still finds
+  // (and removes) it.
+  unflushedHeldFrames.add(entry);
+  const done = (err) => {
+    if (!unflushedHeldFrames.delete(entry)) return;
+    if (err) console.error(`The ${entry.type} frame for ${entry.taskID || '(no task)'} did not reach ${entry.hubURL || 'the hub'}: ${err.message || err}`);
+    settle();
+  };
+  try {
+    hub.ws.send(payload, done);
+  } catch (e) {
+    done(e);
+    throw e;
+  }
+}
+
+function waitForHeldFrames(deadlineAt) {
+  if (unflushedHeldFrames.size === 0) return Promise.resolve(true);
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) return Promise.resolve(false);
+  let timer = null;
+  const expired = new Promise(resolve => { timer = setTimeout(() => resolve('deadline'), remaining); });
+  const drained = Promise.all(Array.from(unflushedHeldFrames, e => e.flushed));
+  return Promise.race([drained, expired]).then(outcome => {
+    clearTimeout(timer);
+    if (outcome === 'deadline') return unflushedHeldFrames.size === 0;
+    // A decline sent during the wait is held too; go round again for it.
+    return waitForHeldFrames(deadlineAt);
+  });
+}
+
 function sendTo(hub, msg) {
   // #5715: a local-only task (the synthetic pr-review cycle) has no
   // server-issued lease, so an ownership frame naming it can only ever be
@@ -2409,6 +2620,8 @@ function sendTo(hub, msg) {
     if (hub.repoScope !== null || hub.scopeSent) msg = { ...msg, scope_version: hub.scopeVersion };
   }
   if (msg && msg.type === 'ready' && quotaHoldActive()) return;
+  // A relay on its way out must not ask for work it will never run.
+  if (msg && msg.type === 'ready' && shuttingDown) return;
   // #7996: same choke point for an expired CLI login — see enterLoginHold.
   if (msg && msg.type === 'ready' && loginHoldActive()) return;
   if (msg && msg.type === 'ready') {
@@ -2440,7 +2653,8 @@ function sendTo(hub, msg) {
       // answer it with a close nobody can attribute.
       console.error(`Frame ${msg.type} is still ${utf8Bytes(payload)} bytes after trimming (limit ${budget}) — the hub may close the connection with code 1009`);
     }
-    hub.ws.send(payload);
+    if (msg && SHUTDOWN_HELD_FRAMES.has(msg.type)) sendHeldFrame(hub, msg, payload);
+    else hub.ws.send(payload);
     // #7732: recorded only for a frame that actually left, so a `ready`
     // dropped on a closed socket does not look like an open question.
     if (msg && msg.type === 'ready') hub.readyOutstanding = true;
@@ -2699,6 +2913,7 @@ function stopHub(hub, reason) {
     hub.ws = null;
   }
   hub.authenticated = false;
+  hub.standbyAcked = false;
   hub.readyOutstanding = false;
   hub.connectGeneration++;
   writeRelayStatus();
@@ -3804,10 +4019,18 @@ function resolveBackendShell() {
 // play — agy's effort is conditional on exactly that.
 function modelFlagFor() {
   if (BACKEND === 'pi' && !PI_SELECTION.valid) throw new Error(PI_SELECTION.error);
+  if (BACKEND === 'pi') checkMlxRuntime(MODEL, PI_ENV);
+  if (BACKEND === 'pi' && PI_SELECTION.provider === 'mlx') {
+    return `--model ${MODEL} --extension ${shellQuote(path.join(__dirname, 'mlx-pi-extension.js'))}`;
+  }
   return MODEL && !NO_MODEL_FLAG_BACKENDS.includes(BACKEND) ? `--model ${MODEL}` : '';
 }
 
 function effectiveProvider() {
+  if (BACKEND === 'cline') {
+    const slash = MODEL.indexOf('/');
+    return slash > 0 && slash < MODEL.length - 1 ? MODEL.slice(0, slash) : '';
+  }
   return BACKEND === 'pi' && PI_SELECTION.valid ? PI_SELECTION.provider : '';
 }
 
@@ -3860,7 +4083,9 @@ const MUSE_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'
 // the flag; inference routes (litellm) that drive the same binary do not.
 const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-function effectiveReasoningEffort() {
+// requestedReasoningEffort is the effort the launch command builder applies:
+// what buildLaunchCommand() and buildHeadlessArgv() pass to the CLI.
+function requestedReasoningEffort() {
   // agy is the only backend whose effort is conditional on a model being passed.
   if (BACKEND === 'agy') return modelFlagFor() ? agyEffort : '';
   // muse applies effort with or without a model, but only for values it takes.
@@ -3871,6 +4096,87 @@ function effectiveReasoningEffort() {
   // selection), read by detectOmpSelection; the env var still wins when set,
   // the same precedence effectiveModel() applies (#7760).
   return REASONING_EFFORT || detectedEffort || '';
+}
+
+// effortFlagFor is the effort flag the builder adds for this backend, or ''
+// when the backend gets none. At most one backend case applies.
+function effortFlagFor() {
+  if (BACKEND === 'codex') return REASONING_EFFORT ? `-c 'model_reasoning_effort="${REASONING_EFFORT}"'` : '';
+  const effort = requestedReasoningEffort();
+  if (!effort) return '';
+  // agy: paired with --model, never on its own — requestedReasoningEffort()
+  // is '' without one. claude: only claude-valid levels (#8377). muse: only
+  // values muse accepts, so the report never advertises an effort it rejected.
+  if (BACKEND === 'agy' || BACKEND === 'claude') return `--effort ${effort}`;
+  if (BACKEND === 'muse') return `--reasoning-effort ${effort}`;
+  return '';
+}
+
+// --- Launch line reconciliation (hivecommons/hive#16222) ---------------------
+//
+// An entrypoint-resolved AGENT_LAUNCH_CMD is reused verbatim (see
+// buildLaunchCommand), so the flags the builder would add are NOT added to it.
+// When that line lacks the --model or effort flag, the CLI never received the
+// value, and reporting AGENT_MODEL / AGENT_REASONING_EFFORT to the hub would
+// advertise a configuration that is not running — standby model tiers and the
+// PR attribution trailer both read that report. The relay then reports only
+// what it can observe (the transcript-detected model/effort, or nothing).
+// Headless mode never types that line, so it is unaffected.
+
+// shellWords splits a shell command line into words with the quoting the
+// launchers use removed: '…' around a word, and backslash escapes (printf %q).
+function shellWords(line) {
+  return line.split(/\s+/).filter(Boolean).map((w) => {
+    if (w.length >= 2 && w.startsWith("'") && w.endsWith("'")) return w.slice(1, -1);
+    return w.replace(/\\(.)/g, '$1');
+  });
+}
+
+// entrypointLineCarries reports whether the entrypoint launch line contains
+// flag's words, consecutively.
+function entrypointLineCarries(flag) {
+  const line = shellWords(ENTRYPOINT_LAUNCH_CMD);
+  const want = shellWords(flag);
+  for (let i = 0; i + want.length <= line.length; i++) {
+    if (want.every((w, j) => line[i + j] === w)) return true;
+  }
+  return false;
+}
+
+function entrypointLineGoverns() {
+  return !!ENTRYPOINT_LAUNCH_CMD && CONTRIBUTOR_MODE === MODE_INTERACTIVE;
+}
+
+const warnedLaunchLineDrops = new Set();
+function warnLaunchLineDrop(what, flag) {
+  if (warnedLaunchLineDrops.has(what)) return;
+  warnedLaunchLineDrops.add(what);
+  console.error(`AGENT_LAUNCH_CMD does not carry \`${flag}\`; the CLI is not running with that ${what}, so it is not reported to the hub (#16222)`);
+}
+
+function launchLineDropsModel() {
+  if (!entrypointLineGoverns() || !MODEL || NO_MODEL_FLAG_BACKENDS.includes(BACKEND)) return false;
+  const flag = `--model ${MODEL}`;
+  if (entrypointLineCarries(flag)) return false;
+  warnLaunchLineDrop('model', flag);
+  return true;
+}
+
+function launchLineDropsEffort() {
+  if (!entrypointLineGoverns()) return false;
+  // agy applies effort only alongside a model the CLI actually received.
+  if (BACKEND === 'agy' && launchLineDropsModel()) return true;
+  const flag = effortFlagFor();
+  if (!flag || entrypointLineCarries(flag)) return false;
+  warnLaunchLineDrop('effort', flag);
+  return true;
+}
+
+// effectiveReasoningEffort is the effort reported to the hub: the requested
+// one, unless the entrypoint launch line never applied it.
+function effectiveReasoningEffort() {
+  if (launchLineDropsEffort()) return detectedEffort || '';
+  return requestedReasoningEffort();
 }
 
 // --- Model auto-detection from the CLI's own session transcript (#4117) ----
@@ -4349,8 +4655,10 @@ function advisorFields() {
 }
 
 // effectiveModel is the model counterpart of effectiveReasoningEffort(): the
-// single source of truth for the model actually reported to the hub.
+// single source of truth for the model actually reported to the hub. A model
+// the entrypoint launch line never passed is not reported (#16222).
 function effectiveModel() {
+  if (launchLineDropsModel()) return detectedModel || '';
   return MODEL || detectedModel || '';
 }
 
@@ -4374,24 +4682,11 @@ function buildLaunchCommand() {
     return cachedLaunchCommand;
   }
   const { cmd, perm } = resolveBackendShell();
-  const modelFlag = modelFlagFor();
-  const reasoningFlag = BACKEND === 'codex' && REASONING_EFFORT
-    ? `-c 'model_reasoning_effort="${REASONING_EFFORT}"'`
-    : '';
-  // Paired with modelFlag, never on its own: agy without --model needs no
-  // --effort, and passing one alone would be a flag agy has no model to apply.
-  const agyEffortFlag = BACKEND === 'agy' && modelFlag ? `--effort ${effectiveReasoningEffort()}` : '';
-  // muse takes effort on its own, independent of --model (unlike agy), and
-  // validates the value itself. Only values muse actually accepts are passed,
-  // so effectiveReasoningEffort() never advertises an effort muse rejected.
-  const museEffortFlag = BACKEND === 'muse' && effectiveReasoningEffort()
-    ? `--reasoning-effort ${effectiveReasoningEffort()}`
-    : '';
-  // claude: `--effort <v>` only when a claude-valid effort is set (#8377).
-  const claudeEffortFlag = BACKEND === 'claude' && effectiveReasoningEffort()
-    ? `--effort ${effectiveReasoningEffort()}`
-    : '';
-  cachedLaunchCommand = [cmd, perm, modelFlag, reasoningFlag, agyEffortFlag, museEffortFlag, claudeEffortFlag].filter(Boolean).join(' ');
+  // effortFlagFor() pairs agy's --effort with --model, never on its own: agy
+  // without --model needs no --effort, and passing one alone would be a flag
+  // agy has no model to apply. config/backends.conf's
+  // backend_selection_flags_shell emits the same two flags for local mode.
+  cachedLaunchCommand = [cmd, perm, modelFlagFor(), effortFlagFor()].filter(Boolean).join(' ');
   return cachedLaunchCommand;
 }
 
@@ -4414,6 +4709,9 @@ function buildLaunchCommand() {
 // task time rather than silently stalling. Extending this table is how a
 // future PR adds a backend once its headless invocation is verified.
 const HEADLESS_BACKENDS = {
+  // Use the canonical Crux adapter for capability checks, isolated auth/state,
+  // NDJSON results and cancellation. The task is sent on stdin, not argv.
+  cline: { flag: [] },
   // claude -p "<prompt>" — print mode: runs the prompt non-interactively and
   // exits. Same perm flags as the interactive launch (bypass permissions).
   claude: { flag: '-p' },
@@ -4506,7 +4804,13 @@ function headlessSupportsBackend() {
 function buildHeadlessArgv(prompt) {
   const spec = HEADLESS_BACKENDS[BACKEND];
   if (!spec) return null;
+  if (BACKEND === 'cline') {
+    const args = ['cline-turn', '--model', MODEL];
+    if (REASONING_EFFORT) args.push('--thinking', REASONING_EFFORT);
+    return { bin: process.env.HIVE_CLINE_RUNNER || 'crux', args, input: prompt };
+  }
   if (BACKEND === 'pi' && !PI_SELECTION.valid) throw new Error(PI_SELECTION.error);
+  if (BACKEND === 'pi') checkMlxRuntime(MODEL, PI_ENV);
   const { cmd, perm } = resolveBackend();
   const permArgs = perm ? perm.split(/\s+/).filter(Boolean) : [];
   const modelArgs = MODEL && !NO_MODEL_FLAG_BACKENDS.includes(BACKEND) ? ['--model', MODEL] : [];
@@ -4518,14 +4822,16 @@ function buildHeadlessArgv(prompt) {
   // tokens for backends needing a sub-command plus a flag (goose). Normalize
   // to an array so both shapes spread the same way ahead of the prompt.
   const oneShotArgs = Array.isArray(spec.flag) ? spec.flag : [spec.flag];
-  const museEffortArgs = BACKEND === 'muse' && effectiveReasoningEffort()
-    ? ['--reasoning-effort', effectiveReasoningEffort()]
+  const museEffortArgs = BACKEND === 'muse' && requestedReasoningEffort()
+    ? ['--reasoning-effort', requestedReasoningEffort()]
     : [];
   // Same claude-valid-only rule as the interactive launch (#8377).
-  const claudeEffortArgs = BACKEND === 'claude' && effectiveReasoningEffort()
-    ? ['--effort', effectiveReasoningEffort()]
+  const claudeEffortArgs = BACKEND === 'claude' && requestedReasoningEffort()
+    ? ['--effort', requestedReasoningEffort()]
     : [];
-  const flagArgs = [...permArgs, ...modelArgs, ...reasoningArgs, ...agyEffortArgs, ...museEffortArgs, ...claudeEffortArgs];
+  const mlxArgs = BACKEND === 'pi' && PI_SELECTION.provider === 'mlx'
+    ? ['--extension', path.join(__dirname, 'mlx-pi-extension.js')] : [];
+  const flagArgs = [...permArgs, ...modelArgs, ...mlxArgs, ...reasoningArgs, ...agyEffortArgs, ...museEffortArgs, ...claudeEffortArgs];
   // Sub-command-first CLIs parse their options on the sub-command, not the
   // root binary, so the one-shot token has to lead (see flagsAfterCommand).
   const args = spec.flagsAfterCommand
@@ -4664,7 +4970,7 @@ function installRepoToolchain(task, then) {
   child.stderr.on('data', (d) => { output += d.toString(); });
   const timer = setTimeout(() => {
     console.error(`repo-toolchain did not finish within ${REPO_TOOLCHAIN_TIMEOUT_MS} ms — continuing without the declared tools`);
-    try { child.kill('SIGKILL'); } catch (_) { /* already gone */ }
+    try { child.kill(BACKEND === 'cline' ? 'SIGTERM' : 'SIGKILL'); } catch (_) { /* already gone */ }
     finish();
   }, REPO_TOOLCHAIN_TIMEOUT_MS);
   child.on('error', (e) => {
@@ -4701,12 +5007,25 @@ function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// fixPRRunningWhere says where this relay is already running fix-pr task
+// taskId, or null. One fix-pr task runs in exactly one place: a second
+// task_assign with the same task_id (a hub that delivered it twice) must not
+// start it again as the primary task or in a parallel session.
+function fixPRRunningWhere(taskId) {
+  if (!taskId) return null;
+  if (currentTask && currentTask.task_id === taskId) return 'as the primary task';
+  if (parallelFixes.has(taskId)) return 'in a parallel fix session';
+  if (preemptingFix && preemptingFix.task_id === taskId) return 'as the fix preempting the primary task';
+  if (deferredFixes.some(d => d.task.task_id === taskId)) return 'deferred until the current task ends';
+  return null;
+}
+
 // handleFixPRInterrupt decides spawn / preempt / defer for a fix-pr task that
 // arrived while currentTask is running.
 function handleFixPRInterrupt(msg, hub) {
-  if (parallelFixes.has(msg.task_id) || deferredFixes.some(d => d.task.task_id === msg.task_id)
-    || (preemptingFix && preemptingFix.task_id === msg.task_id)) {
-    console.log(`Ignoring duplicate fix-pr ${sanitizeHubText(msg.task_id)} — already handling it`);
+  const where = fixPRRunningWhere(msg.task_id);
+  if (where) {
+    console.log(`Ignoring duplicate fix-pr ${sanitizeHubText(msg.task_id)} — already running it ${where}`);
     return;
   }
   noteTaskAttemptStart(hub, msg);
@@ -4773,7 +5092,7 @@ function spawnParallelFix(msg, hub) {
     console.log(`fix-pr ${fixPRLabel(msg)}: parallel fix session ${ok ? 'completed' : 'failed: ' + reason}`);
   };
   timeout = setTimeout(() => {
-    if (entry.child && !entry.child.killed) entry.child.kill('SIGKILL');
+    if (entry.child && !entry.child.killed) entry.child.kill(BACKEND === 'cline' ? 'SIGTERM' : 'SIGKILL');
     finish(false, `fix session exceeded ${formatDuration(FIX_PR_CHILD_TIMEOUT_MS)}`);
   }, FIX_PR_CHILD_TIMEOUT_MS);
   if (timeout.unref) timeout.unref();
@@ -4788,7 +5107,10 @@ function spawnParallelFix(msg, hub) {
   if (child.stdout) child.stdout.on('data', chunk => output.append(chunk));
   if (child.stderr) child.stderr.on('data', chunk => output.append(chunk));
   child.on('error', err => finish(false, `spawn error: ${err.message}`));
-  if (child.stdin) child.stdin.end();
+  if (child.stdin) {
+    child.stdin.on('error', err => finish(false, `stdin error: ${err.code || 'write failed'}`));
+    child.stdin.end(built.input);
+  }
   child.on('close', (code, signal) => {
     if (code === 0) finish(true);
     else finish(false, `fix session exited ${code === null ? `on ${signal}` : code}`);
@@ -4915,7 +5237,7 @@ function runHeadlessTask(task) {
   let spawnError = null;
   const timeout = setTimeout(() => {
     timedOut = true;
-    if (headlessChild && !headlessChild.killed) headlessChild.kill('SIGKILL');
+    if (headlessChild && !headlessChild.killed) headlessChild.kill(BACKEND === 'cline' ? 'SIGTERM' : 'SIGKILL');
   }, HEADLESS_TASK_TIMEOUT_MS);
   if (timeout.unref) timeout.unref();
 
@@ -4933,7 +5255,10 @@ function runHeadlessTask(task) {
   // headless codex task produced zero output and hung until the timeout
   // killed it (found live by bin/test_backend_smoke.sh). Close stdin for
   // every backend — a one-shot child has no interactive input coming.
-  if (headlessChild.stdin) headlessChild.stdin.end();
+  if (headlessChild.stdin) {
+    headlessChild.stdin.on('error', err => { spawnError = err; });
+    headlessChild.stdin.end(built.input);
+  }
   // #7778: keep the hub's progress lease alive for as long as the child is.
   // Without this the hub heard exactly one task_progress per headless task and
   // reclaimed it at wsTaskTimeout (30 min), two hours or more before the
@@ -5034,7 +5359,7 @@ function runHeadlessTask(task) {
       // was given stays valid for the rest of wsTokenTTL. Drop it with the
       // task, so a credential never outlives the assignment it belongs to.
       stopAgentForTaskExit();
-      send({ type: 'task_complete', seq: nextSeq(), task_id: task.task_id, task_gen: task.task_gen, result: 'completed', summary: 'Headless one-shot invocation exited 0', tmux_output: outTail, pr_url: prURL, ...verdictWireFields(noWork), ...effectiveSelectionFields() });
+      send({ type: 'task_complete', seq: nextSeq(), task_id: task.task_id, task_gen: task.task_gen, result: 'completed', summary: 'Headless one-shot invocation exited 0', tmux_output: outTail, pr_url: prURL, ...verdictWireFields(noWork), ...idleReasonWireFields({ kind: task.kind, prURL, noWork, verdict: detectHiveVerdict(outTail, HIVE_VERDICT_TOKENS) }), ...effectiveSelectionFields() });
       currentTask = null;
       currentTaskStartedAt = null;
       writeRelayStatus();
@@ -5708,6 +6033,10 @@ const PROMPT_SUBMIT_DELAYED_RENDER_POLLS = 2;
 // `send-keys -l` bursts. Keep other backends on their long-tested literal path
 // until their panes show the same transport failure.
 const TASK_PROMPT_BRACKETED_PASTE_BACKENDS = new Set(['codex']);
+// #16423: tmux rejects a single command above a few KB ("command too long"),
+// and `send-keys -l '<prompt>'` is one command. Donated standby prompts carry
+// the lane role prompt (~55 KB), so any backend pastes above this size.
+const TASK_PROMPT_PASTE_BUFFER_THRESHOLD_BYTES = 8192;
 const STRICT_PROMPT_CONFIRM_BACKENDS = new Set(['codex']);
 let tmuxPromptBufferSeq = 0;
 
@@ -5735,7 +6064,8 @@ function tmuxPasteTaskPrompt(text) {
 }
 
 function tmuxDeliverTaskPrompt(text) {
-  if (TASK_PROMPT_BRACKETED_PASTE_BACKENDS.has(BACKEND)) {
+  if (TASK_PROMPT_BRACKETED_PASTE_BACKENDS.has(BACKEND) ||
+      Buffer.byteLength(text, 'utf8') > TASK_PROMPT_PASTE_BUFFER_THRESHOLD_BYTES) {
     tmuxPasteTaskPrompt(text);
   } else {
     execSync(`tmux send-keys -t ${TMUX_SESSION} -l ${shellQuote(text)}`, { timeout: 30000 });
@@ -6008,6 +6338,8 @@ function tmuxSendKeys(text) {
     }
     if (!sent) {
       console.error('All tmux prompt paste attempts failed — task prompt lost');
+      // #16423: tell the hub, or the item sits as an accepted task that never started.
+      failCurrentTask('All tmux prompt paste attempts failed — task prompt lost', { kind: 'environment' });
       return;
     }
     // #6717/#9078: settle before submitting. sleepMs() is a no-op under
@@ -6551,6 +6883,43 @@ function verdictWireFields(noWork) {
     ...alreadyDone,
     verdict_blocked: noWork.verdict === HIVE_VERDICT_BLOCKED ? true : undefined,
     verdict_needs_decision: noWork.needsDecision ? true : undefined,
+  };
+}
+
+// A completion with no PR and no no-work-family verdict used to reach the hub
+// with no reason at all: it logged `verdict=idle verdict_reason=""`, booked the
+// no-PR cooldown, re-offered the issue, and nobody could say why the relay
+// dropped it without reading the relay's own pane. The agent's sentence after
+// `HIVE_VERDICT: complete —` was parsed and then thrown away.
+//
+// idleReasonWireFields is that reason, as `verdict_reason` and deliberately
+// WITHOUT a `verdict` token: the hub keeps booking the completion as idle, and
+// a hub that predates this reads exactly the shape a tooling-failure blocked
+// verdict already sends (verdictWireFields above), which it logs and records
+// and does nothing else with.
+//
+//   - not an issue task (a fix-pr or review task ends with no new PR by
+//     design): nothing, as before;
+//   - a PR is attributed to the task: nothing (the PR is the result);
+//   - a no-work-family verdict (no_work_needed, blocked, wrong_base): nothing,
+//     verdictWireFields owns those and they are unchanged;
+//   - `complete` with no PR: the agent's own sentence, marked as the agent's;
+//   - no verdict at all: the relay says so.
+//
+// The reason is read off a pane capture redactTokens() already scrubbed, and
+// `verdict_reason` is one of FRAME_TRUNCATABLE_FIELDS, so it is bounded and
+// scrubbed exactly as the existing verdict reasons are.
+const IDLE_REASON_NO_CONCLUSION = 'agent exited without a conclusion';
+const IDLE_REASON_COMPLETE_NO_PR = 'agent reported complete without a pull request';
+
+function idleReasonWireFields({ kind, prURL, noWork, verdict } = {}) {
+  if (kind !== 'issue' || prURL || isNoWorkVerdict(noWork)) return {};
+  if (!verdict) return { verdict_reason: IDLE_REASON_NO_CONCLUSION };
+  const said = String(verdict.reason || '').trim();
+  return {
+    verdict_reason: said
+      ? `${IDLE_REASON_COMPLETE_NO_PR}: ${said}`
+      : `${IDLE_REASON_COMPLETE_NO_PR} and gave no reason`,
   };
 }
 
@@ -7293,7 +7662,7 @@ function stopAgentForTaskExit(opts) {
   }
   if (CONTRIBUTOR_MODE === MODE_HEADLESS) {
     if (headlessChild) {
-      try { headlessChild.kill('SIGKILL'); } catch (_) {}
+      try { headlessChild.kill(BACKEND === 'cline' ? 'SIGTERM' : 'SIGKILL'); } catch (_) {}
       headlessChild = null;
       writeHeadlessStatus(HEADLESS_STATE_WAITING);
     }
@@ -8217,6 +8586,33 @@ function markIssueNeedsDecision(task, reason) {
   markIssueLabel(task, reason, label, 'Waiting on a maintainer decision; not contributor work until a human clears the label', 'needs_decision');
 }
 
+// readOpenSubIssues asks GitHub, with the task credential, how many of the
+// issue's native sub-issues are still open: one read of the issue, whose
+// payload carries a `sub_issues_summary` block ({ total, completed }) on a
+// parent and none on a leaf. Returns { open, total }, or { error } when the
+// read failed or its output is not that block. The host is pinned to the one
+// the label call's issue URL names.
+function readOpenSubIssues(task, env) {
+  let out;
+  try {
+    out = execSync(
+      `gh api --hostname github.com ${shellQuote(`repos/${task.repo}/issues/${task.number}`)} --jq .sub_issues_summary 2>/dev/null`,
+      { encoding: 'utf8', timeout: 20000, env });
+  } catch (e) {
+    return { error: ((e && e.message) || 'unknown error').toString().trim() };
+  }
+  const text = String(out || '').trim();
+  if (text === 'null') return { open: 0, total: 0 };
+  let summary = null;
+  try { summary = JSON.parse(text); } catch (_) { /* reported below */ }
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+    return { error: `unexpected sub_issues_summary output: ${text.slice(0, 120) || '(empty)'}` };
+  }
+  const total = Number(summary.total) || 0;
+  const completed = Number(summary.completed) || 0;
+  return { open: Math.max(0, total - completed), total };
+}
+
 function markIssueAlreadyDone(task, reason) {
   if (!task || task.kind !== 'issue' || !task.repo || !(task.number > 0) || task.external_id) return;
   const hub = task._hub || hubs[activeHubIndex];
@@ -8227,6 +8623,19 @@ function markIssueAlreadyDone(task, reason) {
   let token = null;
   try { token = fs.readFileSync(GH_TOKEN_CACHE, 'utf8').trim() || null; } catch (_) {}
   const env = token ? { ...process.env, GH_TOKEN: token } : process.env;
+  // An issue with an open sub-issue is a parent waiting on its children, not
+  // finished work: the label would mark it done and keep it out of the queue
+  // while the children are still open. When the read fails the label is
+  // skipped too — the hub's own hold already suppresses the re-offer.
+  const kids = readOpenSubIssues(task, env);
+  if (kids.error) {
+    console.log(`Task ${task.task_id}: already-done verdict on ${task.repo}#${task.number}, but its sub-issues could not be read (${kids.error}) — not applying the '${ALREADY_DONE_WORKFLOW_LABEL}' label; the hub's already-done hold suppresses re-offer`);
+    return;
+  }
+  if (kids.open > 0) {
+    console.log(`Task ${task.task_id}: already-done verdict on ${task.repo}#${task.number}, but it has ${kids.open} open sub-issue(s) of ${kids.total} — not applying the '${ALREADY_DONE_WORKFLOW_LABEL}' label; a parent is done when its sub-issues are`);
+    return;
+  }
   const issueURL = `https://github.com/${task.repo}/issues/${task.number}`;
   const addLabel = () => execSync(
     `gh issue edit ${shellQuote(issueURL)} --add-label ${shellQuote(ALREADY_DONE_WORKFLOW_LABEL)} 2>&1`,
@@ -8250,7 +8659,7 @@ function markIssueAlreadyDone(task, reason) {
   console.log(`Applied the '${ALREADY_DONE_WORKFLOW_LABEL}' label to ${task.repo}#${task.number} (#8477): ${reason || '(no reason given)'} — a human removes it if work remains`);
 }
 
-function finishCurrentTask({ completionSignal, summary, tmuxLines, prURL, noWork, unaddressedNotes = [] }) {
+function finishCurrentTask({ completionSignal, summary, tmuxLines, prURL, noWork, verdict = null, unaddressedNotes = [] }) {
   if (!currentTask) return;
   // hivecommons/hive#14832: the agent ended the task because its own runtime
   // cannot run commands. That is not a completion: hand it back as an
@@ -8289,7 +8698,7 @@ function finishCurrentTask({ completionSignal, summary, tmuxLines, prURL, noWork
   // launches in flight. Its credential is still dropped.
   const bobAlreadyExited = BACKEND === 'bob' && !bobIsRunning();
   stopAgentForTaskExit({ skipCLI: bobAlreadyExited });
-  send({ type: 'task_complete', seq: nextSeq(), task_id: currentTask.task_id, task_gen: currentTask.task_gen, result: 'completed', summary, tmux_output: tmuxLines, pr_url: prURL, completion_signal: completionSignal, ...verdictWireFields(noWork) });
+  send({ type: 'task_complete', seq: nextSeq(), task_id: currentTask.task_id, task_gen: currentTask.task_gen, result: 'completed', summary, tmux_output: tmuxLines, pr_url: prURL, completion_signal: completionSignal, ...verdictWireFields(noWork), ...idleReasonWireFields({ kind: currentTask.kind, prURL, noWork, verdict }) });
   // bob exits after each turn, so the pane is now a bare shell. Bring it
   // back up before the next task, or the prompt would be typed into bash
   // ("-bash: <prompt>: command not found") and silently lost.
@@ -8575,6 +8984,7 @@ function onTaskProgressLeaseExpired() {
       tmuxLines,
       prURL: prFinding.url,
       noWork,
+      verdict: completionVerdict,
     });
     return;
   }
@@ -9292,7 +9702,7 @@ function progressTick() {
       console.log(`Task ${currentTask.task_id}: ${unaddressedNotes.length} advisor note(s) under the final verdict were not addressed before completion — recording them (#7879)`);
       completionSummary += `\n\n${UNADDRESSED_ADVISOR_NOTES_HEADING}:\n${unaddressedNotes.map(n => `- ${n}`).join('\n')}`;
     }
-    finishCurrentTask({ completionSignal, summary: completionSummary, tmuxLines, prURL, noWork, unaddressedNotes });
+    finishCurrentTask({ completionSignal, summary: completionSummary, tmuxLines, prURL, noWork, verdict: completionVerdict, unaddressedNotes });
   } else if (paneState === PANE_STATE_IDLE_COMPLETE) {
     // Idle chrome, no verdict, grace not yet elapsed (#5376). Report progress
     // and wait — this is the tick or two in which a momentary misread (a
@@ -9466,7 +9876,7 @@ function handleMessage(data, hub) {
         seq: nextSeq(),
         registration_token: hub.regToken,
         cli_backend: BACKEND,
-        // Pi derives this evidence from the canonical provider/model input. It
+        // Pi/Cline derive this evidence from the canonical provider/model input. It
         // remains advisory and is never used by the hub to route work.
         provider: effectiveProvider() || undefined,
         // #4117: AGENT_MODEL if set, else the model detected from the CLI's
@@ -9527,6 +9937,14 @@ function handleMessage(data, hub) {
       hub.authFailed = false;
       hub.connectionId = msg.connection_id || '';
       hub.serverCapabilities = Array.isArray(msg.server_capabilities) ? msg.server_capabilities.slice() : [];
+      // A fresh connection starts out not held on the hub; restate a live hold
+      // before anything else so contributor-first cover is right from the start.
+      hub.quotaHoldSent = false;
+      reportQuotaHold(hub);
+      // Same for busy_elsewhere: a new connection starts out not busy on the
+      // hub, so restate another hive's running task to it.
+      hub.busyElsewhereSent = false;
+      reportBusyElsewhere(hub);
       declareStandby(hub);
       hub.scopeSent = false;
       negotiateRepoScope(hub);
@@ -9635,6 +10053,7 @@ function handleMessage(data, hub) {
       const accepted = (msg.standby && Array.isArray(msg.standby.accepted)) ? msg.standby.accepted.length : 0;
       const rejected = (msg.standby && Array.isArray(msg.standby.rejected)) ? msg.standby.rejected.length : 0;
       console.log(`Standby acknowledged by ${hub.url}: ${accepted} accepted, ${rejected} rejected`);
+      hub.standbyAcked = accepted > 0;
       break;
     }
 
@@ -9656,7 +10075,27 @@ function handleMessage(data, hub) {
         sendTo(hub, { type: 'task_failed', seq: nextSeq(), task_id: msg.task_id, reason: 'Hive disabled by contributor', failure_kind: 'environment' });
         break;
       }
-      if (!currentTask && hub !== hubs[activeHubIndex]) {
+      // An assignment that answers the `ready` a just-finished task sent, and
+      // lands while the relay waits for that task's frame to leave: hand it
+      // straight back rather than start work the exit would abandon.
+      if (shuttingDown) {
+        console.log(`Declining ${taskKey(msg)} from ${hub.url} — the relay is shutting down`);
+        sendTo(hub, { type: 'task_failed', seq: nextSeq(), task_id: msg.task_id, reason: 'contributor relay is shutting down', failure_kind: 'environment' });
+        break;
+      }
+      // A standby assignment is pushed by the hub that acknowledged this relay's
+      // standby; the relay is not polling, so that hub is never the active slot.
+      const standbyPush = !!msg.standby_lane && hub.standbyAcked === true;
+      // A fix-pr task is rework on this contributor's own PR, and it is
+      // pushed by the hive that owns the PR whichever hive the relay was
+      // polling. Refusing it from a non-active hub threw away a fix the relay
+      // had already accepted and deferred (projectbluefin/utah-packages#972,
+      // 2026-11-09: "Hub is not the active polling slot" the moment the
+      // headless primary ended). It is taken from any subscribed hub; the
+      // ordinary path below makes that hub the active slot and tells every
+      // other hive the relay is busy elsewhere.
+      const fixPush = msg.kind === FIX_PR_KIND;
+      if (!currentTask && !standbyPush && !fixPush && hub !== hubs[activeHubIndex]) {
         console.log(`Rejecting task ${taskDisplay(msg)} from ${hub.url} — hub is not the active polling slot`);
         sendTo(hub, { type: 'task_failed', seq: nextSeq(), task_id: msg.task_id, reason: 'Hub is not the active polling slot' });
         break;
@@ -9666,6 +10105,10 @@ function handleMessage(data, hub) {
       // active task". With no task running it takes the ordinary path below.
       if (currentTask && msg.kind === FIX_PR_KIND) {
         handleFixPRInterrupt(msg, hub);
+        break;
+      }
+      if (msg.kind === FIX_PR_KIND && fixPRRunningWhere(msg.task_id)) {
+        console.log(`Ignoring duplicate fix-pr ${sanitizeHubText(msg.task_id)} — already running it ${fixPRRunningWhere(msg.task_id)}`);
         break;
       }
       if (currentTask) {
@@ -9760,6 +10203,7 @@ function handleMessage(data, hub) {
       writeRelayStatus();
       activeHubIndex = hubs.indexOf(hub);
       console.log(`Task assigned: ${sanitizeHubText(msg.kind)} ${sanitizeHubText(taskDisplay(msg))} — ${sanitizeHubText(msg.title)} (from ${hub.url})`);
+      if (msg.kind === FIX_PR_KIND) console.log(`fix-pr ${fixPRLabel(msg)}: running as the primary task (no task was running)`);
       if (msg.github_token) {
         injectGhToken(msg.github_token);
         tokenExpiresAt = msg.token_expires_at ? new Date(msg.token_expires_at).getTime() : null;
@@ -10102,6 +10546,7 @@ function connectHub(hub) {
     hub.readyOutstanding = false;
     hub.authenticated = false;
     hub.scopeAckVersion = null;
+    hub.standbyAcked = false;
     hub.scopePending = hub.repoScope !== null || !!hub.scopeSent;
     writeRelayStatus();
     invalidateReadyRetry(hub, 'socket closed');
@@ -10158,8 +10603,37 @@ function cleanup() {
   }
 }
 
-process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-process.on('SIGINT', () => { cleanup(); process.exit(0); });
+// Overridable in tests only, so the handler can be driven in-process.
+let exitProcess = (code) => process.exit(code);
+
+// SIGTERM/SIGINT. With no finished task's frame still on the wire this is the
+// old immediate cleanup-and-exit. With one (see SHUTDOWN_HELD_FRAMES), wait
+// for its write callback, bounded by SHUTDOWN_FLUSH_DEADLINE_MS, then exit.
+// shuttingDown is set first, so nothing asks for or accepts work meanwhile. A
+// second signal during the wait exits at once.
+function handleShutdownSignal(signal) {
+  if (shuttingDown) {
+    console.warn(`${signal} again while waiting to report a finished task — exiting now`);
+    cleanup();
+    exitProcess(0);
+    return;
+  }
+  shuttingDown = true;
+  if (unflushedHeldFrames.size === 0) {
+    cleanup();
+    exitProcess(0);
+    return;
+  }
+  const what = Array.from(unflushedHeldFrames, e => `${e.type} for ${e.taskID || '(no task)'} to ${e.hubURL || 'the hub'}`).join(', ');
+  console.log(`${signal}: waiting up to ${Math.round(SHUTDOWN_FLUSH_DEADLINE_MS / 1000)}s for ${what} to be written before exiting`);
+  waitForHeldFrames(Date.now() + SHUTDOWN_FLUSH_DEADLINE_MS).then(drained => {
+    if (!drained) console.warn(`${signal}: exiting with a finished task's frame still unwritten after ${SHUTDOWN_FLUSH_DEADLINE_MS}ms — the hub will book the task from the dropped connection`);
+    try { cleanup(); } finally { exitProcess(0); }
+  });
+}
+
+process.on('SIGTERM', () => handleShutdownSignal('SIGTERM'));
+process.on('SIGINT', () => handleShutdownSignal('SIGINT'));
 process.on('SIGUSR1', handleProfileSwitchSignal);
 
 // Last-resort backstop (kubestellar/hive#5655): the scoped token must never
@@ -10283,6 +10757,9 @@ if (process.env.HIVE_RELAY_TEST_MODE === '1') {
     consumeQuotaOverrideOnce,
     quotaOverrideApplies,
     quotaPauseOverrideActive,
+    quotaResetEpochsMatch,
+    QUOTA_RESET_EPOCH_TOLERANCE_MS,
+    quotaGuardReleaseMessage,
     QUOTA_SESSION_ID,
     QUOTA_RELAY_ID,
     QUOTA_POOL_KEY: quotaPool ? quotaPool.poolKey : null,
@@ -10365,10 +10842,14 @@ if (process.env.HIVE_RELAY_TEST_MODE === '1') {
     isEnvironmentFailureReason,
     ENVIRONMENT_FAILURE_REASON_PATTERNS,
     verdictWireFields,
+    idleReasonWireFields,
+    IDLE_REASON_NO_CONCLUSION,
+    IDLE_REASON_COMPLETE_NO_PR,
     alreadyDoneVerdictFields,
     markIssueBlocked,
     markIssueNeedsDecision,
     markIssueAlreadyDone,
+    readOpenSubIssues,
     detectHiveVerdict,
     detectHiveVerdicts,
     detectCompletionVerdict,
@@ -10490,11 +10971,17 @@ if (process.env.HIVE_RELAY_TEST_MODE === '1') {
     FIX_PR_DONE_MARKER,
     FIX_PR_FAILED_MARKER,
     fixPRState,
+    fixPRRunningWhere,
     scanPaneForFixMarkers,
     relaySupportsParallelFixes,
     blockingPromptKey,
     getCLIState,
     setWs: (w) => { hubs[0].ws = w; },
+    handleShutdownSignal,
+    isShuttingDown: () => shuttingDown,
+    unflushedHeldFrameCount: () => unflushedHeldFrames.size,
+    SHUTDOWN_FLUSH_DEADLINE_MS,
+    __setExitProcess: (fn) => { exitProcess = fn; },
     getHubs: () => hubs,
     getReadyRetryArmed: (hub = hubs[0]) => !!(hub && hub.readyRetryTimer),
     // Peer-protocol compatibility (kubestellar/hive#2547). Exported so the
@@ -10632,6 +11119,15 @@ if (process.env.HIVE_RELAY_TEST_MODE === '1') {
       writeHeadlessStatus(HEADLESS_STATE_FAILED, { result: 'failed', reason: PI_SELECTION.error });
     }
     process.exit(1);
+  }
+  if (BACKEND === 'pi') {
+    try { checkMlxRuntime(MODEL, PI_ENV); } catch (error) {
+      console.error(`FATAL: ${error.message}`);
+      if (CONTRIBUTOR_MODE === MODE_HEADLESS) {
+        writeHeadlessStatus(HEADLESS_STATE_FAILED, { result: 'failed', reason: error.message });
+      }
+      process.exit(1);
+    }
   }
   // Warm the capability cache BEFORE the first hub connection. detectCapabilities()
   // is called from the auth_challenge handler, and the hub bounds a handshake at

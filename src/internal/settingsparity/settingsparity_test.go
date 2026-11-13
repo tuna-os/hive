@@ -97,6 +97,10 @@ func TestConfigLeaves(t *testing.T) {
 	}
 	want := []Leaf{
 		{Path: "agents.<key>.model", Type: "string"},
+		{Path: "agents.cli_memory.auto_memory", Type: "*bool"},
+		{Path: "agents.cli_memory.clear_on_kick", Type: "bool"},
+		{Path: "agents.cli_memory.drain_on_write", Type: "bool"},
+		{Path: "agents.cli_memory.drain_to_knowledge", Type: "bool"},
 		{Path: "agents.github_api_hourly_cap", Type: "int"},
 		{Path: "agents.session_recycle.enabled", Type: "*bool"},
 		{Path: "agents.session_recycle.max_age", Type: "time.Duration"},
@@ -156,6 +160,27 @@ func TestConfigLeavesRealRepo(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("agents.github_api_hourly_cap must always be reported")
+	}
+}
+
+// github.attention is typed attention.Config (pkg/attention); its sub-keys
+// must be enumerated rather than collapsing into one opaque leaf.
+func TestConfigLeavesRealRepoEnumeratesAttention(t *testing.T) {
+	leaves, err := ConfigLeaves(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatalf("ConfigLeaves on the real repo: %v", err)
+	}
+	got := map[string]bool{}
+	for _, leaf := range leaves {
+		got[leaf.Path] = true
+	}
+	for _, want := range []string{"github.attention.admitter.<key>", "github.attention.flap_window", "github.attention.recipient_budget", "github.attention.digest_recipients[]"} {
+		if !got[want] {
+			t.Errorf("leaf %q must be enumerated", want)
+		}
+	}
+	if got["github.attention"] {
+		t.Error("github.attention must not be an opaque leaf")
 	}
 }
 

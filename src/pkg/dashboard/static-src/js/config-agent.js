@@ -1,4 +1,56 @@
     // ── Agent Tab Renderers ──
+    // Contributor-first lane keys (agents.<name>.contributor_first and
+    // contributor_first_grace, #16518). The toggle can only be turned on for a
+    // role contributors may act as, the same rule the load enforces; the
+    // server says which (contributorFirstDelegatable), and a role that is not
+    // gets a disabled toggle and the one line that names the fix.
+    function agentContributorFirstControlsHtml(g, agentName) {
+      const delegatable = g.contributorFirstDelegatable === true;
+      const on = g.contributorFirst === true;
+      const name = String(agentName || '');
+      let why = '';
+      if (!delegatable) {
+        if (name === 'supervisor') why = 'The supervisor role is never delegatable to contributors.';
+        else if (name !== name.toLowerCase()) why = 'Relays claim roles in lower case, so an agent whose name has capitals cannot be covered.';
+        else why = `Not available: add <code>${esc(name)}</code> to <code>hub.contribute_delegatable_roles</code> so contributors may act as this role.`;
+      }
+      const tip = `When on, a connected contributor relay acting as this role becomes the lane's primary worker and the resident agent's kicks are withheld. Kicks resume on the normal cadence once no relay has covered the role for the grace below. Budget pause and standby are unaffected, and a manual Kick still works. The role must be one contributors may act as (hub.contribute_delegatable_roles, or the default scanner, quality and outreach).`;
+      const graceTip = `How long the resident agent's kicks stay withheld after the last relay covering this role disconnects, so a relay can reconnect without the resident agent being kicked in between. Use s, m or h, e.g. 10m. Leave blank for the default, 10m.`;
+      const grace = Number(g.contributorFirstGrace) || 0;
+      return `<div class="config-toggle">
+          <div class="config-toggle-switch ${on ? 'on' : ''} ${delegatable ? '' : 'disabled'}" id="cfg-contributor-first" data-action="${delegatable ? 'toggleConfigSwitch' : ''}" data-section="general" data-key="contributorFirst" data-disabled="${delegatable ? 'false' : 'true'}"></div>
+          <span class="config-toggle-label">Contributor-first ${yamlHint('agents.<key>.contributor_first')} ${settingHelpMark('agent-configuration', 'contributor-first-lanes-contributor_first', 'Contributor-first', tip)}</span>
+        </div>
+        ${delegatable ? '' : `<div class="text-muted" id="cfg-contributor-first-disabled" style="font-size:0.7rem">${why}</div>`}
+        <div class="config-field">
+          <label>Contributor-first grace ${yamlHint('agents.<key>.contributor_first_grace')} ${settingHelpMark('agent-configuration', 'contributor-first-lanes-contributor_first', 'Contributor-first grace', graceTip)}</label>
+          <input type="text" id="cfg-contributor-first-grace" value="${grace > 0 ? cadenceToHuman(grace) : ''}" placeholder="10m" data-change-action="contributorFirstGraceChanged">
+        </div>`;
+    }
+    // The API proxy's GitHub API hourly cap for this agent
+    // (agents.<key>.github_api_hourly_cap). Blank inherits the fleet default
+    // (Settings → Forge App) and saves null; 0 removes the cap for this agent.
+    // A replica or review head is rebuilt from its base agent, so it shows the
+    // base agent's cap read-only and names where to change it.
+    function agentGitHubCapFieldHtml(g) {
+      const capLabel = n => Number(n) === 0 ? 'no cap' : String(n);
+      const fleet = g.githubApiHourlyCapFleet === undefined ? 300 : g.githubApiHourlyCapFleet;
+      const effective = g.githubApiHourlyCapEffective === undefined ? fleet : g.githubApiHourlyCapEffective;
+      const own = (g.githubApiHourlyCap === null || g.githubApiHourlyCap === undefined) ? '' : String(g.githubApiHourlyCap);
+      const tip = `How many charged GitHub API responses this agent may receive through the API proxy in a sliding hour before the proxy answers 429. Blank inherits the fleet default from Settings &rarr; Forge App; 0 removes the cap for this agent. Replicas and review heads of this agent use the same value. All agents draw on the one hourly bucket of the App installation, and the agent reserve floor still refuses agent reads when that bucket runs low. Applies without a restart.`;
+      const label = `GitHub API hourly cap ${yamlHint('agents.<key>.github_api_hourly_cap')} ${settingHelpMark('operator-reference/runtime-and-quota', 'github-api-quota', 'GitHub API hourly cap', tip)}`;
+      if (g.githubApiHourlyCapBase) {
+        return `<div class="config-field">
+          <label>${label}</label>
+          <div class="fs-sm" id="cfg-github-api-cap-inherited">${esc(capLabel(effective))} <span class="text-muted">— taken from <code>${esc(g.githubApiHourlyCapBase)}</code>; change it there</span></div>
+        </div>`;
+      }
+      return `<div class="config-field">
+          <label for="cfg-github-api-cap">${label}</label>
+          <input type="number" id="cfg-github-api-cap" min="0" step="1" value="${esc(own)}" placeholder="inherit fleet default (${esc(capLabel(fleet))})" data-change-action="githubApiCapChanged">
+          <div class="text-muted" style="font-size:0.7rem">Now: ${esc(capLabel(effective))}. Blank inherits the fleet default; 0 = no cap.</div>
+        </div>`;
+    }
     function renderAgentGeneral(g) {
       const agentName = _configState.agent || '';
       const isCreate = _configState.isCreate === true;
@@ -110,12 +162,15 @@
           </div>
         </div>
         <div class="config-field">
-          <label>Operating Mode ${settingHelpMark('agent-configuration', 'anatomy-of-an-agent', 'Operating Mode', `Controls what GitHub actions this agent can take. ADVISORY: beads only. ISSUES_ONLY: open issues, no PRs. ISSUES_AND_PRS: issues + PRs. ISSUES_PRS_MERGE: full auto-merge. Leave blank to use the ACMM level default.`)}</label>
+          <label>Operating Mode ${settingHelpMark('agent-configuration', 'anatomy-of-an-agent', 'Operating Mode', `Controls what GitHub actions this agent can take. ADVISORY: beads only. ISSUES_ONLY: open issues, no PRs. ISSUES_AND_PRS: issues + PRs. ISSUES_PRS_MERGE: full auto-merge. NO_GITHUB: the legacy name for ADVISORY, which the API and the admin MCP still accept; listed only for an agent that has it. Leave blank to use the ACMM level default.`)}</label>
           ${(() => {
-            const allModes = ['ADVISORY','ISSUES_ONLY','ISSUES_AND_PRS','ISSUES_PRS_MERGE'];
+            const current = g.mode || '';
+            // NO_GITHUB is a legacy alias for ADVISORY. It is offered only when
+            // the agent already has it, so the select shows the real mode
+            // instead of falling back to the level default.
+            const allModes = ['ADVISORY','ISSUES_ONLY','ISSUES_AND_PRS','ISSUES_PRS_MERGE'].concat(current === 'NO_GITHUB' ? ['NO_GITHUB'] : []);
             const statusAgent = ((window._lastStatus || {}).agents || []).find(sa => sa.name === agentName);
             const dflt = statusAgent ? statusAgent.defaultMode : '';
-            const current = g.mode || '';
             return '<select id="cfg-agent-mode" data-change-action="markDirty" data-arg0="general" data-arg1="mode" data-arg-types="s,s,v">'
               + '<option value=""' + (!current ? ' selected' : '') + '>— use level default' + (dflt ? ' (' + modeEmoji(dflt) + ' ' + dflt + ')' : '') + '</option>'
               + allModes.map(m => '<option value="' + m + '"' + (current === m ? ' selected' : '') + '>' + modeEmoji(m) + ' ' + m + (m === dflt ? ' (default)' : '') + '</option>').join('')
@@ -130,6 +185,9 @@
           <div class="config-toggle-switch ${g.sandboxEnabled ? 'on' : ''}" id="cfg-agent-sandbox" data-action="toggleConfigSwitch" data-section="general" data-key="sandboxEnabled"></div>
           <span class="config-toggle-label">Run in sandbox ${settingHelpMark('sandbox-isolation', '', 'Run in sandbox', `Opt this agent into the credential-free sandbox runner. Requires the hive-wide sandbox gate in Governor → Security to be enabled.`)}${g.sandboxEffective ? ' ' + statusBadgeHTML('ready', 'sandboxed', '', 'done') : ''}</span>
         </div>
+        <details class="settings-subsection-details"><summary class="settings-subsection-summary">Substrate sandbox overrides</summary>
+        ${substrateSandboxFields('general', g.sandboxSubstrate)}
+        </details>
         <div class="config-toggle">
           <div class="config-toggle-switch ${g.clearOnKick !== false ? 'on' : ''}" id="cfg-clear-on-kick" data-action="toggleConfigSwitch" data-section="general" data-key="clearOnKick"></div>
           <span class="config-toggle-label">Clear on Kick ${settingHelpMark('agent-configuration', 'anatomy-of-an-agent', 'Clear on Kick', `Send /clear before each governor kick to reset conversation context. Prevents stale context buildup across runs. On by default for all agents.`)}</span>
@@ -138,6 +196,7 @@
           <div class="config-toggle-switch ${g.onDemand === true ? 'on' : ''}" id="cfg-on-demand" data-action="toggleConfigSwitch" data-section="general" data-key="onDemand"></div>
           <span class="config-toggle-label">On Demand ${settingHelpMark('agent-configuration', 'anatomy-of-an-agent', 'On Demand', `When on, this agent is never started at boot and never kicked by the governor or by event (CEL) triggers — it only runs when something summons it explicitly. Turn it OFF to make the agent run on its cadence like a normal agent. Note: an agent also needs a cadence entry in the ACTIVE governor mode before it will actually be kicked. On-demand agents are also excluded from review fan-out, so a reviewer left on-demand cannot be dispatched.`)}${g.onDemand === true ? ' ' + statusBadgeHTML('on_demand', 'on demand', '', '') : ''}</span>
         </div>
+        ${isCreate ? '' : agentContributorFirstControlsHtml(g, agentName)}
         <div class="config-toggle">
           <div class="config-toggle-switch ${g.includeRepos !== false ? 'on' : ''}" id="cfg-include-repos" data-action="toggleConfigSwitch" data-section="general" data-key="includeRepos"></div>
           <span class="config-toggle-label">Include Repos in Kicks ${settingHelpMark('agent-configuration', 'anatomy-of-an-agent', 'Include Repos in Kicks', `Append monitored repo information to the kick dialog. Disable for agents that don't need repo context (e.g. outreach).`)}</span>
@@ -172,9 +231,9 @@
         </div>
         <div class="config-field">
           <label>Model ${settingHelpMark('agent-configuration', 'anatomy-of-an-agent', 'Model', `Per-agent model override. Precedence: this model if set → otherwise the backend default (a gateway's default_model from Settings → Model Gateways, or the CLI's own default). Pick "(backend default — …)" to clear the per-agent model. A model marked "not allowed by gateway" fails every call with a 403. The governor may downgrade models automatically when budget is tight, unless Model Lock is enabled in Governor Health settings.`)}</label>
-          <select id="cfg-model" title="${esc(MODEL_PRECEDENCE_TITLE)}" data-change-action="markDirty" data-arg0="general" data-arg1="model" data-arg-types="s,s,v">
+          ${_agentBackend === 'cline' ? `<input id="cfg-model" type="text" value="${esc(g.model || '')}" placeholder="provider/model (required)" data-change-action="markDirty" data-arg0="general" data-arg1="model" data-arg-types="s,s,v">` : `<select id="cfg-model" title="${esc(MODEL_PRECEDENCE_TITLE)}" data-change-action="markDirty" data-arg0="general" data-arg1="model" data-arg-types="s,s,v">
             ${modelSelectOptionsHtml(_agentBackend, g.model || '', _modelOpts)}
-          </select>
+          </select>`}
         </div>
         <div class="config-field">
           <label>Caveman Mode ${settingHelpMark('agent-configuration', 'caveman-prompt-compression', 'Caveman Mode', `Enable Caveman output compression to reduce token usage by ~65%. Modes: lite (removes filler), full (caveman-speak), ultra (telegraphic), wenyan (classical Chinese). Leave empty to disable.`)}</label>
@@ -200,6 +259,7 @@
           <input type="text" id="cfg-agent-repos" value="${esc((g.repos || []).join(', '))}" placeholder="(empty = every repo in the hive)" data-change-action="gh39repos">
           <div style="font-size:0.7rem;color:var(--muted);margin-top:var(--sp-2)">${(g.repos && g.repos.length) ? `🎯 scoped to ${g.repos.length} repo(s)` : 'hive-wide — serves every repo'}${(g.projectRepos && g.projectRepos.length) ? ` · this hive watches: ${esc(g.projectRepos.join(', '))}` : ''}</div>
         </div>
+        ${isCreate ? '' : agentGitHubCapFieldHtml(g)}
         <div class="config-field">
           <label>Lane Keywords ${settingHelpMark('agent-configuration', 'anatomy-of-an-agent', 'Lane Keywords', `Comma-separated keywords for issue classification routing. Issues matching these keywords are routed to this agent.`)}</label>
           <input type="text" id="cfg-agent-lane-kw" value="${esc((g.laneKeywords || []).join(', '))}" placeholder="e.g. bug, triage, security" data-change-action="gh36">
@@ -619,10 +679,12 @@
     // --- Channels tab ---
 
     const CHANNEL_COLORS = {kick:'var(--blue)',webhook:'var(--green)',discord:'#7c3aed',schedule:'var(--orange)',bead:'#0891b2'};
-    const CHANNEL_TYPES = ['kick','webhook','discord','schedule','bead'];
+    const CHANNEL_TYPES = ['kick'];
 
     function renderAgentChannels(channels) {
-      let html = '<div style="font-size:0.78rem;color:var(--muted);line-height:1.55;background:color-mix(in srgb, var(--accent) 7%, transparent);border:1px solid color-mix(in srgb, var(--accent) 22%, transparent);border-radius:var(--r);padding:10px 12px;margin-bottom:14px"><b>What this is.</b> The trigger channels that can wake this agent: governor timer kick, webhook, discord, schedule (cron), or bead. <b>Why use it.</b> They let an agent respond to real events (a pushed commit, a Discord message, a cron tick) instead of only the governor timer. <b>Where it shows up.</b> Each active channel is listed here; with no channels defined the agent falls back to governor timer kicks. <b>How to configure.</b> Add a channel by type and fill its fields (a schedule channel needs a cron expression, a webhook needs events); toggle to enable or disable.</div>';
+      const disabled = _configState.savingChannels ? ' disabled' : '';
+      let html = '<div style="font-size:0.78rem;color:var(--muted);line-height:1.55;background:color-mix(in srgb, var(--accent) 7%, transparent);border:1px solid color-mix(in srgb, var(--accent) 22%, transparent);border-radius:var(--r);padding:10px 12px;margin-bottom:14px"><b>What this is.</b> Governor kick channels. Only <code>kick</code> has a supported channel runtime; webhook, discord, schedule, and bead channels are not supported. <b>How to configure.</b> Add a kick channel or toggle an existing channel; with no explicit channels the agent uses governor kicks by default. <b>GitHub issue triggers.</b> To select an agent for a newly seen actionable issue, configure a top-level <code>triggers:</code> CEL rule using <code>event.kind == "issue.opened"</code> and the agent name. Signed GitHub webhooks wake evaluation through the existing GitHub App/hub relay or <code>/api/webhook/github</code> receiver. Saving a channel does not register a GitHub webhook. See <code>docs/cel-triggers.md</code> and <code>docs/operator-reference.md</code> for setup and restart semantics.</div>';
+      html += '<p><button class="hv-btn btn-primary btn-sm" data-action="openEventTriggerSettings">Event triggers — configure scanner / GitHub issue routing in Settings</button></p>';
       if (!channels || channels.length === 0) {
         html += '<div style="font-size:0.8rem;color:var(--muted);padding:var(--sp-6) var(--sp-0);text-align:center;border:1px dashed var(--border);border-radius:8px">No explicit channels — this agent uses governor timer kicks by default.</div>';
       } else {
@@ -637,10 +699,10 @@
           if (ch.patterns && ch.patterns.length) html += 'patterns: '+ch.patterns.map(p => '<code>'+esc(p)+'</code>').join(', ');
           if (ch.schedule) html += 'schedule: <code>'+esc(ch.schedule)+'</code>';
           if (ch.match) html += 'match: '+Object.entries(ch.match).map(([k,v]) => '<code>'+esc(k)+'='+esc(v)+'</code>').join(', ');
-          if (ch.repos && ch.repos.length) html += ' (repos: '+ch.repos.join(', ')+')';
+          if (ch.repos && ch.repos.length) html += ' (repos: '+ch.repos.map(esc).join(', ')+')';
           html += '</div>';
-          html += '<label style="font-size:0.7rem;display:flex;align-items:center;gap:var(--sp-2);cursor:pointer"><input type="checkbox" '+(enabled?'checked':'')+' data-change-action="toggleChannel" data-arg0="+i+" data-arg-types="s,c"> on</label>';
-          html += '<button class="hv-btn btn-danger" data-action="removeChannel" data-arg0="+i+">✕</button>';
+          html += '<label style="font-size:0.7rem;display:flex;align-items:center;gap:var(--sp-2);cursor:pointer"><input type="checkbox" '+(enabled?'checked':'')+disabled+' data-change-action="toggleChannel" data-arg0="'+i+'" data-arg-types="s,c"> on</label>';
+          html += '<button class="hv-btn btn-danger" data-action="removeChannel" data-arg0="'+i+'"'+disabled+'>✕</button>';
           html += '</div>';
         }
       }
@@ -649,68 +711,68 @@
       html += '<div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:end">';
       html += '<div><label style="font-size:0.7rem;color:var(--muted)">Type</label><select id="ch-add-type" style="display:block;padding:var(--sp-3) var(--sp-4);border:1px solid var(--border);border-radius:var(--r-sm);font-size:0.78rem;background:var(--bg);color:var(--fg)" data-change-action="channelTypeChanged">'+CHANNEL_TYPES.map(t => '<option value="'+t+'">'+t+'</option>').join('')+'</select></div>';
       html += '<div id="ch-add-fields" style="display:flex;gap:var(--sp-3);flex:1;flex-wrap:wrap"></div>';
-      html += '<button class="hv-btn btn-primary btn-sm" data-action="addChannel">Add</button>';
+      html += '<button class="hv-btn btn-primary btn-sm" data-action="addChannel"'+disabled+'>Add</button>';
       html += '</div></div>';
       setTimeout(channelTypeChanged, 0);
       return html;
     }
 
     function channelTypeChanged() {
-      const type = (document.getElementById('ch-add-type') || {}).value;
       const el = document.getElementById('ch-add-fields');
       if (!el) return;
-      let h = '';
-      if (type === 'webhook') h = '<div><label style="font-size:0.7rem;color:var(--muted)">Events (comma-sep)</label><input id="ch-add-events" type="text" placeholder="issues.opened, push" style="display:block;padding:var(--sp-3) var(--sp-4);border:1px solid var(--border);border-radius:var(--r-sm);font-size:0.78rem;background:var(--bg);color:var(--fg);min-width:200px"></div><div><label style="font-size:0.7rem;color:var(--muted)">Repos (optional)</label><input id="ch-add-repos" type="text" placeholder="repo1, repo2" style="display:block;padding:var(--sp-3) var(--sp-4);border:1px solid var(--border);border-radius:var(--r-sm);font-size:0.78rem;background:var(--bg);color:var(--fg);min-width:120px"></div>';
-      else if (type === 'discord') h = '<div><label style="font-size:0.7rem;color:var(--muted)">Patterns</label><input id="ch-add-patterns" type="text" placeholder="!deploy*" style="display:block;padding:var(--sp-3) var(--sp-4);border:1px solid var(--border);border-radius:var(--r-sm);font-size:0.78rem;background:var(--bg);color:var(--fg);min-width:200px"></div>';
-      else if (type === 'schedule') h = '<div><label style="font-size:0.7rem;color:var(--muted)">Cron expression</label><input id="ch-add-schedule" type="text" placeholder="0 */6 * * *" style="display:block;padding:var(--sp-3) var(--sp-4);border:1px solid var(--border);border-radius:var(--r-sm);font-size:0.78rem;background:var(--bg);color:var(--fg);min-width:160px"></div>';
-      else if (type === 'bead') h = '<div><label style="font-size:0.7rem;color:var(--muted)">Match key=value</label><input id="ch-add-match" type="text" placeholder="nudge_target=scanner" style="display:block;padding:var(--sp-3) var(--sp-4);border:1px solid var(--border);border-radius:var(--r-sm);font-size:0.78rem;background:var(--bg);color:var(--fg);min-width:200px"></div>';
-      el.innerHTML = h;
+      el.textContent = 'Governor kick — no additional fields.';
     }
 
     function addChannel() {
       const type = (document.getElementById('ch-add-type') || {}).value;
-      const ch = {type: type};
-      if (type === 'webhook') {
-        const evts = (document.getElementById('ch-add-events') || {}).value || '';
-        ch.events = evts.split(',').map(s => s.trim()).filter(Boolean);
-        const repos = (document.getElementById('ch-add-repos') || {}).value || '';
-        if (repos.trim()) ch.repos = repos.split(',').map(s => s.trim()).filter(Boolean);
-      } else if (type === 'discord') {
-        const pats = (document.getElementById('ch-add-patterns') || {}).value || '';
-        ch.patterns = pats.split(',').map(s => s.trim()).filter(Boolean);
-      } else if (type === 'schedule') {
-        ch.schedule = (document.getElementById('ch-add-schedule') || {}).value || '';
-      } else if (type === 'bead') {
-        const matchStr = (document.getElementById('ch-add-match') || {}).value || '';
-        ch.match = {};
-        matchStr.split(',').forEach(pair => { const [k,v] = pair.split('='); if (k && v) ch.match[k.trim()] = v.trim(); });
+      if (!CHANNEL_TYPES.includes(type)) {
+        showToast('Only kick channels are supported. Use triggers: for GitHub issue routing.', 'error');
+        return;
       }
       const channels = (_configState.data.channels || []).slice();
-      channels.push(ch);
-      _configState.data.channels = channels;
-      saveChannels(channels);
+      channels.push({type: type});
+      return saveChannels(channels);
     }
 
     function removeChannel(idx) {
       const channels = (_configState.data.channels || []).slice();
       channels.splice(idx, 1);
-      _configState.data.channels = channels;
-      saveChannels(channels);
+      return saveChannels(channels);
     }
 
     function toggleChannel(idx, enabled) {
       const channels = (_configState.data.channels || []).slice();
-      if (channels[idx]) channels[idx].enabled = enabled;
-      _configState.data.channels = channels;
-      saveChannels(channels);
+      if (channels[idx]) channels[idx] = {...channels[idx], enabled: enabled};
+      return saveChannels(channels);
     }
 
     function saveChannels(channels) {
-      const name = _configState.agent;
-      fetch('/api/config/agent/' + name + '/channels', {method:'PUT', headers:_inceptionAuthHeaders(), body:JSON.stringify({channels:channels})})
-        .then(r => { if (!r.ok) throw new Error('save failed'); return r.json(); })
-        .then(() => { showToast('Channels saved', 'success'); renderConfigTab('Channels'); })
-        .catch(e => showToast('Save error: ' + e.message, 'error'));
+      const state = _configState;
+      if (state.savingChannels) return Promise.resolve();
+      const name = state.agent;
+      state.savingChannels = true;
+      if (state.tab === 'Channels') renderConfigTab('Channels');
+      return fetch('/api/config/agent/' + encodeURIComponent(name) + '/channels', {method:'PUT', headers:_inceptionAuthHeaders(), body:JSON.stringify({channels:channels})})
+        .then(async r => {
+          let data;
+          try {
+            data = await r.json();
+          } catch (_) {
+            if (r.ok) throw new Error('Invalid server response (HTTP ' + r.status + ')');
+            throw new Error('HTTP ' + r.status);
+          }
+          if (!r.ok) throw new Error((data && data.error) || ('HTTP ' + r.status));
+          return data;
+        })
+        .then(() => {
+          state.data.channels = channels;
+          if (_configState === state) showToast('Channels saved', 'success');
+        })
+        .catch(e => { if (_configState === state) showToast('Save error: ' + e.message, 'error'); })
+        .finally(() => {
+          state.savingChannels = false;
+          if (_configState === state && state.tab === 'Channels') renderConfigTab('Channels');
+        });
     }
 
     // --- Tools tab ---
@@ -1454,4 +1516,3 @@
       else note = 'No hive default set, so agents that leave Explain Mode unset do not explain.';
       return 'In force now: <strong class="text-default">' + esc(effective) + '</strong>. ' + esc(note) + ' Applies from the next kick &mdash; no restart needed.';
     }
-

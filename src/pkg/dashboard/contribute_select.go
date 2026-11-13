@@ -162,6 +162,48 @@ func (h *ContributeWSHub) rateWindowCounts(identity string, now time.Time) (hour
 	return hour, day
 }
 
+// tierRateLimitHit says which assignment-rate cap an identity has used up:
+// Reason is taskUnavailableHourlyLimit or taskUnavailableDailyLimit, Count is
+// the assignments counted in that window and Max the cap. A zero value means
+// the identity may be handed another task.
+type tierRateLimitHit struct {
+	Reason     string
+	Count, Max int
+}
+
+// tierRateLimitReached is the one rule for "this identity has used up its
+// hourly or daily task allowance" (#2566). selectTaskPass refuses work with it,
+// and RoleCoverage uses it so a relay that selection refuses for this reason
+// does not count as contributor-first cover.
+//
+// The limits are hub.tier_limits[tier] for the connection's trust tier, and
+// nothing else: config load fills in the shipped row for each built-in tier
+// the operator did not set (config/defaults.go), there is no per-contributor
+// override (ContributorProfile.RateLimits is stored but never enforced), and a
+// tier with no row is unlimited. A cap of 0 or less is unlimited. The hourly
+// cap is checked first, so a relay at both caps reports hourly_limit, as
+// selection always has.
+//
+// It takes rateMu (through rateWindowCounts) and reads the config without a
+// lock, as selection does. The caller must not hold rateMu.
+func (h *ContributeWSHub) tierRateLimitReached(identity, tier string, now time.Time) tierRateLimitHit {
+	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.Config == nil {
+		return tierRateLimitHit{}
+	}
+	limits, ok := h.server.deps.Config.Hub.TierLimits[tier]
+	if !ok || (limits.MaxPerHour <= 0 && limits.MaxPerDay <= 0) {
+		return tierRateLimitHit{}
+	}
+	hourCount, dayCount := h.rateWindowCounts(identity, now)
+	if limits.MaxPerHour > 0 && hourCount >= limits.MaxPerHour {
+		return tierRateLimitHit{Reason: taskUnavailableHourlyLimit, Count: hourCount, Max: limits.MaxPerHour}
+	}
+	if limits.MaxPerDay > 0 && dayCount >= limits.MaxPerDay {
+		return tierRateLimitHit{Reason: taskUnavailableDailyLimit, Count: dayCount, Max: limits.MaxPerDay}
+	}
+	return tierRateLimitHit{}
+}
+
 // recordAssignment appends an assignment timestamp for the identity. Called once
 // per task_assign actually shipped, so the rate windows count tasks HANDED OUT
 // (matching max_concurrent's semantics and the max_tasks_per_hour/day naming), not
@@ -235,6 +277,7 @@ func (h *ContributeWSHub) rollbackAssignment(c *ContributorConnection, taskID st
 	c.tokenMintedAt = time.Time{}
 	c.lastLeaseRenew = time.Time{}
 	c.taskAssignedAt = time.Time{}
+	c.clearResumeAnchorLocked()
 	c.currentTaskGen = h.nextTaskGen()
 	c.mu.Unlock()
 	h.revokeLease(identityOf(c), taskID)
@@ -335,10 +378,14 @@ func (h *ContributeWSHub) canonicalRepoKey(repo string) string {
 func (h *ContributeWSHub) resumeGateReason(c *ContributorConnection) string {
 	tier := ""
 	if c != nil && c.profile != nil {
-		if c.profile.TrustTier == "revoked" {
-			return "contribution access revoked"
-		}
 		tier = c.profile.TrustTier
+	}
+	// The per-contributor half (revoked, disabled tier) is tierAccessGateReason,
+	// which RoleCoverage shares. A revoked profile outranks every other reason,
+	// as it always has; a disabled tier is reported after the hub checks.
+	tierReason := h.tierAccessGateReason(tier)
+	if tierReason == resumeRefusedAccessRevoked {
+		return tierReason
 	}
 	if h.server == nil {
 		return taskUnavailableHubNotReady
@@ -347,13 +394,49 @@ func (h *ContributeWSHub) resumeGateReason(c *ContributorConnection) string {
 		if h.server.deps.Config.Hub.ContributeSuspended {
 			return taskUnavailableContributionSuspended
 		}
-		for _, dt := range h.server.deps.Config.Hub.DisabledTiers {
-			if dt == tier {
-				return taskUnavailableTierDisabled
-			}
-		}
+	}
+	return tierReason
+}
+
+// resumeRefusedAccessRevoked is the reason resumeGateReason gives for a revoked
+// contributor profile.
+const resumeRefusedAccessRevoked = "contribution access revoked"
+
+// tierAccessGateReason is the one rule for "this trust tier may not be handed
+// work": a revoked profile (resumeRefusedAccessRevoked) or a tier the operator
+// listed in hub.disabled_tiers (taskUnavailableTierDisabled). "" means the tier
+// is open. resumeGateReason refuses a resume with it, selectTaskPass refuses a
+// fresh assignment with its disabled-tier half (tierDisabled; selection never
+// checked revoked, which is refused at auth), and RoleCoverage uses it so a
+// relay that would be refused for either reason does not count as
+// contributor-first cover.
+//
+// It takes a tier rather than a connection so callers read the tier under c.mu
+// and evaluate with every lock released. It reads the config without a lock,
+// as selection does.
+func (h *ContributeWSHub) tierAccessGateReason(tier string) string {
+	if tier == contributorTierRevoked {
+		return resumeRefusedAccessRevoked
+	}
+	if h.tierDisabled(tier) {
+		return taskUnavailableTierDisabled
 	}
 	return ""
+}
+
+// tierDisabled reports whether the operator listed tier in hub.disabled_tiers
+// (#2436 finding 2). It is the disabled-tier half of tierAccessGateReason, and
+// what selectTaskPass refuses a fresh assignment with.
+func (h *ContributeWSHub) tierDisabled(tier string) bool {
+	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.Config == nil {
+		return false
+	}
+	for _, dt := range h.server.deps.Config.Hub.DisabledTiers {
+		if dt == tier {
+			return true
+		}
+	}
+	return false
 }
 
 // mintFailureRepoCooldown is how long a repository stays excluded from selection
@@ -509,16 +592,15 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 	if c.profile != nil {
 		tier = c.profile.TrustTier
 	}
-	if h.server.deps != nil && h.server.deps.Config != nil {
-		for _, dt := range h.server.deps.Config.Hub.DisabledTiers {
-			if dt == tier {
-				h.logger.Warn("[contribute-ws] refusing task: tier disabled",
-					"username", identityOf(c), "tier", tier)
-				h.recordDecision(decisionUsername(c), decisionRefused, "", "", 0,
-					"tier "+tier+" is disabled on this hive")
-				return h.taskUnavailable(taskUnavailableTierDisabled)
-			}
-		}
+	// The disabled-tier rule is tierDisabled, which RoleCoverage shares through
+	// tierAccessGateReason, so a relay refused here is never reported as
+	// covering its role.
+	if h.tierDisabled(tier) {
+		h.logger.Warn("[contribute-ws] refusing task: tier disabled",
+			"username", identityOf(c), "tier", tier)
+		h.recordDecision(decisionUsername(c), decisionRefused, "", "", 0,
+			"tier "+tier+" is disabled on this hive")
+		return h.taskUnavailable(taskUnavailableTierDisabled)
 	}
 
 	// activeIssues tracks issues already held by SOME live connection so we do
@@ -590,28 +672,27 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 						strconv.Itoa(limits.MaxConcurrent))
 				return h.taskUnavailable(taskUnavailableConcurrencyLimit)
 			}
-			if limits.MaxPerHour > 0 || limits.MaxPerDay > 0 {
-				hourCount, dayCount := h.rateWindowCounts(identityOf(c), time.Now())
-				if limits.MaxPerHour > 0 && hourCount >= limits.MaxPerHour {
-					h.logger.Warn("[contribute-ws] refusing task: hourly rate limit reached",
-						"username", identityOf(c), "tier", tier,
-						"assigned_last_hour", hourCount, "max_per_hour", limits.MaxPerHour)
-					h.recordDecision(decisionUsername(c), decisionRefused, "", "", 0,
-						"hourly rate limit for tier "+tier+": "+strconv.Itoa(hourCount)+
-							" assigned in the last hour, max "+strconv.Itoa(limits.MaxPerHour))
-					return h.taskUnavailable(taskUnavailableHourlyLimit)
-				}
-				if limits.MaxPerDay > 0 && dayCount >= limits.MaxPerDay {
-					h.logger.Warn("[contribute-ws] refusing task: daily rate limit reached",
-						"username", identityOf(c), "tier", tier,
-						"assigned_last_day", dayCount, "max_per_day", limits.MaxPerDay)
-					h.recordDecision(decisionUsername(c), decisionRefused, "", "", 0,
-						"daily rate limit for tier "+tier+": "+strconv.Itoa(dayCount)+
-							" assigned in the last day, max "+strconv.Itoa(limits.MaxPerDay))
-					return h.taskUnavailable(taskUnavailableDailyLimit)
-				}
-			}
 		}
+	}
+	// The hourly/daily caps live in tierRateLimitReached, which RoleCoverage
+	// shares, so a relay refused here is never reported as covering its role.
+	switch hit := h.tierRateLimitReached(identityOf(c), tier, time.Now()); hit.Reason {
+	case taskUnavailableHourlyLimit:
+		h.logger.Warn("[contribute-ws] refusing task: hourly rate limit reached",
+			"username", identityOf(c), "tier", tier,
+			"assigned_last_hour", hit.Count, "max_per_hour", hit.Max)
+		h.recordDecision(decisionUsername(c), decisionRefused, "", "", 0,
+			"hourly rate limit for tier "+tier+": "+strconv.Itoa(hit.Count)+
+				" assigned in the last hour, max "+strconv.Itoa(hit.Max))
+		return h.taskUnavailable(taskUnavailableHourlyLimit)
+	case taskUnavailableDailyLimit:
+		h.logger.Warn("[contribute-ws] refusing task: daily rate limit reached",
+			"username", identityOf(c), "tier", tier,
+			"assigned_last_day", hit.Count, "max_per_day", hit.Max)
+		h.recordDecision(decisionUsername(c), decisionRefused, "", "", 0,
+			"daily rate limit for tier "+tier+": "+strconv.Itoa(hit.Count)+
+				" assigned in the last day, max "+strconv.Itoa(hit.Max))
+		return h.taskUnavailable(taskUnavailableDailyLimit)
 	}
 
 	// #6450: pause claims for an identity whose recent assignments all died
@@ -991,9 +1072,9 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 			//
 			// Logged rather than skipped silently: an issue that is never offered
 			// should not be a mystery to the operator watching the queue.
-			if isTracker, _ := issue["is_tracker"].(bool); isTracker {
+			if hold := contributeTrackerHoldFor(issue); hold.held {
 				h.logger.Info("[contribute-ws] skipping tracker/umbrella issue",
-					"repo", repo.Full, "number", number, "title", title)
+					"repo", repo.Full, "number", number, "title", title, "open_sub_issues", hold.openSubIssues)
 				return
 			}
 			if requestedRole != "" && !h.issueMatchesAgentRole(requestedRole, title, labels, lane) {
@@ -1112,6 +1193,11 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 	// set, this is a no-op and behaviour is identical to the previous first-eligible pick.
 	ownFirst := make([]candidate, len(candidates))
 	copy(ownFirst, candidates)
+	integrationKeys := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		integrationKeys = append(integrationKeys, c.ref.Key())
+	}
+	integrationRanks := h.server.integrationAgingRanks(integrationKeys)
 	sort.SliceStable(ownFirst, func(i, j int) bool {
 		if ri, rj := orderRank(ownFirst[i]), orderRank(ownFirst[j]); ri != rj {
 			return ri < rj // operator-pinned (lower rank) sorts ahead
@@ -1124,6 +1210,9 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 		}
 		if ownFirst[i].recentFailures != ownFirst[j].recentFailures {
 			return ownFirst[i].recentFailures < ownFirst[j].recentFailures // fewer failures first
+		}
+		if len(integrationRanks) > 0 {
+			return integrationRanks[ownFirst[i].ref.Key()] < integrationRanks[ownFirst[j].ref.Key()]
 		}
 		return false // equal keys → SliceStable preserves original scan order
 	})
@@ -1183,8 +1272,9 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 	// progress report, so it cannot serve as the start time. Also the stamp
 	// rollbackAssignment hands back to unrecordAssignment.
 	c.taskAssignedAt = assignedAt
+	c.clearResumeAnchorLocked()
 	c.currentLabels = chosen.labels
-	c.lastIdleReason = ""
+	c.clearIdleReasonLocked()
 	// The prompt and the credential are not known yet — see below. A stale
 	// pendingToken from a previous task must not survive into this claim.
 	c.currentPrompt = ""
@@ -1376,7 +1466,8 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 	prompt := buildTaskPromptForContributorWithIssue(chosen.ref, chosen.title, chosen.body,
 		chosen.targetBranch, canPush, guide, hints)
 	if requestedRole != "" {
-		prompt = wrapRoleTaskPrompt(prompt, requestedRole, h.roleKickPrompt(requestedRole))
+		task := ghpkg.Issue{Repo: chosen.repoFull, Number: chosen.number, Title: chosen.title, Body: chosen.body, Labels: chosen.labels}
+		prompt = wrapRoleTaskPrompt(prompt, requestedRole, h.roleKickPrompt(requestedRole, task))
 	}
 	if chosen.stage != "" {
 		prompt += runStageWorktreePrompt(chosen.repoFull, chosen.ref.Key(), chosen.stage, gen)
@@ -1415,7 +1506,7 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 	c.mu.Unlock()
 
 	turnEnvelopeID := h.persistTurnEnvelopeForAssignment(c, assignment, gen, prompt, chosen.labels)
-	mcp := h.mintTaskMCPForAssignment(identityOf(c), assignment, assignedAt.Add(leaseTTL), c.profile.GitHubUsername)
+	mcp := h.mintTaskMCPForAssignment(identityOf(c), assignment, assignedAt.Add(taskMCPLeaseTokenMaxTTL), c.profile.GitHubUsername)
 
 	// #8380: assert the issue claim for this lease — on the issue itself when
 	// the tier may write comments, on the lease alone otherwise. Runs after the

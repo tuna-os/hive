@@ -1,18 +1,24 @@
 package claude
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/hivecommons/hive/crux/sharedfile"
 )
 
 const (
@@ -39,7 +45,27 @@ const (
 	// TokenExchangeTimeout limits how long we wait for the token endpoint,
 	// which can take 40-60s to respond.
 	TokenExchangeTimeout = 120 * time.Second
+
+	// ProfileURL is the OAuth profile endpoint Claude Code itself reads right
+	// after its own token exchange to learn the plan behind the new token
+	// (organization.organization_type and organization.rate_limit_tier). See
+	// FetchProfile.
+	ProfileURL = "https://api.anthropic.com/api/oauth/profile"
+
+	// ProfileFetchTimeout matches the 10s Claude Code allows the same call.
+	ProfileFetchTimeout = 10 * time.Second
 )
+
+// profileEndpointOverride redirects FetchProfile away from ProfileURL. TEST
+// SEAM ONLY, like tokenEndpointOverride: never set in production.
+var profileEndpointOverride string
+
+func profileEndpoint() string {
+	if profileEndpointOverride != "" {
+		return profileEndpointOverride
+	}
+	return ProfileURL
+}
 
 // tokenEndpointOverride redirects the token exchange away from the real Claude
 // endpoint. TEST SEAM ONLY: it is never set in production, where every exchange
@@ -82,6 +108,30 @@ type OAuthTokens struct {
 	Scopes                []string `json:"scopes"`
 	SubscriptionType      string   `json:"subscriptionType,omitempty"`
 	RateLimitTier         string   `json:"rateLimitTier,omitempty"`
+
+	// SignInAccount records which account and organization the dashboard
+	// sign-in minted this token for, as the token endpoint reported them. It
+	// is hive's own key, read only by ApplyProfile: it lets a later sign-in
+	// whose profile read fails tell whether the plan already on file belongs
+	// to the same account. Claude Code ignores it, and drops it when it
+	// rewrites the token block on its own refresh or sign-in, so a file the
+	// CLI rewrote never vouches for a plan.
+	SignInAccount *SignInAccount `json:"hiveSignInAccount,omitempty"`
+}
+
+// SignInAccount identifies the account and organization behind a token.
+type SignInAccount struct {
+	AccountUUID      string `json:"accountUuid"`
+	OrganizationUUID string `json:"organizationUuid,omitempty"`
+}
+
+// sameAccount reports whether a and b positively name the same account and
+// organization. A missing identity on either side is not a match.
+func sameAccount(a, b *SignInAccount) bool {
+	if a == nil || b == nil || a.AccountUUID == "" {
+		return false
+	}
+	return a.AccountUUID == b.AccountUUID && a.OrganizationUUID == b.OrganizationUUID
 }
 
 // tokenResponse is the raw response from the Claude token endpoint.
@@ -93,6 +143,15 @@ type tokenResponse struct {
 	Scope        string          `json:"scope"`
 	Error        json.RawMessage `json:"error"`
 	ErrorDesc    string          `json:"error_description"`
+	// Account and Organization identify who the token was minted for. Claude
+	// Code reads the same two objects from this response (account.uuid,
+	// organization.uuid) to record the signed-in account.
+	Account *struct {
+		UUID string `json:"uuid"`
+	} `json:"account"`
+	Organization *struct {
+		UUID string `json:"uuid"`
+	} `json:"organization"`
 }
 
 func (t *tokenResponse) ErrorString() string {
@@ -179,16 +238,136 @@ func ExchangeCode(code, codeVerifier, redirectURI string) (*OAuthTokens, error) 
 		scopes = strings.Fields(DefaultScopes)
 	}
 
-	return &OAuthTokens{
+	out := &OAuthTokens{
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
 		ExpiresAt:    time.Now().UnixMilli() + int64(tok.ExpiresIn)*1000,
 		Scopes:       scopes,
+	}
+	if tok.Account != nil && tok.Account.UUID != "" {
+		out.SignInAccount = &SignInAccount{AccountUUID: tok.Account.UUID}
+		if tok.Organization != nil {
+			out.SignInAccount.OrganizationUUID = tok.Organization.UUID
+		}
+	}
+	return out, nil
+}
+
+// subscriptionTypes maps the profile's organization.organization_type to the
+// subscriptionType value Claude Code stores in .credentials.json. It is the
+// CLI's own table; any other organization type stores no subscriptionType.
+var subscriptionTypes = map[string]string{
+	"claude_max":        "max",
+	"claude_pro":        "pro",
+	"claude_enterprise": "enterprise",
+	"claude_team":       "team",
+}
+
+// Profile is the plan behind an OAuth token, in the form Claude Code stores it.
+type Profile struct {
+	SubscriptionType string
+	RateLimitTier    string
+}
+
+type profileResponse struct {
+	Organization *struct {
+		OrganizationType string `json:"organization_type"`
+		RateLimitTier    string `json:"rate_limit_tier"`
+	} `json:"organization"`
+}
+
+// FetchProfile reads the plan behind accessToken from the OAuth profile
+// endpoint, the same call Claude Code makes after its own sign-in:
+//
+//	GET https://api.anthropic.com/api/oauth/profile
+//	Authorization: Bearer <access token>
+//
+// subscriptionType is organization.organization_type mapped through the CLI's
+// table (claude_max → max, …); rateLimitTier is organization.rate_limit_tier
+// as returned. Without this, a dashboard sign-in writes a token with no plan
+// and Claude Code labels the session "Claude API" / "API Usage Billing" even
+// on a subscription. Errors never carry the token or the response body.
+func FetchProfile(ctx context.Context, accessToken string) (Profile, error) {
+	ctx, cancel := context.WithTimeout(ctx, ProfileFetchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileEndpoint(), nil)
+	if err != nil {
+		return Profile{}, fmt.Errorf("build profile request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return Profile{}, fmt.Errorf("profile request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return Profile{}, fmt.Errorf("profile request: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return Profile{}, fmt.Errorf("read profile response: %w", err)
+	}
+	var pr profileResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return Profile{}, fmt.Errorf("parse profile response: %w", err)
+	}
+	if pr.Organization == nil {
+		return Profile{}, fmt.Errorf("profile response has no organization")
+	}
+	return Profile{
+		SubscriptionType: subscriptionTypes[pr.Organization.OrganizationType],
+		RateLimitTier:    pr.Organization.RateLimitTier,
 	}, nil
 }
 
-// WriteCredentials atomically writes tokens to the credentials file.
+// ApplyProfile stamps the plan onto freshly exchanged tokens before they are
+// written over previous (the token block currently on file, or nil).
+//
+// A successful read always wins. When the read failed, the plan on file is
+// kept only if previous was signed in by hive for the same account and
+// organization as tokens; otherwise the token is written with no plan, which
+// is what a sign-in wrote before hive read the profile at all. It reports
+// whether the previous plan was kept.
+func ApplyProfile(tokens *OAuthTokens, prof Profile, fetchErr error, previous *OAuthTokens) bool {
+	if tokens == nil {
+		return false
+	}
+	if fetchErr == nil {
+		tokens.SubscriptionType = prof.SubscriptionType
+		tokens.RateLimitTier = prof.RateLimitTier
+		return false
+	}
+	tokens.SubscriptionType, tokens.RateLimitTier = "", ""
+	if previous == nil || !sameAccount(previous.SignInAccount, tokens.SignInAccount) {
+		return false
+	}
+	tokens.SubscriptionType = previous.SubscriptionType
+	tokens.RateLimitTier = previous.RateLimitTier
+	return tokens.SubscriptionType != "" || tokens.RateLimitTier != ""
+}
+
+// ErrNoAccessToken is returned by WriteCredentials for a token set with no
+// access token. Writing one would replace whatever login is on file with a
+// signed-out credential.
+var ErrNoAccessToken = errors.New("refusing to write a Claude credential with no access token")
+
+// CredentialsFileMode is the mode of the shared credentials file: owner and
+// group read/write, so every agent uid reaches it through the shared group.
+const CredentialsFileMode = 0o660
+
+// WriteCredentials atomically writes tokens to the credentials file. It
+// refuses a nil token set or one with an empty access token
+// (ErrNoAccessToken), so no hive caller can replace the shared login with a
+// signed-out credential. The write is sharedfile.Replace: the credentials
+// directory is shared with every agent uid, so the temporary name is random,
+// metadata is set by descriptor, and a non-regular file at the destination or
+// a directory that is not this process's own is refused rather than written
+// through.
 func WriteCredentials(tokens *OAuthTokens, path string) error {
+	if tokens == nil || tokens.AccessToken == "" {
+		return ErrNoAccessToken
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o2775); err != nil {
 		return fmt.Errorf("create credentials dir: %w", err)
@@ -199,13 +378,30 @@ func WriteCredentials(tokens *OAuthTokens, path string) error {
 	if err != nil {
 		return fmt.Errorf("marshal credentials: %w", err)
 	}
-
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o660); err != nil {
-		return fmt.Errorf("write temp credentials: %w", err)
+	if err := removeDeadCredentialLink(path); err != nil {
+		return fmt.Errorf("write credentials: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("rename credentials: %w", err)
+	if err := sharedfile.Replace(path, data, CredentialsFileMode, sharedfile.Options{PreserveOwner: true}); err != nil {
+		return fmt.Errorf("write credentials: %w", err)
+	}
+	return nil
+}
+
+// removeDeadCredentialLink unlinks a symlink at path that resolves to nothing
+// (dangling, or a loop such as a link to itself, which an older bridge repair
+// once left on live hives) so a sign-in can recover the shared login. A link
+// that resolves to an existing file is left alone: sharedfile.Replace refuses
+// it, because nothing hive writes may land through a link another uid planted.
+func removeDeadCredentialLink(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	if _, err := os.Stat(path); err == nil || !(errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP)) {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove dead credential link: %w", err)
 	}
 	return nil
 }
@@ -214,10 +410,29 @@ func WriteCredentials(tokens *OAuthTokens, path string) error {
 // nil when the file is absent, malformed, or carries no token block. It never
 // applies an expiry rule — callers decide what a stale token means to them.
 func LoadTokens(path string) *OAuthTokens {
-	data, err := os.ReadFile(path)
+	tokens, err := ReadTokens(path)
 	if err != nil {
 		return nil
 	}
+	return tokens
+}
+
+// ReadTokens is LoadTokens with the read error kept, for callers that must
+// tell "this process cannot read the file" (fs.ErrNotExist, or
+// fs.ErrPermission on another uid's 0600 credential) apart from "the file
+// holds no usable token". A file that was read but is malformed, or carries
+// no token block, returns (nil, nil). The error never carries file content.
+func ReadTokens(path string) (*OAuthTokens, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseTokens(data), nil
+}
+
+// ParseTokens decodes a credentials file already in memory. Nil for malformed
+// bytes or a file with no token block, like LoadTokens.
+func ParseTokens(data []byte) *OAuthTokens {
 	var creds Credentials
 	if err := json.Unmarshal(data, &creds); err != nil {
 		return nil
@@ -281,11 +496,17 @@ func HasValidToken(path string) bool {
 // Positive evidence only: an unreadable or absent file returns false, leaving
 // callers exactly where they were before they asked.
 func HasUsableToken(path string) bool {
-	tokens := LoadTokens(path)
+	return TokensUsable(LoadTokens(path), time.Now())
+}
+
+// TokensUsable is HasUsableToken over an already-loaded token set, for callers
+// that must judge two credentials side by side (the per-agent credential
+// bridge repair compares an agent's private copy with the shared file). A nil
+// token set is not usable.
+func TokensUsable(tokens *OAuthTokens, now time.Time) bool {
 	if tokens == nil {
 		return false
 	}
-	now := time.Now()
 	if tokens.AccessToken != "" && !expired(tokens.ExpiresAt, now) {
 		return true
 	}

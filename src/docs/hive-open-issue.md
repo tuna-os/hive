@@ -42,8 +42,8 @@ Shapes are selected by an optional leading positional keyword (`comment`,
 `issue`):
 
 ```sh
-hive-open-issue --repo <owner/repo> --title "<t>" [--body "<b>"|--body-file f] [--label a,b] [--parent <n>] [--blocked-by <n[,n]>] [--needs-decision] [--no-consolidate <reason>] [--step-kind release --release-tag <tag> --release-target <sha>]
-hive-open-issue comment --repo <owner/repo> <number|url> --body "<b>" [--needs-decision] [--blocked-on-pr <n>]
+hive-open-issue --repo <owner/repo> --title "<t>" [--body "<b>"|--body-file f] [--label a,b] [--parent <n>] [--blocked-by <n[,n]>] [--needs-decision] [--no-consolidate <reason>] [--step-kind release --release-tag <tag> --release-target <sha>] [--claim]
+hive-open-issue comment --repo <owner/repo> <number|url> --body "<b>" [--needs-decision|--withdraw-decision] [--blocked-by <n[,n]>] [--blocked-on-pr <n|owner/repo#n>]
 hive-open-issue claim   --repo <owner/repo> <number|url>
 hive-open-issue label   --repo <owner/repo> <number|url> [--label a,b] [--remove-label c]
 hive-open-issue request-review --repo <owner/repo> <number|url> [--reviewer a,b] [--team-reviewer t]
@@ -59,14 +59,16 @@ hive-open-issue request-review --repo <owner/repo> <number|url> [--reviewer a,b]
 | `--remove-label` | — | label | repeatable; labels to take off the item |
 | `--reviewer` | `--add-reviewer` | request-review | repeatable; comma-separated GitHub logins to ask for a review |
 | `--team-reviewer` | — | request-review | repeatable; team slugs (an `org/` prefix is accepted) to ask for a review |
-| `--parent` | — | issue | issue number in the same repo to link the new issue to as a GitHub sub-issue |
-| `--blocked-by` | — | issue | repeatable; issue numbers in the same repo the new issue is blocked by, recorded as GitHub "blocked by" dependencies (`#` prefix tolerated) |
+| `--parent` | — | issue | issue number in the same repo to link the new issue to as a GitHub sub-issue. Declaring it also exempts the request from the file-set, component and canonical-subject folds (see [DAG children never take a fold](#dag-children-never-take-a-fold)), so `--no-consolidate` is not needed for a decomposition child |
+| `--blocked-by` | — | issue, comment | repeatable; issue numbers in the same repo the new issue is blocked by, recorded as GitHub "blocked by" dependencies (`#` prefix tolerated). Like `--parent`, declaring it exempts the request from the shared-path folds (see [DAG children never take a fold](#dag-children-never-take-a-fold)) |
 | `--step-kind` | — | issue, comment | `release`; requires `--needs-decision`, `--release-tag` and `--release-target`; records metadata only, never publishes a release |
 | `--release-tag` | — | issue, comment | release tag from the repository's version source |
 | `--release-target` | — | issue, comment | full lowercase 40-character commit SHA for the proposed release |
 | `--needs-decision` | — | issue, comment | park the new issue, or the existing issue being commented on, on a maintainer decision: the watcher applies the hive's configured needs-decision label itself (see [Parking an issue that needs a decision](#parking-an-issue-that-needs-a-decision)). On both subcommands a Hive-authored non-risk question is downgraded instead of parked under `project.agent_issue_decision_policy: resolve` (the default); a typed `--step-kind` owner step always parks |
-| `--no-consolidate` | — | issue | requires a non-empty reason; the watcher skips open-issue consolidation (same-subject, file-set and component folds) and files a new issue, echoing the reason as `consolidation_skipped_reason` in the result and logging it. Use it for unrelated work that only shares a file or component with an open issue ([#14360](https://github.com/hivecommons/hive/issues/14360)). The request carries `"no_consolidate_reason"` |
-| `--blocked-on-pr` | — | comment | park the issue on open PR `<n>` in the same repo: the watcher prefixes the note with `<!-- hive:blocked-on pr=owner/repo#n -->`, strips `@`-mentions from it, adds the `blocked` label and removes `help wanted` (see [Blocked on an unmerged PR](#blocked-on-an-unmerged-pr)) |
+| `--withdraw-decision` | — | comment | take back a decision park you placed yourself; see [Withdrawing your own park](#withdrawing-your-own-park). Cannot be combined with `--needs-decision` |
+| `--claim` | — | issue | file the new issue **and** claim it for this agent in the same request (see [Filing your own next step](#filing-your-own-next-step)). The request carries `"claim": true`; the result reports `claimed`, or `claim_error` when the claim did not land |
+| `--no-consolidate` | — | issue | requires a non-empty reason; the watcher skips open-issue consolidation (same-subject, file-set and component folds) and files a new issue, echoing the reason as `consolidation_skipped_reason` in the result and logging it. Use it for unrelated work that only shares a file or component with an open issue ([#14360](https://github.com/hivecommons/hive/issues/14360)). The request carries `"no_consolidate_reason"`. A request that declares `--parent` or `--blocked-by` needs no reason: it is a distinct DAG node and never takes the file-set, component or canonical-subject folds, and a genuine create reports `consolidation_skipped_reason` as `parent` or `blocked_by` ([#16065](https://github.com/hivecommons/hive/issues/16065)) |
+| `--blocked-on-pr` | — | comment | park the issue on open PR `<n>` in the same repo, or on `owner/repo#n` in another repository (the request then also carries `"blocked_on_pr_repo"`): the watcher prefixes the note with `<!-- hive:blocked-on pr=owner/repo#n -->`, strips `@`-mentions from it, adds the `blocked` label and removes `help wanted` (see [Blocked on an unmerged PR](#blocked-on-an-unmerged-pr)) |
 | `--number` | — | comment, claim, close, label, request-review | the issue/PR number; a bare positional number or a `.../issues/N` or `.../pull/N` URL is also accepted |
 | `--dry-run` | `-n` | all | validate the arguments and print the exact request that would be written, then exit `0` **without writing it** — nothing is created, commented, claimed, or closed. **This is how you test the tool.** A live call creates a real GitHub issue/comment/label change under the hive's App identity |
 
@@ -115,6 +117,20 @@ To retract an issue you filed by mistake, use `hive-open-issue close --repo
 <owner/repo> <number>` — it goes through the watcher with the App token, so it
 works even when the agent's own scoped token cannot edit or comment.
 
+A `close` request for an issue that still has an open GitHub sub-issue is
+refused: the request is parked as `.denied`, never retried, and the result
+carries the reason (`issue close refused: <owner/repo>#<n> has 2 open
+sub-issues, so it is not finished; …`). `--override-reason` does not change
+that. The issue can be closed once its sub-issues are closed, or by a
+maintainer before then; the sub-issues are open work, so do not close them to
+get past the refusal. If you believe the parent itself is a mistake or a
+duplicate, you still cannot close it: say so, with the evidence, in one
+comment on the issue parked for a maintainer (`hive-open-issue comment
+--needs-decision`, see
+[Parking an issue that needs a decision](#parking-an-issue-that-needs-a-decision)),
+and leave its sub-issues alone. A `close` request for a pull request is not
+affected.
+
 ### `issue` (default)
 
 `--repo`, `--title`, and `--body` are all required — an empty body is treated
@@ -158,6 +174,33 @@ be resolved is reported on the result file (`blocked_by_errors`, alongside
 block (A blocked by B, B blocked by A) would hide both forever, so the hive
 drops that pair with a warning and offers both.
 
+On `comment`, `--blocked-by` links the existing issue the same way, after the
+comment is posted. Use it when a park only defers to another parked issue's
+decision (a release tag that rides on #N's change: "answer on #N; the same
+choice applies here"). The dashboard then counts the pair as one owner ask:
+a decision park blocked by an open issue that is itself parked on a decision
+reads as "Waits on the decision on #N", not as your turn
+([Danathar/tududi#512](https://github.com/Danathar/tududi/issues/512)). A
+blocker that is ordinary open work, a `needs-human` park, or an issue the
+snapshot does not carry leaves the park your turn: that decision is still the
+owner's to make, and a link alone never hides it. Asks blocked by each other
+(directly or round a loop) all stay your turn, so a loop never hides every
+one of them.
+
+When a `--needs-decision` park (issue or comment) gives no `--blocked-by`, the
+watcher links it itself if the text asks a decision another open issue already
+asks: it reads up to four same-repo `#N` the text names, each lower-numbered
+than the issue being parked (filed earlier, so two asks never wait on each
+other), and links the first that is an open issue still parked on a decision
+and that the text either defers to in so many words ("answer on #N", "pick on
+#N", "the same choice ... #N", "parking this with #N", "#N settles it") or
+shares a cited Actions run with (`/actions/runs/<id>` in its body or a Hive
+comment on it). The park gets one added line, "Hive linked this issue as
+blocked by #N: it asks the same decision, so answer on #N and this issue
+follows it", the result lists the link in `blocked_by_linked`, and the write
+audit records `folded_into`. A pull request is never a target: GitHub's
+"blocked by" links issues.
+
 #### Parking an issue that needs a decision
 
 `--needs-decision` is the way an agent parks an issue it files or, on `comment`, an existing issue. Hive-authored issues must not use it for sequencing, naming, numbering, config-shape, scope, or "approach A vs B" engineering questions: with `project.agent_issue_decision_policy: resolve` (default), the relay records `Decision taken by hive: …`, keeps the issue actionable, and audits the downgrade. Use it only when the body asks the maintainer to decide a risk category, and include `Risk: <category>` for security posture, data loss, irreversible or public-facing behaviour, governance/policy/licensing, spend, owner-only credentials/secrets/infra, or uninferable human intent. The script sends `"needs_decision": true` on the request, and
@@ -196,6 +239,59 @@ Hive posts records the done decision, and that reply is what tells the lane
 that next picks the issue up to re-check the step and close the issue once the
 fix is verified — nothing else routes it. The flag applies only to `issue` and
 `comment`; on any other kind the script exits `2` and writes nothing.
+
+One park is handed to a lane instead of the owner: a workflow-only change from
+a lane that cannot push `.github/workflows/**`. When the text says so (the
+workflows blocker, or `.github/workflows` named with "workflows permission")
+and lists no lettered options, and an enabled ISSUES_PRS_MERGE lane serves the
+repository (a lane scoped to other repositories with `repos:` is never chosen),
+the watcher adds `hive/workflows-lane` instead of the park label, appends a
+"Handed to `<lane>`" note and no owner-step marker, and the scheduler routes the
+issue to that lane. On `issue` the new issue is created at
+`stage/010-actionable` with the label. The hand-off is skipped (the park
+stands) when the App installation is known to lack `workflows: write`.
+
+A lane that can push workflow files itself is refused the park instead. When
+the parking lane runs at the trusted or merger tier (ISSUES_PRS_MERGE), whose
+token asks for the Workflows permission, and the App installation grants
+`workflows: write` (read at most every five minutes), the watcher parks
+nothing, adds no label, and appends a "Not parked: `<lane>`'s token can push
+`.github/workflows/`" note: the issue stays with that lane to push the change.
+If the installation lacks the permission, or cannot be read, the park stands. It
+also stands when the park quotes GitHub's own rejection of the push ("refusing to
+allow a GitHub App to create or update workflow … without `workflows`
+permission"): that is evidence, and the blocker it records is never released by
+the scheduled re-check. The quote counts as evidence only from a lane whose own
+token asks for the permission (or from a report with no `— hive:` trailer, such
+as a person pasting the error); a contributor-tier lane's quote shows only that
+its own token lacks it, so that blocker stays releasable.
+
+#### Withdrawing your own park
+
+When the question goes away while the issue is parked (you found a cause that
+needs no choice, or an open PR already carries the answer and closes the
+issue), take the park back instead of leaving the owner to answer it:
+
+```
+hive-open-issue comment --repo <owner/repo> <number> --withdraw-decision \
+  --body "No decision is needed any more: PR #176 fixes the cause and closes this issue."
+```
+
+The watcher refuses the request, writing nothing, unless the issue is parked
+on a decision (`stage/045-needs-decision` or the configured needs-decision
+label), carries no `needs-human` (a person lifts that), and the newest Hive
+park text on it — the issue body of a Hive-filed issue or a later Hive comment
+carrying the `<!-- hive:owner-step -->` marker, since the last accepted `/hive`
+command — ends in your own `— hive: agent=<you>` line. Like a park it needs
+`label` in the lane's write allowlist. It then posts the comment with a hidden
+`<!-- hive:park-withdrawn by=<agent> -->` marker, lifts the park through the
+stage engine (the issue re-derives: `040-covered-by-pr` when an open PR covers
+it, else `010-actionable`), removes an operator-renamed decision label, and
+deletes the "What to reply" notice so it stops offering the options you took
+back. `approved-direction` is not added: no one decided anything. A retry after
+the comment went up only finishes the lift. Never withdraw a park another lane
+or a person placed; the watcher refuses it
+([Danathar/openaudible-autoupdate#177](https://github.com/Danathar/openaudible-autoupdate/issues/177)).
 
 #### Recording a release-only owner step
 
@@ -273,6 +369,11 @@ hive-open-issue comment --repo o/r 13093 --blocked-on-pr 13092 \
   --body "Blocked on #13092: the flagged file exists only on that PR; nothing to ship until it lands."
 ```
 
+A PR in another repository is named `owner/repo#n`
+(`--blocked-on-pr acme/gadget#42`); the marker then reads
+`<!-- hive:blocked-on pr=acme/gadget#42 -->` and the sweep lifts the block
+when that PR merges or closes.
+
 The watcher prefixes the body with the marker `<!-- hive:blocked-on
 pr=o/r#13092 -->`, strips any `@login` mention from it (the PR's author is not
 asked to do the hive's work; address them only in a review comment on their
@@ -284,7 +385,21 @@ blocked sweep that follows each stage-label sync lifts the label and posts
 one `<!-- hive:unblocked -->` note once the tracked PR is merged or closed,
 and strips `help wanted` again should the org workflow re-add it while the
 PR is open. The review backlog applies the same parking itself when it files
-a finding whose file does not exist on the reviewed PR's base branch.
+a finding whose file does not exist on the reviewed PR's base branch. The
+review-backlog reconciler and the blocked sweep can both lift the same block;
+whichever runs second sees the first one's note for that PR (newer than the
+last blocked-on marker) and posts nothing. On an issue `project.issue_filter`
+does not admit (for example no `triage/accepted`), the note says
+"Unblocked — waiting for a maintainer to admit it" and names the label that
+admits it, instead of "actionable now" or "re-triaging".
+
+A blocker that is an issue rather than a PR (another repository's build or
+release tracked as an issue) is named by the issue form of the marker,
+`<!-- hive:blocked-on issue=owner/repo#N -->`, in the issue body or a
+comment; a contributor's `blocked` verdict comment carries it. The sweep keeps
+`blocked` while that issue is open, never lifts it as marker-less, and lifts
+it with one `<!-- hive:unblocked -->` note once the issue closes. A malformed
+marker counts as none.
 
 A posted comment is the agent's **start signal** on that issue only when it
 says work is starting. The hub records a 2h agent claim the first time the
@@ -316,6 +431,19 @@ starts when any comment or label counted; neither is now.
 The claim applies the `hive/claimed-by-<agent>` label and posts a bot
 comment with a timestamped marker so maintainers can see when work began.
 
+On a **pull request**, a comment that defers it is also a recorded decision
+([#17347](https://github.com/hivecommons/hive/issues/17347)): a sentence or
+line that opens with "Deferring" / "Deferred" (anywhere in the comment — a
+PR deferral usually concludes a diagnosis), or one of the opening deferral
+forms above, with no start phrase. After posting it the relay looks up the
+PR's head and audits `agent_pr_deferred` with that head, the issue / PR
+references the comment names (the successors, in order, never the PR
+itself), whether it says a maintainer may close the PR ("a maintainer may
+close it now", "safe to close") and the deferral's own words. The activity
+monitor then reads *Deferred · waiting on #N* for that head instead of
+*Unassigned*; a new head clears it. Name the successor issues in the
+deferral itself so the row can point at them.
+
 ### `claim`
 
 `--repo` and a number or URL are required; no body or title needed. A claim
@@ -339,12 +467,53 @@ issue labelled `needs-human` or held, on an issue parked on a person's
 decision (`stage/045-needs-decision`, `needs-spec`, the retired decision
 labels), and on an umbrella issue wearing a never-claim label
 (`governor.claims.never_claim_labels`, default `epic`, case-insensitive):
-an epic is the list of work, not the work. The same gate admits every
-automated claim producer, so a start signal on such an issue records nothing. The
+an epic is the list of work, not the work. The claim is also refused when
+another principal already holds the issue — a live claim by a contributor or
+another hive's agent — or when another author's open PR covers it: the same
+claim-target gate that refuses a `hive-open-pr` closing reference
+([hive-open-pr.md](hive-open-pr.md#closes-n-on-an-issue-someone-else-is-working-is-rejected)),
+also applied to a relay comment that announces a start. The hive posts one
+notice on the issue (marker `<!-- hive:pr-request-claim-target -->`) saying
+what was asked, who holds it, and that the owner decides. The claim is also
+refused when the claiming agent itself filed the issue without `--claim`
+(`filed for outside help by <agent>`; see below). The dispatch-block gate
+(`needs-human`, decision labels, never-claim labels) admits every automated
+claim producer — the hub's own dispatch of an issue to an agent included — so
+a start signal on such an issue records nothing. The
 `stage/030-pr-in-progress` label is swapped for `stage/040-covered-by-pr` when
 the agent's `hive-open-pr --issues` request opens the PR, and cleared when the
 claim is released or at enumeration once PR evidence exists or the marker
 lapsed (default 2h).
+
+### Filing your own next step
+
+An issue filed without `--claim` is open to anyone: the org's help-wanted
+automation advertises it, and a contributor can claim it before the filing
+agent's separate `claim` request lands
+([#17299](https://github.com/hivecommons/hive/issues/17299)). When you file
+an issue you are about to work on yourself, pass `--claim`: right after the
+create the watcher runs the same gate and claim a `claim` request does
+(`hive/claimed-by-<agent>` label, in-progress fact, start marker) and
+removes `help wanted`, so there is no window. The claim is a separate
+`claim` write: the lane's write allowlist must list `claim` as well as
+`create_issue`, or the issue is created and `claim_error` says why. The start signal it raises
+(`filed_claim`) also counts as the issue's kick listing on the hub, so the
+hub's claim ledger records the claim even though no kick ever named the
+new issue. A claim that fails or is refused does
+not undo the create; the result is still `ok` and says why in `claim_error`.
+A request folded into an existing issue is not claimed. When the create
+reuses an existing open issue (same-title `already_existed`), `--claim` claims
+that reused issue, the same outcome as an explicit `hive-open-issue claim` on it.
+
+An issue filed **without** `--claim` carries a hidden
+`<!-- hive:filed-for-help <agent> -->` marker: the hive asked for outside
+help, so a later `claim` of it by the same agent — or the hub dispatching it
+back to that agent — is refused. A marker already in the request body is
+replaced by the filer's own, so the body cannot name someone else. Other
+agents and contributors may still claim it; a maintainer who wants the filer to take it
+after all removes the marker from the issue body. Children filed with
+`--parent` are not marked: they are the hive's own decomposition output, and
+the next kick dispatches them normally.
 
 ### `label`
 
@@ -377,7 +546,12 @@ the PR and audits it as `agent_review_requested` with the repository and number
 ([#9587](https://github.com/hivecommons/hive/issues/9587)). It is the audited
 alternative to `gh pr edit --add-reviewer`. Logins and team slugs are checked
 before any GitHub call; an impossible name, or more than 15 reviewers in total,
-is quarantined as malformed rather than retried.
+is quarantined as malformed rather than retried. Users and teams whose review
+request on the PR is still pending are skipped rather than re-pinged; they are
+listed in the `.result.json` as `reviewers_already_pending` /
+`team_reviewers_already_pending`, and when everyone named is already pending
+no GitHub call is made (see
+[notifications.md › Review requests](notifications.md#review-requests)).
 
 ## It is asynchronous, by design
 
@@ -723,6 +897,39 @@ Every consolidated result also carries `consolidated_reason`: `subject` (a
 canonical title match on a human-filed issue), `file_set` (an exact file-set
 twin) or `component:<path>` (a same-component fold on `<path>`), so the agent
 can tell a true twin from a shared-path fold.
+
+### Dedupe checklists never take a fold
+
+A dedupe-agent checklist (body carrying `<!-- hive:dedupe-checklist repo=… -->`)
+cites every path its pairs touch, so a path fold would bury the whole repo
+checklist in whichever finding shares one: projectbluefin/actions#543, a
+data-loss bug, received the repository's checklist as a "Folded finding". A
+checklist skips the same folds as a DAG child (below); an open issue with the
+exact same title is still reused.
+
+### DAG children never take a fold
+
+A request that declares `--parent` or `--blocked-by` is an explicit statement
+that it is a new node in a decomposition DAG
+([#16065](https://github.com/hivecommons/hive/issues/16065)). Its body
+legitimately names the file it will touch, and its title shares a stem with
+its siblings ("RFC title: child A", "RFC title: child B"), so under the rules
+above the third child of an RFC was routinely folded into an older sibling —
+the one place it must never land — and the agent only learned of it from the
+result's `number`. Such a request therefore skips the exact file-set twin,
+the same-component fold and the canonical-subject reuse and files its own
+issue. The create's idempotency replay (the 24-hour journal key that makes a
+reworded re-filing of one finding a replay of the first) is keyed on the
+exact title for such a request too, so two siblings that share a stem and
+cite the same file within the window each get their own issue rather than
+the second being handed the first's `number` as `already_existed`. The
+**exact-title** match (ignoring the `[<agent>]` tag) and the
+rejected-twin gate are unchanged, so a retried create still reuses the issue
+it filed. When the request did create a new issue, the result carries
+`consolidation_skipped_reason: "parent"` (or `"blocked_by"` when only
+`--blocked-by` was given), mirroring `--no-consolidate`; the watcher logs the
+skip. A result that reused an exact-title twin reports `already_existed:
+true` and no skip reason.
 
 ### Unattended comments are rate-limited per issue
 

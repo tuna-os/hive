@@ -134,6 +134,10 @@
     let _kbServerPaged = false;
     let _kbHasMore = false;
     let _kbRequest = 0;
+    // {url, subpath} of the git source loaded into the Add Git Source form by
+    // Edit; null while the form adds a new source. Reset on every re-render.
+    let _kbGitSourceEditing = null;
+    let _kbGitSourceFailed = null;
     const KB_POLL_MS = 30000;
     const KB_LAYER_ICONS = { personal: '🔒', project: '📁', org: '🏢', community: '🌍' };
     const KB_LAYER_LABELS = { personal: 'Personal', project: 'Project', org: 'Org', community: 'Community' };
@@ -148,6 +152,16 @@
     function kbFactsLabel(n) {
       const total = Number(n) || 0;
       return formatNumber(total) + ' fact' + (total === 1 ? '' : 's');
+    }
+
+    // Validate the same layer totals used by the displayed facts badge.
+    // Missing layers are unknown, not an empty knowledge base.
+    function kbSidebarFactCount(stats) {
+      if (!stats || typeof stats.enabled !== 'boolean') return null;
+      if (!stats.enabled) return 0;
+      if (!Array.isArray(stats.layers) || stats.layers.some(l => !l || !Number.isSafeInteger(l.total_pages) || l.total_pages < 0)) return null;
+      const count = kbTotalFactsFromStats(stats);
+      return Number.isSafeInteger(count) ? count : null;
     }
 
     // ── Document Sources ──
@@ -206,17 +220,19 @@
        (actionableNow.issues / .prs, the same numbers the Governor tiles
        print). Both stay hidden until their feed has answered once.
        sidebarPairBadgeText() is pure so sidebar_pair_badge_test.go can
-       execute it under node. */
-    function sidebarPairBadgeText(issues, prs) {
-      return (Number(issues) || 0) + '/' + (Number(prs) || 0);
+       execute it under node. The optional prefix names the pair — only
+       Overview passes one ("BP = " for board pressure, #17240); the
+       Governor and Contributors pills stay a bare "x/y". */
+    function sidebarPairBadgeText(issues, prs, prefix) {
+      return (prefix || '') + (Number(issues) || 0) + '/' + (Number(prs) || 0);
     }
 
-    function setSidebarPairBadge(el, issues, prs, title) {
+    function setSidebarPairBadge(el, issues, prs, title, prefix) {
       if (!el) return;
       const i = Number(issues) || 0;
       const p = Number(prs) || 0;
       el.hidden = false;
-      el.textContent = sidebarPairBadgeText(i, p);
+      el.textContent = sidebarPairBadgeText(i, p, prefix);
       if (i === 0 && p === 0) el.setAttribute('data-zero', '');
       else el.removeAttribute('data-zero');
       if (title) el.title = title;
@@ -252,10 +268,21 @@
         _kbCache._documents = (docsR && docsR.ok) ? await docsR.json() : [];
         _kbCache._reviewDrafts = reviewDrafts;
         setSectionSummary('knowledge-section', kbFactsLabel(kbTotalFactsFromStats(_kbCache)));
-        var kbBadge = document.getElementById('knowledge-sidebar-badge');
+        const kbBadge = document.getElementById('knowledge-sidebar-badge');
         if (kbBadge) {
-          var kbFacts = kbTotalFactsFromStats(_kbCache);
-          setSidebarCountBadge(kbBadge, _kbCache && _kbCache.enabled ? kbFacts : 0, kbFactsLabel(kbFacts));
+          const kbFacts = kbSidebarFactCount(_kbCache);
+          const kbShown = kbTotalFactsFromStats(_kbCache);
+          const hasLayers = Array.isArray(_kbCache.layers);
+          const title = kbFacts !== null ? kbFactsLabel(kbShown) : hasLayers
+            ? kbFactsLabel(kbShown) + ' known; some layer counts unavailable'
+            : 'Knowledge fact count unavailable';
+          // Toggling priming changes what the badge shows, not stored facts.
+          if (prev && prev.enabled !== _kbCache.enabled) navCountDelta(kbBadge, null);
+          // Partial layer stats still refresh the section and its known
+          // facts. Only the delta baseline needs a complete numeric total.
+          if (kbFacts !== null || hasLayers) setSidebarCountBadge(kbBadge, _kbCache.enabled ? kbShown : 0, title);
+          else kbBadge.title = title;
+          navCountDelta(kbBadge, kbFacts, title);
         }
         if (_kbInitialLoad && _kbCache && _kbCache.enabled) {
           _kbSetupView = 'none';
@@ -307,6 +334,12 @@
       renderKnowledgeFacts();
     }
 
+    // Auto-memory review (#17058): drafts the CLI-memory drain wrote. The
+    // search API is an operator read, so include_states=draft lists them;
+    // no agent read ever does until one is approved.
+    const KB_AUTO_MEMORY_VIEW = 'auto-memory';
+    const KB_AUTO_MEMORY_TAG = 'cli-memory';
+
     async function kbLoadFacts(offset) {
       const request = ++_kbRequest;
       const query = _kbSearchQuery;
@@ -315,6 +348,9 @@
       let url;
       if (query) {
         url = '/api/knowledge/search?q=' + encodeURIComponent(query) + '&limit=50';
+        if (typeFilter) url += '&type=' + encodeURIComponent(typeFilter);
+      } else if (layer === KB_AUTO_MEMORY_VIEW) {
+        url = '/api/knowledge/search?tag=' + KB_AUTO_MEMORY_TAG + '&include_states=draft&limit=200';
         if (typeFilter) url += '&type=' + encodeURIComponent(typeFilter);
       } else if (layer && layer !== 'all') {
         // Check if this is a vault, document, or standard layer type
@@ -345,6 +381,7 @@
         _kbPageOffset = offset;
         _kbHasMore = !!data.has_more;
         _kbFacts = Array.isArray(data) ? data : (data.results || data.facts || []);
+        if (!query && layer === KB_AUTO_MEMORY_VIEW) _kbFacts = _kbFacts.filter(f => f.state === 'draft');
         _kbSelectedFact = null;
         renderKnowledgeFacts();
       } catch (e) {
@@ -1100,6 +1137,7 @@
       html += '<div class="kb-layer-list" id="kb-layer-btns">';
       // Aggregate row stays on top as the filter reset (kbSelectLayer keys on the 'All Layers' text)
       html += `<button class="hv-btn btn-secondary btn-sm kb-layer-btn${_kbSelectedLayer === 'all' ? ' active' : ''}" data-action="kbSelectLayer" data-arg0="all"><span class="kb-layer-label">📋 All Layers</span><span class="kb-layer-count">${totalPages}</span></button>`;
+      html += `<button class="hv-btn btn-secondary btn-sm kb-layer-btn${_kbSelectedLayer === KB_AUTO_MEMORY_VIEW ? ' active' : ''}" data-action="kbSelectLayer" data-arg0="${KB_AUTO_MEMORY_VIEW}" title="Drafts drained from the coding CLIs' own memory stores. No agent sees one until it is approved."><span class="kb-layer-label">🧠 Auto-memory drafts</span></button>`;
       for (const l of layers) {
         const isGitSource = l.type && l.type.startsWith('git_source:');
         const icon = KB_LAYER_ICONS[l.type] || (isGitSource ? '📄' : '📂');
@@ -1325,6 +1363,7 @@
         html += `<span class="kb-type-badge ${typeClass}">${escapeHtml(f.type || 'unknown')}</span>`;
         html += `<span class="kb-layer-badge ${layerClass}">${escapeHtml(f.layer || '')}</span>`;
         if (f.status) html += `<span class="kb-layer-badge" style="background:var(--bg);color:var(--muted)">${escapeHtml(f.status)}</span>`;
+        html += kbAutoMemoryRowHTML(f);
         html += '</div></div></div>';
       }
       if (_kbPageOffset > 0 || hasNext) {
@@ -1334,6 +1373,44 @@
         html += '<button class="hv-btn btn-secondary btn-sm" data-action="kbNextPage"' + (!hasNext ? ' disabled' : '') + '>Next</button></div>';
       }
       el.innerHTML = html;
+    }
+
+    function kbIsAutoMemory(f) {
+      return (f.tags || []).some(t => String(t).trim().toLowerCase() === KB_AUTO_MEMORY_TAG);
+    }
+
+    // Agent tags of a drained CLI-memory fact, plus approve and discard for
+    // an owner while it is still a draft. Discard deprecates rather than
+    // deletes, so the drain's content hash keeps it from being re-drafted.
+    function kbAutoMemoryRowHTML(f) {
+      if (!kbIsAutoMemory(f)) return '';
+      let html = '';
+      for (const t of (f.tags || [])) {
+        const m = /^agent:(.+)$/i.exec(String(t).trim());
+        if (m) html += `<span class="kb-layer-badge" title="Drained from this agent's CLI memory">agent ${escapeHtml(m[1])}</span>`;
+      }
+      if (f.state === 'draft' && viewerIsOwner()) {
+        const slug = escapeHtml(f.slug || '');
+        html += `<button class="hv-btn btn-primary btn-sm" data-action="kbAutoMemoryReview" data-arg0="${slug}" data-arg1="approved" data-stop="1" title="Approve: agents whose scope includes this entry receive it in their kicks">Approve</button>`;
+        html += `<button class="hv-btn btn-danger btn-sm" data-action="kbAutoMemoryReview" data-arg0="${slug}" data-arg1="deprecated" data-stop="1" title="Discard: mark it deprecated so no agent receives it and the drain never re-drafts it">Discard</button>`;
+      }
+      return html;
+    }
+
+    async function kbAutoMemoryReview(slug, state) {
+      const question = state === 'approved'
+        ? 'Approve "' + slug + '"? It was written by an agent, and once approved it is injected into the kicks of every agent whose scope includes it.'
+        : 'Discard "' + slug + '"? It is marked deprecated, no agent receives it, and the drain will not re-draft it.';
+      if (!(await hiveConfirm(question))) return;
+      try {
+        const r = await fetch('/api/knowledge/entry/' + encodeURIComponent(slug) + '/state', {
+          method: 'PUT', headers: _inceptionAuthHeaders(),
+          body: JSON.stringify({ state, reason: 'auto-memory review (dashboard)' }),
+        });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); await hiveAlert(e.error || 'Failed to change state'); return; }
+        fetchKnowledgeStats();
+        kbSearch();
+      } catch (e) { await hiveAlert('Error: ' + e.message); }
     }
 
     function renderKnowledgeDetail() {
@@ -1609,8 +1686,8 @@
               </select>
             </label>
           </div>
-          <label class="muted-note">Content
-            <textarea id="kb-import-content" rows="24" style="width:100%;margin-top:var(--sp-2);padding:var(--sp-4);border:1px solid var(--border);border-radius:var(--r);background:var(--bg);color:var(--fg);font-size:0.78rem;font-family:var(--font-mono);resize:vertical;min-height:320px" placeholder="# Guard .join() against undefined\n\nAlways use (arr || []).join(',')..."></textarea>
+          <label class="muted-note">Content <span aria-hidden="true">*</span>
+            <textarea id="kb-import-content" required aria-required="true" rows="24" style="width:100%;margin-top:var(--sp-2);padding:var(--sp-4);border:1px solid var(--border);border-radius:var(--r);background:var(--bg);color:var(--fg);font-size:0.78rem;font-family:var(--font-mono);resize:vertical;min-height:320px" placeholder="# Guard .join() against undefined\n\nAlways use (arr || []).join(',')..."></textarea>
           </label>
           <div style="display:flex;align-items:center;gap:10px;margin-top:var(--sp-2)">
             <label style="font-size:0.72rem;color:var(--muted);cursor:pointer;display:flex;align-items:center;gap:var(--sp-2)">
@@ -1644,9 +1721,9 @@
       const layer = document.getElementById('kb-import-layer')?.value;
       const format = document.getElementById('kb-import-format')?.value;
 
-      if (!content) { await hiveAlert('Content is required'); return; }
-      if (!layer) { await hiveAlert('Pick a channel to import into, or create one with "+ New channel".'); return; }
-      if (layer === RESERVED_KB_CHANNEL) { await hiveAlert(RESERVED_KB_CHANNEL + ' is reserved for automation. Choose or create another channel.'); return; }
+      if (!content) { kbFieldError(document.getElementById('kb-import-content'), 'Content is required'); return; }
+      if (!layer) { kbFieldError(document.getElementById('kb-import-layer'), 'Pick a channel to import into, or create one with "+ New channel".'); return; }
+      if (layer === RESERVED_KB_CHANNEL) { kbFieldError(document.getElementById('kb-import-layer'), RESERVED_KB_CHANNEL + ' is reserved for automation. Choose or create another channel.'); return; }
 
       try {
         const r = await fetch('/api/knowledge/import', {
@@ -1790,6 +1867,17 @@
         html += '</div>';
         html += '<div class="kb-sources-note">Clone a GitHub repo locally. Hive indexes the markdown with Fisher-Rao scored search and syncs every 5 minutes.</div>';
 
+        const failedGs = _kbGitSourceFailed;
+        if (failedGs) {
+          html += '<div class="card-inset row-between mb-3" data-kb-gs-failed="1">';
+          html += '<div style="min-width:0;flex:1">';
+          html += `<div style="font-size:var(--fs-base);font-weight:600;color:var(--fg);display:flex;align-items:center;gap:var(--sp-3)"><span class="status-dot" data-status="error" style="width:7px;height:7px;min-width:7px"></span><span>${escapeHtml(failedGs.name)}</span></div>`;
+          html += `<div style="font-size:0.7rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(failedGs.url)}${failedGs.subpath ? ' / ' + escapeHtml(failedGs.subpath) : ''} &middot; error: ${escapeHtml(failedGs.error)}</div>`;
+          html += '</div><div class="row-end">';
+          html += `<button class="hv-btn btn-secondary nous-btn btn-sm" data-action="kbRetryGitSource" title="Load this attempt back into the form to retry">Retry</button>`;
+          html += '<button class="hv-btn btn-danger nous-btn btn-sm" data-action="kbDismissGitSourceFailure">Dismiss</button>';
+          html += '</div></div>';
+        }
         if (gitSources && gitSources.length > 0) {
           for (const gs of gitSources) {
             const gsStatus = statusMeta(gs.ready ? 'ready' : 'initializing');
@@ -1806,19 +1894,23 @@
             html += ` ↗</a>`;
             html += ` &middot; ${escapeHtml(gs.layer)} &middot; ${gs.pages} pages &middot; ${statusText}</div>`;
             html += '</div>';
+            html += '<div class="row-end">';
+            html += `<button class="hv-btn btn-secondary nous-btn btn-sm" data-action="kbEditGitSource" data-arg0="${escapeHtml(gs.url)}" data-arg1="${escapeHtml(gs.subpath || '')}" data-arg2="${escapeHtml(gs.name || '')}" data-arg3="${escapeHtml(gs.branch || '')}" data-arg4="${escapeHtml(gs.layer || '')}" title="Load this source into the form below to correct it">Edit</button>`;
             html += `<button class="hv-btn btn-danger nous-btn btn-sm" data-action="gh18" data-arg0="${escapeHtml(gs.url)}" data-arg1="${escapeHtml(gs.subpath || '')}">Remove</button>`;
+            html += '</div>';
             html += '</div>';
           }
         } else {
           html += '<div class="empty-dashed">No git sources yet.</div>';
         }
 
-        html += '<details open class="kb-sources-add"><summary class="summary-label">Add Git Source</summary>';
+        _kbGitSourceEditing = null;
+        html += '<details open id="kb-gs-form" class="kb-sources-add"><summary class="summary-label">Add Git Source</summary>';
         html += '<div class="stack kb-sources-form">';
-        html += '<input id="kb-gs-url" type="text" class="kb-search-box" placeholder="https://github.com/org/repo">';
-        html += '<input id="kb-gs-name" type="text" class="kb-search-box" placeholder="Display name">';
+        html += '<input id="kb-gs-url" type="text" class="kb-search-box" required aria-required="true" placeholder="Repository URL * (https://github.com/org/repo)">';
+        html += '<input id="kb-gs-name" type="text" class="kb-search-box" required aria-required="true" placeholder="Display name *">';
         html += '<input id="kb-gs-subpath" type="text" class="kb-search-box" placeholder="Subpath (e.g. docs/skills)">';
-        html += '<input id="kb-gs-branch" type="text" class="kb-search-box" placeholder="Branch (default: main)">';
+        html += '<input id="kb-gs-branch" type="text" class="kb-search-box" placeholder="Branch (blank = repo default)">';
         html += `<select id="kb-gs-layer" class="field-input">
           <option value="project">Project</option>
           <option value="org">Org</option>
@@ -1826,7 +1918,8 @@
           <option value="personal">Personal</option>
         </select>`;
         html += '<div class="row-end">';
-        html += '<button class="hv-btn btn-primary nous-btn btn-blue" data-action="kbAddGitSource">Clone &amp; Index</button>';
+        html += '<button type="button" id="kb-gs-cancel" class="hv-btn btn-secondary nous-btn" hidden data-action="kbCancelGitSourceEdit">Cancel</button>';
+        html += '<button id="kb-gs-submit" class="hv-btn btn-primary nous-btn btn-blue" data-action="kbAddGitSource">Clone &amp; Index</button>';
         html += '</div></div></details>';
         html += '</div>';
 
@@ -1852,7 +1945,7 @@
 
         html += '<details open class="kb-sources-add"><summary class="summary-label">Add Subscription</summary>';
         html += '<div class="stack kb-sources-form">';
-        html += '<input id="kb-sub-url" type="text" class="kb-search-box" placeholder="https://wiki.example.com/mcp">';
+        html += '<input id="kb-sub-url" type="text" class="kb-search-box" required aria-required="true" placeholder="URL * (https://wiki.example.com/mcp)">';
         html += `<input id="kb-sub-name" type="text" class="kb-search-box" placeholder="Display name">`;
         html += `<select id="kb-sub-layer" class="field-input">
           <option value="project">Project</option>
@@ -1899,7 +1992,7 @@
 
         html += '<details open class="kb-sources-add"><summary class="summary-label">Import Document</summary>';
         html += '<div class="stack kb-sources-form">';
-        html += '<input id="kb-doc-url" type="text" class="kb-search-box" placeholder="https://arxiv.org/pdf/2309.06180">';
+        html += '<input id="kb-doc-url" type="text" class="kb-search-box" required aria-required="true" placeholder="URL * (https://arxiv.org/pdf/2309.06180)">';
         html += '<input id="kb-doc-name" type="text" class="kb-search-box" placeholder="Name (optional, derived from URL)">';
         html += `<select id="kb-doc-layer" class="field-input">
           <option value="project">Project</option>
@@ -1910,6 +2003,18 @@
         html += '<div class="row-end">';
         html += '<button class="hv-btn btn-primary nous-btn btn-blue" data-action="kbImportDocFromModal">Import</button>';
         html += '</div></div></details>';
+
+        html += '<details class="kb-sources-add"><summary class="summary-label">🎙️ Plaud voice notes</summary>';
+        html += '<div class="stack kb-sources-form">';
+        html += '<div class="muted-xs">Make your Plaud Note recordings (Plaud summary + transcript) searchable knowledge via the free official Plaud MCP server. $0 beyond your Plaud plan; sign-in is Plaud OAuth in your browser.</div>';
+        html += '<div><button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbOpenPlaudIntegration">Configure in Integrations</button></div>';
+        html += '</div></details>';
+
+        html += '<details class="kb-sources-add"><summary class="summary-label">🗣️ Wispr Flow dictation</summary>';
+        html += '<div class="stack kb-sources-form">';
+        html += '<div class="muted-xs">Dictate straight into any field here — put the cursor in <strong>+ New Fact</strong> and hold the Flow key; no connector needed. To also pull your past dictations in, the Wispr Flow connector reads the app\'s local history (flow.sqlite or an export folder). $0 beyond your Wispr Flow plan.</div>';
+        html += '<div><button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbOpenWisprFlowIntegration">Configure in Integrations</button></div>';
+        html += '</div></details>';
 
         html += '<details open class="kb-sources-add"><summary class="summary-label">📚 Import from Context7</summary>';
         html += '<div class="stack kb-sources-form">';
@@ -1959,7 +2064,7 @@
           <option value="markdown" selected>Markdown</option>
           <option value="json">JSON</option>
         </select>`;
-        html += '<textarea id="kb-import-content" rows="8" class="kb-sources-textarea" placeholder="# Guard .join() against undefined\n\nAlways use (arr || []).join(\',\')..."></textarea>';
+        html += '<textarea id="kb-import-content" rows="8" class="kb-sources-textarea" required aria-required="true" placeholder="# Guard .join() against undefined\n\nAlways use (arr || []).join(\',\')..."></textarea>';
         html += '<div class="row-between kb-sources-actions">';
         html += '<label class="kb-sources-file"><span>or load from file:</span><input type="file" accept=".md,.json,.txt" data-change-action="kbLoadFile" data-arg-types="t"></label>';
         html += '<button class="hv-btn btn-primary nous-btn btn-blue" data-action="kbSubmitImport">Import</button>';
@@ -1975,6 +2080,86 @@
       }
     }
 
+    function kbClearFieldError(el) {
+      if (!el) return;
+      el.classList.remove('field-invalid');
+      el.removeAttribute('aria-invalid');
+      const next = el.nextElementSibling;
+      if (next && next.classList.contains('field-error')) next.remove();
+    }
+
+    // Marks a required input invalid, shows msg directly under it and focuses it; clears on the next edit.
+    function kbFieldError(el, msg) {
+      if (!el) { showToast(msg, 'error'); return; }
+      kbClearFieldError(el);
+      el.classList.add('field-invalid');
+      el.setAttribute('aria-invalid', 'true');
+      const err = document.createElement('div');
+      err.className = 'field-error';
+      err.setAttribute('role', 'alert');
+      err.textContent = msg;
+      el.insertAdjacentElement('afterend', err);
+      el.addEventListener('input', () => kbClearFieldError(el), { once: true });
+      el.addEventListener('change', () => kbClearFieldError(el), { once: true });
+      el.focus();
+    }
+
+    function kbGitSourceSubmitLabel() {
+      return _kbGitSourceEditing ? 'Save' : 'Clone & Index';
+    }
+
+    // Keeps the submit label and Cancel visibility in step with _kbGitSourceEditing.
+    function kbSyncGitSourceFormMode() {
+      const btn = document.getElementById('kb-gs-submit');
+      if (btn) btn.textContent = kbGitSourceSubmitLabel();
+      const cancel = document.getElementById('kb-gs-cancel');
+      if (cancel) cancel.hidden = !_kbGitSourceEditing;
+    }
+
+    function kbEditGitSource(url, subpath, name, branch, layer) {
+      _kbGitSourceEditing = { url, subpath: subpath || '' };
+      const fields = { 'kb-gs-url': url, 'kb-gs-name': name, 'kb-gs-subpath': subpath, 'kb-gs-branch': branch };
+      for (const id of Object.keys(fields)) {
+        const input = document.getElementById(id);
+        if (!input) continue;
+        input.value = fields[id] || '';
+        kbClearFieldError(input);
+      }
+      const layerSel = document.getElementById('kb-gs-layer');
+      if (layerSel) layerSel.value = layer || 'project';
+      const form = document.getElementById('kb-gs-form');
+      if (form) form.open = true;
+      kbSyncGitSourceFormMode();
+      document.getElementById('kb-gs-url')?.focus();
+    }
+
+    function kbRetryGitSource() {
+      const f = _kbGitSourceFailed;
+      if (!f) return;
+      kbEditGitSource(f.url, f.subpath, f.name, f.branch, f.layer);
+      // A failed Save keeps targeting the original source; a failed connect is a fresh add.
+      _kbGitSourceEditing = f.editing || null;
+      kbSyncGitSourceFormMode();
+    }
+
+    function kbDismissGitSourceFailure() {
+      _kbGitSourceFailed = null;
+      kbLoadSubscriptions();
+    }
+
+    function kbCancelGitSourceEdit() {
+      _kbGitSourceEditing = null;
+      for (const id of ['kb-gs-url', 'kb-gs-name', 'kb-gs-subpath', 'kb-gs-branch']) {
+        const input = document.getElementById(id);
+        if (!input) continue;
+        input.value = '';
+        kbClearFieldError(input);
+      }
+      const layerSel = document.getElementById('kb-gs-layer');
+      if (layerSel) layerSel.value = 'project';
+      kbSyncGitSourceFormMode();
+    }
+
     async function kbAddGitSource() {
       const url = document.getElementById('kb-gs-url')?.value?.trim();
       const name = document.getElementById('kb-gs-name')?.value?.trim();
@@ -1982,24 +2167,36 @@
       const branch = document.getElementById('kb-gs-branch')?.value?.trim();
       const layer = document.getElementById('kb-gs-layer')?.value;
 
-      if (!url) { await hiveAlert('Repository URL is required'); return; }
-      if (!name) { await hiveAlert('Display name is required'); return; }
+      if (!url) { kbFieldError(document.getElementById('kb-gs-url'), 'Repository URL is required'); return; }
+      if (!name) { kbFieldError(document.getElementById('kb-gs-name'), 'Display name is required'); return; }
 
-      const btn = document.querySelector('#kb-subs-content button[onclick="kbAddGitSource()"]');
-      if (btn) { btn.disabled = true; btn.textContent = 'Cloning...'; }
+      const editing = _kbGitSourceEditing;
+      const btn = document.querySelector('#kb-subs-content [data-action="kbAddGitSource"]');
+      if (btn) { btn.disabled = true; btn.textContent = editing ? 'Saving…' : 'Cloning…'; }
 
       try {
+        const payload = editing
+          ? { url: editing.url, subpath: editing.subpath, new_url: url, new_subpath: subpath || '', name, branch: branch || '', layer }
+          : { url, name, subpath: subpath || '', branch: branch || '', layer };
         const r = await fetch('/api/knowledge/git-sources', {
-          method: 'POST', headers: _inceptionAuthHeaders(),
-          body: JSON.stringify({ url, name, subpath: subpath || '', branch: branch || 'main', layer }),
+          method: editing ? 'PUT' : 'POST', headers: _inceptionAuthHeaders(),
+          body: JSON.stringify(payload),
         });
-        if (!r.ok) { const e = await r.json(); await hiveAlert(e.error || 'Failed to add git source'); return; }
+        if (!r.ok) {
+          const e = await r.json();
+          const reason = e.error || (editing ? 'Failed to save git source' : 'Failed to add git source');
+          _kbGitSourceFailed = { url, subpath: subpath || '', name, branch: branch || '', layer, error: reason, editing };
+          kbLoadSubscriptions();
+          await hiveAlert(reason);
+          return;
+        }
+        _kbGitSourceFailed = null;
         kbLoadSubscriptions();
         fetchKnowledgeStats();
       } catch (e) {
         await hiveAlert('Error: ' + e.message);
       } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Clone & Index'; }
+        if (btn) { btn.disabled = false; btn.textContent = kbGitSourceSubmitLabel(); }
       }
     }
 
@@ -2021,7 +2218,7 @@
       const name = document.getElementById('kb-sub-name')?.value?.trim();
       const layer = document.getElementById('kb-sub-layer')?.value;
 
-      if (!url) { await hiveAlert('URL is required'); return; }
+      if (!url) { kbFieldError(document.getElementById('kb-sub-url'), 'URL is required'); return; }
 
       try {
         const r = await fetch('/api/knowledge/subscriptions', {
@@ -2053,9 +2250,9 @@
       const name = document.getElementById('kb-doc-name')?.value?.trim();
       const layer = document.getElementById('kb-doc-layer')?.value;
 
-      if (!url) { await hiveAlert('Document URL is required'); return; }
+      if (!url) { kbFieldError(document.getElementById('kb-doc-url'), 'Document URL is required'); return; }
 
-      const btn = document.querySelector('#kb-subs-content button[onclick="kbImportDocFromModal()"]');
+      const btn = document.querySelector('#kb-subs-content [data-action="kbImportDocFromModal"]');
       if (btn) { btn.disabled = true; btn.textContent = 'Importing...'; }
 
       try {
@@ -2300,9 +2497,12 @@
       html += '<div class="kb-integration-connector-title"><code>' + escapeHtml(c.name) + '</code> <span class="kc-pill" data-status="' + escapeHtml(status) + '">' + escapeHtml(status) + '</span></div>';
       html += '<div class="muted-xs">' + escapeHtml(c.layer || 'project') + ' · ' + escapeHtml(c.interval || '15m') + ' · last sync ' + escapeHtml(kcAgo(r.last_sync)) + ' · pages/facts ' + (r.pages || 0) + '/' + (r.facts || 0) + escapeHtml(publish) + '</div>';
       if (r.last_error) html += '<div class="kc-error" title="' + escapeHtml(r.last_error) + '">' + escapeHtml(r.last_error.length > 140 ? r.last_error.slice(0, 140) + '…' : r.last_error) + '</div>';
+      if (type === 'plaud') html += kbPlaudAuthLine(c.name) + kbPlaudPasteHtml(c.name);
+      if (type === 'wisprflow') html += kbWisprFlowSourceLine(c);
       html += '</div>';
       if (owner) {
         html += '<div class="kb-integration-actions">';
+        if (type === 'plaud') html += kbPlaudAuthButtons(c.name);
         html += '<button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbIntegrationSync" data-arg0="' + escapeHtml(c.name) + '"' + (status === 'syncing' ? ' disabled' : '') + '>Sync now</button>';
         html += '<button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbIntegrationEdit" data-arg0="' + escapeHtml(c.name) + '">Edit</button>';
         html += '<button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbIntegrationToggle" data-arg0="' + escapeHtml(c.name) + '">' + (c.enabled ? 'Disable' : 'Enable') + '</button>';
@@ -2318,7 +2518,7 @@
       const connectors = (_kcState.connectors || []).filter(c => c.type === type);
       if (!_kbIntegrationEditName || !connectors.some(c => c.name === _kbIntegrationEditName)) _kbIntegrationEditName = connectors[0]?.name || '';
       const edited = connectors.find(c => c.name === _kbIntegrationEditName) || { name: '', type, enabled: true, layer: 'project', interval: '', scope: {}, auth: {} };
-      let html = '<div class="card-inset mb-5"><div class="row-between"><div><div class="title-sm kb-integration-title">' + kbIntegrationIcon(type) + escapeHtml(info.label) + '</div><p class="muted-note m-0">' + escapeHtml(info.description) + '</p></div><a href="/docs/knowledge-connectors.md" target="_blank" rel="noopener" class="hv-btn btn-secondary btn-sm">Docs ↗</a></div></div>';
+      let html = '<div class="card-inset mb-5"><div class="row-between"><div><div class="title-sm kb-integration-title">' + kbIntegrationIcon(type) + escapeHtml(info.label) + '</div><p class="muted-note m-0">' + escapeHtml(info.description) + '</p></div><span class="row">' + (type === 'plaud' ? '<a href="/docs/inbox-voice-sources.md" target="_blank" rel="noopener" class="hv-btn btn-secondary btn-sm">Inbox quickstart ↗</a>' : '') + '<a href="/docs/knowledge-connectors.md" target="_blank" rel="noopener" class="hv-btn btn-secondary btn-sm">Docs ↗</a></span></div></div>';
       html += '<div class="row-between mb-4"><div class="section-label m-0">Configured entries</div>' + (owner ? '<button type="button" class="hv-btn btn-primary btn-sm" data-action="kbIntegrationNew" data-arg0="' + escapeHtml(type) + '">Add ' + escapeHtml(info.label) + '</button>' : '') + '</div>';
       html += connectors.length ? connectors.map(c => kbConnectorRow(type, c, owner)).join('') : '<div class="empty-dashed mb-4">No ' + escapeHtml(info.label) + ' connector configured yet.</div>';
       html += owner ? kbConnectorFormHTML(type, edited, !!edited.name) : '<p class="muted-note">Only the hive owner can edit connector configuration.</p>';
@@ -2339,6 +2539,8 @@
       html += '<label class="muted-note">Credential reference<input class="kb-search-box mt-2" type="text" data-kb-kc-auth-value value="' + escapeHtml(authVal) + '" placeholder="TOKEN_ENV or /run/secrets/token" autocomplete="off"></label></div>';
       html += '<div class="kb-integration-scope-grid">' + kcScopeFieldsHTML(type, c.scope || {}) + '</div>';
       if (type === 'context7') html += kbContext7FormExtras(c);
+      if (type === 'wisprflow') html += '<p class="muted-xs" data-kb-wisprflow-note>Leave the credential source as None: the connector reads Wispr Flow\'s local history read-only with the sqlite3 CLI. Leave the path empty for the default app location on the hive host (macOS: ~/Library/Application Support/Wispr Flow/flow.sqlite; Windows: %APPDATA%\\Wispr Flow\\flow.sqlite), or point it at a copy of flow.sqlite or a folder of exported .json/.ndjson/.csv/.md files. New dictations need no connector at all — dictate into + New Fact directly.</p>';
+      if (type === 'plaud') html += '<p class="muted-xs" data-kb-plaud-note>Leave the credential source as None: Plaud signs in with its own OAuth flow (Connect on the entry above) and keeps the token in the MCP server\'s own store. Requires Node.js ≥ 20 on the hive host and costs nothing beyond your Plaud plan.</p>';
       html += '<label class="muted-note kb-integration-enabled"><input type="checkbox" data-kb-kc-enabled' + (c.enabled ? ' checked' : '') + '> Enabled</label>';
       html += '<div class="hive-dialog-error" role="alert" data-kb-kc-msg></div>';
       html += '<div class="row-end kb-integration-form-actions"><button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbIntegrationValidate">Validate</button><button type="button" class="hv-btn btn-primary btn-sm" data-action="kbIntegrationSave">Save</button></div></div>';
@@ -2423,3 +2625,90 @@
       setTimeout(() => kbLoadIntegrationsModal(_kbIntegrationSelected), 1500);
     }
 
+    // ── Plaud sign-in (OAuth through the Plaud MCP server) ──
+    // Cached per connector name; loaded lazily when the Plaud card renders.
+    const _kbPlaudAuth = {};
+    function kbPlaudAuthLine(name) {
+      const a = _kbPlaudAuth[name];
+      if (!a) {
+        setTimeout(() => kbPlaudAuthLoad(name, false), 0);
+        return '<div class="muted-xs" data-kb-plaud-auth="' + escapeHtml(name) + '">Plaud: checking sign-in…</div>';
+      }
+      let text;
+      if (a.error) text = 'Plaud: ' + a.error;
+      else if (a.pending) text = 'Plaud: waiting for authorization' + (a.auth_url ? ' — <a href="' + escapeHtml(a.auth_url) + '" target="_blank" rel="noopener">open the Plaud authorization page ↗</a>' : ' (URL pending…)');
+      else if (a.connected) text = 'Plaud: connected' + (a.account ? ' as <strong>' + escapeHtml(a.account) + '</strong>' : '');
+      else text = 'Plaud: not connected' + (a.message ? ' — ' + escapeHtml(a.message) : '');
+      return '<div class="muted-xs" data-kb-plaud-auth="' + escapeHtml(name) + '" data-connected="' + (a.connected ? '1' : '0') + '">' + text + '</div>';
+    }
+    function kbPlaudAuthButtons(name) {
+      const a = _kbPlaudAuth[name] || {};
+      const n = escapeHtml(name);
+      let html = '';
+      if (a.connected) html += '<button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbPlaudDisconnect" data-arg0="' + n + '">Disconnect</button>';
+      else html += '<button type="button" class="hv-btn btn-primary btn-sm" data-action="kbPlaudConnect" data-arg0="' + n + '"' + (a.pending ? ' disabled' : '') + '>Connect Plaud</button>';
+      html += '<button type="button" class="hv-btn btn-secondary btn-sm" data-action="kbPlaudRefreshAuth" data-arg0="' + n + '" title="Re-check sign-in with Plaud">Check</button>';
+      return html;
+    }
+    async function kbPlaudAuthLoad(name, refresh) {
+      try {
+        const r = await fetch('/api/knowledge/connectors/' + encodeURIComponent(name) + '/auth' + (refresh ? '?refresh=1' : ''));
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        _kbPlaudAuth[name] = data;
+      } catch (e) {
+        _kbPlaudAuth[name] = { error: e.message };
+      }
+      if (document.querySelector('[data-kb-plaud-auth="' + CSS.escape(name) + '"]')) kbRenderIntegrationsModal();
+    }
+    async function kbPlaudRefreshAuth(name) {
+      showToast('Checking Plaud sign-in…', 'info');
+      await kbPlaudAuthLoad(name, true);
+    }
+    async function kbPlaudConnect(name) {
+      try {
+        const r = await fetch('/api/knowledge/connectors/' + encodeURIComponent(name) + '/auth/connect', { method: 'POST' });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        _kbPlaudAuth[name] = data;
+        kbRenderIntegrationsModal();
+        if (data.connected) showToast('Plaud connected' + (data.account ? ' as ' + data.account : ''), 'success');
+        else if (data.auth_url) { showToast('Open the Plaud authorization link shown on the card, then click Check.', 'info'); kbPlaudPollAuth(name, 0); }
+        else showToast('Plaud login started; the authorization URL will appear on the card shortly.', 'info');
+        if (!data.connected && !data.auth_url) kbPlaudPollAuth(name, 0);
+      } catch (e) {
+        showToast('Plaud connect failed: ' + e.message, 'error');
+      }
+    }
+    // Poll the cached state while a login is pending (URL arrival, completion).
+    function kbPlaudPollAuth(name, attempt) {
+      if (attempt > 60) return;
+      setTimeout(async () => {
+        await kbPlaudAuthLoad(name, false);
+        const a = _kbPlaudAuth[name] || {};
+        if (a.connected) { showToast('Plaud connected' + (a.account ? ' as ' + a.account : ''), 'success'); return; }
+        if (a.pending) kbPlaudPollAuth(name, attempt + 1);
+      }, 5000);
+    }
+    async function kbPlaudDisconnect(name) {
+      if (!(await hiveConfirm('Sign out of Plaud? Synced recordings stay in the vault until you remove the connector.'))) return;
+      try {
+        const r = await fetch('/api/knowledge/connectors/' + encodeURIComponent(name) + '/auth/disconnect', { method: 'POST' });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        _kbPlaudAuth[name] = data;
+        kbRenderIntegrationsModal();
+        showToast('Plaud disconnected', 'success');
+      } catch (e) {
+        showToast('Plaud disconnect failed: ' + e.message, 'error');
+      }
+    }
+    function kbOpenPlaudIntegration() { _kbIntegrationSelected = 'plaud'; _kbIntegrationEditName = ''; kbOpenIntegrations(); }
+
+    // ── Wispr Flow (local dictation history, no sign-in) ──
+    function kbWisprFlowSourceLine(c) {
+      const path = (c.scope && c.scope.path) || '';
+      const group = (c.scope && c.scope.group) === 'day' ? 'one fact per day' : 'one fact per dictation';
+      return '<div class="muted-xs" data-kb-wisprflow-source>Wispr Flow: ' + (path ? '<code>' + escapeHtml(path) + '</code>' : 'default app location on the hive host') + ' · ' + group + '</div>';
+    }
+    function kbOpenWisprFlowIntegration() { _kbIntegrationSelected = 'wisprflow'; _kbIntegrationEditName = ''; kbOpenIntegrations(); }

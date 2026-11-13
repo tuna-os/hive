@@ -196,6 +196,7 @@ func TestStageTrackerAdvisoryChipAndAction(t *testing.T) {
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED"),
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS"),
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION"),
 		jsConstLine(t, html, "STAGE_TRACKER_PRE_MERGE_SOAK"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTIVE_WORD"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTOR"),
@@ -233,6 +234,10 @@ func TestStageTrackerAdvisoryChipAndAction(t *testing.T) {
 		jsFunc(t, html, "stageTrackerActorTip"),
 		jsFunc(t, html, "stageTrackerHeadline"),
 		jsFunc(t, html, "stageTrackerSegments"),
+		jsFunc(t, html, "stageTrackerWaitingOnPerson"),
+		jsFunc(t, html, "stageTrackerTrackRunning"),
+		jsFunc(t, html, "stageTrackerAgoWord"),
+		jsFunc(t, html, "stageTrackerActivityTrackHtml"),
 		jsFunc(t, html, "stageTrackerStripItems"),
 		jsFunc(t, html, "stageTrackerItemOnHold"),
 		jsFunc(t, html, "stageTrackerItemNeedsHuman"),
@@ -293,7 +298,7 @@ const ordinary = { repo: 'o/r', number: 2, kind: 'issue', stage: 0, caption: 'No
 const ids = as => as.map(a => a.id);
 const ctx = { user: true, canHold: true, canHuman: true };
 const as = stageTrackerRowActions(empty, ctx);
-assert.deepStrictEqual(ids(as), ['decide:close-read', 'hold', 'retry', 'needs-human', 'open', 'copy'], ids(as).join(','));
+assert.deepStrictEqual(ids(as), ['decide:close-read', 'hold', 'retry', 'needs-human', 'decide:close-issue', 'open', 'copy'], ids(as).join(','));
 assert.strictEqual(as[0].label, 'Close now');
 assert.ok(as[0].lead && as[0].enabled, JSON.stringify(as[0]));
 assert.ok(as[0].hint.startsWith('nothing found'), as[0].hint);

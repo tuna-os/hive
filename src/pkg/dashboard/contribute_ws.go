@@ -116,11 +116,32 @@ type ContributorConnection struct {
 	advisorModel  string
 	advisorEffort string
 	standby       map[string]StandbyConnectionState
-	role          string // empty = task-driven mode, "scanner"/"reviewer"/etc. = role mode
-	clientRole    string // relay-requested HIVE_AGENT_ROLE; owner assignment may override it
-	assignedRole  string // owner-selected role; "none" forces general work
-	connectedAt   time.Time
-	currentTask   *WSTaskAssign
+	// standbyDeclared is set by ANY standby_declare on this connection,
+	// accepted or rejected, and cleared when standby_release leaves no lane
+	// recorded. A relay in standby mode never asks for ordinary work, even
+	// when every lane it declared was rejected (a suspended standby key), so
+	// RoleCoverage must not count it as covering its role either way.
+	standbyDeclared bool
+	// busyElsewhere is the relay's own report (busy_elsewhere, capability
+	// busy_elsewhere_v1) that it is working a task from ANOTHER hive it is
+	// subscribed to. Such a relay heartbeats and keeps its role here but asks
+	// this hub for nothing until that task ends, so RoleCoverage skips it
+	// unless this hub has handed it work too. Set and cleared by the relay;
+	// also cleared by the relay's next `ready` here (a relay asks only when it
+	// holds no task), and it dies with the connection. A relay that never sends
+	// busy_elsewhere leaves it false, which is today's reading.
+	busyElsewhere bool
+	// quotaHeld is the relay's own report (quota_hold, capability
+	// quota_hold_v1) that its contributor quota guard or provider quota hold
+	// is withholding `ready`: the socket stays up and heartbeats, but the
+	// relay asks for no work. RoleCoverage skips such a connection. A relay
+	// that never sends quota_hold leaves it false, which is today's reading.
+	quotaHeld    bool
+	role         string // empty = task-driven mode, "scanner"/"reviewer"/etc. = role mode
+	clientRole   string // relay-requested HIVE_AGENT_ROLE; owner assignment may override it
+	assignedRole string // owner-selected role; "none" forces general work
+	connectedAt  time.Time
+	currentTask  *WSTaskAssign
 	// fixTasks are the fix-pr tasks in flight on this connection, keyed by
 	// task id (hivecommons/hive#12436). They never replace currentTask: a
 	// spawned fix runs beside the primary task and a preempting one parks it.
@@ -157,7 +178,18 @@ type ContributorConnection struct {
 	// (task_run_log.go). Zero when no task is active or the task was adopted
 	// via the resume path without a fresh assignment.
 	taskAssignedAt time.Time
-	lastPong       time.Time
+	// adoptedOnResume and resumedAssignedAt carry the run log's duration
+	// anchor for a task this connection adopted on the task_progress resume
+	// path (a socket flap, or a hub restart that restored the lease from
+	// disk). Such a connection never saw the assignment, so taskAssignedAt
+	// stays zero — and stays zero on purpose, because its other readers
+	// (the fast-failure streak, standby dispatch stamps, settle evidence)
+	// were written against that. resumedAssignedAt is the lease's ORIGINAL
+	// assignment time instead, zero when the lease predates that field;
+	// runStartLocked picks between the two. A fresh assignment clears both.
+	adoptedOnResume   bool
+	resumedAssignedAt time.Time
+	lastPong          time.Time
 	// tmuxOutput is the last pane snapshot the relay reported, and
 	// tmuxOutputTask is the task_id that report named (#7605). Every
 	// task_progress and task_complete frame overwrites both, so the pane on
@@ -190,8 +222,18 @@ type ContributorConnection struct {
 	// connection (#2546): one of the taskUnavailable* reasons. It lets the ops tab
 	// show WHY a connected clanker is idle (suspended vs hub-not-ready vs
 	// no-matching-work vs an enforced refusal) instead of an indistinguishable
-	// silence. Cleared when a task is actually assigned. Purely diagnostic.
+	// silence. Cleared with lastIdleReasonSince below. It never routes or gates
+	// a work item; its one gating reader is RoleCoverage, which uses the pair to
+	// tell the governor a relay is not working its lane.
 	lastIdleReason string
+	// lastIdleReasonSince is when the current run of lastIdleReason began: the
+	// first of the consecutive task_unavailable answers that carried it, with
+	// no_matching_work and repo_unmintable counted as one run (idleRunKey).
+	// Set by noteIdleReasonLocked; zeroed with lastIdleReason by
+	// clearIdleReasonLocked when a task is assigned or adopted on resume, or a
+	// fix-pr task is dispatched. RoleCoverage stops counting a relay that has
+	// had nothing but "no work for you" for coverageNoWorkWindow.
+	lastIdleReasonSince time.Time
 	// capabilities is the client-declared runtime posture from auth_response
 	// (#2547 declare half): container runtime, OS/arch, agent/relay versions,
 	// credential type. Nil when the client declared nothing (an unversioned
@@ -537,6 +579,7 @@ type WSMessage struct {
 	Permissions                  []string                    `json:"permissions,omitempty"`
 	Reason                       string                      `json:"reason,omitempty"`
 	State                        string                      `json:"state,omitempty"`
+	Since                        string                      `json:"since,omitempty"`
 	ContributeNeedsDecisionLabel *string                     `json:"contribute_needs_decision_label,omitempty"`
 	OperatorMessage              *ContributorOperatorMessage `json:"operator_message,omitempty"`
 	// FailureKind is the OPTIONAL, client-declared cause of a task_failed
@@ -961,6 +1004,9 @@ type ContributeWSHub struct {
 	fixSched      *fixqueue.Scheduler
 	fixOwners     map[string]map[string]bool
 	fixDispatched func(*ContributorConnection, WSMessage)
+	// prOpenFn overrides the forge-cache lookup the fleet snapshot uses to
+	// drop merged/closed PRs from a contributor's rework; a test hook.
+	prOpenFn func(repo string, number int) (open, known bool)
 	// fixFailedSig is closed (and replaced) whenever a relay reports a
 	// fix-pr task failed, waking a Nudge that is waiting to learn whether its
 	// dispatch was refused (hivecommons/hive#14668). fixAckGrace overrides
@@ -971,6 +1017,12 @@ type ContributeWSHub struct {
 	fixWaiters   int
 	fixFailures  map[string]string
 	fixAckGrace  time.Duration
+	// fixRetryAfter replaces time.AfterFunc for the re-dispatch of a fix the
+	// relay handed back unstarted (retryReturnedFixAfter); a test hook.
+	fixRetryAfter func(time.Duration, func())
+	// fixPRStateHook replaces fixPRStateOf's GitHub read of a queued PR's
+	// state (open, merged, closed); a test hook.
+	fixPRStateHook func(ctx context.Context, repo string, number int) (fixPRState, string, error)
 	// stageStore is the stage-label memory the fleet view reads "PRs returned
 	// to this contributor" from (hivecommons/hive#12502). Nil means the
 	// process-wide stagelabels.Shared(); tests inject an in-memory store.
@@ -1109,7 +1161,13 @@ type ContributeWSHub struct {
 	// EXPIRING before the next dispatch, so this must survive that sweep.
 	// Guarded by completedMu; persisted in the same PVC-backed ledger dir as
 	// the cooldowns so a pod restart does not forget the verdict.
-	noWorkVerdicts         map[string]noWorkVerdictRecord
+	noWorkVerdicts map[string]noWorkVerdictRecord
+	// idleCompletions records, per work item, the reason of the latest
+	// no-PR idle completion (contribute_idle_completions.go): why the last
+	// relay dropped the issue. Explanation only — it never withholds an
+	// issue. Guarded by completedMu and persisted beside the no-PR streaks.
+	idleCompletions        map[string]idleCompletionRecord
+	idleCompletionsFile    string
 	standbyReconcileCancel context.CancelFunc
 	standbyReconcileDone   chan struct{}
 	standbyOutcomes        []standbyOutcomeRecord
@@ -1213,6 +1271,14 @@ type ContributeWSHub struct {
 	// GHClient. gateParkRekicks records the one re-kick each issue gets.
 	gateParkReleaser func(ctx context.Context, repo string, number int, reporter, reason string) error
 	gateParkRekicks  gateParkRekicks
+	// needsDecisionParkPoster is the seam for posting the question a
+	// needs-decision park was left without (contribute_needs_decision_park.go);
+	// nil means use GHClient.
+	needsDecisionParkPoster func(ctx context.Context, repo string, number int, since time.Time, body string) error
+	// needsDecisionParkRetry holds the retry of a park question GitHub
+	// refused for a rate limit: its test seams and the count of questions
+	// waiting (contribute_needs_decision_park_retry.go).
+	needsDecisionParkRetry needsDecisionParkRetryState
 	// verdictBlockerRecorder is the seam for recording the blocker a blocked
 	// verdict names (contribute_verdict_blocker.go); nil means use GHClient.
 	// verdictBlockersRecorded dedupes re-delivered verdicts per task.
@@ -1306,6 +1372,7 @@ func NewContributeWSHub(logger *slog.Logger, server *Server) *ContributeWSHub {
 		reclaimCooldowns:          make(map[string]time.Time),
 		noPRStreaks:               make(map[string]noPRStreakRecord),
 		noWorkVerdicts:            make(map[string]noWorkVerdictRecord),
+		idleCompletions:           make(map[string]idleCompletionRecord),
 		standbyOutcomes:           []standbyOutcomeRecord{},
 		activityFilePath:          contributorStatePath(contributorsDir, activityFilePath, "activity.json"),
 		completedTasksFile:        contributorStatePath(contributorsDir, completedTasksFile, "completed-tasks.json"),
@@ -1337,6 +1404,7 @@ func NewContributeWSHub(logger *slog.Logger, server *Server) *ContributeWSHub {
 	hub.loadFailedTasks()
 	hub.loadNoPRStreaks()
 	hub.loadNoWorkVerdicts()
+	hub.loadIdleCompletions()
 	hub.loadStandbyOutcomes()
 	hub.loadActivity()
 	// #5681: restore the leases the PREVIOUS process issued before any relay can
@@ -1859,13 +1927,13 @@ func (h *ContributeWSHub) appendAbandonedRun(c *ContributorConnection, task *WST
 		AbandonCause:  cause,
 		Reason:        abandonReason(cause),
 	}
-	// Zero when the task was adopted on the resume path without a fresh
-	// assignment (see taskAssignedAt's comment). Left unset rather than
-	// reported as a 0-second run, which would read as an instant hand-back —
-	// the very thing an operator is trying to tell apart from a 26-minute
-	// stall.
-	if !assignedAt.IsZero() {
-		rec.DurationS = time.Since(assignedAt).Seconds()
+	// Zero when the task's start is unknown: a task adopted on the resume
+	// path from a lease written before leases recorded their assignment
+	// time (see runStartLocked). Left unset rather than reported as a
+	// 0-second run, which would read as an instant hand-back — the very
+	// thing an operator is trying to tell apart from a 26-minute stall.
+	if d, ok := runDurationSeconds(assignedAt, time.Now()); ok {
+		rec.DurationS = d
 	}
 	// #7317 item 3: the last pane the relay reported before it gave the task
 	// back or dropped off — for a stall this is the frozen screen itself, the
@@ -2229,7 +2297,7 @@ func (h *ContributeWSHub) yankAndReassign(targets []releaseTarget, reason, revok
 			// the ready handler does.
 			if msg != nil {
 				tgt.conn.mu.Lock()
-				tgt.conn.lastIdleReason = msg.Reason
+				tgt.conn.noteIdleReasonLocked(msg.Reason, time.Now())
 				tgt.conn.mu.Unlock()
 			}
 			continue
@@ -2312,6 +2380,18 @@ func generationAccepted(clientGen, currentGen uint64, everFenced bool) bool {
 		return !everFenced
 	}
 	return clientGen == currentGen
+}
+
+// relayLocalTaskIDPrefix is the task id prefix the contributor relay gives the
+// PR-review task it builds for itself (bin/contributor-relay.js,
+// LOCAL_TASK_ID_PREFIX; kubestellar/hive#5715). The hub never assigns it: hub
+// task ids start "ct-", "fix-" or "run-". Keep the two spellings identical.
+const relayLocalTaskIDPrefix = "pr-review-"
+
+// isRelayLocalTaskID reports whether taskID names a relay-local PR-review task.
+// It only picks a log level; it grants and refuses nothing.
+func isRelayLocalTaskID(taskID string) bool {
+	return strings.HasPrefix(taskID, relayLocalTaskIDPrefix)
 }
 
 func (h *ContributeWSHub) SetAssignedAgentRole(contributorID, assignedRole string, grants []string) {
@@ -2567,6 +2647,10 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.handleStandbyDeclare(msg)
 		case "standby_release":
 			s.handleStandbyRelease(msg)
+		case "quota_hold":
+			s.handleQuotaHold(msg)
+		case "busy_elsewhere":
+			s.handleBusyElsewhere(msg)
 		case "knowledge_state":
 			s.handleKnowledgeState(msg)
 		case "pong":
@@ -2624,7 +2708,7 @@ func (s *wsSession) releaseOnDisconnect() {
 		// #7317: see the `ready` path — captured under the same lock so the
 		// run record can carry how long the task was held before the socket
 		// died.
-		abandonedTaskAt := s.contributor.taskAssignedAt
+		abandonedTaskAt := s.contributor.runStartLocked()
 		s.contributor.currentTask = nil
 		// #2568: bump the generation on release so any late message from this
 		// now-defunct socket carrying the old generation is fenced.
@@ -3175,6 +3259,9 @@ func (s *wsSession) handleStandbyDeclare(msg WSMessage) {
 	config := standbyConfigFromConnection(s.contributor)
 	key := standbyOutcomeKey(s.contributor.profile.GitHubUsername, config)
 	if suspended, _ := s.h.standbySuspended(key); suspended {
+		s.contributor.mu.Lock()
+		s.contributor.standbyDeclared = true
+		s.contributor.mu.Unlock()
 		for _, lane := range lanes {
 			rejected = append(rejected, WSStandbyLane{Lane: lane, Reason: string(standbypkg.ReasonSuspended)})
 		}
@@ -3182,6 +3269,7 @@ func (s *wsSession) handleStandbyDeclare(msg WSMessage) {
 		return
 	}
 	s.contributor.mu.Lock()
+	s.contributor.standbyDeclared = true
 	if s.contributor.standby == nil {
 		s.contributor.standby = map[string]StandbyConnectionState{}
 	}
@@ -3226,8 +3314,77 @@ func (s *wsSession) handleStandbyRelease(msg WSMessage) {
 			delete(s.contributor.standby, lane)
 		}
 	}
+	if len(s.contributor.standby) == 0 {
+		s.contributor.standbyDeclared = false
+	}
 	s.contributor.mu.Unlock()
 	_ = s.contributor.send(WSMessage{Type: "standby_ack", Seq: msg.Seq})
+}
+
+// handleQuotaHold records the relay's report that its quota guard has started
+// or stopped holding all work (capability quota_hold_v1). The relay sends
+// State "held" when it starts withholding `ready` for quota and "released"
+// when it is about to ask again; any other value reads as released, which is
+// what a hub that never heard the message assumes. The flag only feeds
+// RoleCoverage: it changes no lease, no assignment and no standby state, and
+// the relay still declines a pushed assignment on its own while held.
+func (s *wsSession) handleQuotaHold(msg WSMessage) {
+	if s.contributor == nil {
+		return
+	}
+	held := strings.EqualFold(strings.TrimSpace(msg.State), "held")
+	s.contributor.mu.Lock()
+	changed := s.contributor.quotaHeld != held
+	s.contributor.quotaHeld = held
+	s.contributor.mu.Unlock()
+	if changed {
+		reason := strings.TrimSpace(msg.Reason)
+		if len(reason) > 64 {
+			reason = reason[:64]
+		}
+		s.h.logger.Info("[contribute-ws] contributor relay quota hold changed",
+			"id", s.contributor.connID,
+			"username", contributorUsername(s.contributor),
+			"held", held,
+			"reason", reason)
+	}
+}
+
+// handleBusyElsewhere records the relay's report that it has started or
+// finished working a task from another hive it is subscribed to (capability
+// busy_elsewhere_v1). The relay sends State "busy" when such a task starts and
+// "clear" when it ends; any other value reads as clear, which is what a hub
+// that never heard the message assumes. The flag only feeds RoleCoverage: it
+// changes no lease, assignment or standby state here.
+func (s *wsSession) handleBusyElsewhere(msg WSMessage) {
+	if s.contributor == nil {
+		return
+	}
+	busy := strings.EqualFold(strings.TrimSpace(msg.State), "busy")
+	s.contributor.mu.Lock()
+	changed := s.contributor.busyElsewhere != busy
+	s.contributor.busyElsewhere = busy
+	s.contributor.mu.Unlock()
+	if changed {
+		s.logBusyElsewhereChange(busy, msg.Since, "relay")
+	}
+}
+
+// logBusyElsewhereChange is the one log line for a busy_elsewhere transition.
+// since is client-supplied, so it is bounded like quota_hold's reason; source
+// names who cleared it ("relay" for the relay's own frame, "ready" when the
+// relay asked this hub for work).
+func (s *wsSession) logBusyElsewhereChange(busy bool, since, source string) {
+	since = strings.TrimSpace(since)
+	if len(since) > 40 {
+		since = since[:40]
+	}
+	s.h.logger.Info("[contribute-ws] contributor relay busy on another hive changed",
+		"id", s.contributor.connID,
+		"username", contributorUsername(s.contributor),
+		"busy_elsewhere", busy,
+		"since", since,
+		"source", source)
 }
 
 func normalizeStandbyLanes(lanes []string) []string {
@@ -3387,22 +3544,21 @@ func standbyProposeItemTier(item standbypkg.Item) standbypkg.Tier {
 	return standbypkg.NormalizeTier(classify.ProposeStandbyItemTierFromLabels(item.Labels).Tier)
 }
 
-// standbyLaneItems projects the hive's actionable queue into the per-lane item
-// lists QualifiedStandbyCounts takes. The lane split mirrors
-// buildLaneQueueDepths so the M in "N waiting, M qualify" is counted over the
-// same items as the N.
-func standbyLaneItems(lanes []string, actionable *ghpkg.ActionableResult) map[string][]standbypkg.Item {
-	if len(lanes) == 0 || actionable == nil {
+// standbyLaneItems projects the dispatchable admission queue into the per-lane
+// item lists QualifiedStandbyCounts takes. Its lane and held-item filters match
+// standbyDispatchItem so the tile counts only work dispatch can offer.
+func standbyLaneItems(lanes []string, queue []ReadyQueueItem) map[string][]standbypkg.Item {
+	if len(lanes) == 0 || queue == nil {
 		return nil
 	}
 	out := make(map[string][]standbypkg.Item, len(lanes))
 	for _, lane := range lanes {
-		items := make([]standbypkg.Item, 0, len(actionable.Issues.Items))
-		for _, issue := range actionable.Issues.Items {
-			if lane != "scanner" && issue.Lane != lane && issue.Lane != "" {
+		items := make([]standbypkg.Item, 0, len(queue))
+		for _, item := range queue {
+			if item.Held || !strings.EqualFold(strings.TrimSpace(item.Lane), lane) {
 				continue
 			}
-			items = append(items, standbypkg.Item{Repo: issue.Repo, Labels: issue.Labels})
+			items = append(items, standbypkg.Item{Repo: item.Repo, Labels: item.Labels})
 		}
 		out[lane] = items
 	}
@@ -3625,6 +3781,12 @@ func (s *wsSession) handleReady(msg WSMessage) (stop bool) {
 	// #12805: the scope version this ready was sent under; selection only
 	// proceeds when it matches the acknowledged scope (0 = not stated).
 	s.contributor.readyScopeVersion = msg.ScopeVersion
+	// A relay asks for work only when it holds no task, so a ready also says
+	// it is no longer busy on another hive (busy_elsewhere_v1). Clearing here
+	// means a lost "clear" frame cannot keep the relay out of coverage once it
+	// is back asking this hub.
+	wasBusyElsewhere := s.contributor.busyElsewhere
+	s.contributor.busyElsewhere = false
 	abandoned := s.contributor.currentTask
 	// #7317: captured under the same lock as currentTask so the run record
 	// below can report the task's real wall-clock duration. On the session
@@ -3632,7 +3794,7 @@ func (s *wsSession) handleReady(msg WSMessage) (stop bool) {
 	// ~26 min is PANE_STALL_TIMEOUT_MS, ~10 min is CLI_READY_TIMEOUT_MS —
 	// which is the most diagnostic number in the record, and it was being
 	// discarded along with the rest of the abandonment.
-	abandonedAt := s.contributor.taskAssignedAt
+	abandonedAt := s.contributor.runStartLocked()
 	s.contributor.currentTask = nil
 	// #2568: bump the generation on release so a re-`ready` abandon fences any
 	// later message echoing the old generation for the just-abandoned task.
@@ -3644,6 +3806,9 @@ func (s *wsSession) handleReady(msg WSMessage) (stop bool) {
 	s.contributor.credentialDelivered = false
 	s.contributor.pendingExternalTask = nil
 	s.contributor.mu.Unlock()
+	if wasBusyElsewhere {
+		s.logBusyElsewhereChange(false, "", "ready")
+	}
 	if abandoned != nil {
 		// C4: the relay explicitly gave up this task, so revoke its
 		// server-issued lease — a later task_progress for it must not resurrect
@@ -3712,7 +3877,7 @@ func (s *wsSession) handleReady(msg WSMessage) (stop bool) {
 		// no_matching_work). Record the reason on the connection so the ops
 		// tab can show WHY this clanker is idle, then send it.
 		s.contributor.mu.Lock()
-		s.contributor.lastIdleReason = task.Reason
+		s.contributor.noteIdleReasonLocked(task.Reason, time.Now())
 		s.contributor.mu.Unlock()
 		if err := s.contributor.send(*task); err != nil {
 			h.logger.Warn("[contribute-ws] failed to send task_unavailable", "error", err)
@@ -3736,7 +3901,13 @@ func (s *wsSession) handleReady(msg WSMessage) (stop bool) {
 			// the disconnect path finds nothing to release: no release cooldown
 			// on an issue the contributor never received, no lease left to
 			// expire, no rate-window slot spent on a task that never shipped.
-			h.logger.Warn("[contribute-ws] failed to send task_assign; releasing the undelivered claim", "error", err, "task", task.TaskID)
+			// A Close frame can win the race with selection's GitHub calls.
+			// ErrCloseSent is then expected teardown, not a hub defect (#16496).
+			level := slog.LevelWarn
+			if errors.Is(err, websocket.ErrCloseSent) {
+				level = slog.LevelInfo
+			}
+			h.logger.Log(context.Background(), level, "[contribute-ws] failed to send task_assign; releasing the undelivered claim", "error", err, "task", task.TaskID)
 			h.rollbackAssignment(s.contributor, task.TaskID)
 			return true
 		}
@@ -3885,6 +4056,7 @@ func (s *wsSession) handleTaskDeclined(msg WSMessage) {
 		contributor.currentTaskGen = h.nextTaskGen()
 		contributor.lastLeaseRenew = time.Time{}
 		contributor.taskAssignedAt = time.Time{}
+		contributor.clearResumeAnchorLocked()
 		contributor.currentPrompt = ""
 		contributor.currentLabels = nil
 		contributor.pendingToken = ""
@@ -3978,6 +4150,12 @@ func repoScopeGateReason(c *ContributorConnection) string {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return repoScopeGateReasonLocked(c)
+}
+
+// repoScopeGateReasonLocked is repoScopeGateReason for a caller that already
+// holds c.mu (the fleet snapshot explains an undispatched fix with it).
+func repoScopeGateReasonLocked(c *ContributorConnection) string {
 	if c.repoScopeInvalid {
 		return taskUnavailableRepoScopeInvalid
 	}
@@ -4016,6 +4194,14 @@ func (s *wsSession) handleTaskProgress(msg WSMessage) {
 		// rejected: the relay is told to re-`ready` for fresh work.
 		if s.contributor.currentTask == nil {
 			if msg.TaskID == "" {
+				s.contributor.mu.Unlock()
+				return
+			}
+			// A fix-pr task handed out at a task boundary runs as the
+			// relay's primary task and reports progress like one, but it
+			// is tracked in fixTasks and holds no lease. It is not a resume
+			// claim: revoking it killed the fix mid-run.
+			if _, fix := s.contributor.fixTasks[msg.TaskID]; fix {
 				s.contributor.mu.Unlock()
 				return
 			}
@@ -4123,7 +4309,13 @@ func (s *wsSession) handleTaskProgress(msg WSMessage) {
 			s.contributor.mu.Lock()
 			s.contributor.currentTask = rebuilt
 			s.contributor.currentTaskGen = lease.gen
+			s.contributor.clearIdleReasonLocked()
 			s.contributor.lastLeaseRenew = time.Now()
+			// The run log measures this task from its ORIGINAL assignment,
+			// which the lease carries across a flap and a restart; a lease
+			// written before it recorded that time leaves the start unknown.
+			s.contributor.adoptedOnResume = true
+			s.contributor.resumedAssignedAt = lease.assignedAt
 			s.contributor.tmuxOutput = msg.TmuxOutput
 			s.contributor.tmuxOutputTask = lease.taskID
 			s.contributor.mu.Unlock()
@@ -4192,7 +4384,11 @@ func (s *wsSession) handleTaskProgress(msg WSMessage) {
 			)
 			h.recordDecision(s.contributor.profile.GitHubUsername, decisionStaleGenRejected,
 				msg.TaskID, "", 0,
-				"task_progress fenced: client_gen "+strconv.FormatUint(staleGen, 10)+" no longer matches the assignment")
+				"task_progress fenced: client_gen "+strconv.FormatUint(staleGen, 10)+" no longer matches the assignment; task_revoke sent")
+			// hivecommons/hive#16218: without a revoke the relay keeps pinging
+			// every tick for a task it no longer owns, logging a WARN each time.
+			// Live-connection write: go through send (writeMu + write deadline).
+			_ = s.contributor.send(WSMessage{Type: "task_revoke", Seq: h.nextSeq(), TaskID: msg.TaskID, Reason: "stale task generation; the task was released or reassigned"})
 			return
 		}
 		s.contributor.tmuxOutput = msg.TmuxOutput
@@ -4322,10 +4518,12 @@ func (s *wsSession) handleTaskComplete(msg WSMessage) {
 		hasTask := s.contributor.currentTask != nil && s.contributor.currentTask.TaskID == msg.TaskID
 		completedTask := s.contributor.currentTask
 		completedLabels := append([]string(nil), s.contributor.currentLabels...)
-		// Captured before the clear below so the run log can record the
-		// task's wall-clock duration. Zero when the task was adopted
-		// without a fresh assignment; the record then omits duration.
+		// Captured before the clear below. taskAssignedAt is zero for a
+		// task adopted on the resume path; runStart is the run log's
+		// duration anchor, which for such a task is the lease's original
+		// assignment time (zero, and duration omitted, when unknown).
 		taskAssignedAt := s.contributor.taskAssignedAt
+		runStart := s.contributor.runStartLocked()
 		// SECURITY (audit N9, CWE-862/639): clear ONLY when the reported
 		// task_id actually matches the held assignment.
 		//
@@ -4348,6 +4546,7 @@ func (s *wsSession) handleTaskComplete(msg WSMessage) {
 			s.contributor.currentLabels = nil
 			s.contributor.tokenMintedAt = time.Time{}
 			s.contributor.taskAssignedAt = time.Time{}
+			s.contributor.clearResumeAnchorLocked()
 			// #2537: clear any pending/delivered credential state with the task.
 			s.contributor.pendingToken = ""
 			s.contributor.credentialDelivered = false
@@ -4376,21 +4575,23 @@ func (s *wsSession) handleTaskComplete(msg WSMessage) {
 			// bar was "a PR was reported", still trusting an unverified field).
 			// verifiedPR is the ONLY value allowed to unlock the PR-gated
 			// rewards below; the raw msg.PRURL is never trusted directly again.
-			// C4: a completion is terminal — revoke the server-issued lease so a
-			// later task_progress for this task cannot resurrect ownership and be
-			// re-minted a credential.
-			if completedTask != nil {
-				h.completeWavefrontTask(completedTask, completedLabels, taskAssignedAt)
-			}
 			verifiedPR := ""
 			var prDetail ghpkg.PRVerification
 			if completedTask != nil {
 				prDetail = h.verifyReportedPRDetail(completedTask.Repo, msg.PRURL, s.contributor.profile.GitHubUsername)
+				// #17300: the scan ledger has usually not seen a PR the relay
+				// just opened with its own token, so record the verified PR
+				// before the revoke below decides whether the claim is kept.
+				h.recordCompletionPRClaim(completedTask, msg.PRURL, s.contributor.profile.GitHubUsername, prDetail)
 			}
+			// C4: a completion is terminal — revoke the server-issued lease so a
+			// later task_progress for this task cannot resurrect ownership and be
+			// re-minted a credential.
 			// The run only reaches `completed` once the reported PR verified
 			// (#10090); an unverified completion still drops the lease and its
 			// worktree but leaves the run open.
 			if completedTask != nil {
+				h.completeWavefrontTask(completedTask, completedLabels, taskAssignedAt)
 				if !prDetail.Verified || !h.completeImplementStage(identityOf(s.contributor), completedTask.TaskID, time.Now()) {
 					h.releaseImplementStageUnverified(identityOf(s.contributor), completedTask.TaskID)
 				}
@@ -4488,11 +4689,15 @@ func (s *wsSession) handleTaskComplete(msg WSMessage) {
 			// issue is re-offered, and lift the `blocked` label the relay
 			// applied so the fleet's workflow gate does not park it until a
 			// human notices (hivecommons/hive#11775, #11776).
+			blockedWithoutReason := false
 			if downgraded, ok := reclassifyToolingBlockedVerdict(verdict, verdictReason); ok {
-				h.logger.Warn("[contribute-ws] blocked verdict reclassified: reason describes contributor tooling, not an external dependency",
+				h.logger.Warn("[contribute-ws] blocked verdict reclassified: reason is the contributor's own tooling or says nothing, not an external dependency",
 					"username", s.contributor.profile.GitHubUsername,
 					"task", msg.TaskID,
 					"verdict_reason", verdictReason)
+				// ok means the verdict WAS blocked; which of the two grounds
+				// demoted it is read here, while it is still certain.
+				blockedWithoutReason = isBlockedVerdictReasonless(verdictReason)
 				verdict = downgraded
 				if completedTask != nil {
 					go h.releaseToolingBlockedIssue(completedTask, s.contributor.profile.GitHubUsername, verdictReason)
@@ -4522,6 +4727,36 @@ func (s *wsSession) handleTaskComplete(msg WSMessage) {
 					verdict = downgraded
 					go h.releaseGateParkedIssue(completedTask, s.contributor.profile.GitHubUsername, verdictReason)
 				}
+			}
+			// A no-PR idle never goes on record without a reason: the hub
+			// fills in what the completion signal says when the relay sent
+			// none, so the log line and the run record below say why the
+			// issue was dropped (contribute_idle_completions.go).
+			if verdict == completionVerdictIdle && verifiedPR == "" {
+				switch {
+				case blockedWithoutReason:
+					// The agent said blocked and nothing about what it waits
+					// on; the hub demoted that to idle above. Whatever the
+					// reason field held (nothing, or a footer) says nothing,
+					// so the record says what the agent reported.
+					verdictReason = idleCompletionBlockedNoReason
+				case verdictReason != "":
+					// The relay's own reason stands.
+				case strings.TrimSpace(msg.PRURL) != "":
+					// The relay did report a pull request; the hub booked
+					// the completion without it. Say that, not that the
+					// agent stopped without one.
+					verdictReason = idleCompletionReportedPRReason(prDetail.Verified, prDetail.Reason)
+				default:
+					verdictReason = normalizeIdleCompletionReason("", msg.CompletionSignal)
+				}
+			}
+			// A needs-decision verdict that stands parks the issue at 045 with
+			// the relay's label alone; the hub posts the question when the
+			// agent left none (contribute_needs_decision_park.go).
+			if verdict == completionVerdictNeedsDecision && completedTask != nil {
+				taskCopy := *completedTask
+				go h.postNeedsDecisionPark(&taskCopy, msg.TaskID, s.contributor.profile.GitHubUsername, verdictReason, taskAssignedAt)
 			}
 			if completedTask != nil {
 				// #2393 item 7 + #2565: the full week-long cooldown is applied
@@ -4643,8 +4878,8 @@ func (s *wsSession) handleTaskComplete(msg WSMessage) {
 					},
 				})
 			}
-			if !taskAssignedAt.IsZero() {
-				runRec.DurationS = time.Since(taskAssignedAt).Seconds()
+			if d, ok := runDurationSeconds(runStart, time.Now()); ok {
+				runRec.DurationS = d
 			}
 			h.auditRelay(s.contributor, agentaudit.AuditRelayTaskCompleted, completedTask,
 				"pr_url", verifiedPR, "verdict", verdict, "duration_s", int(runRec.DurationS),
@@ -4717,7 +4952,17 @@ func (s *wsSession) handleTaskComplete(msg WSMessage) {
 			// after the handler had already cleared currentTask and the
 			// credential state, which made the bypass look like a no-op in the
 			// logs.
-			h.logger.Warn("[contribute-ws] task_complete for unassigned task ignored (assignment left intact)",
+			//
+			// A relay's own PR-review cycle is the expected case, not a
+			// warning: the relay builds that task locally, sends its
+			// task_complete on purpose, and relies on this branch ignoring it
+			// (bin/contributor-relay.js, LOCAL_TASK_ID_PREFIX). It stays at
+			// debug so it is still traceable; only the log level changes.
+			logUnassigned := h.logger.Warn
+			if isRelayLocalTaskID(msg.TaskID) {
+				logUnassigned = h.logger.Debug
+			}
+			logUnassigned("[contribute-ws] task_complete for unassigned task ignored (assignment left intact)",
 				"username", s.contributor.profile.GitHubUsername,
 				"task", msg.TaskID,
 			)
@@ -4772,9 +5017,11 @@ func (s *wsSession) handleTaskFailed(msg WSMessage) {
 		}
 		hasTask := s.contributor.currentTask != nil && s.contributor.currentTask.TaskID == msg.TaskID
 		failedTask := s.contributor.currentTask
-		// Duration anchor for the run log, captured before the clear —
-		// same shape as task_complete above.
+		// Captured before the clear — same shape as task_complete above:
+		// runStart is the run log's duration anchor, taskAssignedAt the
+		// fresh-assignment stamp the fast-failure streak reads.
 		taskAssignedAt := s.contributor.taskAssignedAt
+		runStart := s.contributor.runStartLocked()
 		// SECURITY (audit N9, CWE-862/639): same hole as task_complete —
 		// clear only on a genuine TaskID match. Unconditionally, a failure
 		// naming any other task released the assignment while revokeLease
@@ -4785,6 +5032,7 @@ func (s *wsSession) handleTaskFailed(msg WSMessage) {
 			s.contributor.currentTask = nil
 			s.contributor.tokenMintedAt = time.Time{}
 			s.contributor.taskAssignedAt = time.Time{}
+			s.contributor.clearResumeAnchorLocked()
 			// #2537: clear any pending/delivered credential state with the task.
 			s.contributor.pendingToken = ""
 			s.contributor.credentialDelivered = false
@@ -4881,8 +5129,8 @@ func (s *wsSession) handleTaskFailed(msg WSMessage) {
 				runRec.Repo = failedTask.Repo
 				runRec.Number = failedTask.Number
 			}
-			if !taskAssignedAt.IsZero() {
-				runRec.DurationS = time.Since(taskAssignedAt).Seconds()
+			if d, ok := runDurationSeconds(runStart, time.Now()); ok {
+				runRec.DurationS = d
 			}
 			h.auditRelay(s.contributor, agentaudit.AuditRelayTaskFailed, failedTask,
 				"class", failureKind, "duration_s", int(runRec.DurationS))
@@ -5217,6 +5465,9 @@ func (h *ContributeWSHub) cleanupLoop() {
 			if n := h.claimsLedger().Expire(); n > 0 {
 				h.logger.Info("[claims] expired claims released", "count", n)
 			}
+			// #17300: a claim kept for its holder's covering PR lasts until
+			// that PR merges or closes.
+			h.sweepPRHeldClaims()
 
 			// Deregister under the lock; CLOSE outside it.
 			//
@@ -5598,12 +5849,18 @@ func (s *Server) CloseContributeHub() {
 }
 
 // Close shuts down server-managed background resources, including the
-// contributor hub.
+// contributor hub and the Matrix line source.
 func (s *Server) Close() {
 	if s == nil {
 		return
 	}
 	s.CloseContributeHub()
+	s.matrixMu.Lock()
+	m := s.matrix
+	s.matrixMu.Unlock()
+	if m != nil {
+		m.close()
+	}
 }
 
 func contributorStatePath(contributorsDir, currentPath, name string) string {

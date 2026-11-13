@@ -2,7 +2,14 @@
     var _eventSourceReconnectTimer = null;
     var _sseLastFrameAtMs = 0;
     var _sseOpenedAtMs = 0;
-    function noteSSEFrame() { _sseLastFrameAtMs = Date.now(); }
+    // The newest frame ever seen; unlike _sseLastFrameAtMs a reconnect does
+    // not reset it, so display mode can say how long the stream has been
+    // quiet (tracker-display.js).
+    var _sseEverFrameAtMs = 0;
+    function noteSSEFrame() {
+      _sseLastFrameAtMs = _sseEverFrameAtMs = Date.now();
+      if (typeof stageTrackerDisplayNoteFrame === 'function') stageTrackerDisplayNoteFrame();
+    }
     // sseWatchdogTick recycles a silent stream (see sseStreamIdle). `force`
     // (tab became visible again) always refetches /api/status: Safari and
     // Chrome throttle hidden-tab timers to once a minute or less, so the tick
@@ -21,6 +28,7 @@
       if (_eventSource) { _eventSource.onerror = null; _eventSource.onmessage = null; _eventSource.close(); _eventSource = null; }
       const source = new EventSource('/api/events');
       _eventSource = source;
+      if (window.HIVE_READER) window.hiveReaderAttach(source);
       _sseOpenedAtMs = Date.now();
       _sseLastFrameAtMs = 0;
       const conn = document.getElementById('conn');
@@ -87,6 +95,15 @@
         noteSSEFrame();
         if (_stageTrackerSig || _stageTrackerEtag) stageTrackerNudge();
       });
+      // Another maintainer added or deleted a note on an item: refetch
+      // that item's notes so the row's badge and open expander follow.
+      source.addEventListener('maintainer-notes', (e) => {
+        noteSSEFrame();
+        try {
+          const p = JSON.parse(e.data || '{}');
+          if (p && p.repo && p.number) hamNotesLoad(hamNotesKey(p.repo, p.number));
+        } catch (err) { hamNotesLoad(); }
+      });
 
       source.addEventListener('agent-status', (e) => {
         noteSSEFrame();
@@ -105,10 +122,14 @@
           const lastData = window._lastStatus || {};
           if (lastData.agents) {
             applyPinOverrides(lastData.agents);
-            renderAgents(lastData.agents);
+            dashboardRenderSection('agents', ['agents-section', 'agent-activity-section'], () => {
+              if (!_dropdownOpen && !_configModalOpen) renderAgents(lastData.agents);
+            });
             // Keep the cost table's "running agents" column live as agents
             // switch models or pause/resume between cost polls.
-            if (_lastCost) renderCost(_lastCost);
+            if (_lastCost) dashboardRenderSection('cost', ['cost-panel'], () => {
+              if (_lastCost) renderCost(_lastCost);
+            });
           }
           ocUpdateFocusedState();
           const _lvl = (lastData.acmmLevel != null) ? lastData.acmmLevel : 0;
@@ -120,13 +141,25 @@
         }
       });
 
+      // The pod announces its own roll before the stream drops (#15788).
+      source.addEventListener('upgrading', (e) => {
+        try {
+          versionHandleUpgradingEvent(JSON.parse(e.data));
+        } catch (err) {
+          console.error('SSE upgrading parse error:', err);
+        }
+      });
+
       source.onerror = () => {
         if (conn) {
+          const roll = typeof versionReadUpgradeProgress === 'function' ? versionReadUpgradeProgress() : null;
+          const rolling = roll && roll.source === 'roll' && !roll.completedAt;
           conn.className = 'connection';
-          conn.innerHTML = '<span class="dot-dead">●</span> reconnecting...';
+          conn.innerHTML = '<span class="dot-dead">●</span> ' + (rolling ? (roll.target ? 'upgrading · reconnecting…' : 'restarting · reconnecting…') : 'reconnecting...');
         }
         source.close();
         if (_eventSource === source) _eventSource = null;
+        if (typeof stageTrackerDisplayNoteReconnectFailed === 'function') stageTrackerDisplayNoteReconnectFailed();
         if (!_eventSourceReconnectTimer) {
           _eventSourceReconnectTimer = setTimeout(function() { _eventSourceReconnectTimer = null; connect(); }, 3000);
         }
@@ -169,7 +202,7 @@
       const el = document.getElementById("project-name");
       if (el && repoDisplay) {
         el.textContent = "for " + repoDisplay;
-        document.title = "Hive Dashboard for " + repoDisplay;
+        if (!(window.hivePopoutMode && window.hivePopoutMode())) document.title = "Hive Dashboard for " + repoDisplay;
       }
       const ocEl = document.getElementById("oc-project-name");
       if (ocEl && repoDisplay) ocEl.textContent = repoDisplay;

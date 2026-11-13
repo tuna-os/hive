@@ -219,6 +219,71 @@ check "--blocked-by refusal writes no request" "" "$(find_req badblockedbot)"
 rm -rf "$REQ_DIR"
 mkdir -p "$REQ_DIR"
 
+# On a comment --blocked-by links the existing issue: a park that only defers
+# to another issue's decision (Danathar/tududi#512 → #511) waits on it.
+run_script "blockedcommentbot" comment --repo "hiveorg/widgets" 512 --body "Answer on #511; the same choice applies here." \
+  --needs-decision --blocked-by "#511" >/dev/null
+REQ_FILE="$(find_req blockedcommentbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_BLOCKED="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('kind'), d.get('number'), d.get('needs_decision'), d.get('blocked_by'))" "$REQ_FILE")"
+  check "comment --blocked-by carries blocked_by on the comment request" "comment 512 True [511]" "$GOT_BLOCKED"
+else
+  echo "  FAIL: request file not created for comment --blocked-by test"
+  FAIL=$((FAIL + 1))
+fi
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+set +e
+run_script "badblockedcommentbot" comment --repo "hiveorg/widgets" 512 --body "x" --blocked-by "eleven" >/dev/null 2>&1
+BAD_RC=$?
+set -e
+check "comment --blocked-by refuses a non-numeric blocker (exit 2)" "2" "$BAD_RC"
+check "comment --blocked-by refusal writes no request" "" "$(find_req badblockedcommentbot)"
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+# --blocked-on-pr takes a same-repo number or owner/repo#n (a PR in another
+# repository): the request carries the number and, for the second, its repo.
+run_script "blockedonprbot" comment --repo "hiveorg/widgets" 7 --body "Lands after the upstream change." \
+  --blocked-on-pr "hiveorg/gadgets#42" >/dev/null
+REQ_FILE="$(find_req blockedonprbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_BLOCKED="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('blocked_on_pr'), d.get('blocked_on_pr_repo'))" "$REQ_FILE")"
+  check "comment --blocked-on-pr owner/repo#n carries the number and the repo" "42 hiveorg/gadgets" "$GOT_BLOCKED"
+else
+  echo "  FAIL: request file not created for --blocked-on-pr owner/repo#n test"
+  FAIL=$((FAIL + 1))
+fi
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+run_script "blockedonprsamebot" comment --repo "hiveorg/widgets" 7 --body "Lands after #41." --blocked-on-pr 41 >/dev/null
+REQ_FILE="$(find_req blockedonprsamebot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_BLOCKED="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('blocked_on_pr'), d.get('blocked_on_pr_repo'))" "$REQ_FILE")"
+  check "comment --blocked-on-pr <n> stays same-repo (no blocked_on_pr_repo)" "41 None" "$GOT_BLOCKED"
+else
+  echo "  FAIL: request file not created for --blocked-on-pr <n> test"
+  FAIL=$((FAIL + 1))
+fi
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+set +e
+run_script "badblockedonprbot" comment --repo "hiveorg/widgets" 7 --body "x" --blocked-on-pr "hiveorg/gadgets#" >/dev/null 2>&1
+BAD_RC=$?
+set -e
+check "comment --blocked-on-pr refuses a malformed owner/repo#n (exit 2)" "2" "$BAD_RC"
+check "comment --blocked-on-pr refusal writes no request" "" "$(find_req badblockedonprbot)"
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
 # --- Section 3d: --close-on-merge flag (filing-time opt-in, #10304) ---
 run_script "closeonmergebot" --repo "hiveorg/widgets" --title "Sweep finding" --body "found by reading the code" --close-on-merge
 
@@ -327,6 +392,38 @@ BAD_RC=$?
 set -e
 check "--needs-decision on a claim is refused (exit 2)" "2" "$BAD_RC"
 check "--needs-decision refusal writes no request" "" "$(find_req needsdecisionclaimbot)"
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+# --withdraw-decision on a comment takes back the caller's own park
+# (Danathar/openaudible-autoupdate#177).
+run_script "withdrawbot" comment --repo "hiveorg/widgets" 177 --body "No decision is needed: PR #176 closes this." --withdraw-decision >/dev/null
+REQ_FILE="$(find_req withdrawbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_WD="$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(r['kind'], r['number'], r.get('withdraw_decision'), r.get('needs_decision'))" "$REQ_FILE")"
+  check "comment --withdraw-decision sets withdraw_decision" "comment 177 True None" "$GOT_WD"
+else
+  echo "  FAIL: request file not created for comment --withdraw-decision test"
+  FAIL=$((FAIL + 1))
+fi
+run_script "plaincommentbot" comment --repo "hiveorg/widgets" 177 --body "note" >/dev/null
+REQ_FILE="$(find_req plaincommentbot)"
+check "a plain comment omits withdraw_decision" "None" "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('withdraw_decision'))" "$REQ_FILE")"
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+for bad in "withdrawissue:--repo hiveorg/widgets --title T --body B --withdraw-decision" \
+           "withdrawboth:comment --repo hiveorg/widgets 5 --body B --withdraw-decision --needs-decision"; do
+  name="${bad%%:*}"
+  read -r -a args <<<"${bad#*:}"
+  set +e
+  run_script "$name" "${args[@]}" >/dev/null 2>&1
+  BAD_RC=$?
+  set -e
+  check "--withdraw-decision misuse ($name) is refused (exit 2)" "2" "$BAD_RC"
+  check "--withdraw-decision misuse ($name) writes no request" "" "$(find_req "$name")"
+done
 
 rm -rf "$REQ_DIR"
 mkdir -p "$REQ_DIR"

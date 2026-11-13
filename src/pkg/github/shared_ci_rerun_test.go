@@ -44,9 +44,11 @@ type sharedCIRerunFake struct {
 	issues       []sharedCIRerunIssue
 	prs          map[int]*sharedCIRerunPR
 	reruns       []int64
+	fullReruns   []int64
 	posted       map[int][]string
 	commentLists map[int]int
 	forbidRerun  bool
+	forbidAfter  int
 }
 
 func newSharedCIRerunFake(t *testing.T, issues []sharedCIRerunIssue, prs []*sharedCIRerunPR) (*httptest.Server, *sharedCIRerunFake) {
@@ -57,6 +59,7 @@ func newSharedCIRerunFake(t *testing.T, issues []sharedCIRerunIssue, prs []*shar
 	}
 	commentsRE := regexp.MustCompile(`^/repos/org/repo/issues/(\d+)/comments$`)
 	rerunRE := regexp.MustCompile(`^/repos/org/repo/actions/runs/(\d+)/rerun-failed-jobs$`)
+	fullRerunRE := regexp.MustCompile(`^/repos/org/repo/actions/runs/(\d+)/rerun$`)
 	updated := "2026-10-15T00:00:00Z"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -135,11 +138,15 @@ func newSharedCIRerunFake(t *testing.T, issues []sharedCIRerunIssue, prs []*shar
 		case rerunRE.MatchString(r.URL.Path) && r.Method == http.MethodPost:
 			id, _ := strconv.ParseInt(rerunRE.FindStringSubmatch(r.URL.Path)[1], 10, 64)
 			f.reruns = append(f.reruns, id)
-			if f.forbidRerun {
+			if f.forbidRerun || (f.forbidAfter > 0 && len(f.reruns) > f.forbidAfter) {
 				w.WriteHeader(http.StatusForbidden)
 				_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
 				return
 			}
+			w.WriteHeader(http.StatusCreated)
+		case fullRerunRE.MatchString(r.URL.Path) && r.Method == http.MethodPost:
+			id, _ := strconv.ParseInt(fullRerunRE.FindStringSubmatch(r.URL.Path)[1], 10, 64)
+			f.fullReruns = append(f.fullReruns, id)
 			w.WriteHeader(http.StatusCreated)
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -275,6 +282,60 @@ func TestSweepSharedCIReruns_SkipsWorkflowWhoseNewestRunPassed(t *testing.T) {
 	}
 }
 
+// hivecommons/hive#17500: a job cut off by its timeout-minutes is recorded
+// as a cancelled run, not a failed one; hive#17471 sat "Deferred" after
+// incident #17463 closed because the sweep saw nothing red. A cancelled
+// newest run is red: the whole workflow is re-run once, the PR is told the
+// deferral lifted, and the next pass does nothing.
+func TestSweepSharedCIReruns_LiftsDeferralWhenTheRedRunWasCancelled(t *testing.T) {
+	now := sharedCIRerunNow()
+	issues := []sharedCIRerunIssue{{Number: 17463, Title: "[shared-ci] mutation failing across org/repo", ClosedAt: now.Add(-time.Hour)}}
+	prs := []*sharedCIRerunPR{{
+		Number: 1, SHA: "41dda120fa", Comments: []string{"tracked in #17463; deferring until that incident closes.\n\n<!-- hive-shared-ci-17463 -->"},
+		Runs: []sharedCIRerunRun{{ID: 59, WorkflowID: 7, RunNumber: 59, Attempt: 1, Status: "completed", Conclusion: "cancelled"}},
+	}}
+	srv, fake := newSharedCIRerunFake(t, issues, prs)
+	c := newTestClient(t, srv, "org", []string{"org/repo"})
+	opts := SharedCIRerunOptions{Now: sharedCIRerunNow}
+	res, err := c.SweepSharedCIReruns(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	reruns, posted, _ := fake.snap()
+	fake.mu.Lock()
+	full := append([]int64(nil), fake.fullReruns...)
+	fake.mu.Unlock()
+	if len(reruns) != 0 || !reflect.DeepEqual(full, []int64{59}) || len(res.Rerun) != 1 {
+		t.Fatalf("a cancelled run is re-run whole: failed-jobs=%v full=%v result=%+v", reruns, full, res)
+	}
+	if len(posted[1]) != 1 {
+		t.Fatalf("one lift comment, got %q", posted[1])
+	}
+	for _, want := range []string{"<!-- hive-shared-ci-lifted-17463 -->", "<!-- hive-shared-ci-rerun-17463 -->", "Shared-CI incident #17463 closed — re-running `CI`"} {
+		if !strings.Contains(posted[1][0], want) {
+			t.Fatalf("lift comment misses %q: %q", want, posted[1][0])
+		}
+	}
+
+	res, err = c.SweepSharedCIReruns(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second sweep: %v", err)
+	}
+	_, posted, _ = fake.snap()
+	fake.mu.Lock()
+	full = append([]int64(nil), fake.fullReruns...)
+	fake.mu.Unlock()
+	if len(full) != 1 || len(posted[1]) != 1 || len(res.Rerun) != 0 {
+		t.Fatalf("second pass must lift nothing: full=%v posted=%d result=%+v", full, len(posted[1]), res)
+	}
+
+	// The memo is per process; a fresh client sees the lifted marker and stays quiet too.
+	c2 := newTestClient(t, srv, "org", []string{"org/repo"})
+	if res, err = c2.SweepSharedCIReruns(context.Background(), opts); err != nil || len(res.Rerun) != 0 {
+		t.Fatalf("fresh client re-lifted: err=%v result=%+v", err, res)
+	}
+}
+
 func TestPendingSharedCIReruns(t *testing.T) {
 	closed := map[int]bool{10: true, 11: true}
 	cases := []struct {
@@ -285,6 +346,7 @@ func TestPendingSharedCIReruns(t *testing.T) {
 		{"no marker", []string{"hello"}, nil},
 		{"closed incident pending", []string{"<!-- hive-shared-ci-10 -->"}, []int{10}},
 		{"already rerun", []string{"<!-- hive-shared-ci-10 -->", "<!-- hive-shared-ci-rerun-10 -->"}, nil},
+		{"already lifted", []string{"<!-- hive-shared-ci-10 -->", "<!-- hive-shared-ci-lifted-10 -->"}, nil},
 		{"newest marker still open", []string{"<!-- hive-shared-ci-10 -->", "<!-- hive-shared-ci-12 -->"}, nil},
 		{"two closed incidents", []string{"<!-- hive-shared-ci-11 -->", "<!-- hive-shared-ci-10 -->"}, []int{10, 11}},
 		{"rerun marker alone is not a deferral", []string{"<!-- hive-shared-ci-rerun-10 -->"}, nil},
@@ -317,5 +379,77 @@ func TestSweepSharedCIReruns_ForbiddenStopsAndIsRememberedPerRepo(t *testing.T) 
 	}
 	if len(res.Rerun) != 0 || len(posted[1]) != 0 || len(posted[2]) != 0 {
 		t.Fatalf("expected no rerun result or marker comment: result=%+v posted=%v", res, posted)
+	}
+	if block, ok := c.SharedCIRerunBlocked("org/repo", 1, "aaaaaaaaaa"); !ok || block.RunID == 0 {
+		t.Fatalf("permission refusal was not recorded: %+v %v", block, ok)
+	}
+	if _, ok := c.SharedCIRerunBlocked("org/repo", 1, "new-head"); ok {
+		t.Fatal("old-head refusal applied to a new head")
+	}
+	if _, err := c.SweepSharedCIReruns(context.Background(), SharedCIRerunOptions{Now: sharedCIRerunNow}); err != nil {
+		t.Fatal(err)
+	}
+	reruns, _, _ = fake.snap()
+	if len(reruns) != 1 {
+		t.Fatalf("cooldown allowed another POST: %v", reruns)
+	}
+
+	fake.mu.Lock()
+	fake.forbidRerun = false
+	fake.mu.Unlock()
+	c.sharedCIRerunMu.Lock()
+	c.sharedCIRerunForbidden["org/repo"] = time.Now().Add(-sharedCIRerunForbiddenTTL - time.Second)
+	c.sharedCIRerunMu.Unlock()
+	res, err = c.SweepSharedCIReruns(context.Background(), SharedCIRerunOptions{Now: sharedCIRerunNow})
+	if err != nil || len(res.Rerun) != 2 {
+		t.Fatalf("unchanged PRs did not recover after permission change: %+v %v", res, err)
+	}
+	if _, ok := c.SharedCIRerunBlocked("org/repo", 1, "aaaaaaaaaa"); ok {
+		t.Fatal("successful recovery retained permission block")
+	}
+}
+
+func TestSharedCIRerunManualRecoveryClearsBlockDuringCooldown(t *testing.T) {
+	now := sharedCIRerunNow()
+	pr := &sharedCIRerunPR{Number: 1, SHA: "aaa", Comments: []string{"<!-- hive-shared-ci-800 -->"}, Runs: []sharedCIRerunRun{failedRun(11, 1)}}
+	srv, fake := newSharedCIRerunFake(t, []sharedCIRerunIssue{{Number: 800, Title: "[shared-ci] incident", ClosedAt: now.Add(-time.Hour)}}, []*sharedCIRerunPR{pr})
+	fake.forbidRerun = true
+	c := newTestClient(t, srv, "org", []string{"org/repo"})
+	opts := SharedCIRerunOptions{Now: sharedCIRerunNow}
+	if _, err := c.SweepSharedCIReruns(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	pr.Runs[0].Conclusion = "success"
+	fake.mu.Unlock()
+	opts.Now = func() time.Time { return now.Add(DefaultSharedCIRerunLookback + time.Hour) }
+	if _, err := c.SweepSharedCIReruns(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.SharedCIRerunBlocked("org/repo", 1, "aaa"); ok {
+		t.Fatal("manual recovery must clear the block without a PR edit or TTL expiry")
+	}
+	reruns, posted, _ := fake.snap()
+	if len(reruns) != 1 || len(posted[1]) != 0 {
+		t.Fatalf("manual recovery retried or stamped an automated success: %v %v", reruns, posted)
+	}
+}
+
+func TestSharedCIRerunPartialPermissionFailureDoesNotFinishIncident(t *testing.T) {
+	now := sharedCIRerunNow()
+	pr := &sharedCIRerunPR{Number: 1, SHA: "aaa", Comments: []string{"<!-- hive-shared-ci-800 -->"}, Runs: []sharedCIRerunRun{failedRun(11, 1), failedRun(12, 2)}}
+	srv, fake := newSharedCIRerunFake(t, []sharedCIRerunIssue{{Number: 800, Title: "[shared-ci] incident", ClosedAt: now.Add(-time.Hour)}}, []*sharedCIRerunPR{pr})
+	fake.forbidAfter = 1
+	c := newTestClient(t, srv, "org", []string{"org/repo"})
+	res, err := c.SweepSharedCIReruns(context.Background(), SharedCIRerunOptions{Now: sharedCIRerunNow})
+	if err != nil || len(res.Rerun) != 1 || len(res.Rerun[0].RunIDs) != 1 {
+		t.Fatalf("partial recovery audit = %+v, %v", res, err)
+	}
+	_, posted, _ := fake.snap()
+	if len(posted[1]) != 0 {
+		t.Fatalf("partial recovery stamped incident complete: %v", posted)
+	}
+	if _, ok := c.SharedCIRerunBlocked("org/repo", 1, "aaa"); !ok {
+		t.Fatal("partial recovery hid outstanding permission block")
 	}
 }

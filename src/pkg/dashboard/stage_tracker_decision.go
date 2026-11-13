@@ -90,7 +90,6 @@ const (
 	decisionActionCloseWontfix    = "decide:close-wontfix"
 	decisionActionMergeNow        = "decide:merge-now"
 	decisionActionQueueMerge      = "decide:queue-merge"
-	decisionActionReauthor        = "decide:re-author"
 	decisionActionAcceptTriage    = "accept-triage"
 	decisionActionHold            = "hold"
 	decisionActionRelease         = "release"
@@ -123,6 +122,9 @@ const (
 	decisionWhyNoPermission   = "Only a person with the permission can do this"
 	decisionWhyApproveNoGrant = "Approving does not grant the missing permission"
 	decisionHeldBlockerPlain  = "On hold — the hive does nothing until the hold is released."
+	// decisionWhyBotAuthorBranch disables Give direction on another bot's
+	// PR (stagelabels.LaneReasonBotAuthorFinding): no fixer pushes there.
+	decisionWhyBotAuthorBranch = "No agent pushes to a branch another bot regenerates; fix it on the base branch"
 )
 
 // stageTrackerVerdictLookup returns a lookup over review-verdicts.json for
@@ -212,8 +214,16 @@ func stageTrackerDecisionNeededWith(it StageTrackerItem, verdict *review.Aggrega
 		return decisionForBlocker(it, held, bctx)
 	case it.Kind == "pr" && (it.Stage == stagelabels.NeedsDecision.Number() || slices.Contains(it.Modifiers, modNeedsDecision)):
 		return decisionForPR(it, verdict, sentinelLabel, held)
+	case it.Kind == "pr" && it.Stage == stagelabels.ReadyForHumanMerge.Number() && it.SentinelAlert && !it.SentinelNotice:
+		// The sentinel is a gate on the PR's real stage, not a stage of its
+		// own (hivecommons/hive#17327): a green, reviewed head sits in the
+		// merge queue as "held" and asks the sentinel question — Approve,
+		// give direction, or close — never "ready to merge".
+		return decisionForPR(it, verdict, sentinelLabel, held)
 	case it.Kind == "pr" && it.Stage == stagelabels.ReadyForHumanMerge.Number():
 		return decisionForHumanMerge(it, held)
+	case it.Kind == "pr" && it.Stage == 0 && it.New != nil && it.New.AutoMergeOff && it.New.NextMover == StageTrackerMoverMaintainer:
+		return decisionForAutoMergeOffNew(it, held)
 	case it.Kind == "issue" && it.Mirrored:
 		// The issue rides its covering PR; the PR's own row (nested under
 		// the issue) carries the decision.
@@ -237,6 +247,12 @@ func stageTrackerDecisionNeededWith(it StageTrackerItem, verdict *review.Aggrega
 		// person's to end (Adopt now / Reroute) — hivecommons/hive#15038.
 		return decisionForWaitingOnContributor(it, held, now)
 	case it.Kind == "pr" && it.AuthorKind == authorKindHuman && slices.Contains(stageTrackerNeedsHumanAuthorStages, it.Stage):
+		if stageTrackerPushPending(it) {
+			// The author pushed and CI / the re-review for the new head
+			// still run: nothing to decide until the hive has looked
+			// (hivecommons/hive#16021).
+			return nil
+		}
 		return decisionForWaitingOnAuthor(it, held)
 	case stageTrackerNeedsHuman(it) || (held && stageTrackerNeedsHuman(stageTrackerWithoutHold(it))):
 		// Flagged for a person by a stage/kind pairing none of the cases

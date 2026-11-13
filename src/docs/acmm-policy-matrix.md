@@ -16,6 +16,41 @@ issues. The **KB** is the knowledge base of reusable facts; an **RFC** is a
 request for comments on a proposed design. For a first deployment's trust
 choices, start with [Securing your hive](securing-your-hive.md).
 
+## What is a pack?
+
+An ACMM **pack** is the bundle of settings Hive applies for one ACMM level.
+Hive ships six, `level-1.yaml` through `level-6.yaml`
+(`src/pkg/config/packs/`, embedded in the binary), one per level. Each pack
+defines that level's agent roster, each agent's policy mode and kick template,
+the governor cadences, and the merge policy. Setting `acmm_level` (or
+`PUT /api/packs/level`) selects the pack, and applying it reconciles the
+hive's agents to match; see [Changing a hive's ACMM level](#changing-a-hives-acmm-level).
+Your explicit `backend:`, `model:`, and `enabled: false` settings win over
+pack values. "Pack" is a Hive term for implementing a level; the ACMM paper
+describes levels, not packs. For the full reconcile rules, see
+[ACMM levels: agent rosters as packs](agent-configuration.md#acmm-levels-agent-rosters-as-packs).
+
+## Repository E2E detection
+
+The codebase evaluator's `acmm:prereq-e2e` prerequisite accepts the existing
+Playwright/Cypress configuration and E2E directory conventions, as well as
+GitHub Actions workflow files named `test*-install*.yml`, `test*-boot*.yml`,
+or `*e2e*.yml` (also `.yaml`). These workflow alternatives cover projects
+whose end-to-end boundary is installing and booting a system rather than
+driving a web browser.
+
+Workflow patterns use Go `path.Match` semantics on the file basename, only
+inside the literal `.github/workflows` directory. They do not recurse, match
+directories named like workflow files, or accept an unrelated CI workflow
+just because it exists. Detection remains a file-existence heuristic, not
+proof that a workflow passes or that its contents implement an E2E test;
+maintainers must keep these paths backed by real coverage rather than add
+empty directories or dummy workflows to satisfy the criterion.
+
+An evaluator fix takes effect only after a release containing it is deployed.
+After deployment, refresh the ACMM evaluation (subject to its refresh debounce)
+before closing an existing false-negative gap issue.
+
 ## Policy Modes
 
 The four policy tiers below describe the main autonomy ladder. The roster also
@@ -92,7 +127,7 @@ Delivery agents open GitHub issues — bugs, docs gaps, CI problems, security vu
 | brainstorm | advisory | `brainstorm-advisory.md` |
 | reviewer | converse | `reviewer-queue.md` |
 
-### L5 — Semi-Autonomous (Semi-Automated) (14 agents)
+### L5 — Semi-Autonomous (Semi-Automated) (15 agents)
 
 **Permission boundary:** agents open issues and PRs, but do not merge
 autonomously. Agent PRs get literal `hold` from the level gate for human
@@ -110,6 +145,10 @@ manual hold; `hive/<hive-id>` records provenance only.
   checklist per repository (near-duplicates, common root causes, unlinked
   PR/issue pairs and already-resolved items), parked with `--needs-decision`.
   It never closes or edits anyone else's items.
+- Redteam ([red-team agent](redteam.md)) is opt-in: paused in every mode, and
+  refused every repository until its `repos:` scope names the one holding the
+  `ioscan` red-team corpus. It adds measured attack cases there in
+  `hold`-labelled PRs and never posts attack text anywhere else.
 
 Per-repo opt-in `auto_merge.queue_on_approve_and_unhold` (off by default) lets a person finish an agent PR in one step: when one trusted merger both submits an APPROVED review on an agent PR's current head and removes its level `hold`, Hive queues the PR for auto-merge on green CI exactly as the dashboard's queue button does. Nothing else counts as consent, and the self-merge floor stays at L6. See [hive-merge.md](hive-merge.md#one-human-step-at-l5-approve-and-unhold).
 
@@ -128,9 +167,10 @@ Per-repo opt-in `auto_merge.queue_on_approve_and_unhold` (off by default) lets a
 | dedupe | issues-only | `dedupe-issues.md` |
 | telemetry (paused) | holdgated | `telemetry-holdgated.md` |
 | operations (paused) | holdgated | `operations-holdgated.md` |
+| redteam (paused) | holdgated | `redteam-holdgated.md` |
 | brainstorm | advisory | `brainstorm-advisory.md` |
 
-### L6 — Autonomous (15 agents)
+### L6 — Autonomous (16 agents)
 
 **Permission boundary:** autonomous delivery lanes can open issues/PRs and
 eligible PRs can merge on green CI. Auto-merge is off below L6. Switching to
@@ -151,7 +191,8 @@ authority.
   de-escalates, recommends closure and may close escalated `needs-human` Hive
   PRs at L6, but never merges. Dedupe stays recommendation-only. Telemetry and
   operations stay paused and use `ISSUES_AND_PRS`, despite their `full`
-  template names; they never merge their own PRs.
+  template names; they never merge their own PRs. Redteam stays paused, keeps
+  its hold-gated template and labels every PR `hold`, even at L6.
 
 #### Review and decision gates
 
@@ -174,12 +215,19 @@ unverifiable claims, or `hive-decision-risk: high`. Set `escalate` to park
 every decision question at PR stage 085. Use actual holds or GitHub branch
 rules for a universal merge stop.
 
-#### Workflow approval, not App Actions-write permission
+#### Workflow approval
 
-For trusted same-repo bot/App/registry-trusted clanker PRs with
-`action_required` workflow runs, Hive posts `/ok-to-test` once per head.
-The repository's self-contained `hive-ok-to-test` workflow approves the runs
-using its own `GITHUB_TOKEN`; the App needs no Actions-write grant. If that
+By default (`governor.ci.auto_approve_workflows: true`) Hive approves
+`action_required` `pull_request` runs itself, once per PR head, with the
+App token: for Dependabot/Renovate/App-authored or -triggered runs and for
+heads a verified owner or merger admitted from the dashboard. This needs
+the App's **Actions: Read and write**; a `403` is recorded once as a
+`permission_error` and the CI caption says the run needs approval on
+GitHub. With the sweep set to `false` (or the grant missing), trusted
+same-repo bot/App/registry-trusted clanker PRs fall back to the
+`/ok-to-test` path: Hive posts the command once per head and the
+repository's self-contained `hive-ok-to-test` workflow approves the runs
+using its own `GITHUB_TOKEN`, with no App Actions-write grant. If that
 workflow is missing or `sentinel-alert` is present, Hive surfaces
 `workflow-approval-required:<ctx>` / PR stage 085 for human action.
 
@@ -199,6 +247,7 @@ workflow is missing or `sentinel-alert` is present, Hive surfaces
 | dedupe | issues-only | `dedupe-issues.md` |
 | telemetry (paused) | full | `telemetry-full.md` |
 | operations (paused) | full | `operations-full.md` |
+| redteam (paused) | holdgated | `redteam-holdgated.md` |
 | brainstorm | advisory | `brainstorm-advisory.md` |
 
 ## What hive will say on GitHub at each level
@@ -219,12 +268,48 @@ gated. Defaults (override under `writeback.kinds.<kind>`):
 | `sentinel` comment + `sentinel-alert` label | dashboard only | dashboard only | opt-in label only | all PRs |
 | `hold_gate_notice` (mergeability / drift) | — | hive PRs only | hive PRs only | hive PRs only |
 | `stage_label`, `needs_decision_comment` on foreign PRs | internal tracking | internal tracking | opt-in label | opt-in label |
-| `supersession_notice`, `duplicate_fix_notice`, `reporter_trust_hold`, `covered_by_pr_label`, `issue_close`, `parent_issue_edit`, `gate_comment` | — | — | opt-in label | opt-in label |
-| `supersession_close`, `contributor_adopt`, `ci_rerun` | — | — | — | opt-in label |
+| `supersession_notice`, `duplicate_fix_notice`, `reporter_trust_hold`, `human_merge_path_release`, `covered_by_pr_label`, `issue_close`, `parent_issue_edit`, `gate_comment` | — | — | opt-in label | opt-in label |
+| `supersession_close`, `contributor_adopt`, `ci_rerun`, `base_refresh`, `bot_rebase_request` | — | — | — | opt-in label |
 | `verdict_label` | L3: opt-in label | opt-in label | opt-in label | opt-in label |
 | `claim_comment` | — | opt-in label | opt-in label | opt-in label |
 | `welcome_comment` | — | — | opt-in label | all items |
 | `issue_file` (new hive-authored issues) | L3+ | yes | yes | yes |
+| `blocked_repair` (a `blocked` label the hive applied itself, with no blocker named) | L1+ | yes | yes | yes |
+
+`ci_rerun` also covers the one transient re-run of a red PR from
+`auto_merge.trusted_bot_authors` (a hive PR is its own item and is not gated):
+on a bot PR it needs the opt-in label unless
+`writeback.kinds.ci_rerun.unlabeled_min_level` is set, and a refused re-run
+hands the PR to a person with the reason. `bot_rebase_request` only ticks
+Renovate's rebase/retry box; a stranded Dependabot PR is handed to a person
+instead, because Dependabot refuses commands from apps.
+
+`blocked_repair` replaces a marker-less `blocked` the hive applied with a
+`needs-human` ask (see
+[`blocked`](labels-and-control-signals/reference.md#blocked)). It needs no
+opt-in label and ignores the backfill guard, because the hive has already
+written to that issue: a contributor relay applies the label with a task
+token at any level, so the repair has the lowest floor. On an issue whose
+`blocked` the hive did not apply, the kind is never used.
+
+`needs_decision_comment` has one case that needs no opt-in label: the park
+re-check note (see
+[When a park's premise moves](maintainer-commands.md#when-a-parks-premise-moves))
+on an issue whose current decision park the hive applied itself. A
+contributor relay applies the park label with a hub-minted token, so the
+hive has already written to that issue. "The hive applied the park" means
+every label that parks the issue on a person is the hive's: the label event
+the park is dated from, and the newest `labeled` event of every hard-suppress
+label the issue carries, were made by one of the hive's own accounts. A park
+that rests on a label a person applied (a maintainer's `needs-spec`, which
+the hive then mirrors as `stage/045-needs-decision`, or a park label a person
+re-added) is not the hive's, and the note needs the opt-in label as before.
+The note then needs only the kind's minimum level (L5 by default) and
+ignores the backfill guard. A paused repository, the `writeback.per_repo`
+mode, `own_only` and `min_level` still refuse it. A note allowed this way
+lists only the changes the park text names and the pull requests merged in
+the project's own repositories. A refused note is logged once per issue and
+reason (`park re-check note held by writeback gate`).
 
 In practice: **L4 means hive files issues and talks only on its own PRs**;
 **L5 adds comments and labels on PRs a maintainer labelled `hive-review`**;
@@ -233,6 +318,17 @@ listed only so an agent can file regression issues should carry
 `writeback.per_repo.<repo>.mode: issues-only`, which holds at every level.
 `backfill: false` (default) additionally keeps every kind off items that
 predate hive's first sight of, or write access to, the repo.
+
+"Internal tracking" means the stage engine still records the PR's stage
+when the gate keeps its `stage_label` write off GitHub: the record carries
+`labels_suppressed` and the gate's reason, the Overview bands and the
+your-turn inbox read that stage in place of the missing label (a refused 085
+park is still *Parked until a maintainer decides*), the Activity Monitor row
+says "Stage label not on GitHub" with the reason, and an escalation note
+says the hive *would* move the PR to `stage/085-needs-decision` and why it
+did not instead of "Moving to". The backfill guard applies to
+`stage_label` like every other kind; with the stage tracked internally an
+older PR is still in the inbox, only unlabelled on GitHub.
 
 ## Example config alignment
 
@@ -257,6 +353,7 @@ predate hive's first sight of, or write access to, the repo.
    Roster history: [#8023](https://github.com/hivecommons/hive/issues/8023)
    and [#13574](https://github.com/hivecommons/hive/issues/13574).
 8. **Telemetry and operations are L5/L6-only opt-in agents.** Below L5 they are absent from the pack roster and dashboard, do not spawn panes, and cannot be kicked. At L5–L6 they use a paused cadence in every governor mode until an operator opts in; they may open issues and PRs but never merge.
+9. **Redteam is an L5/L6-only opt-in agent that needs a scope.** It is paused in every governor mode, and with no `repos:` scope it serves no repository at all — the one agent for which an empty scope means nothing rather than everything. See [Red-team agent](redteam.md).
 
 ## ioscan hardening defaults per level
 

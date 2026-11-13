@@ -54,6 +54,7 @@ const (
 	contributorLaneReasonNoLinkedIssue     = prstage.ContributorLaneReasonNoLinkedIssue
 	contributorLaneReasonNoReviewer        = prstage.ContributorLaneReasonNoReviewer
 	contributorLaneReasonNoVerdict         = prstage.ContributorLaneReasonNoVerdict
+	contributorLaneReasonReviewOff         = prstage.ContributorLaneReasonReviewOff
 	contributorLaneReasonReporterTrustHold = prstage.ContributorLaneReasonReporterTrustHold
 	contributorLaneReasonSentinelBlocked   = prstage.ContributorLaneReasonSentinelBlocked
 	contributorLaneReasonSoaking           = prstage.ContributorLaneReasonSoaking
@@ -68,6 +69,7 @@ const (
 	stageReasonSharedCIIncident            = prstage.StageReasonSharedCIIncident
 	trustedBotLaneSkipReason               = prstage.TrustedBotLaneSkipReason
 	workflowApprovalRequiredPrefix         = prstage.WorkflowApprovalRequiredPrefix
+	requiredCheckNeverReportedPrefix       = prstage.RequiredCheckNeverReportedPrefix
 	stageReasonUnauthorizedPrefix          = prstage.StageReasonUnauthorizedPrefix
 )
 
@@ -250,9 +252,14 @@ func StageHumanApprovalReason(d stageDetail, head string) string {
 
 // stageHandoffReasons are reasons that mean "not this lane's PR".
 var stageHandoffReasons = map[string]bool{
-	"not-app-authored": true, trustedBotLaneSkipReason: true, "repo-auto-merge-disabled": true,
+	"not-app-authored": true, trustedBotLaneSkipReason: true,
 	trustedAuthorReasonAppAuthored: true, contributorLaneReasonAppAuthored: true, contributorLaneReasonNoAuthor: true, "missing-head-sha": true,
 	"fetch-pr": true, "fetch-pr-recheck": true,
+	// A merge to the destination was in flight, so the lane did not look at
+	// the PR. Read as an owned base-refresh stage it overwrote the stage the
+	// other sweep wrote one pass earlier, every pass
+	// (projectbluefin/utah-packages#869 080↔085, #873 080↔090).
+	prstage.StageReasonBaseRefreshMergeGuard: true,
 }
 
 // stageAdmissionReasons are reasons that mean "this lane cannot vouch for
@@ -280,13 +287,14 @@ var stageAdmissionReasons = map[string]int{
 // 085), not merely a merge click.
 var stageNeedsHumanReasons = map[string]bool{
 	contributorLaneReasonWorkflowPath: true, contributorLaneReasonTestsRemoved: true,
-	contributorLaneReasonNoReviewer: true, contributorLaneReasonReporterTrustHold: true, contributorLaneReasonSentinelBlocked: true,
-	contributorLaneReasonNoAppBotLogin: true, contributorLaneReasonFilesEvidence: true,
+	contributorLaneReasonNoReviewer: true, contributorLaneReasonReviewOff: true,
+	contributorLaneReasonReporterTrustHold: true,
+	contributorLaneReasonNoAppBotLogin:     true, contributorLaneReasonFilesEvidence: true,
 	autoMergeReasonHumanMergePath: true, autoMergeReasonHumanMergePathEvidence: true,
 	autoMergeReasonIntentUnauthorized: true, autoMergeReasonIntentEvidence: true,
 	autoMergeReasonWorkflowPermission: true, autoMergeReasonForkWorkflowUpdate: true,
 	"approval-desk-withheld": true, "author-permission-missing": true, "fork-non-member": true,
-	"held": true, "label:hold": true, "label:needs-human": true, "exempt-label": true, "sentinel": true,
+	"label:needs-human": true, "exempt-label": true,
 	autoMergeReasonNoAppBotLogin: true, "self-authorization-hold-released": true,
 	// GitHub refused the merge for a reason no retry cures: branch
 	// protection wants a person's approving review, or the repository has
@@ -298,6 +306,23 @@ var stageNeedsHumanReasons = map[string]bool{
 	// is matched here, before the native-merge-queue prefix keeps the rest
 	// at 100.
 	prstage.AutoMergeReasonNativeQueueMethod: true,
+}
+
+// stageHeldGateReasons are the lane reasons that are gates, not stages
+// (owner rule, hivecommons/hive#17327): an open sentinel alert or a
+// hold-class label stops the merge for as long as it stands, but says
+// nothing about how far the head has come. The stage is the head's real
+// progress — CI running or red, a reviewer's question, or 090 once the
+// head is green and reviewed — and the gate rides it as a pill; the
+// Merge queue column reads "held", never "queued", because the lane
+// refuses the merge on the label itself (automerge_sweep_trusted,
+// automerge_contributor_lane), not on the stage number.
+//
+// `blocked` (label:blocked) is the same kind of gate: the PR waits on the
+// pull requests its Depends-on lines name, or on a person's own reason,
+// and its stage is still the head's progress.
+var stageHeldGateReasons = map[string]bool{
+	"held": true, "label:hold": true, "label:blocked": true, "sentinel": true, contributorLaneReasonSentinelBlocked: true,
 }
 
 // stageMergeQueueReasons are reasons reached only after every gate passed,
@@ -345,6 +370,14 @@ func ClassifyStage(o stageObservation) stageVerdict {
 	if reason != "closed" && reason != "gone" && reason != "label-removed" && HasLabelFold(o.Labels, prstage.SupersessionPendingLabel) && HasLabelFold(o.Labels, NeedsHumanLabel) && !HasLabelFold(o.Labels, "hive/keep-open") {
 		return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Human: true, Reason: prstage.ReasonSupersessionPending}
 	}
+	if reason == prstage.StageReasonBaseRefreshMergeGuard {
+		// The lane could not take the destination-merge lock, so it never
+		// looked at the PR. Lanes return that refusal with its error; read
+		// through the errored branch below, an approved head became a weak
+		// 080 that replaced a standing 085 on the same red head and seated
+		// it at a merge train's front (projectbluefin/utah-packages#917).
+		return stageVerdict{}
+	}
 	if o.Err {
 		// The lane tripped before deciding. If every author-side gate is
 		// already satisfied the PR is waiting on the hive, not the author.
@@ -375,6 +408,10 @@ func ClassifyStage(o stageObservation) stageVerdict {
 	if stageHandoffReasons[reason] {
 		return stageVerdict{}
 	}
+	if strings.HasPrefix(reason, "base-refresh:") {
+		// Preparation/queued is not ready-to-merge or a merge train seat.
+		return stageVerdict{Stage: stagelabels.ReviewPending, Rank: stageRankOwned, Reason: reason}
+	}
 	if train, ok := prstage.ParseMergeTrain(reason); ok {
 		// The merge train parked this PR behind an overlapping front
 		// (hivecommons/hive#15117): a hive-side wait at the merge gate,
@@ -394,6 +431,22 @@ func ClassifyStage(o stageObservation) stageVerdict {
 			// — 072 for a relay contributor, 071 for a person, 070 for
 			// the App's own — as superseded, never "waiting its turn".
 			return stageVerdict{Stage: fixing, Rank: stageRankOwned}
+		}
+		// Items that have not passed the review or CI is not green should
+		// not be (a) ready for merge, (b) in a merge train
+		// (hivecommons/hive#15825): the train seats only heads the lane
+		// found green and reviewed, and a seat never outranks what this
+		// head's own evidence says.
+		if VerdictBlocks(o.Detail) {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned, Reason: StageVerdictReason(o.Detail)}
+		}
+		if name := o.Detail.RedCheck(o.HeadSHA); name != "" {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned, Reason: stageReasonOptionalCheckFailing + name}
+		}
+		if train.State == prstage.MergeTrainStateRebasing {
+			// The hive is rebasing it: the head it pushes has no CI and no
+			// verdicts yet, so it is being fixed (070), not merge-queued.
+			return stageVerdict{Stage: stagelabels.Fixing, Rank: stageRankOwned}
 		}
 		return WithHumanApprovalReason(stageVerdict{Stage: stagelabels.AwaitingMergeAdmission, Rank: stageRankOwned}, humanApprovalReason)
 	}
@@ -419,6 +472,12 @@ func ClassifyStage(o stageObservation) stageVerdict {
 	if strings.HasPrefix(reason, workflowApprovalRequiredPrefix) {
 		return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Human: true}
 	}
+	if strings.HasPrefix(reason, requiredCheckNeverReportedPrefix) {
+		// The configured required check does not exist on this repo and no
+		// other check vouches for the head: the human gate names the check
+		// instead of a bare "needs a person".
+		return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Human: true}
+	}
 	if strings.HasPrefix(reason, stageReasonUnauthorizedPrefix) {
 		// The App lacks the permission the next step needs; only a person
 		// can take it (hivecommons/hive#14589). The reason keeps the step.
@@ -435,6 +494,71 @@ func ClassifyStage(o stageObservation) stageVerdict {
 		}
 		if v, ok := HumanChangeRequestStage(o); ok {
 			return v
+		}
+		return WithHumanApprovalReason(stageVerdict{Stage: stagelabels.ReadyForHumanMerge, Rank: stageRankOwned, Human: true}, humanApprovalReason)
+	}
+	if stageHeldGateReasons[reason] {
+		if HasLabelFold(o.Labels, "needs-rebase") {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned}
+		}
+		if v, ok := HumanChangeRequestStage(o); ok {
+			// A trusted maintainer answered the gate on this head and asked
+			// for changes: the author acts next (hivecommons/hive#15159).
+			return v
+		}
+		if v, ok := RequiresHumanStage(o, stageRankOwned); ok {
+			return v
+		}
+		if VerdictBlocks(o.Detail) {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned, Reason: StageVerdictReason(o.Detail)}
+		}
+		if name := o.Detail.RedCheck(o.HeadSHA); name != "" {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned, Reason: stageReasonOptionalCheckFailing + name}
+		}
+		// A 090 candidate: passDecision refines it through RouteHuman
+		// against the head's evidence (pending CI → 060, no verdict → 050)
+		// and rides the gate on the result as a pill, never as the stage.
+		return WithHumanApprovalReason(stageVerdict{Stage: stagelabels.ReadyForHumanMerge, Rank: stageRankOwned, Human: true}, humanApprovalReason)
+	}
+	if reason == "repo-auto-merge-disabled" {
+		// Auto-merge is off for the repo (hivecommons/hive#17565): nothing
+		// will merge the head, so its stage comes from the head's own
+		// evidence and is never 080, 095 or 100. Approved and green parks
+		// at 090 under the lane reason, the "auto-merge off" human merge.
+		if HasLabelFold(o.Labels, "needs-rebase") {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned}
+		}
+		if v, ok := HumanChangeRequestStage(o); ok {
+			return v
+		}
+		if VerdictBlocks(o.Detail) {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned, Reason: StageVerdictReason(o.Detail)}
+		}
+		if v, ok := RequiresHumanStage(o, stageRankOwned); ok {
+			return v
+		}
+		if d := o.Detail; d.VerdictKnown && d.Verdict.DecisionRequested && (strings.TrimSpace(d.HumanApprover) == "" || strings.TrimSpace(d.HumanApprovalHead) != strings.TrimSpace(o.HeadSHA)) {
+			// An approve verdict that still asks a question is not ready
+			// for a merge click: the person owes the decision first.
+			return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Human: true, Reason: StageVerdictReason(d)}
+		}
+		if v, ok := SharedCIDeferredStage(o); ok {
+			return v
+		}
+		if v, ok := BaseBranchRedStage(o); ok {
+			return v
+		}
+		if v, ok := ForkGuardStage(o); ok {
+			return v
+		}
+		if name := o.Detail.RedCheck(o.HeadSHA); name != "" {
+			return stageVerdict{Stage: fixing, Rank: stageRankOwned, Reason: stageReasonOptionalCheckFailing + name}
+		}
+		if o.Detail.SentinelAlert || len(stagelabels.Holds(o.Labels)) > 0 {
+			return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Human: true}
+		}
+		if !AuthorSideDone(o) && humanApprovalReason == "" {
+			return stageVerdict{Stage: stagelabels.ReviewPending, Rank: stageRankOwned}
 		}
 		return WithHumanApprovalReason(stageVerdict{Stage: stagelabels.ReadyForHumanMerge, Rank: stageRankOwned, Human: true}, humanApprovalReason)
 	}
@@ -572,13 +696,14 @@ func RequiresHumanStage(o stageObservation, rank int) (stageVerdict, bool) {
 	return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: rank, Human: true, Reason: StageVerdictReason(o.Detail)}, true
 }
 
-func PreserveNormalizedFixingStage(prev stagelabels.Record, hadPrev bool, obs stageObservation, verdict stageVerdict) (stageVerdict, bool) {
-	if !hadPrev || prev.Stage != stagelabels.Fixing || prev.Reason != stagelabels.LaneReasonChangesRequested {
-		return stageVerdict{}, false
-	}
-	if prev.ActivityHead == "" || obs.HeadSHA == "" || prev.ActivityHead != obs.HeadSHA {
-		return stageVerdict{}, false
-	}
+// PreserveNormalizedFixingStage canonicalizes a raw human opinion using the
+// current review's remediation evidence. The previous record is deliberately
+// irrelevant: requiring a prior 070 made identical evidence select 070 or 085
+// depending on which sweep last wrote the record (#16880). Keep the parameters
+// for callers sharing the legacy pass API, but never use stage history as review
+// evidence. Explicit decisions and risk escalations remain human-owned through
+// NormalizeReviewVerdict.
+func PreserveNormalizedFixingStage(_ stagelabels.Record, _ bool, obs stageObservation, verdict stageVerdict) (stageVerdict, bool) {
 	if verdict.Stage != stagelabels.NeedsDecision || verdict.Reason != StageReasonVerdictRequiresHuman {
 		return stageVerdict{}, false
 	}
@@ -590,7 +715,77 @@ func PreserveNormalizedFixingStage(prev stagelabels.Record, hadPrev bool, obs st
 	if raw != "requires_human" || normalized != "changes_requested" {
 		return stageVerdict{}, false
 	}
-	return stageVerdict{Stage: stagelabels.Fixing, Rank: stageRankOwned, Reason: stagelabels.LaneReasonChangesRequested}, true
+	return stageVerdict{Stage: FixingStage(obs), Rank: stageRankOwned, Reason: stagelabels.LaneReasonChangesRequested}, true
+}
+
+// PreserveStageOnStaleDecisionAnswer keeps a PR parked at 085 when the only
+// thing pulling it back to its fixing stage is a trusted human's answered
+// decision on a head that has not moved since, and no fixer will act on
+// that answer (fixerExcluded: exhausted, no enabled fixer, …). Without it
+// the flip to 070 reset the record's dwell and stripped stage/stalled
+// ("removed:[stage/stalled] reason:contributor-lane:decision-answered" on
+// hive's own #15308, hivecommons/hive#15744) while nobody was fixing.
+func PreserveStageOnStaleDecisionAnswer(prev stagelabels.Record, hadPrev bool, obs stageObservation, verdict stageVerdict, fixerExcluded bool) (stageVerdict, bool) {
+	if !hadPrev || !fixerExcluded || prev.Stage != stagelabels.NeedsDecision {
+		return stageVerdict{}, false
+	}
+	if verdict.Terminal || verdict.Stage != FixingStage(obs) || verdict.Reason != StageReasonDecisionAnswered {
+		return stageVerdict{}, false
+	}
+	if prev.ActivityHead == "" || obs.HeadSHA == "" || prev.ActivityHead != obs.HeadSHA {
+		return stageVerdict{}, false
+	}
+	return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Reason: prev.Reason}, true
+}
+
+// PreserveNeedsDecisionOnSameHead keeps a PR parked at 085 when it was placed
+// on 085 for this head with a recorded decision question, until a human
+// reply, a new push, or an explicit /hive command. Checks re-running on the
+// same head (e.g. triggered by the hive's own label write) are not new
+// information (#16974).
+func PreserveNeedsDecisionOnSameHead(prev stagelabels.Record, hadPrev bool, obs stageObservation, verdict stageVerdict) (stageVerdict, bool) {
+	if !hadPrev || prev.Stage != stagelabels.NeedsDecision || verdict.Terminal {
+		return stageVerdict{}, false
+	}
+	head := strings.TrimSpace(obs.HeadSHA)
+	if head == "" {
+		return stageVerdict{}, false
+	}
+	if prev.ActivityHead == "" || !strings.EqualFold(prev.ActivityHead, head) {
+		return stageVerdict{}, false
+	}
+	d := NormalizeStageDetail(obs.Detail)
+	if TrustedHumanApprovedRequiresHuman(d, head) || TrustedHumanChangeRequested(d, head) ||
+		(d.VerdictKnown && d.Verdict.DecisionAnswered && strings.EqualFold(strings.TrimSpace(d.Verdict.DecisionAnsweredHead), head)) {
+		return stageVerdict{}, false
+	}
+	// An explicit `/hive decision approve` (admission) on this head is the
+	// human's answer: it releases the hold without waiting for the merge.
+	if prev.AdmittedHead != "" && strings.EqualFold(strings.TrimSpace(prev.AdmittedHead), head) {
+		return stageVerdict{}, false
+	}
+	var hasQuestion bool
+	if d.VerdictKnown {
+		// A re-review of the same head that came back approve or
+		// changes_requested is new information: nothing asks for a
+		// decision any more, so the raw verdict must win (090/070).
+		if !VerdictNeedsHuman(d) {
+			return stageVerdict{}, false
+		}
+		hasQuestion = d.Verdict.DecisionRequested || strings.TrimSpace(d.Verdict.DecisionQuestion) != ""
+	} else {
+		// No verdict for this head yet (e.g. the check re-ran because of
+		// the hive's own label write): the recorded question still stands.
+		hasQuestion = prev.Reason == StageReasonDecisionRequested
+	}
+	if !hasQuestion {
+		return stageVerdict{}, false
+	}
+	reason := prev.Reason
+	if reason == "" {
+		reason = StageReasonDecisionRequested
+	}
+	return stageVerdict{Stage: stagelabels.NeedsDecision, Rank: stageRankOwned, Human: true, Reason: reason}, true
 }
 
 // AuthorSideDone reports whether the PR has nothing left for its author to

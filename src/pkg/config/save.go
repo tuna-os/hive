@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -77,7 +79,9 @@ func (c *Config) SetAgentPausedAndSave(name string, paused bool) (bool, error) {
 	}
 	ac.Paused = paused
 	c.Agents[name] = ac
-	return true, c.saveLocked()
+	err := c.saveLocked()
+	c.syncAgentOverlayPausedLocked(name, paused)
+	return true, err
 }
 
 // ReconcilePausedAndSave sets each named agent's Paused field to the given
@@ -90,13 +94,19 @@ func (c *Config) SetAgentPausedAndSave(name string, paused bool) (bool, error) {
 func (c *Config) ReconcilePausedAndSave(livePaused map[string]bool) error {
 	saveMu.Lock()
 	defer saveMu.Unlock()
+	var changed []string
 	for name, paused := range livePaused {
 		if ac, ok := c.Agents[name]; ok && ac.Paused != paused {
 			ac.Paused = paused
 			c.Agents[name] = ac
+			changed = append(changed, name)
 		}
 	}
-	return c.saveLocked()
+	err := c.saveLocked()
+	for _, name := range changed {
+		c.syncAgentOverlayPausedLocked(name, livePaused[name])
+	}
+	return err
 }
 
 // saveLocked performs the actual marshal-and-write. Callers MUST hold saveMu.
@@ -112,6 +122,7 @@ func (c *Config) saveLocked() error {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
 
+	saveSeq.Add(1)
 	notifySaveObserver()
 
 	// Write the dashboard overlay before touching the watched primary config.
@@ -124,10 +135,14 @@ func (c *Config) saveLocked() error {
 	// layer this Save is about to persist.
 	overlayErr := c.saveDashboardOverlay()
 
-	// Open the existing file (preserving its inode) rather than creating a
-	// temp file and renaming. Rename breaks Docker bind mounts because it
-	// replaces the inode — the host file is never updated, so acmm_level
-	// and other runtime changes are lost on container restart.
+	// Replace the primary config atomically (temp file + fsync + rename onto
+	// the resolved target) — see writeFileAtomic for why that is safe on the
+	// #17468 symlink and still works on single-file Docker bind mounts.
+	//
+	// #17862: the previous O_WRONLY|O_TRUNC in-place write could be killed
+	// between truncate and write (liveness probe on a crash-looping hive),
+	// leaving a 0-byte runtime config that the entrypoint skipped in favour
+	// of a months-stale hive.yaml.bak. Pinned by TestSaveSurvivesKillMidWrite.
 	//
 	// #3961: a source-path failure must NOT abort the save. On deployments
 	// that mount the config read-only (a ConfigMap mounted straight at
@@ -141,29 +156,19 @@ func (c *Config) saveLocked() error {
 	// writing the runtime layer, and report success iff the state will actually
 	// survive a restart.
 	var srcErr error
-	f, err := os.OpenFile(c.SourcePath, os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		// File may not exist yet — fall back to create. Continue below so
-		// the PVC backup and dashboard overlay are still written.
-		if writeErr := os.WriteFile(c.SourcePath, data, 0o644); writeErr != nil {
-			srcErr = fmt.Errorf("writing config (create fallback): %w", writeErr)
-		}
-	} else {
-		if _, err := f.Write(data); err != nil {
-			_ = f.Close() // best-effort cleanup; the write error is what's recorded
-			srcErr = fmt.Errorf("writing config: %w", err)
-		} else if err := f.Sync(); err != nil {
-			_ = f.Close() // best-effort cleanup; the sync error is what's recorded
-			srcErr = fmt.Errorf("syncing config: %w", err)
-		} else if err := f.Close(); err != nil {
-			srcErr = fmt.Errorf("closing config: %w", err)
-		}
+	if err := writeFileAtomic(c.SourcePath, data, sourceConfigMode(c.SourcePath)); err != nil {
+		srcErr = fmt.Errorf("writing config: %w", err)
 	}
 
-	// Persist the runtime config to the PVC. In K8s this is a recovery copy
-	// (the ConfigMap seed plus the overlay is authoritative); in Docker/LXC
-	// it IS the boot-time source of truth, since there is no ConfigMap and
-	// no overlay there. The entrypoint decides which applies.
+	// Persist the runtime config to the PVC. In K8s this is the boot input
+	// after first boot (#2392): the entrypoint boots from it and the seed +
+	// overlay merge runs only when it is absent. On hosted spokes
+	// SourcePath already links to it (#17468), so this write is the same
+	// file a second time; it still matters on the restart right after
+	// first boot and on legacy-.bak-only spokes, where the config path is
+	// a plain copy. In Docker/LXC it IS the boot-time source of truth,
+	// since there is no ConfigMap and no overlay there. The entrypoint
+	// decides which applies.
 	//
 	// Always written under the new name. The legacy file is never written,
 	// renamed or removed here — see RuntimeConfigFileLegacy.
@@ -175,11 +180,11 @@ func (c *Config) saveLocked() error {
 	// owner credential to every unprivileged agent user (#5331).
 	if guardLivePVCPathUnderTest(runtimePath, defaultRuntimeConfigFile, "RuntimeConfigFile") {
 		runtimeErr = errLivePVCPathGuarded
-	} else if err := os.WriteFile(runtimePath, data, 0o600); err != nil {
+	} else if err := writeFileAtomic(runtimePath, data, 0o600); err != nil {
 		// Common cause: init container created the file as root, runtime user
 		// can't overwrite. Remove and retry so runtime state is not silently lost.
-		_ = os.Remove(runtimePath) // best-effort; the retry's own WriteFile error is what's recorded below
-		if retryErr := os.WriteFile(runtimePath, data, 0o600); retryErr != nil {
+		_ = os.Remove(runtimePath) // best-effort; the retry's own error is what's recorded below
+		if retryErr := writeFileAtomic(runtimePath, data, 0o600); retryErr != nil {
 			runtimeErr = retryErr
 			log.Printf("[config] warning: failed to write PVC runtime config to %s (even after remove): %v", runtimePath, retryErr)
 		} else {
@@ -187,12 +192,6 @@ func (c *Config) saveLocked() error {
 		}
 	} else {
 		log.Printf("[config] PVC runtime config written to %s", runtimePath)
-		// os.WriteFile's mode only applies when it CREATES the file; a
-		// pre-existing world-readable inode (every hive deployed before
-		// this fix) keeps its old 0644 bits, so tighten explicitly.
-		if chmodErr := os.Chmod(runtimePath, 0o600); chmodErr != nil {
-			log.Printf("[config] warning: failed to tighten permissions on %s: %v", runtimePath, chmodErr)
-		}
 	}
 
 	if srcErr == nil {
@@ -209,6 +208,16 @@ func (c *Config) saveLocked() error {
 		return nil
 	}
 	return srcErr
+}
+
+// sourceConfigMode returns the mode Save should give the primary config
+// path: the existing file's permission bits when it exists (an operator may
+// have tightened them), else the historical 0644 default.
+func sourceConfigMode(path string) os.FileMode {
+	if fi, err := os.Stat(path); err == nil {
+		return fi.Mode().Perm()
+	}
+	return 0o644
 }
 
 // RuntimeConfigFile is where Save() persists the full runtime config on the
@@ -235,22 +244,51 @@ const defaultRuntimeConfigFile = "/data/hive.yaml.runtime"
 
 // RuntimeConfigFileLegacy is the pre-rename name of RuntimeConfigFile.
 //
-// It is READ as a fallback and never written, renamed or removed: ~51 live
-// hives carry only this file, and on Docker/LXC it is the single copy of
-// their live configuration. Mutating it at boot could lose owner
-// customisations with no warning, so the migration is copy-forward only —
-// readers prefer RuntimeConfigFile and fall back to this one.
+// It is READ as a fallback and never written by Save: ~51 live hives carry
+// only this file, and on Docker/LXC it is the single copy of their live
+// configuration. Readers prefer RuntimeConfigFile and fall back to this one.
+// The entrypoint refreshes it from a good RuntimeConfigFile on every clean
+// boot (#17862) — a fallback frozen at the Aug 2026 rename booted a
+// months-old level/roster when a kill mid-save truncated the runtime file.
 //
 // Removable one release after every live hive has written the new name.
 const RuntimeConfigFileLegacy = "/data/hive.yaml.bak"
 
+// ResolvedConfigPath is path with symlinks resolved, or path itself when it
+// cannot be resolved. On hosted spokes /etc/hive/hive.yaml links to
+// RuntimeConfigFile (#17468), so this names the file a boot actually read.
+func ResolvedConfigPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
+}
+
+// PersistedConfigPath names the file whose content survives a restart and is
+// the next boot's input — the one an operator must edit. That is
+// RuntimeConfigFile whenever the hive has one (every container deployment
+// after its first boot), else the legacy name the entrypoint falls back to;
+// otherwise the loaded config path, resolved, is the only copy (a bare binary
+// on a host).
+func PersistedConfigPath(sourcePath string) string {
+	for _, p := range []string{RuntimeConfigFile, RuntimeConfigFileLegacy} {
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+			return p
+		}
+	}
+	return ResolvedConfigPath(sourcePath)
+}
+
 // DashboardOverlayFile is where Save() persists a secret-free copy of the
-// dashboard-edited config on the PVC in Kubernetes mode. The copy-config
-// init container re-seeds /etc/hive/hive.yaml FROM THE CONFIGMAP on every
-// pod boot, so without this overlay every dashboard save (LiteLLM
-// endpoint, notifications, agent tweaks, ...) silently vanished on the
-// next restart or upgrade. The entrypoint merges this file over the
-// ConfigMap seed at boot; the ConfigMap stays authoritative for the
+// dashboard-edited config on the PVC in Kubernetes mode. Before #2402 the
+// copy-config init container re-seeded /etc/hive/hive.yaml from the
+// ConfigMap on every pod boot, so without this overlay every dashboard save
+// (LiteLLM endpoint, notifications, agent tweaks, ...) silently vanished on
+// the next restart or upgrade. Since #2402 the runtime config is the boot
+// input once it exists (and since #17468 the config path links to it), so
+// the overlay is consumed only on a boot with no runtime config — first
+// boot or a reprovision onto a fresh PVC — where the entrypoint merges it
+// over the ConfigMap seed; the ConfigMap stays authoritative there for the
 // hub/admin-managed keys (acmm_level, hub.is_public).
 //
 // A package var (not const) only so tests can point it at a temp dir; it
@@ -269,6 +307,124 @@ func guardLivePVCPathUnderTest(current, production, label string) bool {
 	}
 	log.Printf("[config] test binary: refusing to write the live %s at %s — point config.%s at a temp dir to exercise it", label, current, label)
 	return true
+}
+
+// productionAgentOverlayDir is DefaultAgentOverlayDir's production value. A
+// test binary never rewrites a per-agent overlay there.
+const productionAgentOverlayDir = "/data/agent-configs"
+
+// syncAgentOverlayPausedLocked keeps the paused bit in name's per-agent
+// overlay file (Data.AgentsDir/<name>.yaml) equal to the pause just
+// persisted to the main config. The overlay replaces the agent's whole
+// main-config entry at load (MergeAgentOverrides), paused included, but it is
+// written only by config edits (SaveAgentFile) and pack applies, never by a
+// pause or resume. So it kept whatever the agent's state was at its last
+// config edit: an agent whose model was changed while it was paused came
+// back paused after a later resume and a hive restart, and because
+// hive-state.json no longer recorded that pause, it came back with no
+// trigger, reason, actor or time (an operator pause, as far as anything could
+// tell). An agent with no overlay file is left alone. Failures are logged:
+// the main config, the pause's authority, is already saved. Caller holds
+// saveMu.
+//
+// Only the paused key is patched, in place (yaml.Node): every other key and
+// comment in the file is kept byte-for-byte in meaning. Round-tripping the
+// file through AgentConfig would not be: enabled and clear_on_kick default
+// to true only while the key is absent (UnmarshalYAML), and marshaling
+// writes them back as explicit false, so a hand-authored overlay without
+// them would come back disabled on the next load.
+func (c *Config) syncAgentOverlayPausedLocked(name string, paused bool) {
+	dir := c.Data.AgentsDir
+	if dir == "" || guardLivePVCPathUnderTest(dir, productionAgentOverlayDir, "AgentsDir") {
+		return
+	}
+	if strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+		return
+	}
+	path := filepath.Join(dir, name+".yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[config] warning: could not read agent overlay %s to record its pause state: %v", path, err)
+		}
+		return
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		log.Printf("[config] warning: could not parse agent overlay %s to record its pause state: %v", path, err)
+		return
+	}
+	changed, err := setOverlayPausedNode(&doc, paused)
+	if err != nil {
+		log.Printf("[config] warning: could not record pause state in agent overlay %s: %v", path, err)
+		return
+	}
+	if !changed {
+		return
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		log.Printf("[config] warning: could not record pause state in agent overlay %s: %v", path, err)
+		return
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, out, 0o644); err != nil {
+		log.Printf("[config] warning: could not record pause state in agent overlay %s: %v", path, err)
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		log.Printf("[config] warning: could not record pause state in agent overlay %s: %v", path, err)
+	}
+}
+
+// setOverlayPausedNode sets the top-level paused key of a parsed overlay
+// document to paused, adding the key when it is absent and paused is true
+// (an absent key already means false). It reports whether the document
+// changed.
+func setOverlayPausedNode(doc *yaml.Node, paused bool) (bool, error) {
+	root := doc
+	if root.Kind == yaml.DocumentNode {
+		if len(root.Content) == 0 {
+			root.Content = []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}
+		}
+		root = root.Content[0]
+	}
+	if root.Kind == 0 {
+		// An empty file parses to an empty node; make it a document holding
+		// one mapping so the key has somewhere to go.
+		*doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}}
+		root = doc.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return false, fmt.Errorf("top level is %v, not a mapping", root.Tag)
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "paused" {
+			continue
+		}
+		val := root.Content[i+1]
+		var cur bool
+		if err := val.Decode(&cur); err != nil {
+			return false, fmt.Errorf("paused: %w", err)
+		}
+		if cur == paused {
+			return false, nil
+		}
+		val.Kind = yaml.ScalarNode
+		val.Tag = "!!bool"
+		val.Style = 0
+		val.Value = strconv.FormatBool(paused)
+		val.Content = nil
+		return true, nil
+	}
+	if !paused {
+		return false, nil
+	}
+	root.Content = append(root.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "paused"},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"})
+	return true, nil
 }
 
 // saTokenFile is the Kubernetes serviceaccount token path IsKubernetesPod

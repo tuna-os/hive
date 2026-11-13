@@ -10,8 +10,10 @@ import (
 	cruxconfig "github.com/hivecommons/hive/crux/config"
 
 	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/pkg/attention"
 	"github.com/hivecommons/hive/pkg/authorkind"
 	"github.com/hivecommons/hive/pkg/beads"
+	itemblocker "github.com/hivecommons/hive/pkg/blocker"
 	"github.com/hivecommons/hive/pkg/claims"
 	"github.com/hivecommons/hive/pkg/dashboard"
 	"github.com/hivecommons/hive/pkg/github"
@@ -112,8 +114,16 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	// one process-wide write-back gate (pkg/writeback); a rebuilt client
 	// must inherit it or the sweeps regress to ungated.
 	client.SetWritebackGate(b.writebackGate())
+	client.SetAttention(b.cfg.HiveID, func() attention.Config { return b.cfg.GitHub.Attention })
 	client.SetSentinelAlertLabel(b.cfg.Sentinel.LabelOrDefault())
+	// Evaluated heads persist so a restart or rebuild neither re-diffs every
+	// open PR nor blanks the Matrix feed until the next sweep (#16276).
+	client.SetSentinelHeadsPath(sentinelHeadsStatePath)
 	client.SetAPIBudgetThresholds(b.cfg.GitHub.APIReserve, b.cfg.GitHub.APICritical)
+	// The conditional-request cache is process-wide, not per client; size it
+	// from github.etag_cache_max_mb / _max_entries so a hive that evicts
+	// within hours can be given more room without a rebuild.
+	github.SetETagCacheLimits(b.cfg.GitHub.EffectiveETagCacheMaxBytes(), b.cfg.GitHub.EffectiveETagCacheMaxEntries())
 	// Per-repo pause (#6203). A live predicate over the shared config, so a
 	// pause taken in the dashboard narrows the very next enumeration and
 	// automerge sweep without a restart.
@@ -122,6 +132,10 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	client.SetRedMainThresholdFunc(b.cfg.RepoRedMainThreshold)
 	// Open-held-PR cap (#13645), live per repo.
 	client.SetMaxOpenHeldPRsFunc(b.cfg.RepoMaxOpenHeldPRs)
+	// Changed-digest rewrite floor (#17435); the eval cycle re-applies it
+	// from live config so a dashboard edit takes effect without a rebuild.
+	client.SetAdvisoryDigestMinInterval(b.cfg.Governor.Advisory.EffectiveDigestMinInterval())
+	client.SetScheduledBaseRefresh(func(repo string) bool { return b.cfg.AutoMerge.RequireCurrentBaseFor(repo) })
 	// Per-repo custom agents (#6204). A live predicate over the shared
 	// config, so the hive-open-pr / hive-merge / hive-open-issue relays
 	// refuse an out-of-scope request without a restart.
@@ -147,9 +161,25 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	client.SetIssueFilter(b.cfg.Project.IssueFilter)
 	b.applyPriorArtFilingGate(client)
 	client.SetAgentIssueDecisionPolicy(b.cfg.Project.EffectiveAgentIssueDecisionPolicy())
+	// A lane that cannot push .github/workflows/** hands a workflow-only park
+	// to the lane that can, instead of the owner (issue_workflows_handoff.go).
+	// Live predicate over the shared config, like the scope funcs above.
+	client.SetWorkflowsLaneFunc(b.cfg.WorkflowsLaneFor)
+	// A lane whose own token asks for the Workflows permission is refused a
+	// workflow-only park when the installation grants it, and the blocker
+	// ledger records "App lacks workflows" only when the hive cannot push
+	// them (projectbluefin/testsuite#1059). The ledger is process-wide, so a
+	// rebuilt client re-installs its check.
+	client.SetWorkflowsSelfPushFunc(b.cfg.AgentPushesWorkflows)
+	itemblocker.Shared().SetCapabilityCheck(client.CapabilityAvailable)
+	itemblocker.Shared().SetProofCheck(client.WorkflowsRejectionProves)
 	client.SetReporterConfirmationEnabledFunc(func() bool {
 		return b.cfg.Issues.ReporterConfirmationEnabled()
 	})
+	// ci.failed CEL trigger source: the red-main sweep reports default-branch
+	// CI failures only while a trigger rule names ci.failed. Both hooks read
+	// b.cfg / b.agentMgr / b.gov when called, so boot order does not matter.
+	client.SetCIFailedHook(b.ciFailedTriggerWanted, b.emitCIFailedTrigger)
 	// Hive-authored superseded PR auto-close (hivecommons/hive#14965):
 	// governor.auto_close_superseded gates it, the repo's ACMM level must
 	// allow own-PR closes.
@@ -160,6 +190,13 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	// ledger is read per call because the client can be configured before
 	// it is built.
 	client.SetRelayContributor(b.relayContributor)
+	// Park-text provenance for the park re-check (#16697): the live claim
+	// above expires with the relay task lease, but the re-check reads park
+	// comments days later, so it keys on the durable registry-backed
+	// predicate instead — tier-aware, since the registry admits
+	// self-registered newcomers (api_contribute.go register) and keeps
+	// revoked profiles.
+	client.SetParkTextContributor(b.parkTextContributor)
 	// Ledger fallback for the enumeration-time claim read and the
 	// in-progress sweep: a ledger claim whose 🔒 comment was budget-suppressed
 	// must still read as a claim (claimswire.go, ledgerClaimLookup).
@@ -268,6 +305,41 @@ func (b *boot) reporterTrusted(login, association string) bool {
 // clanker-requested.
 func (b *boot) relayContributor(login string) bool {
 	return ledgerHasContributor(b.issueClaims, login)
+}
+
+// parkTextContributor is the park re-check's contributor-provenance
+// predicate (github.Client.SetParkTextContributor): a live relay claim, or a
+// contributor-registry profile at a tier an operator or auto-promotion
+// granted. It is narrower than firstTimerKnownContributor on purpose — POST
+// /api/contribute/register creates a newcomer profile from a self-asserted
+// username without authentication, and a revoked profile stays in the
+// registry — so neither tier may let a commenter or reporter steer which
+// cross-repo patches the park re-check reads with the App token (#16697).
+func (b *boot) parkTextContributor(login string) bool {
+	return parkTextContributorKnown(b.relayContributor, dashboard.ContributorTrustTierByLogin, login)
+}
+
+// parkTextContributorTierAdmits reports whether a registry tier is
+// provenance for park text: any tier the registry stores except the
+// self-registration default (newcomer) and revoked. An empty tier is a
+// legacy profile written before tiers existed and is not admitted either.
+func parkTextContributorTierAdmits(tier string) bool {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "", "newcomer", "revoked":
+		return false
+	}
+	return true
+}
+
+func parkTextContributorKnown(relay func(string) bool, registryTier func(string) (string, bool), login string) bool {
+	if relay != nil && relay(login) {
+		return true
+	}
+	if registryTier == nil {
+		return false
+	}
+	tier, ok := registryTier(login)
+	return ok && parkTextContributorTierAdmits(tier)
 }
 
 func ledgerHasContributor(ledger *claims.Ledger, login string) bool {
@@ -464,6 +536,12 @@ func (b *boot) applyGitHubClientDashboardHooks(client *github.Client) {
 		}
 		recordObservedMerge(b.dashSrv, b.cfg.Project.Org, obs.Repo, obs.Number, obs.ObservedAt, obs.Actor, path, reworkCommits, reworkObserved)
 	})
+	// #16116: the reviews people and other bots submitted on the PRs the same
+	// settle scan saw merge or close feed the throughput card's Reviewed row.
+	client.SetPRReviewObservedHook(func(obs github.PRReviewObservation) {
+		recordObservedReview(b.dashSrv, obs)
+	})
+	client.StartPRTerminalEnrichment(b.ctx)
 	client.SetPROpenedHook(func(agentName, repo string, number int, url string) {
 		b.dashSrv.LinearAgentPROpened(agentName, repo, number, url)
 		// Same typed hook feeds the lifecycle timeline: the watcher fires

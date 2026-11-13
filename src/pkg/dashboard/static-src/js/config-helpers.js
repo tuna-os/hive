@@ -8,6 +8,16 @@
       if (!el || el.classList.contains('disabled') || el.dataset.disabled === 'true') return;
       const isOn = el.classList.toggle('on');
       if (el.hasAttribute('aria-checked')) el.setAttribute('aria-checked', isOn ? 'true' : 'false');
+      if (section === 'merge-train') {
+        el.setAttribute('aria-checked', String(isOn));
+        markDirtyMergeTrain(key, isOn);
+        return;
+      }
+      if (section === 'native-queue') {
+        el.setAttribute('aria-checked', String(isOn));
+        markDirtyNativeQueue(key, isOn);
+        return;
+      }
       markDirty(section, key, isOn);
       if (section === 'dashboard' && key === 'experiment_lab') noteExperimentLabToggle(isOn);
       if (section === 'review' && (key === 'fan_out' || key === 'combined_perspectives')) refreshReviewerAgentSummary();
@@ -20,6 +30,17 @@
 
     function markBoolDirty(section, key, value) {
       markDirty(section, key, value === true || value === 'true');
+    }
+
+    function markDirtyMergeTrain(key, value) {
+      const staged = ((_configState.dirty || {})['auto-merge'] || {}).merge_train || {};
+      markDirty('auto-merge', 'merge_train', Object.assign({}, staged, { [key]: value }));
+    }
+
+    function markDirtyNativeQueue(key, value) {
+      if (key === 'repos' || key === 'bases') value = String(value).split(',').map(s => s.trim()).filter(Boolean);
+      const staged = ((_configState.dirty || {})['auto-merge'] || {}).native_merge_queue || {};
+      markDirty('auto-merge', 'native_merge_queue', Object.assign({}, staged, { [key]: value }));
     }
 
     // Review label gate (Settings → Features → Review Gate → "Only review
@@ -46,6 +67,10 @@
     }
     function markDirtyReviewRequireLabels(text) {
       markDirty('review', 'require_labels', parseReviewRequireLabels(text));
+    }
+
+    function markDirtyReviewFixerFallbackAgents(text) {
+      markDirty('review', 'fixer_fallback_agents', String(text || '').split(',').map(s => s.trim()).filter(Boolean));
     }
 
     // Reviewer agents pick-list (Settings → Features → Review Gate →
@@ -134,6 +159,24 @@
       markSentinelDirty('sensitivePaths', []);
       renderConfigTab('Security');
     }
+    /* Security → Sentinel → Sensitive files per repository. Stages one
+       repository's project.repo_policies[].sentinel_sensitive_paths under
+       sentinel.repoSensitivePaths: hive-wide sends null (clears it), "flag
+       no paths" sends [], own list sends the box's globs. It does not touch
+       sentinelState(), whose repoSensitivePaths is the saved list. */
+    function markSentinelRepoPathsRow(el) {
+      const row = el && el.closest ? el.closest('.sn-repo-paths-row') : null;
+      if (!row || !row.dataset.repo) return;
+      const mode = row.querySelector('.sn-repo-paths-mode');
+      const list = row.querySelector('.sn-repo-paths-list');
+      const m = mode ? mode.value : 'hive';
+      if (list) list.disabled = m !== 'own';
+      const lines = list ? String(list.value || '').split('\n').map(l => l.trim()).filter(Boolean) : [];
+      if (!_configState.dirty.security) _configState.dirty.security = {};
+      const bag = _configState.dirty.security.sentinel || {};
+      bag.repoSensitivePaths = Object.assign({}, bag.repoSensitivePaths || {}, { [row.dataset.repo]: m === 'hive' ? null : (m === 'none' ? [] : lines) });
+      _configState.dirty.security.sentinel = bag;
+    }
     function markSentinelPathsFromText(text) {
       const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
       /* An emptied box restores defaults rather than disabling the rule. */
@@ -194,6 +237,7 @@
       const dests = reviewBacklogDestinationsFor(ws);
       const dest = dests.some(o => o.value === bl.destination) ? bl.destination : 'github_issue';
       const labels = Array.isArray(bl.labels) ? bl.labels : ['origin/reviewer'];
+      const minSeverity = ['P0', 'P1', 'P2', 'P3'].includes(String(bl.min_severity || '').toUpperCase()) ? String(bl.min_severity).toUpperCase() : '';
       const presetBtns = REVIEW_SEVERITY_PRESETS.map(p => `<button type="button" class="hv-btn ${blockAt === p.blockAt ? 'btn-primary' : 'btn-secondary'} btn-sm btn-small" data-action="applyReviewSeverityPreset" data-arg0="${p.blockAt}" aria-pressed="${blockAt === p.blockAt ? 'true' : 'false'}"${dis}>${esc(p.label)}</button>`).join(' ');
       const toggle = (key, on, label, tip) => `<div class="config-toggle mt-3">
               <div class="config-toggle-switch ${on ? 'on' : ''}${canEdit ? '' : ' disabled'}" data-action="toggleReviewSeverityFlag" data-arg0="${key}" data-arg-types="s" role="switch" aria-checked="${on ? 'true' : 'false'}"></div>
@@ -233,8 +277,18 @@
             <input type="text" id="review-backlog-labels" value="${esc(labels.join(', '))}" placeholder="origin/reviewer" data-change-action="markDirtyReviewBacklogLabels" data-arg-types="v"${dis}>
           </div>
           <div class="config-field mt-3">
-            <label>Max backlog items per PR per day ${settingHelpMark('review-swarm', 'blocking-line-reviewseverity-reviewbacklog', 'Max backlog items per PR per day', `review.backlog.max_per_pr_per_day: cap on items filed from one PR in a day. 0 or blank uses the default of 10.`)}</label>
-            <input type="number" id="review-backlog-max" min="0" value="${esc(String(bl.max_per_pr_per_day || ''))}" placeholder="10" data-change-action="markDirtyReviewBacklog" data-arg0="max_per_pr_per_day" data-arg-types="s,N"${dis}>
+            <label>Lowest severity filed as a backlog item ${settingHelpMark('review-swarm', 'blocking-line-reviewseverity-reviewbacklog', 'Lowest severity filed as a backlog item', `review.backlog.min_severity: findings at or above this priority become backlog items; anything below is listed in the PR&apos;s Follow-ups comment instead. Default P2 (P3 files everything).`)}</label>
+            <select id="review-backlog-min-severity" data-change-action="markDirtyReviewBacklog" data-arg0="min_severity" data-arg-types="s,v"${dis}>
+              ${[['', 'Default (P0–P2)'], ['P0', 'P0 only'], ['P1', 'P0–P1'], ['P2', 'P0–P2'], ['P3', 'P0–P3 (everything)']].map(([v, l]) => `<option value="${v}"${minSeverity === v ? ' selected' : ''}>${l}</option>`).join('')}
+            </select>
+          </div>
+          <div class="config-field mt-3">
+            <label>Max backlog items per PR ${settingHelpMark('review-swarm', 'blocking-line-reviewseverity-reviewbacklog', 'Max backlog items per PR', `review.backlog.max_per_pr: cap on items filed or re-raised from one PR over its lifetime. 0 or blank uses the default of 3 (or the retired review.backlog.max_per_pr_per_day if still set).`)}</label>
+            <input type="number" id="review-backlog-max" min="0" value="${esc(String(bl.max_per_pr || ''))}" placeholder="3" data-change-action="markDirtyReviewBacklog" data-arg0="max_per_pr" data-arg-types="s,N"${dis}>
+          </div>
+          <div class="config-field mt-3">
+            <label>Max backlog items per PR per day (retired) ${settingHelpMark('review-swarm', 'blocking-line-reviewseverity-reviewbacklog', 'Max backlog items per PR per day (retired)', `review.backlog.max_per_pr_per_day: the retired per-day cap. Still read as the lifetime cap when max_per_pr is unset. 0 or blank means not set.`)}</label>
+            <input type="number" id="review-backlog-max-per-day" min="0" value="${esc(String(bl.max_per_pr_per_day || ''))}" placeholder="not set" data-change-action="markDirtyReviewBacklog" data-arg0="max_per_pr_per_day" data-arg-types="s,N"${dis}>
           </div>
         </div>`;
     }
@@ -260,7 +314,8 @@
     }
     function markDirtyReviewBacklog(key, value) {
       const rv = reviewSeverityState();
-      if (key === 'max_per_pr_per_day') value = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+      if (key === 'max_per_pr_per_day' || key === 'max_per_pr') value = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+      if (key === 'min_severity') value = String(value || '').trim().toUpperCase();
       rv.backlog[key] = value;
       markDirty('review', 'backlog', Object.assign({}, (_configState.dirty.review || {}).backlog, { [key]: value }));
     }
@@ -308,6 +363,15 @@
       const liveLine = live && live.enabled
         ? `<p class="am-trusted-authors-note">Now: <strong>${live.current}</strong> reviewer${live.current === 1 ? '' : 's'} (target ${live.target}, band ${live.min}–${live.max})${live.draining && live.draining.length ? ', draining ' + live.draining.map(esc).join(', ') : ''}; backlog ${live.backlog}${live.oldestWait ? ', oldest ' + esc(live.oldestWait) : ''}${live.lastDecision ? ' — last: ' + esc(reviewerAutoscaleDecisionText(live.lastDecision)) : ''}</p>`
         : '';
+      // Which agent the saved setting scales, as the server resolved it
+      // (GET /api/config/review reviewer_autoscale). Hidden while an unsaved
+      // edit to the switch or the agent would make it stale.
+      const res = (rv && rv.reviewer_autoscale) || {};
+      const laneHelp = settingHelpMark('review-swarm', 'reviewer-autoscale-reviewreviewersautoscale', 'Scaled agent', 'The agent whose replicas grow and shrink, as saved. With no lane agent named, the hive picks the first agent in the reviewer list, or with no list the first agent the &quot;review&quot; keyword scan admits. It never picks an agent the review gate sends no reviews to.');
+      const laneLine = !(a.enabled && res.enabled) || (a.agent || '') !== (res.agent || '') ? ''
+        : res.effective_agent
+          ? `<p class="am-trusted-authors-note" id="review-reviewer-autoscale-lane">Scaling <strong>${esc(res.effective_agent)}</strong>${res.agent ? '' : ' (chosen by the hive)'} ${laneHelp}</p>`
+          : `<p class="am-trusted-authors-note" id="review-reviewer-autoscale-lane">Not scaling any agent: ${esc(res.reason || 'no agent takes reviews from the review gate')} ${laneHelp}</p>`;
       const num = (key, yamlPath, label, help, step) => `<div class="config-field"><label>${label} ${yamlHint(yamlPath)} ${settingHelpMark('review-swarm', 'reviewer-autoscale-reviewreviewersautoscale', label, help)}</label>
               <input type="number" min="0"${step ? ' step="' + step + '"' : ''} value="${esc(String(a[key] || ''))}" placeholder="${esc(String(REVIEWER_AUTOSCALE_DEFAULTS[key]))}" data-change-action="markDirtyReviewerAutoscale" data-arg0="${key}" data-arg-types="s,N"${dis}></div>`;
       const fields = a.enabled ? `
@@ -325,7 +389,7 @@
             <div class="config-field-row mt-3">
               ${num('cpu_per_reviewer', 'review.reviewers.autoscale.cpu_per_reviewer', 'CPU per reviewer (cores)', 'The CPU one reviewer is assumed to need. A scale-up is refused when the pod cgroup has less than this free; unknown limits (no cgroup) never block.', '0.1')}
               ${num('mem_per_reviewer_mb', 'review.reviewers.autoscale.mem_per_reviewer_mb', 'Memory per reviewer (MiB)', 'The memory one reviewer is assumed to need. A scale-up is refused when the pod cgroup has less than this free.')}
-              <div class="config-field"><label>Lane agent ${yamlHint('review.reviewers.autoscale.agent')} ${settingHelpMark('review-swarm', 'reviewer-autoscale-reviewreviewersautoscale', 'Lane agent', 'The base reviewer agent whose replicas scale. Empty picks the first agent with role reviewer, then review.reviewer_agents[0].')}</label>
+              <div class="config-field"><label>Lane agent ${yamlHint('review.reviewers.autoscale.agent')} ${settingHelpMark('review-swarm', 'reviewer-autoscale-reviewreviewersautoscale', 'Lane agent', 'The base reviewer agent whose replicas scale. It must be a reviewer the review gate sends reviews to (see Reviewers above); any other agent is refused, because its replicas could not take a waiting PR. Empty picks the first agent in the reviewer list, or with no list the first agent the &quot;review&quot; keyword scan admits. Changing it retires the old agent&#39;s extra replicas and starts the new agent from its own replica count.')}</label>
                 <input type="text" value="${esc(a.agent || '')}" placeholder="reviewer" data-change-action="markDirtyReviewerAutoscale" data-arg0="agent" data-arg-types="s,w"${dis}></div>
             </div>` : '';
       return `<div id="review-reviewer-autoscale" class="mt-4">
@@ -333,7 +397,7 @@
               <div class="config-toggle-switch ${a.enabled ? 'on' : ''}${canEdit ? '' : ' disabled'}" data-action="toggleReviewerAutoscaleEnabled" role="switch" aria-checked="${a.enabled ? 'true' : 'false'}"></div>
               <span class="config-toggle-label">Scale reviewers with the backlog ${yamlHint('review.reviewers.autoscale.enabled')} ${settingHelpMark('review-swarm', 'reviewer-autoscale-reviewreviewersautoscale', 'Scale reviewers with the backlog', `Off by default. On, the reviewer lane grows from Min to Max replicas while PRs wait for a free reviewer, and drains back when idle. Replicas added this way are ordinary reviewer-N agents (same role, prompt, scoped token, pane and cadence as a configured replica). Scale-ups are refused when the pod cgroup lacks CPU or memory for another reviewer, when the provider budget latch is on or provider headroom is under 10%, or when reviewer kicks are failing to reach the CLI input prompt — a saturated pod, not demand. Each decision is logged as &quot;reviewer autoscale: 2→3 reason=…&quot;. Owner only.`)}</span>
             </div>
-            ${liveLine}${fields}
+            ${laneLine}${liveLine}${fields}
           </div>`;
     }
     function reviewerAutoscaleDecisionText(d) {
@@ -383,6 +447,8 @@
       };
       if (this && this.id === 'am-require-current-base') markDirty('auto-merge', 'require_current_base', selected('am-require-current-base'));
       if (this && this.id === 'am-squash-only') markDirty('auto-merge', 'squash_only', selected('am-squash-only'));
+      if (this && this.id === 'am-no-ci-ok') markDirty('auto-merge', 'no_ci_ok', selected('am-no-ci-ok'));
+      if (this && this.id === 'am-allow-unprotected-base') markDirty('auto-merge', 'allow_unprotected_base', selected('am-allow-unprotected-base'));
       if (this && this.classList && this.classList.contains('am-human-merge-path-input')) {
         const paths = {};
         document.querySelectorAll('#am-human-merge-paths .am-human-merge-path-row').forEach(row => {
@@ -392,6 +458,26 @@
         });
         markDirty('auto-merge', 'human_merge_paths', paths);
       }
+    }
+
+    // Settings → Features → Auto-merge → Pin bumps that skip the hand merge.
+    // Stages auto_merge.human_merge_pin_only in full, one entry per row; a
+    // row that is off with nothing filled in drops out.
+    function markDirtyAutoMergePinOnly() {
+      const policies = {};
+      document.querySelectorAll('#am-human-merge-pin-only .am-pin-only-row').forEach(row => {
+        const enabled = row.querySelector('.am-pin-only-enabled');
+        const paths = row.querySelector('.am-pin-only-paths');
+        const authors = row.querySelector('.am-pin-only-authors');
+        const entry = {
+          enabled: !!(enabled && enabled.checked),
+          paths: splitConfigLines(paths ? paths.value : ''),
+          kinds: Array.from(row.querySelectorAll('.am-pin-only-kind')).filter(k => k.checked).map(k => k.value),
+          trusted_authors: splitConfigLines(authors ? authors.value : '')
+        };
+        if (row.dataset.repo && (entry.enabled || entry.paths.length || entry.kinds.length || entry.trusted_authors.length)) policies[row.dataset.repo] = entry;
+      });
+      markDirty('auto-merge', 'human_merge_pin_only', policies);
     }
 
     function markDirtyContributorLane() {
@@ -405,8 +491,10 @@
       const repos = document.getElementById('am-contributor-lane-repos');
       const tiers = document.getElementById('am-contributor-lane-require-tiers');
       const scope = document.getElementById('am-contributor-lane-auto-promotion-scope');
+      const fenceScope = document.getElementById('am-contributor-lane-workflow-fence-scope');
       const soakMinutes = soak ? parseInt(soak.value, 10) : 30;
-      markDirty('auto-merge', 'contributor_lane', {
+      const staged = ((_configState.dirty || {})['auto-merge'] || {}).contributor_lane || {};
+      markDirty('auto-merge', 'contributor_lane', Object.assign({
         enabled: !!(enabled && enabled.classList.contains('on')),
         soak_minutes: Number.isFinite(soakMinutes) && soakMinutes >= 0 ? soakMinutes : 30,
         require_reviewer_verdict: !!(verdict && verdict.classList.contains('on')),
@@ -414,10 +502,84 @@
         approve_held_runs_for_registry_trusted: !!(heldRuns && heldRuns.classList.contains('on')),
         owner_approval_releases_workflow_fence: !!(workflowApproval && workflowApproval.classList.contains('on')),
         auto_promotion_scope: scope && scope.value ? scope.value : 'hive',
+        workflow_fence_scope: fenceScope && fenceScope.value ? fenceScope.value : 'all',
         exclude_labels: labels ? labels.value.split(',').map(s => s.trim()).filter(Boolean) : [],
         repos: repos ? Array.from(repos.selectedOptions).map(o => o.value).filter(Boolean) : [],
         require_tiers: tiers ? tiers.value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) : []
+      }, staged.workflow_fence_scope_repos ? { workflow_fence_scope_repos: staged.workflow_fence_scope_repos } : {}));
+    }
+
+    // Settings → Features → Auto-merge → Workflow fence scope per repository.
+    // Stages one repository's project.repo_policies[].workflow_fence_scope
+    // inside contributor_lane: a scope sets it, '' (hive-wide) sends null,
+    // which clears it. Only repositories changed here are sent.
+    function markDirtyFenceScopeRepo(repo, value) {
+      const staged = ((_configState.dirty || {})['auto-merge'] || {}).contributor_lane || {};
+      const repos = Object.assign({}, staged.workflow_fence_scope_repos || {}, { [repo]: value ? value : null });
+      markDirty('auto-merge', 'contributor_lane', Object.assign({}, staged, { workflow_fence_scope_repos: repos }));
+    }
+
+    // Settings → Features → Let hive decide → per-repository overrides. A row
+    // edit is staged as {repo: true | false | null}; null means "follow the
+    // hive-wide switch". decisionsDelegateSaveBody merges it into the saved map.
+    function markDirtyDecisionsDelegateRepo(repo, value) {
+      const staged = ((_configState.dirty || {})['decisions-delegate'] || {}).repos || {};
+      const next = value === 'on' ? true : (value === 'off' ? false : null);
+      markDirty('decisions-delegate', 'repos', Object.assign({}, staged, { [repo]: next }));
+    }
+
+    // decisionsDelegateSameRepo: owner/repo keys match case-insensitively, and
+    // a bare name (hive.yaml may use one) matches the repository of that name.
+    function decisionsDelegateSameRepo(a, b) {
+      const x = String(a || '').toLowerCase();
+      const y = String(b || '').toLowerCase();
+      if (x === y) return true;
+      if (x.includes('/') && y.includes('/')) return false;
+      return x.slice(x.indexOf('/') + 1) === y.slice(y.indexOf('/') + 1);
+    }
+
+    // decisionsDelegateReposBody is the repos map a save sends. PUT
+    // /api/config/decisions/delegate replaces the map whole, so it carries
+    // every saved override plus the staged row edits, never the edited rows
+    // alone; a row set back to hive-wide drops out.
+    function decisionsDelegateReposBody(saved, staged) {
+      const out = {};
+      Object.entries(saved || {}).forEach(([repo, v]) => {
+        if (v && typeof v.enabled === 'boolean') out[repo] = { enabled: v.enabled };
       });
+      Object.entries(staged || {}).forEach(([repo, v]) => {
+        Object.keys(out).forEach(k => { if (decisionsDelegateSameRepo(k, repo)) delete out[k]; });
+        if (v === true || v === false) out[repo] = { enabled: v };
+      });
+      return out;
+    }
+
+    // decisionsDelegateEffectTimeoutValid mirrors the server's check: empty
+    // (the default), or a Go duration above zero such as 30m, 1h30m or 2h.
+    function decisionsDelegateEffectTimeoutValid(raw) {
+      const s = String(raw || '').trim();
+      if (!s) return true;
+      if (!/^\+?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:ns|us|µs|μs|ms|s|m|h))+$/.test(s)) return false;
+      return /[1-9]/.test(s);
+    }
+
+    // decisionsDelegateSaveBody builds the PUT body from the staged values.
+    // Only staged fields are sent; an absent field is left alone by the server.
+    function decisionsDelegateSaveBody(values, savedRepos) {
+      const body = {};
+      if (values.enabled !== undefined) body.enabled = values.enabled;
+      if (values.llm_enabled !== undefined || values.llm_model !== undefined) {
+        body.llm = {};
+        if (values.llm_enabled !== undefined) body.llm.enabled = values.llm_enabled;
+        if (values.llm_model !== undefined) body.llm.model = values.llm_model;
+      }
+      if (values.repos !== undefined) body.repos = decisionsDelegateReposBody(savedRepos, values.repos);
+      if (values.effect_timeout !== undefined) {
+        const raw = String(values.effect_timeout || '').trim();
+        if (!decisionsDelegateEffectTimeoutValid(raw)) throw new Error('Let hive decide effect timeout must be a duration above zero, such as 30m or 2h, or empty for the default (30m)');
+        body.effect_timeout = raw;
+      }
+      return body;
     }
 
     function markDirtyPerspectives() {
@@ -508,6 +670,7 @@
             : 'No soak telemetry recorded yet — it accumulates one row per eval cycle, so give it a few cycles.';
           return;
         }
+
         const groups = {};
         for (const e of entries) {
           const k = `${e.commit || '?'} / ${e.mode || '?'} (gen ${e.generation || 0})`;
@@ -540,6 +703,32 @@
         out.innerHTML = rows.join('');
       } catch (err) {
         out.textContent = `Failed to load soak telemetry: ${err.message}`;
+      }
+    }
+
+    async function loadIntegrationOrchestration() {
+      const out = document.getElementById('integration-orchestration-summary');
+      if (!out) return;
+      out.textContent = 'Loading authoritative observations…';
+      try {
+        const res = await fetch('/api/integration-orchestration', { headers: _inceptionAuthHeaders() });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const preparation = await fetch('/api/stage-tracker', { headers: _inceptionAuthHeaders() });
+        if (preparation.ok) {
+          const tracker = await preparation.json();
+          data.preparation = {
+            source: '/api/stage-tracker.base_preparation',
+            state: Array.isArray(tracker.base_preparation) ? 'observed' : 'unavailable',
+            queues: Array.isArray(tracker.base_preparation) ? tracker.base_preparation : null,
+            meaning: 'Preparation ownership/backlog only; not green or approved train seats, and not native queue membership.'
+          };
+        } else {
+          data.preparation = { state: 'unavailable', reason: `Tracker HTTP ${preparation.status}` };
+        }
+        out.textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        out.textContent = `Integration observations unknown: ${e.message}`;
       }
     }
 
@@ -706,4 +895,3 @@
       if (!await hiveConfirm({ title: `Stop watching ${repo}?`, message: 'The watch stops polling its upstream. Recorded state and issues already filed are kept.', confirmLabel: 'Stop watching', danger: true })) return;
       putUpstreamWatch({ repos: { [repo]: null } }, `Stopped watching ${repo}`);
     }
-

@@ -10,7 +10,7 @@
     </div>
     <div class="oc-nav-group" id="dashboard-section-nav-group">
       <div class="oc-nav-label">Dashboard</div>
-      <a class="oc-nav-item" data-section="overview-section" data-action="ocNavigate" data-arg0="overview-section"><span class="oc-nav-emoji">🍩</span><span class="oc-nav-text">Overview</span><span id="overview-sidebar-badge" class="badge-count oc-nav-count" data-zero hidden>0/0</span></a>
+      <a class="oc-nav-item" data-section="overview-section" data-action="ocNavigate" data-arg0="overview-section"><span class="oc-nav-emoji">🍩</span><span class="oc-nav-text">Overview</span><span id="overview-sidebar-badge" class="badge-count oc-nav-count" data-zero hidden>BP = 0/0</span></a>
       <a class="oc-nav-item" data-section="activity-monitor-section" data-action="ocNavigate" data-arg0="activity-monitor-section"><span class="oc-nav-emoji">📍</span><span class="oc-nav-text">Hive activity monitor</span><span id="activity-monitor-waiting-badge" class="badge-count oc-nav-count oc-nav-count--waiting" data-zero title="Nothing is waiting on you" aria-label="0 waiting on you">0</span><span id="activity-monitor-sidebar-badge" class="badge-count oc-nav-count" data-zero>0</span></a>
       <a class="oc-nav-item active" data-section="governor" data-action="ocNavigate" data-arg0="governor"><span class="oc-nav-emoji">🚦</span><span class="oc-nav-text">Governor</span><span id="governor-sidebar-badge" class="badge-count oc-nav-count" data-zero hidden>0/0</span></a>
       <a class="oc-nav-item" data-section="runs-section" data-action="ocNavigate" data-arg0="runs-section"><span class="oc-nav-emoji">🏃</span><span class="oc-nav-text">Runs</span><span id="runs-sidebar-badge" class="oc-nav-count" style="display:none"></span></a>
@@ -35,7 +35,7 @@
     <div class="oc-nav-group">
       <div class="oc-nav-label">Resources</div>
       <a class="oc-nav-item" data-section="repos-section" data-action="ocNavigate" data-arg0="repos-section"><span class="oc-nav-emoji">📦</span><span class="oc-nav-text">Projects</span><span id="repos-sidebar-badge" class="badge-count oc-nav-count" data-zero>0</span></a>
-      <a class="oc-nav-item" data-section="contributors-section" data-action="ocNavigate" data-arg0="contributors-section"><span class="oc-nav-emoji">👥</span><span class="oc-nav-text">Contributors</span><span id="contributors-sidebar-badge" class="badge-count oc-nav-count" data-zero hidden>0/0</span></a>
+      <a class="oc-nav-item" data-section="contributors-section" data-action="ocNavigate" data-arg0="contributors-section"><span class="oc-nav-emoji">👥</span><span class="oc-nav-text">Contributors</span><span id="contributors-sidebar-badge" class="badge-count oc-nav-count contributor-online-trigger" tabindex="0" role="link" aria-label="Contributors" data-keydown-action="ocNavigate" data-arg0="contributors-section" data-zero hidden>0/0</span></a>
     </div>
     <div class="oc-nav-group">
       <div class="oc-nav-label">Intelligence</div>
@@ -44,6 +44,7 @@
       <a class="oc-nav-item" data-section="inception-section" data-action="ocNavigate" data-arg0="inception-section"><span class="oc-nav-emoji">💡</span><span class="oc-nav-text">Inception (spektacular)</span></a>
       <a class="oc-nav-item" data-section="knowledge-section" data-action="ocNavigate" data-arg0="knowledge-section"><span class="oc-nav-emoji">📚</span><span class="oc-nav-text">Knowledge</span><span id="knowledge-sidebar-badge" class="badge-count oc-nav-count" data-zero>0</span></a>
       <a class="oc-nav-item" data-section="search-section" data-action="ocNavigate" data-arg0="search-section" hidden><span class="oc-nav-emoji">🔍</span><span class="oc-nav-text">Search</span></a>
+      <a class="oc-nav-item" data-section="inbox-section" data-action="ocNavigate" data-arg0="inbox-section"><span class="oc-nav-emoji">📥</span><span class="oc-nav-text">Inbox</span><span id="inbox-sidebar-badge" class="badge-count oc-nav-count" data-zero hidden>0</span></a>
       <a class="oc-nav-item" data-section="nous-section" data-feature="experiment_lab" hidden data-action="ocNavigate" data-arg0="nous-section"><span class="oc-nav-emoji">🧪</span><span class="oc-nav-text">Experiment Lab (nous)</span></a>
     </div>
     <div class="oc-nav-group">
@@ -107,4 +108,3 @@
        block turns it on. Its id is registered in OVERLAY_SELECTOR so the
        existing installModalScrollLock() observer body-locks scroll for free. -->
   <div id="oc-drawer-backdrop"></div>
-

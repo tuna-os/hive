@@ -20,6 +20,7 @@ import (
 	"github.com/hivecommons/hive/pkg/dashboard"
 	"github.com/hivecommons/hive/pkg/escalate"
 	"github.com/hivecommons/hive/pkg/escalation"
+	"github.com/hivecommons/hive/pkg/evidence/benchmarks"
 	"github.com/hivecommons/hive/pkg/forge"
 	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/github/automerge"
@@ -32,6 +33,7 @@ import (
 	"github.com/hivecommons/hive/pkg/stageengine/prstage"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 	"github.com/hivecommons/hive/pkg/tracing"
+	"github.com/hivecommons/hive/pkg/workflowmodel"
 	"github.com/hivecommons/hive/pkg/worksource"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -123,6 +125,7 @@ func escalationObservation(cfg *config.Config, pr github.PullRequest, owners map
 		FailingChecks:      pr.FailingChecks,
 		Agent:              owners[escalation.Key(repo, pr.Number)],
 		IndependentControl: isIndependentCIControl(cfg, pr),
+		TransientTriaged:   red && pr.TransientCITriaged,
 	}
 }
 
@@ -139,27 +142,14 @@ func redPRFixOwner(agent string) string {
 	return review.DefaultFixerAgent
 }
 
-// dependencyBots are forge bots whose PRs are dependency bumps, not hive fix
-// attempts. They carry the "[bot]" suffix that otherwise marks a PR as
-// agent-authored, but nothing in the hive opened them and no hive agent is
-// iterating on them, so a red one is not a fix loop to break: escalating it
-// only pages a human with "1 distinct fix attempts" about a crate bump that
-// renovate will rebase on its own. Mirrors the hub's default contribute
-// deny-authors list (config: hub.contribute_deny_authors). A bot PR that only a
-// person can unstick (a conflict the bot will not rebase, required CI that
-// stays red, a held or never-started required check) is handed to a person by
-// runDependencyBotConflictSweep (dependency_bot_conflicts.go), not the fix loop.
-var dependencyBots = map[string]bool{
-	"renovate[bot]":    true,
-	"dependabot[bot]":  true,
-	"mergeraptor[bot]": true,
-}
-
 // isHiveAgentAuthor reports whether a PR author is one of OUR agents — the
 // configured ai_author, the App bot identity agents author as, or another
-// bot account — excluding the dependency bots above. Shared by every fix-loop
-// path (staleness clock, reaper, escalation sweep) so they classify PRs
-// identically.
+// bot account — excluding the dependency bots (github.IsDependencyBotAuthor):
+// nothing in the hive opened those and no hive agent iterates on them, so a
+// red one is not a fix loop to break — escalating it only pages a human with
+// "1 distinct fix attempts" about a crate bump the bot rebases on its own.
+// Shared by every fix-loop path (staleness clock, reaper, escalation sweep)
+// so they classify PRs identically.
 func isHiveAgentAuthor(cfg *config.Config, author string) bool {
 	if author == "" {
 		return false
@@ -170,7 +160,7 @@ func isHiveAgentAuthor(cfg *config.Config, author string) bool {
 	if eff := cfg.EffectiveAIAuthor(); eff != "" && author == eff {
 		return true
 	}
-	return strings.HasSuffix(author, "[bot]") && !dependencyBots[author]
+	return strings.HasSuffix(author, "[bot]") && !github.IsDependencyBotAuthor(author)
 }
 
 // isIndependentCIControl reports whether a PR supplies human-authored evidence
@@ -196,6 +186,12 @@ func recordRedStaleness(cfg *config.Config, actionable *github.ActionableResult)
 	owners := auditPRAgents(cfg.Project.Org, time.Now().Add(-auditPRAttributionWindow), "")
 	obs := hivePRObservations(cfg, actionable, owners)
 	getEscalationStore().ObserveRed(obs)
+	// Trusted-bot PRs are folded in only so their transient-triaged head can
+	// owe the one re-run (dependency_bot_transient_rerun.go); they fire no
+	// hook and stay out of the fix loop.
+	if botObs := dbrTrustedBotObservations(cfg, actionable); len(botObs) > 0 {
+		getEscalationStore().ObserveRed(botObs)
+	}
 	for _, ob := range obs {
 		if !ob.Red {
 			continue
@@ -235,8 +231,52 @@ func agentAvailability(cfg *config.Config, mgr crux.Runtime) func(string) bool {
 		if mgr != nil && mgr.IsPaused(name) {
 			return false
 		}
-		return cfg == nil || cadenceReachable(cfg, name)
+		if cfg != nil && !cadenceReachable(cfg, name) {
+			return false
+		}
+		// Keep the old reachability contract unless fallback routing is opted
+		// into. In particular, a busy primary still receives kick attempts when
+		// the list is unset, even if a threshold was configured on its own.
+		if cfg == nil || cfg.Review.EffectiveFixerFallbackAfterUndeliverable() == 0 {
+			return true
+		}
+		ac, ok := cfg.Agents[name]
+		if !ok || !ac.Enabled || ac.Paused || ac.OnDemand || !ac.UsesGovernorKick() {
+			return false
+		}
+		if mgr == nil {
+			return true
+		}
+		st, err := mgr.GetStatusFast(name)
+		if err != nil || st == nil || st.ProviderErrorBackoffUntil.After(time.Now()) {
+			return false
+		}
+		// A fallback already refusing input cannot pick up another repair.
+		if name != redPRFixOwner(cfg.Review.FixerAgent) && slices.Contains(cfg.Review.EffectiveFixerFallbackAgents(), name) && st.KicksUndeliverable > 0 {
+			return false
+		}
+		return !fixerUndeliverable(cfg.Review, st, time.Now())
 	}
+}
+
+// fixerUndeliverable only reads the busy episode; it never interrupts the
+// agent's turn. Old transcript activity alone must not disqualify an idle
+// agent, and a missing transcript is unknown rather than proof of silence.
+func fixerUndeliverable(cfg config.ReviewConfig, st *crux.Process, now time.Time) bool {
+	threshold := cfg.EffectiveFixerFallbackAfterUndeliverable()
+	if threshold == 0 || st == nil || st.KicksUndeliverable == 0 {
+		return false
+	}
+	return st.KicksUndeliverable >= threshold ||
+		(!st.LastTranscriptActivity.IsZero() && now.Sub(st.LastTranscriptActivity) >= st.Config.EffectiveBusyNoActivityThreshold())
+}
+
+// reviewFixerAvailability adds runtime liveness only for opted-in hives.
+func reviewFixerAvailability(cfg *config.Config, mgr crux.Runtime) func(string) bool {
+	if cfg.Review.EffectiveFixerFallbackAfterUndeliverable() == 0 {
+		return nil
+	}
+	return agentAvailability(cfg, mgr)
 }
 
 // cadenceReachable reports whether ANY governor mode gives the agent a cadence
@@ -284,11 +324,13 @@ func ownerReEngageCooldown(cfg *config.Config, name string) time.Duration {
 
 // resolveRedPRFixer picks the agent a stuck red PR's fix kick should go to: its
 // owner, else the configured review fixer agent, else the fleet's default
-// fixer — the same chain the review-fix kick uses (src/docs/review-swarm.md).
+// fixer, then the optional fallback list. Busy candidates are excluded by
+// agentAvailability only when that list is configured.
 // It returns "" when no candidate is reachable, which tells the caller to leave
 // the PR alone rather than spend budget nobody can answer.
 func resolveRedPRFixer(cfg *config.Config, owner string, available func(string) bool) string {
 	candidates := []string{redPRFixOwner(owner), strings.TrimSpace(cfg.Review.FixerAgent), review.DefaultFixerAgent}
+	candidates = append(candidates, cfg.Review.EffectiveFixerFallbackAgents()...)
 	for _, c := range candidates {
 		if c == "" {
 			continue
@@ -327,8 +369,17 @@ func redPRFixKick(o escalation.Observation, rerouted bool) string {
 	fmt.Fprintf(&b, "  gh pr checkout %d --repo %s → fix → git commit -s → git push\n", o.Number, o.Repo)
 	b.WriteString("Push to the SAME branch. Do NOT open a replacement PR.\n")
 	b.WriteString("After the push, STOP: do not watch, poll, or sleep on CI (no gh run watch/view loops).\n")
-	b.WriteString("The automerge sweep merges the PR once it is green; if the failure is infrastructure\n")
-	b.WriteString("(runner lost, no space left, checks still queued) leave one comment and end the turn.\n")
+	b.WriteString("The automerge sweep merges the PR once it is green; if checks are still queued, end the turn.\n")
+	// An infra verdict must reach the hive as a marker, not prose: four
+	// "infrastructure, not this change" comments on projectbluefin/common#1647
+	// were invisible to the fix loop, which kicked again until the PR
+	// escalated, and a lane then pushed an empty "retrigger CI" commit.
+	b.WriteString("If the failure is infrastructure, not this change (runner lost, no space left, a package\n")
+	b.WriteString("mirror or download dropping the connection): do NOT push anything — no empty, no-op or\n")
+	b.WriteString("\"retrigger CI\" commit; a push re-arms review fences and can dismiss approvals. Leave ONE\n")
+	fmt.Fprintf(&b, "comment with the evidence that ends with the transient_marker printed by\n  hive-baseline-check.sh %s '<failing check>' %d --json\n", o.Repo, o.Number)
+	b.WriteString("(one per failing check), then end the turn. Once every failing check carries one, Hive\n")
+	b.WriteString("re-runs the failed jobs itself, once.\n")
 	if o.HeadSHA != "" {
 		fmt.Fprintf(&b, "\nhead: %s\n", o.HeadSHA)
 	}
@@ -403,6 +454,17 @@ func deliverReEngagement(
 	available func(string) bool,
 	logger *slog.Logger,
 ) bool {
+	if store.TransientRerunOwed(o.Repo, o.Number, headSHA) {
+		// An agent already triaged this head's failure as infrastructure;
+		// a fix kick could only produce the same comment again and spend
+		// the budget that escalates the PR (projectbluefin/common#1647).
+		// rerunTransientTriagedPRs re-runs the failed jobs instead.
+		if logger != nil {
+			logger.Debug("re-engagement held: failure triaged as transient, hive re-runs the failed jobs",
+				"repo", o.Repo, "pr", o.Number)
+		}
+		return false
+	}
 	fixer := resolveRedPRFixer(cfg, o.Agent, available)
 	if fixer == "" {
 		// Nobody can be asked right now. Charging budget here is what escalated
@@ -432,6 +494,10 @@ func deliverReEngagement(
 				"repo", o.Repo, "pr", o.Number, "agent", fixer, "error", err)
 		}
 		return false
+	}
+	if logger != nil && fixer != redPRFixOwner(o.Agent) {
+		logger.Info("re-engagement routed to fallback fixer", "repo", o.Repo, "pr", o.Number,
+			"owner", redPRFixOwner(o.Agent), "agent", fixer)
 	}
 	store.RecordReEngagement(o.Repo, o.Number)
 	return true
@@ -815,19 +881,22 @@ func runAutoMergeSweepIfDue(ctx context.Context, ghClient *github.Client, cfg *c
 	ctx, sweepSpan := tracing.StartSpan(ctx, "governor.automerge")
 	defer sweepSpan.End()
 	opts := automerge.Options{
-		Logger:                  logger,
-		MergerAuthorizer:        trustedMergerFunc(cfg),
-		HumanChangeRequests:     review.DefaultHumanChangeRequests(),
-		TrustedAuthorizer:       trustedAuthorFunc(cfg),
-		TrustedAuthorPolicy:     trustedAuthorPolicyFunc(cfg),
-		ContributorLanePolicy:   contributorLanePolicyFunc(cfg),
-		ContributorLaneVerdict:  contributorLaneVerdictFunc(cfg, logger),
-		ContributorRegistryTier: contributorRegistryTierFunc(),
-		ReviewVerdictHold:       reviewVerdictHoldFunc(logger),
-		RecordReviewHoldRelease: reviewHoldReleaseRecorder(logger),
-		StageLabelPolicy:        stageLabelPolicyFunc(cfg),
-		StageEngine:             stageEngineOptions(cfg, logger),
-		MergeQueueBases:         hiveMergeQueueBases,
+		Logger:                   logger,
+		MergerAuthorizer:         trustedMergerFunc(cfg),
+		HumanChangeRequests:      review.DefaultHumanChangeRequests(),
+		TrustedAuthorizer:        trustedAuthorFunc(cfg),
+		TrustedAuthorPolicy:      trustedAuthorPolicyFunc(cfg),
+		ContributorLanePolicy:    contributorLanePolicyFunc(cfg),
+		ContributorLaneVerdict:   contributorLaneVerdictFunc(cfg, logger),
+		ContributorRegistryTier:  contributorRegistryTierFunc(),
+		ReviewVerdictHold:        reviewVerdictHoldFunc(logger),
+		RecordReviewHoldRelease:  reviewHoldReleaseRecorder(logger),
+		StageLabelPolicy:         stageLabelPolicyFunc(cfg),
+		StageEngine:              stageEngineOptions(cfg, logger),
+		MergeQueueBases:          hiveMergeQueueBases,
+		IntegrationAdmission:     dashSrv.IntegrationNativeAdmission,
+		IntegrationExecution:     dashSrv.IntegrationExecutionRoute,
+		IntegrationFilesObserved: dashSrv.IntegrationObserveFiles,
 	}
 	opts.ScanCommitClosingKeywords = true
 	syncStageEngineMode(cfg, ghClient, logger)
@@ -839,17 +908,20 @@ func runAutoMergeSweepIfDue(ctx context.Context, ghClient *github.Client, cfg *c
 	}
 	if cfg != nil {
 		opts.SentinelLabel = func() string { return cfg.Sentinel.LabelOrDefault() }
+		opts.HiveSupersedingAutoMerge = func() bool { return cfg.AutoMerge.HiveSuperseding.AutoMergeEnabled() }
 		if set, ok := cfg.AutoMerge.RequiredCheckSet(); ok {
 			opts.RequiredChecks = set
 		}
 		opts.RequiredChecksForRepo = cfg.AutoMerge.RequiredCheckSetForRepo
 		opts.MinHeadAge = cfg.AutoMerge.EffectiveMinHeadAge()
 		opts.RepoAutoMergeEnabled = func(repo string) bool { return cfg.RepoAutoMergeEnabled(repo) }
+		opts.RepoAutoMergeSwitchedOff = func(repo string) bool { return cfg.RepoAutoMergeSwitchedOff(repo) }
 		opts.QueueOnApproveAndUnhold = func(repo string) bool {
 			return cfg.AutoMerge.QueueOnApproveAndUnholdAllowed(repo, cfg.ACMMLevel)
 		}
 		opts.RepoOnGitHub = func(repo string) bool { return cfg.RepoOnGitHub(repo) }
 		opts.HumanMergePaths = func(repo string) []string { return humanMergePathsFor(cfg, repo) }
+		opts.HumanMergePinOnly = func(repo string) (config.PinOnlyException, bool) { return humanMergePinOnlyFor(cfg, repo) }
 		opts.HumanMergeRule = func() prstage.HumanMergeRule { return humanMergeRuleFor(cfg) }
 		opts.RequireCurrentBase = func(repo string) bool { return cfg.AutoMerge.RequireCurrentBaseFor(repo) }
 		opts.RequireCurrentBaseStrict = func(repo string) bool { return cfg.AutoMerge.RequireCurrentBaseStrictFor(repo) }
@@ -858,9 +930,11 @@ func runAutoMergeSweepIfDue(ctx context.Context, ghClient *github.Client, cfg *c
 			return automerge.MergeTrainPolicy{Enabled: cfg.AutoMerge.MergeTrain.IsEnabled(), MaxRebaseAttempts: cfg.AutoMerge.MergeTrain.EffectiveMaxRebaseAttempts()}
 		}
 		opts.TrustedBotAuthors = func() map[string]bool { return cfg.AutoMerge.TrustedBotAuthorSet() }
+		opts.ReviewBotAuthors = func() []string { return cfg.Review.EffectiveBotAuthors() }
+		opts.TrustedBotSkipReview = func() bool { return cfg.AutoMerge.TrustedBotSkipsReview() }
 		opts.NativeMergeQueue = func() automerge.NativeMergeQueuePolicy {
 			q := cfg.AutoMerge.NativeMergeQueue
-			return automerge.NativeMergeQueuePolicy{Enabled: q.Enabled, Repos: q.RepoSet(), SkipCurrentBaseGate: q.SkipCurrentBaseGate, ProbeTTL: q.EffectiveProbeTTL()}
+			return automerge.NativeMergeQueuePolicy{Enabled: q.Enabled, Repos: q.RepoSet(), Bases: q.BaseSet(), SkipCurrentBaseGate: q.SkipCurrentBaseGate, ProbeTTL: q.EffectiveProbeTTL()}
 		}
 	}
 	audit := func(event automerge.AutoMergeSweepEvent) {
@@ -1215,10 +1289,17 @@ func runBlockedIssuesSweepIfDue(ctx context.Context, ghClient *github.Client, cf
 	res, err := ghClient.SweepBlockedIssues(ctx, github.BlockedSweepOptions{Repos: repos})
 	if err != nil {
 		logger.Warn("blocked issues reconciliation sweep failed", "error", err)
-		return
-	}
-	if res.Unblocked+res.Retargeted+res.Stripped+res.Errors > 0 {
+	} else if res.Unblocked+res.Retargeted+res.Stripped+res.Errors > 0 {
 		logger.Info("blocked issues reconciliation sweep complete", "items", res.Items, "unblocked", res.Unblocked, "retargeted", res.Retargeted, "help_wanted_stripped", res.Stripped, "errors", res.Errors)
+	}
+	// The same sweep holds PRs on the open pull requests their Depends-on
+	// lines name, and lifts that hold once they land.
+	prRes, err := ghClient.SweepBlockedPRDependencies(ctx, github.BlockedSweepOptions{Repos: repos})
+	if err != nil {
+		logger.Warn("blocked PR dependency sweep: a repository could not be listed", "error", err)
+	}
+	if prRes.Placed+prRes.Marked+prRes.Unblocked+prRes.Suppressed+prRes.Errors > 0 {
+		logger.Info("blocked PR dependency sweep complete", "prs", prRes.PRs, "placed", prRes.Placed, "marked", prRes.Marked, "released_by_person", prRes.Released, "unblocked", prRes.Unblocked, "suppressed", prRes.Suppressed, "errors", prRes.Errors)
 	}
 }
 
@@ -1300,7 +1381,14 @@ const sentinelSweepInterval = github.SentinelReconcileInterval
 // trust or rules.
 func sentinelSweepOptions(cfg *config.Config, ghClient *github.Client, dashSrv *dashboard.Server) github.SentinelSweepOptions {
 	sc := cfg.Sentinel
+	// The Matrix line source only ever sees patches when dashboard.matrix is
+	// active (#15934); otherwise PatchObserver stays nil and nothing is kept.
+	var patchObserver func(github.SentinelPatchObservation)
+	if dashSrv != nil {
+		patchObserver = dashSrv.MatrixObserver(cfg.Dashboard.Matrix)
+	}
 	return github.SentinelSweepOptions{
+		PatchObserver:       patchObserver,
 		Label:               sc.LabelOrDefault(),
 		LabelColor:          config.DefaultSentinelLabelColor,
 		LabelDescription:    config.DefaultSentinelLabelDescription,
@@ -1326,6 +1414,19 @@ func sentinelSweepOptions(cfg *config.Config, ghClient *github.Client, dashSrv *
 			}
 			dashSrv.AuditLogRecord("system", action, detail, "", event.Repo, event.Number)
 		},
+		// Per-repo sensitive paths (project.repo_policies[].sentinel_sensitive_paths).
+		SensitivePathsForRepo: sentinelRepoSensitivePathsFunc(cfg),
+	}
+}
+
+// sentinelRepoSensitivePathsFunc resolves Sentinel's sensitive-path globs for
+// one "owner/repo": its project.repo_policies[].sentinel_sensitive_paths
+// override, else the hive-wide sentinel.sensitive_paths (or the shipped
+// defaults).
+func sentinelRepoSensitivePathsFunc(cfg *config.Config) func(repo string) []string {
+	return func(repo string) []string {
+		paths, _ := cfg.RepoSentinelSensitivePaths(repo)
+		return paths
 	}
 }
 
@@ -1365,6 +1466,9 @@ func runSentinelSweepIfDue(ctx context.Context, ghClient *github.Client, cfg *co
 		return
 	}
 	logSentinelResult(result, logger)
+	if dashSrv != nil && cfg.Dashboard.Matrix.Active() {
+		dashSrv.RecordMatrixIngest(time.Now(), matrixIngestInterval)
+	}
 	if len(result.Flagged) > 0 || len(result.Notified) > 0 || len(result.Remediated) > 0 || result.Seen > 0 {
 		logger.Info("sentinel sweep complete", "seen", result.Seen, "flagged", len(result.Flagged), "notified", len(result.Notified), "suppressed", len(result.Suppressed), "remediated", len(result.Remediated), "skipped", result.Skipped, "errors", len(result.Errors), "cached_repos", result.CachedRepos, "listed_repos", result.ListedRepos)
 	}
@@ -1434,6 +1538,15 @@ func runIssueUnparkSweepIfDue(ctx context.Context, ghClient *github.Client, cfg 
 	if lastRun != nil {
 		*lastRun = now
 	}
+	// Capability blockers recorded before the hive could check them, or
+	// before the permission was granted, are re-checked at the same cadence
+	// (and on the first pass after start), so a false "App lacks workflows
+	// permission" clears itself (projectbluefin/testsuite#1059).
+	if released, err := ghClient.SweepWorkflowsBlockers(ctx); err != nil {
+		logger.Warn("workflows blocker re-check: labelling released items failed", "released", len(released), "error", err)
+	} else if len(released) > 0 {
+		logger.Info("workflows blocker re-check released items", "released", len(released))
+	}
 	// `/hive approve` on a PR is answered with what the merge lane will do
 	// with it (hivecommons/hive#13087); the engine here only reads policy.
 	approveOpts := automerge.Options{
@@ -1446,13 +1559,23 @@ func runIssueUnparkSweepIfDue(ctx context.Context, ghClient *github.Client, cfg 
 	if cfg != nil {
 		approveOpts.RepoAutoMergeEnabled = cfg.RepoAutoMergeEnabled
 		approveOpts.HumanMergePaths = func(repo string) []string { return humanMergePathsFor(cfg, repo) }
+		approveOpts.HumanMergePinOnly = func(repo string) (config.PinOnlyException, bool) { return humanMergePinOnlyFor(cfg, repo) }
 		approveOpts.HumanMergeRule = func() prstage.HumanMergeRule { return humanMergeRuleFor(cfg) }
 		approveOpts.TrustedBotAuthors = func() map[string]bool { return cfg.AutoMerge.TrustedBotAuthorSet() }
+		approveOpts.TrustedBotSkipReview = func() bool { return cfg.AutoMerge.TrustedBotSkipsReview() }
 	}
 	approveEngine := automerge.New(ghClient, approveOpts)
+	// A bound workflow model's replies are accepted as `/hive <verb>`
+	// (hivecommons/hive#17620); unbound repositories see no change.
+	var workflowFor func(owner, repo string) *workflowmodel.Profile
+	if cfg != nil {
+		workflowFor = stageEngineOptions(cfg, logger).WorkflowFor
+	}
 	result, err := ghClient.SweepIssueUnparkCommands(ctx, github.IssueUnparkSweepOptions{
 		PRApproveReply:       approveEngine.PRApproveReply,
+		PRReplyOptions:       true,
 		MaxActions:           github.DefaultIssueUnparkSweepMaxActions,
+		WorkflowFor:          workflowFor,
 		LabelDriven:          issueUnparkLabelDriven(cfg),
 		LabelApproval:        labelApprovalPolicyResolver(cfg),
 		ReleaseOnApprove:     issueReleaseOnApprove(cfg),
@@ -1850,12 +1973,17 @@ func issueReopenedHookFor(ledger *github.ClaimLedger, logger *slog.Logger) githu
 }
 
 // claimingPRRedStale builds the Fix #3 release predicate: given a claiming PR
-// (prRepo, prNumber), report whether it is red on a required check AND stale.
-// It looks up the PR's live CI state + head SHA from this pass's enumeration and
-// consults the shared staleness clock. A PR not found in the enumeration, or one
-// that is green/pending, or one whose red head only just appeared, returns false
-// — so a HEALTHY claiming PR still suppresses its issue. Returns a nil func when
-// escalation is disabled, preserving the original unconditional-suppress
+// (prRepo, prNumber), report whether it is red on a required check AND the
+// hive has given up repairing it (escalation.Store.AbandonedRed: stale, and
+// escalated / re-engagement budget spent / red for the whole re-engagement
+// window). It looks up the PR's live CI state + head SHA from this pass's
+// enumeration and consults the shared staleness clock. A PR not found in the
+// enumeration, one that is green/pending, one whose red head only just
+// appeared, or one the reaper is still re-engaging returns false — so a
+// HEALTHY or still-being-fixed claiming PR keeps suppressing its issue, and
+// the issue stays 040-covered-by-pr while the PR reads 070-fixing instead of
+// falling to 010 under a live PR (hivecommons/hive#16522). Returns a nil func
+// when escalation is disabled, preserving the original unconditional-suppress
 // behavior. GENERIC: keys only off check state + staleness.
 func claimingPRRedStale(cfg *config.Config, actionable *github.ActionableResult) github.RedStaleFunc {
 	if cfg.Escalation.Disabled || actionable == nil {
@@ -1888,7 +2016,7 @@ func claimingPRRedStale(cfg *config.Config, actionable *github.ActionableResult)
 		if !ok || !st.red {
 			return false // not enumerated, or healthy → keep suppressing
 		}
-		return store.StaleRed(st.repo, prNumber, st.headSHA)
+		return store.AbandonedRed(st.repo, prNumber, st.headSHA)
 	}
 }
 
@@ -1962,6 +2090,11 @@ func installReviewRelaySettings(client *github.Client, cfg *config.Config, logge
 	client.SetReviewEvidence(func(repo string) github.ReviewEvidenceSettings {
 		return reviewEvidenceSettings(cfg, repo)
 	})
+	// hivecommons/hive#17694: stamp the sandbox runtime and benchmark task
+	// kind on agent-authored bundles so the exporter need not guess.
+	github.EvidenceAgentContext = func(agent string) (string, string) {
+		return cfg.BenchmarkSandboxRuntime(agent), benchmarks.TaskKindFor(agent)
+	}
 	// hivecommons/hive#14581: issue-author credit on every merge path, read
 	// live so a reload of auto_merge.credit_issue_authors applies.
 	client.SetCreditIssueAuthors(func(string) bool { return cfg.AutoMerge.CreditIssueAuthorsEnabled() })
@@ -1980,12 +2113,25 @@ func installReviewRelaySettings(client *github.Client, cfg *config.Config, logge
 	// governor.labels.stage policy as the PR one, read live.
 	client.SetIssueStageLabels(func() github.IssueStagePolicy {
 		p := stageLabelPolicyFunc(cfg)()
-		return github.IssueStagePolicy{Enabled: p.Enabled, Dwell: p.Dwell}
+		// The agent names scope the lapsed claimed-by sweep to this hive's
+		// own `hive/claimed-by-<agent>` labels.
+		agents := make([]string, 0, len(cfg.Agents))
+		for name := range cfg.Agents {
+			agents = append(agents, name)
+		}
+		return github.IssueStagePolicy{Enabled: p.Enabled, Dwell: p.Dwell, AgentNames: agents}
 	})
 	client.SetReviewCadenceLimits(
 		func() bool { return cfg.Review.CombinedPerspectives },
 		func() int { return cfg.Review.MaxReviewsPerHead },
 	)
+	client.SetNotificationsQuiet(func() bool { return cfg.GitHub.Notifications.Quiet() })
+	// github.notifications.shadow (hivecommons/hive#16264): would-notify
+	// instrumentation only, read live; nothing is suppressed.
+	client.SetNotificationsShadow(func() bool { return cfg.GitHub.Notifications.Shadow })
+	// github.notifications.attention_pilot (hivecommons/hive#16358): fold
+	// routine issue notes into the issue's hive:status card. Read live.
+	client.SetAttentionPilot(func() bool { return cfg.GitHub.Notifications.AttentionPilot })
 	// review.require_labels (PR approval allow-list): the relay's half of the
 	// gate, read live so a Features-tab edit applies to the next request.
 	client.SetReviewRequireLabels(func() []string { return cfg.Review.RequireLabels })
@@ -2261,6 +2407,10 @@ func parseReviseCutoff(raw string, logger *slog.Logger) time.Time {
 type reviewPlannerGitHub interface {
 	ReviewPRChangedFiles(ctx context.Context, repo string, number int) ([]string, bool)
 	ReviewDeltaDiff(ctx context.Context, repo, baseRef, previousHead, head string) review.DeltaDiff
+	// ReviewHeadsSamePatch reports whether two heads of a PR carry the same
+	// patch against base, for carrying an in-flight dispatch row across a
+	// rebase or merge-from-base (hivecommons/hive#15823).
+	ReviewHeadsSamePatch(ctx context.Context, repo, base, h1, h2 string) bool
 }
 
 func planReviewDispatch(cfg *config.Config, actionable *github.ActionableResult, agentMgr crux.Runtime, beadStores map[string]*beads.Store, logger *slog.Logger) review.DispatchPlan {
@@ -2315,8 +2465,80 @@ func reviewDeltaDiffFor(ctx context.Context, cfg *config.Config, differ reviewPl
 	return &diff
 }
 
+// carryReviewDispatchAcrossHeadMoves rewrites pending dispatch rows whose
+// PR head moved to a same-patch head (review.CarryPendingAcrossHeadMoves),
+// asking GitHub once per moved row head. No client means no carry.
+func carryReviewDispatchAcrossHeadMoves(ctx context.Context, ghr reviewPlannerGitHub, state review.DispatchState, prs []review.PullRequest, candidates []github.PullRequest, org string, logger *slog.Logger) review.DispatchState {
+	if ghr == nil || len(state.Pending) == 0 {
+		return state
+	}
+	bases := make(map[string]string, len(candidates))
+	for _, pr := range candidates {
+		bases[fmt.Sprintf("%s#%d", strings.ToLower(fullRepoName(pr.Repo, org)), pr.Number)] = pr.BaseRef
+	}
+	state, rebinds := review.CarryPendingAcrossHeadMoves(state, prs, org, func(repo string, number int, oldHead, newHead string) bool {
+		base := bases[fmt.Sprintf("%s#%d", strings.ToLower(repo), number)]
+		if base == "" {
+			return false
+		}
+		return ghr.ReviewHeadsSamePatch(ctx, repo, base, oldHead, newHead)
+	})
+	for _, r := range rebinds {
+		logger.Info("review dispatch row carried across head move", "pr", fmt.Sprintf("%s#%d", r.Repo, r.Number), "h1", r.From, "h2", r.To, "perspective", string(r.Perspective), "agent", r.Agent, "why", "same-patch")
+	}
+	return state
+}
+
+// reviewMergeReady reports a PR whose review verdict is the only thing
+// between it and a merge: CI settled green, GitHub says mergeable, not a
+// draft.
+func reviewMergeReady(pr github.PullRequest) bool {
+	return pr.CIStatus == "success" && pr.Mergeable == github.MergeableYes && !pr.Draft
+}
+
+// reviewCIPending reports a PR whose CI has real checks that have not all
+// settled. A repo with no checks at all is not pending: it has nothing to
+// wait for.
+func reviewCIPending(pr github.PullRequest) bool {
+	if pr.CIChecksRunning {
+		return true
+	}
+	return pr.CIStatus == "pending" && pr.CIRealCheckRunsKnown && pr.CIRealCheckRuns > 0
+}
+
+// reviewPlanChangeRequests is the decision ledger the review planner reads;
+// tests swap it.
+var reviewPlanChangeRequests = func() review.HumanChangeRequestStore { return review.DefaultHumanChangeRequests() }
+
+// anyAnsweredReviewHead reports whether any open or held PR's current head
+// carries a maintainer's answer.
+func anyAnsweredReviewHead(cfg *config.Config, actionable *github.ActionableResult, answered func(fullRepo string, pr github.PullRequest) bool) bool {
+	for _, items := range [][]github.PullRequest{actionable.PRs.Items, actionable.PRs.Held} {
+		for _, pr := range items {
+			if fullRepo := fullRepoName(pr.Repo, cfg.Project.Org); fullRepo != "" && pr.Number > 0 && answered(fullRepo, pr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable *github.ActionableResult, agentMgr crux.Runtime, beadStores map[string]*beads.Store, ghr reviewPlannerGitHub, logger *slog.Logger) review.DispatchPlan {
-	if cfg == nil || actionable == nil || !cfg.Review.RequireApproval || !cfg.Review.FanOut {
+	if cfg == nil || actionable == nil {
+		return review.DispatchPlan{}
+	}
+	// With review dispatch off, a maintainer's answer on a head (a
+	// changes_requested review or `/hive decision <instruction>`) is still
+	// handed to the author agent: the decision reply promises a new head,
+	// and the PR sits at 070-fixing waiting for it (Danathar/dns-failover#155
+	// waited with no fix kick on a hive without review.require_approval).
+	// Only answered heads are planned; with none, nothing is loaded.
+	answeredOnly := !cfg.Review.RequireApproval || !cfg.Review.FanOut
+	changeRequests := reviewPlanChangeRequests()
+	answered := func(fullRepo string, pr github.PullRequest) bool {
+		return review.HumanChangeRequestFor(changeRequests, fullRepo, pr.Number, pr.HeadSHA) != nil
+	}
+	if answeredOnly && !anyAnsweredReviewHead(cfg, actionable, answered) {
 		return review.DispatchPlan{}
 	}
 	botRoute := reviewBotAuthorRoute(cfg)
@@ -2348,6 +2570,9 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 				continue
 			}
 			seenPRs[key] = true
+			if answeredOnly && !answered(fullRepo, pr) {
+				continue
+			}
 			// review.require_labels: an unlabelled PR is never dispatched
 			// to the swarm. The relay refuses it independently.
 			if !cfg.Review.AdmitsPRLabels(pr.Labels) {
@@ -2373,6 +2598,7 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 	})
 
 	scopeReader := reviewScopeLinearReader(cfg, logger)
+	preparationHeads := reviewPreparationHeads(ctx, cfg, candidates, reviewPreparationObserver(cfg, ghr, logger), artifact, logger)
 	prs := make([]review.PullRequest, 0, len(candidates))
 	for _, pr := range candidates {
 		lane := classify.Classify(github.Issue{Title: pr.Title, Labels: pr.Labels}).Lane
@@ -2416,12 +2642,20 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 			// A maintainer's changes_requested review or `/hive decision`
 			// on this head (hivecommons/hive#13041): the planner kicks the
 			// fix lane with it instead of reviewing the head again.
-			HumanChangeRequest: review.HumanChangeRequestFor(review.DefaultHumanChangeRequests(), fullRepo, pr.Number, pr.HeadSHA),
+			HumanChangeRequest: review.HumanChangeRequestFor(changeRequests, fullRepo, pr.Number, pr.HeadSHA),
 			// The compare from the last judged head, for the delta
 			// re-review, its trivial skip and the hive base-sync carry
 			// (review.delta_rereview).
 			DeltaDiff:     reviewDeltaDiffFor(ctx, cfg, ghr, artifact, state, fullRepo, pr.Number, pr.BaseRef, pr.HeadSHA, pr.BodyDigest),
 			BaseDiffEmpty: pr.BaseDiffEmpty,
+			// Reviewer slots go to heads whose verdict unblocks a merge
+			// first and to heads whose CI is still running last
+			// (hivecommons/hive#15823).
+			MergeReady: reviewMergeReady(pr),
+			CIPending:  reviewCIPending(pr),
+			PreparationOwner: reviewMergeReady(pr) && !reviewCIPending(pr) &&
+				pr.HeadSHA != "" && preparationHeads[github.ReviewQueueKey(fullRepo, pr.Number)] == pr.HeadSHA &&
+				reviewPreparationOwesVerdict(artifact, fullRepo, pr),
 		}
 		// The linked Linear issue's text for the scope contract, read here
 		// so reviewers never need a Linear token (hivecommons/hive#14906);
@@ -2438,6 +2672,10 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 	// PRs a review webhook just fired for go first, so the early eval cycle
 	// it triggered spends its review budget on them (hivecommons/hive#11091).
 	prs = prioritizeEventPRs(prs, activeReviewEvents.Load())
+	// A review in flight against a head the PR has since moved off keeps
+	// counting when the new head is the same patch (hivecommons/hive#15823):
+	// the row follows the head instead of being pruned and re-dispatched.
+	state = carryReviewDispatchAcrossHeadMoves(ctx, ghr, state, prs, candidates, cfg.Project.Org, logger)
 	agents := make([]review.AgentCapability, 0, len(cfg.Agents))
 	for name, ac := range cfg.EnabledAgents() {
 		cap := review.CapabilityFromConfig(name, ac)
@@ -2450,26 +2688,34 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 		reviewBotLogins = reviewBots.Logins
 	}
 	plan := review.PlanDispatch(prs, artifact, state, review.DispatchOptions{
-		RequireApproval:       cfg.Review.RequireApproval,
-		FanOut:                cfg.Review.FanOut,
-		MaxParallelReviews:    cfg.Review.EffectiveMaxParallelReviews(),
-		MaxPerspectivesPerPR:  cfg.Review.MaxPerspectivesPerPR,
-		Perspectives:          reviewPerspectiveSet(cfg, logger),
-		CombinedPerspectives:  cfg.Review.CombinedPerspectives,
-		ReviewerAgents:        cfg.Review.ReviewerAgents,
-		FixerAgent:            cfg.Review.FixerAgent,
-		PostComments:          cfg.Review.PostComments,
-		WritingGuideSection:   cfg.Project.WritingGuideSection(),
-		FixHumanPRs:           cfg.Review.FixHumanPRsEnabled(),
-		AcknowledgeNoFindings: cfg.Review.AcknowledgeNoFindings,
+		RequireApproval:      cfg.Review.RequireApproval,
+		FanOut:               cfg.Review.FanOut,
+		AnsweredHeadsOnly:    answeredOnly,
+		MaxParallelReviews:   cfg.Review.EffectiveMaxParallelReviews(),
+		MaxPerspectivesPerPR: cfg.Review.MaxPerspectivesPerPR,
+		Perspectives:         reviewPerspectiveSet(cfg, logger),
+		CombinedPerspectives: cfg.Review.CombinedPerspectives,
+		ReviewerAgents:       cfg.Review.ReviewerAgents,
+		FixerAgent:           cfg.Review.FixerAgent,
+		FixerFallbackAgents:  cfg.Review.EffectiveFixerFallbackAgents(),
+		FixerAvailable:       reviewFixerAvailability(cfg, agentMgr),
+		PostComments:         cfg.Review.PostComments,
+		WritingGuideSection:  cfg.Project.WritingGuideSection(),
+		FixHumanPRs:          cfg.Review.FixHumanPRsEnabled(),
+		// Quiet notification mode never acknowledges a clean review on
+		// GitHub: the one-liner is an email to everyone to say nothing
+		// happened, and the verdict is already on the evidence bundle.
+		AcknowledgeNoFindings: cfg.Review.AcknowledgeNoFindings && !cfg.GitHub.Notifications.Quiet(),
 		ReviseRepos:           cfg.Review.ReviseRepos,
 		ReviseVerdictsBefore:  parseReviseCutoff(cfg.Review.ReviseVerdictsBefore, logger),
 		PendingTTL:            cfg.Review.PendingReviewTTL(),
 		PendingFixTTL:         cfg.Review.PendingReviewFixTTL(),
 		MaxRedispatch:         cfg.Review.EffectiveMaxRedispatch(),
+		AgentGitHubRefusal:    github.AgentGitHubRefusalFunc(),
 		HeadMaxRetries:        cfg.Review.HeadMaxRetries,
 		ProjectOrg:            cfg.Project.Org,
 		AIAuthor:              cfg.EffectiveAIAuthor(),
+		AppLogin:              cfg.GitHub.BotLogin(),
 		Agents:                agents,
 		ReviewBotLogins:       reviewBotLogins,
 		ReviewBotMinPriority:  reviewBots.MinPriority,
@@ -2479,7 +2725,19 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 		DeltaTrivialLines:     cfg.Review.EffectiveDeltaTrivialLines(),
 		DeltaMaxAge:           cfg.Review.EffectiveDeltaMaxAge(),
 	})
+	for _, k := range plan.FixKicks {
+		if slices.Contains(cfg.Review.EffectiveFixerFallbackAgents(), k.Agent) {
+			logger.Info("review fix routed to fallback fixer", "repo", k.Repo, "pr", k.Number,
+				"primary", cfg.Review.FixerAgent, "agent", k.Agent)
+		}
+	}
 	recordReviewDeltaRestamps(plan, logger)
+	pendingRecords, pendingAgents, confirmedAgents := review.PendingReviewerOccupancy(plan.State)
+	if pendingRecords > 0 || plan.SettledReviews > 0 {
+		logger.Info("review dispatch occupancy", "pending_records", pendingRecords,
+			"pending_agents", pendingAgents, "delivery_confirmed_pending_agents", confirmedAgents,
+			"settled_records", plan.SettledReviews, "planned_kicks", len(plan.ReviewKicks))
+	}
 	for _, k := range plan.ReviewKicks {
 		if k.BotAuthorRouted {
 			logger.Info("review routed bot-authored PR to bot_author_model", "repo", k.Repo, "pr", k.Number, "head", k.HeadSHA, "agent", k.Agent, "review_model", k.ReviewModel, "review_backend", k.ReviewBackend)
@@ -2493,7 +2751,7 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 		// Warn once per PR while it keeps expiring (#13687).
 		key := prWarnKey(e.Repo, e.Number)
 		expiredNow[key] = struct{}{}
-		logger.Log(context.Background(), reviewExpiredWarn.level(key), "review pending expired", "repo", e.Repo, "pr", e.Number, "head", e.HeadSHA, "perspective", e.Perspective, "agent", e.Agent, "age", e.Age.Round(time.Second).String(), "expiries", e.Count)
+		logger.Log(context.Background(), reviewExpiredWarn.level(key), "review pending expired", "repo", e.Repo, "pr", e.Number, "head", e.HeadSHA, "perspective", e.Perspective, "agent", e.Agent, "age", e.Age.Round(time.Second).String(), "expiries", e.Count, "cap_caused", e.CapCaused)
 	}
 	reviewExpiredWarn.retain(expiredNow)
 	for _, h := range plan.Exhausted {
@@ -2512,8 +2770,11 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 	for _, w := range plan.Waiting {
 		logger.Info("review dispatch waiting: perspectives still owed, no reviewer this cycle", "repo", w.Repo, "pr", w.Number, "head", w.HeadSHA, "reason", w.Reason)
 	}
+	for _, k := range plan.ReviewKicks {
+		logger.Info("review swarm kick planned", "repo", k.Repo, "pr", k.Number, "head", k.HeadSHA, "agent", k.Agent, "perspective", string(k.Perspective), "priority", k.Priority)
+	}
 	if len(plan.ReviewKicks)+len(plan.FixKicks)+len(plan.FixExclusions) > 0 {
-		logger.Info("review swarm dispatch planned", "review_kicks", len(plan.ReviewKicks), "fix_kicks", len(plan.FixKicks), "fix_excluded", len(plan.FixExclusions), "fix_excluded_reasons", fixExclusionReasonSummary(plan.FixExclusions))
+		logger.Info("review swarm dispatch planned", "review_kicks", len(plan.ReviewKicks), "priority", reviewKickPrioritySummary(plan.ReviewKicks), "fix_kicks", len(plan.FixKicks), "fix_excluded", len(plan.FixExclusions), "fix_excluded_reasons", fixExclusionReasonSummary(plan.FixExclusions))
 	}
 	return plan
 }
@@ -2521,6 +2782,40 @@ func planReviewDispatchWith(ctx context.Context, cfg *config.Config, actionable 
 // fixExclusionReasonSummary renders the cycle's fix exclusions as
 // "reason=count,..." (sorted) for the dispatch summary line, so fix_kicks: 0
 // is never printed without saying why (hivecommons/hive#14665).
+// reviewKickPrioritySummary counts this cycle's review kicks by the order
+// reason that placed their PR (review.ReviewPriority*), e.g.
+// "merge-ready=3 age=2".
+func reviewKickPrioritySummary(kicks []review.DispatchKick) string {
+	if len(kicks) == 0 {
+		return ""
+	}
+	counts := map[string]int{}
+	for _, k := range kicks {
+		p := k.Priority
+		if p == "" {
+			p = review.ReviewPriorityAge
+		}
+		counts[p]++
+	}
+	order := []string{review.ReviewPriorityPreparation, review.ReviewPriorityPreparationYield, review.ReviewPriorityMergeReady, review.ReviewPriorityStarved, review.ReviewPriorityAge, review.ReviewPriorityCIPendingSpare}
+	parts := make([]string, 0, len(counts))
+	for _, p := range order {
+		if n := counts[p]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", p, n))
+			delete(counts, p)
+		}
+	}
+	rest := make([]string, 0, len(counts))
+	for p := range counts {
+		rest = append(rest, p)
+	}
+	sort.Strings(rest)
+	for _, p := range rest {
+		parts = append(parts, fmt.Sprintf("%s=%d", p, counts[p]))
+	}
+	return strings.Join(parts, " ")
+}
+
 func fixExclusionReasonSummary(exclusions []review.FixDispatchExclusion) string {
 	if len(exclusions) == 0 {
 		return ""
@@ -2572,28 +2867,46 @@ func reviewPlannerGitHubFor(c *github.Client) reviewPlannerGitHub {
 }
 
 func refreshReviewVerdicts(cfg *config.Config, logger *slog.Logger) {
+	refreshReviewVerdictsForPRs(cfg, nil, logger)
+}
+
+func refreshReviewVerdictsForPRs(cfg *config.Config, prs []review.PullRequest, logger *slog.Logger) {
 	if cfg == nil || !shouldRefreshReviewVerdicts(cfg) {
 		return
 	}
-	artifact, err := review.CollectAndMerge("", "", review.AggregateOptions{
+	started := time.Now()
+	opts := review.AggregateOptions{
 		// Unanimity is judged against what a PR was eligible to receive. Without
 		// this the cap makes approve unreachable and every PR aggregates to
 		// requires_human.
 		MaxPerspectivesPerPR:       cfg.Review.MaxPerspectivesPerPR,
 		Perspectives:               reviewPerspectiveSet(cfg, logger),
 		SelfAuthoredDecisionPolicy: cfg.Review.EffectiveSelfAuthoredDecisionPolicy(),
-		SensitivePaths:             cfg.Security.SensitivePaths,
-		ModelStamps:                reviewModelStamps(logger),
-		ExpectedHeads:              cfg.ExpectedReviewHeads(),
-		MissingHeads:               reviewMissingHeads(),
-	}, time.Now().UTC())
+		// Owner rule: the hive's superseding copies auto-merge; their
+		// reviewer findings go to the fixer, not to a person.
+		HiveSupersedingAutoMergeOff: !cfg.AutoMerge.HiveSuperseding.AutoMergeEnabled(),
+		SensitivePaths:              cfg.Security.SensitivePaths,
+		ModelStamps:                 reviewModelStamps(logger),
+		ExpectedHeads:               cfg.ExpectedReviewHeads(),
+		MissingHeads:                reviewMissingHeads(),
+	}
+	var artifact review.Artifact
+	var err error
+	if prs == nil {
+		artifact, err = review.CollectAndMerge("", "", opts, time.Now().UTC())
+	} else {
+		artifact, err = review.CollectAndMergeForPRs("", "", prs, opts, time.Now().UTC())
+	}
 	if err != nil {
 		if !os.IsNotExist(err) {
 			logger.Warn("failed to refresh review verdicts", "error", err)
 		}
 		return
 	}
-	logger.Info("review verdict artifact refreshed", "aggregates", len(artifact.Items))
+	logger.Info("review verdict artifact refreshed", "aggregates", len(artifact.Items),
+		"elapsed", time.Since(started), "report_files_read", artifact.Collection.FilesRead,
+		"new_report_receipts", artifact.Collection.NewReports, "max_new_report_lag", artifact.Collection.MaxReportLag,
+		"unreadable_reports_skipped", artifact.Collection.UnreadableSkipped)
 }
 
 // reviewModelStamps reads the dispatch state so a verdict whose report
@@ -2759,24 +3072,77 @@ type reviewFixAuditor interface {
 func auditWithheldReviewFixes(plan review.DispatchPlan, auditor reviewFixAuditor, logger *slog.Logger) {
 	// One WARN per changes_requested head that ends the cycle without a fix
 	// kick: a PR shown as "Fixing" that nobody is fixing must be loud
-	// (hivecommons/hive#14665).
+	// (hivecommons/hive#14665) — once per (pr, head, reason), Debug while
+	// the same exclusion persists (hivecommons/hive#15744).
+	active := make(map[string]struct{}, len(plan.FixExclusions))
+	defer func() { reviewFixExcludedWarn.retain(active) }()
 	for _, x := range plan.FixExclusions {
-		level := slog.LevelWarn
-		if x.Reason == review.FixDispatchExcludedNotHiveAuthored || x.Reason == review.FixDispatchExcludedNotHiveAuthoredDCO {
+		key := reviewFixExcludedWarnKey(x)
+		active[key] = struct{}{}
+		level := reviewFixExcludedWarn.level(key)
+		if x.Reason == review.FixDispatchExcludedNotHiveAuthored || x.Reason == review.FixDispatchExcludedNotHiveAuthoredDCO || x.Reason == review.FixDispatchExcludedOtherBotAuthor {
 			// Policy skip (the hive never pushes to PRs it did not author), not a fault.
-			level = slog.LevelInfo
+			if level == slog.LevelWarn {
+				level = slog.LevelInfo
+			}
 		}
 		logger.Log(context.Background(), level, "review fix dispatch excluded",
 			"repo", x.Repo, "pr", x.Number, "head_sha", x.HeadSHA, "author", x.Author, "reason", x.Reason, "attempts", x.Attempts)
 	}
 	for _, w := range plan.WithheldFixes {
-		logger.Info("review fix withheld: PR not hive-authored; review published, nothing pushed",
-			"repo", w.Repo, "pr", w.Number, "head_sha", w.HeadSHA, "author", w.Author, "setting", w.Setting, "setting_enabled", w.SettingEnabled)
+		if w.CarriedFrom != "" {
+			// A delta re-stamp carried the verdict onto this head without a
+			// session: nothing was published for it, so the line must not
+			// say a review was.
+			logger.Info("review fix withheld: PR not hive-authored; verdict carried from an earlier head without a review, nothing published for this head, nothing pushed",
+				"repo", w.Repo, "pr", w.Number, "head_sha", w.HeadSHA, "carried_from", w.CarriedFrom, "author", w.Author, "setting", w.Setting, "setting_enabled", w.SettingEnabled)
+		} else {
+			logger.Info("review fix withheld: PR not hive-authored; review published, nothing pushed",
+				"repo", w.Repo, "pr", w.Number, "head_sha", w.HeadSHA, "author", w.Author, "setting", w.Setting, "setting_enabled", w.SettingEnabled)
+		}
 		if auditor == nil {
 			continue
 		}
-		auditor.AuditLog("governor", "review_fix_withheld",
-			fmt.Sprintf("pr=%s#%d head=%s author=%s setting=%s=%t reason=%s", w.Repo, w.Number, w.HeadSHA, w.Author, w.Setting, w.SettingEnabled, w.Reason), "")
+		detail := fmt.Sprintf("pr=%s#%d head=%s author=%s setting=%s=%t reason=%s", w.Repo, w.Number, w.HeadSHA, w.Author, w.Setting, w.SettingEnabled, w.Reason)
+		if w.CarriedFrom != "" {
+			detail += " carried_from=" + w.CarriedFrom
+		}
+		auditor.AuditLog("governor", "review_fix_withheld", detail, "")
+	}
+}
+
+func reviewFixExcludedWarnKey(x review.FixDispatchExclusion) string {
+	return prWarnKey(x.Repo, x.Number) + "@" + strings.ToLower(strings.TrimSpace(x.HeadSHA)) + ":" + x.Reason
+}
+
+// fixDispatchStatusReader is the automerge engine's view of the review
+// fixer's standing on a PR head (hivecommons/hive#15744): the persisted
+// dispatch state, re-read per call so a stage pass sees the fixer's latest
+// verdict. No state (fresh hive, unreadable file) reads as unknown.
+func fixDispatchStatusReader() func(repo string, number int, head string) (review.FixDispatchStatus, bool) {
+	var (
+		mu      sync.Mutex
+		state   review.DispatchState
+		modTime time.Time
+		size    int64
+		loaded  bool
+	)
+	return func(repo string, number int, head string) (review.FixDispatchStatus, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		// A stage pass asks once per PR; re-parse only when the file moved.
+		if fi, err := os.Stat(review.ReviewDispatchStatePath); err == nil && loaded && fi.ModTime().Equal(modTime) && fi.Size() == size {
+			return review.FixDispatchStatusFor(state, repo, number, head), true
+		} else if err == nil {
+			modTime, size = fi.ModTime(), fi.Size()
+		}
+		st, err := review.LoadDispatchState("")
+		if err != nil {
+			loaded = false
+			return review.FixDispatchStatus{}, false
+		}
+		state, loaded = st, true
+		return review.FixDispatchStatusFor(state, repo, number, head), true
 	}
 }
 

@@ -300,8 +300,9 @@ func (h *ContributeWSHub) assignStandbyTask(c *ContributorConnection, item Ready
 	c.currentTaskGen = gen
 	c.lastLeaseRenew = assignedAt
 	c.taskAssignedAt = assignedAt
+	c.clearResumeAnchorLocked()
 	c.currentLabels = item.Labels
-	c.lastIdleReason = ""
+	c.clearIdleReasonLocked()
 	c.currentPrompt = ""
 	c.pendingToken = ""
 	c.credentialDelivered = false
@@ -319,7 +320,8 @@ func (h *ContributeWSHub) assignStandbyTask(c *ContributorConnection, item Ready
 	}
 	canPush := h.contributorCanPush(item.Repo, c.profile.GitHubUsername)
 	prompt := buildTaskPromptForContributor(ref, item.Title, canPush, h.writingGuideSection())
-	if policy := strings.TrimSpace(h.roleKickPrompt(lane)); policy != "" {
+	task := ghpkg.Issue{Repo: item.Repo, Number: item.Number, Title: item.Title, Labels: item.Labels}
+	if policy := strings.TrimSpace(h.roleKickPrompt(lane, task)); policy != "" {
 		prompt = buildStandbyTaskPrompt(prompt, lane, policy)
 	} else {
 		prompt = buildStandbyTaskPrompt(prompt, lane, "")
@@ -337,7 +339,7 @@ func (h *ContributeWSHub) assignStandbyTask(c *ContributorConnection, item Ready
 	c.mu.Unlock()
 
 	turnEnvelopeID := h.persistTurnEnvelopeForAssignment(c, assignment, gen, prompt, item.Labels)
-	mcp := h.mintTaskMCPForAssignment(identityOf(c), assignment, assignedAt.Add(leaseTTL), c.profile.GitHubUsername)
+	mcp := h.mintTaskMCPForAssignment(identityOf(c), assignment, assignedAt.Add(taskMCPLeaseTokenMaxTTL), c.profile.GitHubUsername)
 	msg := &WSMessage{
 		Type:           "task_assign",
 		Seq:            h.nextSeq(),

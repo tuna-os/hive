@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,13 @@ func newWatchdogTestManager(t *testing.T, backends map[string]string) (*Manager,
 	origExists := tmuxSessionExists
 	tmuxSessionExists = func(_ *Manager, _ *AgentProcess) bool { return true }
 	t.Cleanup(func() { tmuxSessionExists = origExists })
+	// Observe's bounded probe defers to whatever tmuxSessionExists is faked to
+	// at call time, so tests keep scripting the session through one seam.
+	origProbe := tmuxSessionProbe
+	tmuxSessionProbe = func(_ context.Context, m *Manager, a *AgentProcess) (bool, error) {
+		return tmuxSessionExists(m, a), nil
+	}
+	t.Cleanup(func() { tmuxSessionProbe = origProbe })
 
 	for name := range backends {
 		m.agents[name].State = StateRunning
@@ -166,6 +174,115 @@ func TestWatchdogObserveMissingSession(t *testing.T) {
 	}
 	if obs.Pane != "" {
 		t.Fatal("no capture must be attempted against a missing session")
+	}
+}
+
+// blockingVisiblePaneTerminal is a terminal whose bounded capture behaves
+// like a wedged tmux server: it never answers and only returns once ctx ends.
+type blockingVisiblePaneTerminal struct {
+	funcTerminal
+	called chan struct{}
+}
+
+func (b blockingVisiblePaneTerminal) CaptureVisiblePaneContext(ctx context.Context, _ *AgentProcess) (string, error) {
+	close(b.called)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func shrinkObserveProbeTimeout(t *testing.T) {
+	t.Helper()
+	orig := observeProbeTimeout
+	observeProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { observeProbeTimeout = orig })
+}
+
+// TestWatchdogObserveWedgedSessionProbeIsUnobservable pins #16097: a tmux
+// has-session that never answers must be cut off by the probe deadline and
+// reported as an error (agent unobservable), never as "no session" — which
+// the reconciler would read as dead and restart.
+func TestWatchdogObserveWedgedSessionProbeIsUnobservable(t *testing.T) {
+	m, _ := newWatchdogTestManager(t, map[string]string{"a1": "claude"})
+	shrinkObserveProbeTimeout(t)
+	tmuxSessionProbe = func(ctx context.Context, _ *Manager, _ *AgentProcess) (bool, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("Observe's session probe must carry a deadline")
+		}
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := WatchdogFleet{M: m}.Observe("a1")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Observe err = %v, want deadline exceeded", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Observe did not return: the session probe is unbounded")
+	}
+}
+
+// TestWatchdogObserveWedgedCaptureIsUnobservable is the capture-pane half of
+// #16097: the session exists but capture-pane hangs.
+func TestWatchdogObserveWedgedCaptureIsUnobservable(t *testing.T) {
+	m, _ := newWatchdogTestManager(t, map[string]string{"a1": "claude"})
+	shrinkObserveProbeTimeout(t)
+	term := blockingVisiblePaneTerminal{called: make(chan struct{})}
+	m.terminal = term
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := WatchdogFleet{M: m}.Observe("a1")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Observe err = %v, want deadline exceeded", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Observe did not return: the pane capture is unbounded")
+	}
+	select {
+	case <-term.called:
+	default:
+		t.Fatal("Observe must capture through the context-bounded path")
+	}
+}
+
+// TestTmuxCmdContextHonoursCancelledContext checks the bounded builder runs
+// the same command line as tmuxCmd and refuses to run once ctx is done, so
+// no real tmux is ever spawned here.
+func TestTmuxCmdContextHonoursCancelledContext(t *testing.T) {
+	m, _ := newWatchdogTestManager(t, map[string]string{"a1": "claude"})
+	agent := m.agents["a1"]
+	agent.tmuxSocket = "hive-a1"
+
+	plain := m.tmuxCmd(agent, "has-session", "-t", "hive-a1")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	bounded := m.tmuxCmdContext(ctx, agent, "has-session", "-t", "hive-a1")
+	if fmt.Sprint(plain.Args) != fmt.Sprint(bounded.Args) {
+		t.Fatalf("tmuxCmdContext args = %v, want tmuxCmd's %v", bounded.Args, plain.Args)
+	}
+	// Start reports a missing tmux binary before ctx, so only require that
+	// nothing ran successfully; the probes below pin the ctx error.
+	if err := bounded.Run(); err == nil {
+		t.Fatal("Run with cancelled ctx must fail without running tmux")
+	}
+
+	exists, err := probeTmuxSession(ctx, m, agent)
+	if exists || !errors.Is(err, context.Canceled) {
+		t.Fatalf("probeTmuxSession(cancelled) = %v, %v; want false, context.Canceled", exists, err)
+	}
+	pane, err := (tmuxTerminal{manager: m}).CaptureVisiblePaneContext(ctx, agent)
+	if pane != "" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("CaptureVisiblePaneContext(cancelled) = %q, %v; want \"\", context.Canceled", pane, err)
 	}
 }
 
@@ -370,6 +487,59 @@ func TestWatchdogObserveCarriesStartedAt(t *testing.T) {
 	}
 	if !obs.StartedAt.Equal(started) {
 		t.Fatalf("StartedAt = %v, want %v — without it boot grace cannot apply", obs.StartedAt, started)
+	}
+	if !obs.LastLaunchAt.IsZero() {
+		t.Fatalf("LastLaunchAt = %v, want zero before any CLI launch is recorded", obs.LastLaunchAt)
+	}
+}
+
+// TestWatchdogObserveCarriesLastLaunchAt pins the manager half of #17320: a
+// mid-life CLI relaunch must reach the classifier as LastLaunchAt, distinct
+// from the agent's original StartedAt, or the relaunch gets no boot grace and
+// its login-chrome flash pages an operator.
+func TestWatchdogObserveCarriesLastLaunchAt(t *testing.T) {
+	m, _ := newWatchdogTestManager(t, map[string]string{"a1": "copilot"})
+	started := time.Date(2026, 8, 23, 11, 30, 0, 0, time.UTC)
+	relaunched := started.Add(22 * time.Hour)
+	m.agents["a1"].StartedAt = &started
+	m.agents["a1"].lastCLILaunchAt = relaunched
+
+	obs, err := WatchdogFleet{M: m}.Observe("a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !obs.StartedAt.Equal(started) {
+		t.Fatalf("StartedAt = %v, want %v — a relaunch must not rewrite the agent's start", obs.StartedAt, started)
+	}
+	if !obs.LastLaunchAt.Equal(relaunched) {
+		t.Fatalf("LastLaunchAt = %v, want %v — without it a relaunch gets no boot grace", obs.LastLaunchAt, relaunched)
+	}
+}
+
+// TestMarkCLILaunchedLockedStampsEveryLaunchField guards the single write
+// point launchInTmux uses: StartedAt, the launch generation stale startup-kick
+// goroutines check, and the relaunch timestamp the watchdog dates boot grace
+// from must all move together.
+func TestMarkCLILaunchedLockedStampsEveryLaunchField(t *testing.T) {
+	m, _ := newWatchdogTestManager(t, map[string]string{"a1": "copilot"})
+	agent := m.agents["a1"]
+	first := time.Date(2026, 8, 23, 11, 30, 0, 0, time.UTC)
+	second := first.Add(22 * time.Hour)
+
+	m.mu.Lock()
+	gen := agent.launchGen
+	m.markCLILaunchedLocked(agent, first)
+	m.markCLILaunchedLocked(agent, second)
+	m.mu.Unlock()
+
+	if agent.StartedAt == nil || !agent.StartedAt.Equal(second) {
+		t.Fatalf("StartedAt = %v, want %v", agent.StartedAt, second)
+	}
+	if agent.launchGen != gen+2 {
+		t.Fatalf("launchGen = %d, want %d — one increment per launch", agent.launchGen, gen+2)
+	}
+	if !agent.lastCLILaunchAt.Equal(second) {
+		t.Fatalf("lastCLILaunchAt = %v, want %v", agent.lastCLILaunchAt, second)
 	}
 }
 

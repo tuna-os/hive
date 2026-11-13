@@ -75,10 +75,15 @@ type contributorLaneFixture struct {
 	// (acme/<name>), served to the hive-wide auto-promotion walk; the fake
 	// search/issues endpoint reports a repo only when it holds a merged PR
 	// by the searched author.
-	otherHistory    map[string][]map[string]any
-	searchStatus    int
-	searches        int
-	searchQuery     string
+	otherHistory  map[string][]map[string]any
+	searchStatus  int
+	searches      int
+	searchQuery   string
+	searchQueries []string
+	// unsearchable lists the owner/repo names the fake search/issues
+	// endpoint refuses with GitHub's 422 Validation Failed whenever a query
+	// names them, as it does for a renamed or invisible repository.
+	unsearchable    map[string]bool
 	otherLists      []string
 	issueCommentsSt int
 	reviews         []map[string]any
@@ -91,6 +96,9 @@ type contributorLaneFixture struct {
 	updates         int
 	lastComment     string
 	allComments     []string
+	// commentEdits records the bodies written by PATCH /issues/comments/ID,
+	// which also rewrites the matching prComments entry.
+	commentEdits []string
 	// checkCompletedAt, when set, is the completed_at the check-runs
 	// endpoint reports for sha7 (RFC 3339); empty omits the field.
 	checkCompletedAt string
@@ -105,6 +113,9 @@ type contributorLaneFixture struct {
 	// headStatus, when set, is the combined-status state and check-run
 	// conclusion reported for sha7; empty means "success".
 	headStatus string
+	// headStatuses is what GET commits/sha7/statuses (every commit status,
+	// with its creator) serves; nil serves an empty list.
+	headStatuses []map[string]any
 	// baseRef, when set, gives the PR base a branch name and serves the
 	// branch, protection and compare routes the current-base gate
 	// (automerge_current_base.go) and release hold need; empty leaves the
@@ -112,6 +123,15 @@ type contributorLaneFixture struct {
 	baseRef  string
 	behindBy int // behind_by reported by compare/<baseRef>...sha7
 	compares int
+	// headCommit, when set, is what GET commits/sha7 serves — the parents
+	// and GitHub author the workflow-fence base-refresh carry reads; nil
+	// serves a one-parent commit by the PR author.
+	headCommit map[string]any
+	// compareFiles and compareMergeBase are the files and merge-base SHA
+	// compare/<baseRef>...<head> serves for each head, for the base-refresh
+	// carry; a head without files is answered as before.
+	compareFiles     map[string][]map[string]any
+	compareMergeBase map[string]string
 	// requiredContexts, when set with baseRef, is what branch protection
 	// declares as required_status_checks.contexts; empty keeps the branch
 	// unprotected. The status/check-runs routes only ever report ci/build,
@@ -150,6 +170,10 @@ type contributorLaneFixture struct {
 	labelsCreated int
 	labelsAdded   []string
 	labelsRemoved []string
+	// updateStatus, when set, is the status every PUT update-branch
+	// answers with, carrying updateMessage.
+	updateStatus  int
+	updateMessage string
 }
 
 func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.Server {
@@ -180,6 +204,10 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 		if headStatus == "" {
 			headStatus = "success"
 		}
+		baseRef := fx.baseRef
+		if baseRef == "" {
+			baseRef = "main"
+		}
 		pull := func(sha string) map[string]any {
 			p := map[string]any{
 				"node_id":         fx.nodeID,
@@ -191,11 +219,12 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				"mergeable":       state == "clean",
 				"user":            map[string]string{"login": author},
 				"head":            map[string]any{"sha": sha, "repo": map[string]string{"full_name": headRepo}},
-				"base":            map[string]any{"repo": map[string]string{"full_name": "acme/widget"}},
+				"base":            map[string]any{"ref": "main", "sha": "base1", "repo": map[string]string{"full_name": "acme/widget"}},
 				"labels":          labels,
 			}
 			if fx.baseRef != "" {
 				p["base"].(map[string]any)["ref"] = fx.baseRef
+				p["base"].(map[string]any)["sha"] = "base1"
 			}
 			if !fx.omitAssociation {
 				p["author_association"] = association
@@ -222,6 +251,7 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 		case r.Method == http.MethodGet && r.URL.Path == "/search/issues":
 			fx.searches++
 			fx.searchQuery = r.URL.Query().Get("q")
+			fx.searchQueries = append(fx.searchQueries, fx.searchQuery)
 			if fx.searchStatus != 0 {
 				http.Error(w, "search error", fx.searchStatus)
 				return
@@ -234,6 +264,14 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 					searchedAuthor = strings.TrimPrefix(term, "author:")
 				case strings.HasPrefix(term, "repo:"):
 					searchedRepos = append(searchedRepos, strings.TrimPrefix(term, "repo:"))
+				}
+			}
+			for _, full := range searchedRepos {
+				if fx.unsearchable[full] {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					json.NewEncoder(w).Encode(map[string]any{"message": "Validation Failed", "errors": []map[string]string{{"resource": "Search", "field": "q", "code": "invalid", "message": "The listed users and repositories cannot be searched either because the resources do not exist or you do not have permission to view them."}}})
+					return
 				}
 			}
 			items := []map[string]any{}
@@ -263,7 +301,7 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			sha := "sha7"
-			if fetches > 1 && fx.recheckHeadSHA != "" {
+			if fetches > 2 && fx.recheckHeadSHA != "" {
 				sha = fx.recheckHeadSHA
 			}
 			json.NewEncoder(w).Encode(pull(sha))
@@ -331,6 +369,12 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				"total_count": 1,
 				"statuses":    []map[string]string{{"context": "ci/build", "state": headStatus}},
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/sha7/statuses":
+			statuses := fx.headStatuses
+			if statuses == nil {
+				statuses = []map[string]any{}
+			}
+			json.NewEncoder(w).Encode(statuses)
 		case r.Method == http.MethodGet && (r.URL.Path == "/repos/acme/widget/commits/sha7/check-runs" ||
 			(fx.recheckHeadSHA != "" && r.URL.Path == "/repos/acme/widget/commits/"+fx.recheckHeadSHA+"/check-runs")):
 			if fx.noCIEvidence {
@@ -361,9 +405,9 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]any{"merged": !fx.mergeNotApplied, "sha": "merge7"})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+fx.baseRef:
-			json.NewEncoder(w).Encode(map[string]any{"name": fx.baseRef, "commit": map[string]string{"sha": "base1"}})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+fx.baseRef+"/protection/required_status_checks":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+baseRef:
+			json.NewEncoder(w).Encode(map[string]any{"name": baseRef, "commit": map[string]string{"sha": "base1"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+baseRef+"/protection/required_status_checks":
 			if len(fx.requiredContexts) > 0 {
 				json.NewEncoder(w).Encode(map[string]any{"strict": false, "contexts": fx.requiredContexts})
 				return
@@ -388,7 +432,7 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/rules/branches/"+fx.baseRef:
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/rules/branches/"+baseRef:
 			if len(fx.rulesetContexts) > 0 {
 				checks := make([]map[string]string, 0, len(fx.rulesetContexts))
 				for _, name := range fx.rulesetContexts {
@@ -398,13 +442,33 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			json.NewEncoder(w).Encode([]any{})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/base1/status":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/base1/status":
 			json.NewEncoder(w).Encode(map[string]any{"state": "success", "total_count": 0, "statuses": []any{}})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/compare/"+fx.baseRef+"...sha7":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/compare/"+baseRef+"...sha7":
 			fx.compares++
-			json.NewEncoder(w).Encode(map[string]any{"behind_by": fx.behindBy, "ahead_by": 1})
+			cmp := map[string]any{"behind_by": fx.behindBy, "ahead_by": 1}
+			if files, ok := fx.compareFiles["sha7"]; ok {
+				cmp["files"] = files
+				cmp["merge_base_commit"] = map[string]string{"sha": fx.compareMergeBase["sha7"]}
+			}
+			json.NewEncoder(w).Encode(cmp)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/acme/widget/compare/"+baseRef+"...") && fx.compareFiles[strings.TrimPrefix(r.URL.Path, "/repos/acme/widget/compare/"+baseRef+"...")] != nil:
+			head := strings.TrimPrefix(r.URL.Path, "/repos/acme/widget/compare/"+baseRef+"...")
+			json.NewEncoder(w).Encode(map[string]any{"files": fx.compareFiles[head], "merge_base_commit": map[string]string{"sha": fx.compareMergeBase[head]}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/sha7":
+			commit := fx.headCommit
+			if commit == nil {
+				commit = map[string]any{"sha": "sha7", "parents": []map[string]string{{"sha": "sha6"}}, "author": map[string]string{"login": author}, "committer": map[string]string{"login": author}}
+			}
+			json.NewEncoder(w).Encode(commit)
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/acme/widget/pulls/7/update-branch":
 			fx.updates++
+			if fx.updateStatus != 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(fx.updateStatus)
+				json.NewEncoder(w).Encode(map[string]any{"message": fx.updateMessage})
+				return
+			}
 			json.NewEncoder(w).Encode(map[string]any{"message": "Updating pull request branch."})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widget/labels":
 			fx.labelsCreated++
@@ -446,6 +510,19 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				"body": payload.Body,
 			})
 			json.NewEncoder(w).Encode(map[string]any{"id": 1000 + fx.comments})
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/repos/acme/widget/issues/comments/"):
+			id, _ := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/repos/acme/widget/issues/comments/"), 10, 64)
+			var payload struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			for _, c := range fx.prComments {
+				if cid, ok := c["id"]; ok && fmt.Sprint(cid) == strconv.FormatInt(id, 10) {
+					c["body"] = payload.Body
+				}
+			}
+			fx.commentEdits = append(fx.commentEdits, payload.Body)
+			json.NewEncoder(w).Encode(map[string]any{"id": id, "body": payload.Body})
 		case r.Method == http.MethodGet && otherPRCommentsNumber(r.URL.Path) > 0:
 			comments := fx.otherPRComments[otherPRCommentsNumber(r.URL.Path)]
 			if comments == nil {
@@ -539,6 +616,9 @@ func newContributorLaneEngineRepos(apiURL string, repos []string, policy Contrib
 	client := hgithub.NewClient("token", "acme", repos, nil, apiURL)
 	client.SetAppBotLogin(testHiveAppBotLogin)
 	opts.ContributorLanePolicy = func() ContributorLanePolicy { return policy }
+	if opts.BasePreparation == nil {
+		opts.BasePreparation = NewBasePreparationStore("")
+	}
 	if opts.ContributorLaneVerdict == nil {
 		opts.ContributorLaneVerdict = approvedVerdict
 	}
@@ -608,7 +688,7 @@ func TestTrySweepContributorLanePRSkipReasons(t *testing.T) {
 		{name: "hold label", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"hold"} }, wantReason: "label:hold"},
 		{name: "do-not-merge slash label", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"do-not-merge/wip"} }, wantReason: "label:do-not-merge/wip"},
 		{name: "needs-rebase label returns author fix", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"needs-rebase"} }, wantReason: "label:needs-rebase"},
-		{name: "policy exclude label", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"blocked"} }, wantReason: "excluded-label:blocked"},
+		{name: "blocked label (shared merge gate)", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"blocked"} }, wantReason: autoMergeReasonLabelBlocked},
 		{name: "conflict outranks untrusted claim tier", mutate: func(fx *contributorLaneFixture) {
 			fx.mergeableState = "dirty"
 			tierClaim(" tier=newcomer verified=true")(fx)
@@ -740,6 +820,31 @@ func TestTrySweepContributorLanePRSkipReasons(t *testing.T) {
 			name:       "reviewer configured without approval",
 			verdict:    func(string, int, string) ContributorLaneVerdict { return ContributorLaneVerdict{Configured: true} },
 			wantReason: contributorLaneReasonNoVerdict,
+		},
+		{
+			// hive-wild-mole, 2026-11-07: a reviewer agent exists but the
+			// review swarm is off, so no verdict will ever come. no-verdict
+			// parked twelve PRs at 050 "review swarm requested" for good.
+			name: "review swarm off names the stall",
+			verdict: func(string, int, string) ContributorLaneVerdict {
+				return ContributorLaneVerdict{Configured: true, ReviewOff: true}
+			},
+			wantReason: contributorLaneReasonReviewOff,
+		},
+		{
+			name:   "review swarm off still merges when verdict not required",
+			policy: func(p *ContributorLanePolicy) { p.RequireReviewerVerdict = false },
+			verdict: func(string, int, string) ContributorLaneVerdict {
+				return ContributorLaneVerdict{Configured: true, ReviewOff: true}
+			},
+			wantMerges: 1,
+		},
+		{
+			name: "review swarm off keeps a recorded changes request",
+			verdict: func(string, int, string) ContributorLaneVerdict {
+				return ContributorLaneVerdict{Configured: true, ReviewOff: true, Verdict: "changes_requested"}
+			},
+			wantReason: contributorLaneReasonChangesRequested,
 		},
 		{
 			name:       "no reviewer configured skips",
@@ -1226,6 +1331,7 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 		own          []map[string]any
 		other        map[string][]map[string]any
 		searchStatus int
+		unsearchable []string
 		wantReason   string
 		wantMerges   int
 		wantSearches int
@@ -1301,9 +1407,31 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 			name:         "search failure degrades to the PR's repository",
 			own:          cleanHistory(1),
 			other:        map[string][]map[string]any{"hive": cleanHistory(9)},
-			searchStatus: http.StatusUnprocessableEntity,
+			searchStatus: http.StatusInternalServerError,
 			wantReason:   contributorLaneReasonClaimTier,
 			wantSearches: 1,
+		},
+		// hivecommons/hive#17148: GitHub refuses the whole query when one
+		// listed repository cannot be searched; the others still count. The
+		// PR's own repository is part of the chunk on v6 (per-author cache,
+		// #15088), so the per-repository fallback asks for it too.
+		{
+			name:         "an unsearchable repository does not hide the others",
+			own:          cleanHistory(1),
+			other:        map[string][]map[string]any{"hive": cleanHistory(9)},
+			unsearchable: []string{"acme/docs"},
+			wantMerges:   1,
+			wantSearches: 5,
+			wantLists:    []string{"hive"},
+			wantComment:  "merged=5 scope=hive repos=widget:1,hive:4 -->",
+		},
+		{
+			name:         "an unsearchable author degrades to the PR's repository",
+			own:          cleanHistory(1),
+			other:        map[string][]map[string]any{"hive": cleanHistory(9)},
+			unsearchable: []string{"acme/hive", "acme/docs", "acme/homebrew-hive"},
+			wantReason:   contributorLaneReasonClaimTier,
+			wantSearches: 5,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1312,6 +1440,10 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 			fx.mergedHistory = tc.own
 			fx.otherHistory = tc.other
 			fx.searchStatus = tc.searchStatus
+			fx.unsearchable = map[string]bool{}
+			for _, full := range tc.unsearchable {
+				fx.unsearchable[full] = true
+			}
 			api := newContributorLaneAPI(t, &fx)
 			defer api.Close()
 			policy := defaultContributorLanePolicy()
@@ -1333,16 +1465,17 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 				t.Fatalf("searches = %d, want %d (q=%q)", fx.searches, tc.wantSearches, fx.searchQuery)
 			}
 			if fx.searches > 0 {
+				first := fx.searchQueries[0]
 				for _, want := range []string{"is:pr", "is:merged", "author:" + contributorLaneTestAuthor, "repo:acme/hive", "repo:acme/docs", "repo:acme/homebrew-hive"} {
-					if !strings.Contains(fx.searchQuery, want) {
-						t.Fatalf("search query %q missing %q", fx.searchQuery, want)
+					if !strings.Contains(first, want) {
+						t.Fatalf("search query %q missing %q", first, want)
 					}
 				}
 				// The answer is cached per author for every active repository,
 				// so the PR's own repository is searched too; it is never walked
 				// twice (wantLists below).
-				if !strings.Contains(fx.searchQuery, "repo:acme/widget") {
-					t.Fatalf("search query %q must cover the PR's own repository for the per-author cache", fx.searchQuery)
+				if !strings.Contains(first, "repo:acme/widget") {
+					t.Fatalf("search query %q must cover the PR's own repository for the per-author cache", first)
 				}
 			}
 			if strings.Join(fx.otherLists, ",") != strings.Join(tc.wantLists, ",") {

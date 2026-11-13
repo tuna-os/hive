@@ -54,6 +54,17 @@ if [[ "${1:-}" = "repo" && "${2:-}" = "view" ]]; then
   echo "${MOCK_GH_DEFAULT_BRANCH:-}"
   exit 0
 fi
+# `gh pr view … --json author|body`: the PR's author login and current body,
+# for the own-PR checks on the edit path.
+if [[ "${1:-}" = "pr" && "${2:-}" = "view" ]]; then
+  for _a in "$@"; do
+    case "$_a" in
+      author) echo "${MOCK_GH_PR_AUTHOR:-}"; exit 0 ;;
+      body) [[ -n "${MOCK_GH_PR_BODY_FILE:-}" ]] && cat "$MOCK_GH_PR_BODY_FILE"; exit 0 ;;
+    esac
+  done
+  exit 0
+fi
 if [[ "${MOCK_GH_FAIL_ADD_LABEL:-}" = "true" ]]; then
   for _a in "$@"; do
     if [[ "$_a" = "--add-label" ]]; then
@@ -126,6 +137,48 @@ _run_test() {
   if [[ "$rc" != "$expected_rc" ]]; then
     echo "FAIL: $desc"
     echo "  expected exit code $expected_rc, got $rc"
+    echo "  output: $output"
+    FAILED=$((FAILED + 1))
+    return 1
+  fi
+
+  echo "PASS: $desc"
+  PASSED=$((PASSED + 1))
+}
+
+# _run_test with the output checked too: the staff-agent enumeration denial
+# must name the reads that still work.
+_run_test_staff_gate() {
+  local expected_rc="$1" want_match="$2" want_absent="$3" desc="$4"
+  shift 4
+
+  local output rc=0
+  rm -f "${WORK_DIR}/contributor-marker"
+  output="$(env \
+    HIVE_AGENT="ci-maintainer" \
+    HIVE_AGENT_DISPLAY_NAME="ci-maintainer" \
+    HIVE_AGENT_ID="ci-maintainer" \
+    MOCK_GH_LOGIN="${MOCK_GH_LOGIN:-test-bot[bot]}" \
+    GH_TOKEN="test-token-mock" \
+    bash "$TEST_WRAPPER" "$@" 2>&1)" || rc=$?
+
+  if [[ "$rc" != "$expected_rc" ]]; then
+    echo "FAIL: $desc"
+    echo "  expected exit code $expected_rc, got $rc"
+    echo "  output: $output"
+    FAILED=$((FAILED + 1))
+    return 1
+  fi
+  if [[ "$want_match" != "-" ]] && ! grep -qE -- "$want_match" <<<"$output"; then
+    echo "FAIL: $desc"
+    echo "  expected output to match /${want_match}/"
+    echo "  output: $output"
+    FAILED=$((FAILED + 1))
+    return 1
+  fi
+  if [[ "$want_absent" != "-" ]] && grep -qE -- "$want_absent" <<<"$output"; then
+    echo "FAIL: $desc"
+    echo "  expected output NOT to match /${want_absent}/"
     echo "  output: $output"
     FAILED=$((FAILED + 1))
     return 1
@@ -434,6 +487,86 @@ _run_test_identity_failure 1 "issue list --author test-bot[bot] when identity lo
 
 _run_test_cached_env_spoof 1 "issue list --author env-seeded identity cache octocat (blocked)" \
   issue list --repo test/repo --author octocat
+
+echo ""
+echo "=== Staff agents may list merged PRs; the denial names the reads that work ==="
+
+# Danathar/dns-failover#152: ci-maintainer could not run the repo's agent audit
+# (`gh pr list --state merged --json ... | node scripts/ai-audit-report.mjs`)
+# and parked "say which PR it flags" for the owner. Merged PRs are history,
+# not a work queue.
+ENUM_DENY='reason=enumeration_disabled'
+_run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list --state merged --json (allowed: the audit script's input)" \
+  pr list --repo test/repo --state merged --limit 500 --json number,title,body,author,mergedBy,baseRefName,mergedAt
+_run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list --state=merged (allowed, equals form)" \
+  pr list --repo test/repo --state=merged
+_run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list -s merged (allowed, short flag)" \
+  pr list --repo test/repo -s merged
+_run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list -sMERGED (allowed, attached short flag, any case)" \
+  pr list --repo test/repo -sMERGED
+_run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list -R before the subcommand --state merged (allowed)" \
+  -R test/repo pr list --state merged
+_run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list --state open --state merged (allowed: the last --state wins, as in gh)" \
+  pr list --repo test/repo --state open --state merged
+
+# Everything that could still reach open work stays refused.
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state open (blocked)" \
+  pr list --repo test/repo --state open
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state all (blocked)" \
+  pr list --repo test/repo --state all
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state closed (blocked: closed-unmerged can be reopened work)" \
+  pr list --repo test/repo --state closed
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state merged --state open (blocked: the last --state wins)" \
+  pr list --repo test/repo --state merged --state open
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state merged --search 'is:open' (blocked: search qualifiers bypass --state)" \
+  pr list --repo test/repo --state merged --search 'is:open'
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state merged -S review (blocked: short search flag)" \
+  pr list --repo test/repo --state merged -S review
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state merged --search=x (blocked: equals search flag)" \
+  pr list --repo test/repo --state merged --search=x
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list --state open statusCheckRollup with HIVE_BASELINE_CHECK=1 (allowed: baseline helper's sibling lookup)" \
+  pr list --repo test/repo --state open --limit 100 --json number,headRefOid,isCrossRepository,statusCheckRollup
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list -R before the subcommand, equals/short forms with HIVE_BASELINE_CHECK=1 (allowed: same projection)" \
+  -R test/repo pr list --state=open -L50 --json=number,statusCheckRollup
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state open --search with HIVE_BASELINE_CHECK=1 (blocked)" \
+  pr list --repo test/repo --state open --search foo
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --label actionable with HIVE_BASELINE_CHECK=1 (blocked: flag outside the allowlist)" \
+  pr list --repo test/repo --state open --label actionable --limit 100 --json number,headRefOid,isCrossRepository,statusCheckRollup
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --json number,title,statusCheckRollup with HIVE_BASELINE_CHECK=1 (blocked: field outside the projection)" \
+  pr list --repo test/repo --state open --limit 100 --json number,title,statusCheckRollup
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --json title --json number with HIVE_BASELINE_CHECK=1 (blocked: gh accumulates repeated --json, every occurrence is checked)" \
+  pr list --repo test/repo --state open --limit 100 --json title --json number
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 0 "-" "$ENUM_DENY" "pr list --json number --json statusCheckRollup with HIVE_BASELINE_CHECK=1 (allowed: repeated --json, all fields in the projection)" \
+  pr list --repo test/repo --state open --limit 100 --json number --json statusCheckRollup
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --limit 500 with HIVE_BASELINE_CHECK=1 (blocked: over the helper's 100)" \
+  pr list --repo test/repo --state open --limit 500 --json number,headRefOid,isCrossRepository,statusCheckRollup
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state open without --json with HIVE_BASELINE_CHECK=1 (blocked: no projection)" \
+  pr list --repo test/repo --state open --limit 100
+HIVE_BASELINE_CHECK=1 _run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state all with HIVE_BASELINE_CHECK=1 (blocked: --state open required)" \
+  pr list --repo test/repo --state all --limit 100 --json number,statusCheckRollup
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state open --json statusCheckRollup without HIVE_BASELINE_CHECK (blocked)" \
+  pr list --repo test/repo --state open --json statusCheckRollup
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "pr list --state with no value (blocked)" \
+  pr list --repo test/repo --state
+_run_test_staff_gate 1 "$ENUM_DENY" "-" "issue list --state merged (blocked: issues are never merged)" \
+  issue list --repo test/repo --state merged
+_run_test_staff_gate 1 "author_mismatch" "-" "pr list --state merged --author foreign-user (still the --author gate)" \
+  pr list --repo test/repo --state merged --author foreign-user
+
+# The denial names the reads that still work, so "listing is blocked" is not
+# read as "no way to look up merged PRs".
+_run_test_staff_gate 1 "gh pr list --state merged' \\(merged PRs only" "-" "denial names the merged-PR listing" \
+  pr list --repo test/repo
+_run_test_staff_gate 1 "gh search prs\\|issues --repo <owner/repo> <terms>' without --author" "-" "denial names authorless search" \
+  pr list --repo test/repo
+_run_test_staff_gate 1 "gh api repos/<owner/repo>/pulls\\?state=closed' \\(GET\\)" "-" "denial names the GET api read" \
+  issue list --repo test/repo
+
+# ...and those reads really are allowed.
+_run_test_staff_gate 0 "-" "BLOCKED" "authorless search prs --merged (allowed, as the denial says)" \
+  search prs --repo test/repo --merged audit
+_run_test_staff_gate 0 "-" "BLOCKED" "GET api repos/<o>/<r>/pulls?state=closed (allowed, as the denial says)" \
+  api 'repos/test/repo/pulls?state=closed&per_page=100'
 
 echo ""
 echo "=== Contributor mode tests ==="
@@ -1416,6 +1549,100 @@ WS_OUTPUT="$(env \
   bash "$TEST_WRAPPER" issue close 42 --repo test/repo 2>&1)" || WS_RC=$?
 _ws_expect 0 "relayed: close" "write_surface.enforce" \
   "an enforced lane still closes an issue through the relay"
+
+# ── A body edit of the hive's own PR keeps its `— hive:` line ────────────────
+# The PR-request watcher appends `— hive: agent=… backend=… model=…` when it
+# opens the PR; `gh pr edit --body` replaces the whole body, and an agent that
+# rewrote its description seconds later deleted the line
+# (Danathar/arch-bootc#625). The wrapper re-appends the PR's current line.
+echo ""
+echo "-- pr edit --body keeps the hive attribution line --"
+ATTR_TRAILER="— hive: agent=quality backend=claude model=claude-opus-5-5 effort=high"
+ATTR_OLD_BODY="${WORK_DIR}/attr-old-body.md"
+printf '%s\n\n%s\n' 'Old description: 18 failures.' "$ATTR_TRAILER" >"$ATTR_OLD_BODY"
+ATTR_NO_TRAILER_BODY="${WORK_DIR}/attr-no-trailer-body.md"
+printf '%s\n' 'Old description, opened by hand.' >"$ATTR_NO_TRAILER_BODY"
+ATTR_NEW_FILE="${WORK_DIR}/attr-new-body.md"
+printf '%s\n' 'New description: 16 failures.' >"$ATTR_NEW_FILE"
+ATTR_PR=7795
+
+# _attr_run <author> <current-body-file> <stdin-file> -- <wrapper args...>
+_attr_run() {
+  local author="$1" current="$2" stdin_file="$3"
+  shift 4
+  # The wrapper caches a "not ours" verdict per PR under /tmp; start clean.
+  rm -f "/tmp/.hive-labels-ensured-owner-test_repo-${ATTR_PR}"
+  CAPTURE_EXTRA_ENV=(MOCK_GH_PR_AUTHOR="$author" MOCK_GH_PR_BODY_FILE="$current")
+  _capture_run "$stdin_file" "$@"
+  CAPTURE_EXTRA_ENV=()
+  rm -f "/tmp/.hive-labels-ensured-owner-test_repo-${ATTR_PR}"
+}
+
+# _expect_edit_body <desc> <want-body>: the recorded `gh pr edit` carries
+# exactly one body flag whose value is exactly <want-body>.
+_expect_edit_body() {
+  local desc="$1" want="$2" inv flags body
+  if [[ "$CAPTURE_RC" != "0" ]]; then
+    _body_fail "$desc" "wrapper exited ${CAPTURE_RC}" "stderr: $(cat "${CAPTURE_DIR}/stderr")"
+    return 1
+  fi
+  if ! inv="$(_capture_invocation pr edit)"; then
+    _body_fail "$desc" "no recorded 'gh pr edit' invocation"
+    return 1
+  fi
+  flags="$(_count_body_flags "$inv")"
+  if [[ "$flags" != "1" ]]; then
+    _body_fail "$desc" "expected exactly 1 body flag, got ${flags}" "argv: $(_show_args "$inv")"
+    return 1
+  fi
+  # The trailing x keeps trailing newlines, so the comparison is exact.
+  body="$(_capture_body "$inv" && printf x)" || body="<no --body>"
+  body="${body%x}"
+  if [[ "$body" != "$want" ]]; then
+    _body_fail "$desc" "body: ${body}" "want: ${want}"
+    return 1
+  fi
+  echo "PASS: $desc"
+  PASSED=$((PASSED + 1))
+}
+
+ATTR_KEPT=$'New description: 16 failures.\n\n'"$ATTR_TRAILER"
+
+_attr_run 'test-bot[bot]' "$ATTR_OLD_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo --body 'New description: 16 failures.'
+_expect_edit_body "own PR, --body without the line: the line is re-appended" "$ATTR_KEPT"
+
+_attr_run 'test-bot[bot]' "$ATTR_OLD_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo --body-file "$ATTR_NEW_FILE"
+_expect_edit_body "own PR, --body-file without the line: the line is re-appended" "$ATTR_KEPT"
+
+_attr_run 'test-bot[bot]' "$ATTR_OLD_BODY" "$ATTR_NEW_FILE" -- pr edit "$ATTR_PR" --repo test/repo -F -
+_expect_edit_body "own PR, body on stdin without the line: the line is re-appended" "$ATTR_KEPT"
+
+_attr_run 'test-bot[bot]' "$ATTR_OLD_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo '--body=New description: 16 failures.'
+_expect_edit_body "own PR, --body= form without the line: the line is re-appended" "$ATTR_KEPT"
+
+_attr_run 'test-bot[bot]' "$ATTR_OLD_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo --title '-b looks like a body' --body 'New description: 16 failures.'
+# _count_body_flags would count the title value itself, so read the body.
+if [[ "$CAPTURE_RC" = "0" ]] && _attr_inv="$(_capture_invocation pr edit)" &&
+   [[ "$(_capture_body "$_attr_inv")" == "$ATTR_KEPT" && "$(cat "${_attr_inv}/arg-6")" == '-b looks like a body' ]]; then
+  echo "PASS: a --title value that starts with -b is not read as the body"
+  PASSED=$((PASSED + 1))
+else
+  _body_fail "a --title value that starts with -b is not read as the body" "argv: $(_show_args "${_attr_inv:-/nonexistent}" 2>/dev/null)"
+fi
+
+ATTR_OWN_LINE=$'New description.\n\n— hive: agent=quality backend=claude model=other'
+_attr_run 'test-bot[bot]' "$ATTR_OLD_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo --body "$ATTR_OWN_LINE"
+_expect_edit_body "own PR, new body carries its own line: left as written" "$ATTR_OWN_LINE"
+
+ATTR_PROSE='The audit wants a `— hive:` signature line on every PR.'
+_attr_run 'test-bot[bot]' "$ATTR_OLD_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo --body "$ATTR_PROSE"
+_expect_edit_body "own PR, new body only mentions the prefix in its text: the line is re-appended" "${ATTR_PROSE}"$'\n\n'"$ATTR_TRAILER"
+
+_attr_run 'someone-else' "$ATTR_OLD_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo --body 'New description: 16 failures.'
+_expect_edit_body "a PR the hive did not open: body left as written" 'New description: 16 failures.'
+
+_attr_run 'test-bot[bot]' "$ATTR_NO_TRAILER_BODY" /dev/null -- pr edit "$ATTR_PR" --repo test/repo --body 'New description: 16 failures.'
+_expect_edit_body "own PR whose current body has no line: nothing is invented" 'New description: 16 failures.'
 
 echo ""
 echo "Results: ${PASSED} passed, ${FAILED} failed"

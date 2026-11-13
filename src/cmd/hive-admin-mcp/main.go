@@ -259,7 +259,10 @@ func (r *roster) annotateSkew(err error) error {
 	}
 	var unsupported *unsupportedToolError
 	var api *hivectl.APIError
-	if errors.As(err, &unsupported) || (errors.As(err, &api) && api.StatusCode == http.StatusNotFound) {
+	// A diagnostic read reports its refusal without the hub's response body,
+	// so its 404 is a DiagStatusError and not an APIError.
+	var diag *adminmcp.DiagStatusError
+	if errors.As(err, &unsupported) || (errors.As(err, &api) && api.StatusCode == http.StatusNotFound) || (errors.As(err, &diag) && diag.StatusCode == http.StatusNotFound) {
 		return fmt.Errorf("%w; %s", err, notice)
 	}
 	return err
@@ -282,6 +285,9 @@ func (p readProvider) callWrite(ctx context.Context, tool string, args map[strin
 }
 
 func (p readProvider) ExecuteWrite(ctx context.Context, req adminmcp.WriteRequest) (any, error) {
+	if err := adminmcp.CheckRequestPath(req.Path); err != nil {
+		return nil, err
+	}
 	client, _, err := p.roster.activeClient()
 	if err != nil {
 		return nil, err
@@ -348,9 +354,40 @@ func (p readProvider) Read(ctx context.Context, tool string, args map[string]any
 	if adminmcp.DiagTool(tool) {
 		return p.readDiag(ctx, tool, args)
 	}
+	if tool == adminmcp.ToolContributorQueue || tool == adminmcp.ContributorQueueStateRead {
+		path, err := adminmcp.ContributorQueueReadPath(tool, args)
+		if err != nil {
+			return nil, err
+		}
+		client, _, err := p.roster.activeClient()
+		if err != nil {
+			return nil, err
+		}
+		data, err := getPath(ctx, client, path)
+		if err != nil {
+			return nil, err
+		}
+		return adminmcp.ContributorQueueReadResult(tool, data, args)
+	}
+	if tool == adminmcp.ToolGitHubAPIUsage {
+		client, _, err := p.roster.activeClient()
+		if err != nil {
+			return nil, err
+		}
+		data, err := getPath(ctx, client, adminmcp.GitHubAPIUsageReadPath(args))
+		if err != nil {
+			return nil, err
+		}
+		return adminmcp.GitHubAPIUsageResult(data, args)
+	}
 	if tool == adminmcp.ToolSettingsRead {
 		// An unknown section or a missing agent is refused with its reason.
 		if _, err := adminmcp.SettingsReadPath(args); err != nil {
+			return nil, err
+		}
+	}
+	if tool == adminmcp.ToolDelegatedDecisionStatus {
+		if _, err := adminmcp.DelegatedDecisionStatusPath(args); err != nil {
 			return nil, err
 		}
 	}
@@ -366,8 +403,18 @@ func (p readProvider) Read(ctx context.Context, tool string, args map[string]any
 	if err != nil {
 		return nil, err
 	}
+	if tool == adminmcp.ToolSettingsRead {
+		// A Settings view is not a list to page; see the dashboard provider.
+		return data, nil
+	}
 	if tool == adminmcp.ToolIssuesByBand || tool == adminmcp.ToolPrsByBand {
 		return adminmcp.BandReadResult(tool, data, args)
+	}
+	if tool == adminmcp.ToolStageTrackerRead {
+		return adminmcp.StageTrackerReadResult(data, args)
+	}
+	if tool == adminmcp.ToolDelegatedDecisionStatus {
+		return data, nil
 	}
 	if tool == adminmcp.ToolGovernorSetup {
 		return adminmcp.GovernorSetupProposal(data)
@@ -386,6 +433,9 @@ func (p readProvider) Read(ctx context.Context, tool string, args map[string]any
 // their query as a "?..." suffix; hivectl.Client takes the query separately
 // and would percent-encode a "?" left in the path (#9160).
 func getPath(ctx context.Context, client *hivectl.Client, path string) (any, error) {
+	if err := adminmcp.CheckRequestPath(path); err != nil {
+		return nil, err
+	}
 	apiPath, rawQuery, _ := strings.Cut(path, "?")
 	query, err := url.ParseQuery(rawQuery)
 	if err != nil {
@@ -536,6 +586,13 @@ func readPath(tool string, args map[string]any) (string, bool) {
 	}
 	if tool == adminmcp.ToolAdvisorRecords {
 		return adminmcp.AdvisorRecordsReadPath(args), true
+	}
+	if tool == adminmcp.ToolStageTrackerRead {
+		return adminmcp.StageTrackerReadPath(), true
+	}
+	if tool == adminmcp.ToolDelegatedDecisionStatus {
+		path, err := adminmcp.DelegatedDecisionStatusPath(args)
+		return path, err == nil
 	}
 	return adminmcp.ReadPath(tool, adminmcp.LimitFromArgs(args))
 }

@@ -247,7 +247,9 @@ func (c *Engine) mergeReviewGate(ctx context.Context, displayRepo, owner, repo, 
 		verdict = gate.Verdict(fullRepo, number, head)
 	}
 	outcome := reviewGateOutcome(verdict)
-	enforce := mode == ReviewGateModeEnforce
+	// The trusted-bot lane records the swarm verdict but never holds on it
+	// while auto_merge.trusted_bot_skip_review is on: CI is its safety gate.
+	enforce := mode == ReviewGateModeEnforce && !c.trustedBotReviewAdvisory(lane)
 	humanApprover, overrode := "", ""
 	if enforce && outcome != ReviewGateOutcomeApproved {
 		// A trusted human's APPROVED review on exactly this head outranks
@@ -312,13 +314,25 @@ func reviewGateRecordLane(lane string) string {
 }
 
 func (c *Engine) latestTrustedHumanApproval(ctx context.Context, owner, repo string, number int, head string) (string, bool) {
+	login, _, ok := c.latestTrustedHumanApprovalReach(ctx, owner, repo, number, head)
+	return login, ok
+}
+
+// latestTrustedHumanApprovalReach is latestTrustedHumanApproval plus the
+// commit the review approved when the approval reaches head only by being
+// carried over base merges (reviewReachesHead), "" when it approved head
+// itself, so the fence comment can say so.
+func (c *Engine) latestTrustedHumanApprovalReach(ctx context.Context, owner, repo string, number int, head string) (string, string, bool) {
 	rv, ok := c.latestTrustedHumanReview(ctx, owner, repo, number, head, "APPROVED")
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	login := strings.TrimSpace(hgithub.SafeGetLogin(rv.GetUser()))
 	c.noteStageTrustedHumanApproval(owner, repo, number, head, login)
-	return login, true
+	if c.reviewReachesHead(ctx, owner, repo, number, head, rv).carried {
+		return login, strings.TrimSpace(rv.GetCommitID()), true
+	}
+	return login, "", true
 }
 
 func (c *Engine) trustedHumanApprovalForRequiresHuman(ctx context.Context, owner, repo string, number int, head string, verdict ContributorLaneVerdict) (string, bool) {

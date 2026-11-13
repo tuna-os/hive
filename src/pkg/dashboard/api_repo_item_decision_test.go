@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hivecommons/hive/pkg/delegatedecision"
 	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/review"
 	"github.com/hivecommons/hive/pkg/stagelabels"
@@ -39,6 +40,7 @@ type repoItemDecisionMock struct {
 	prNoMaintainerEdits bool
 	workflowPath        string
 	prMergeState        string
+	prHeadSHA           string
 	updates             int
 	prRedCI             bool
 	prNoCI              bool
@@ -70,6 +72,20 @@ type repoItemDecisionMock struct {
 	fixedIssueClosedBy int
 	// issueTitle / issueBody shape issue #7 (empty = untitled, no body).
 	issueTitle, issueBody string
+	// issueState shapes GET /issues/7 (empty means open).
+	issueState string
+	// commentError / editError refuse POST /comments or PATCH /issues/N.
+	commentError, editError int
+	statusError             int
+	commentBlockText        string
+	commentStarted          chan struct{}
+	// editPaths records each PATCH path alongside edits.
+	editPaths []string
+	// checkRunsFailures is how many GET /check-runs answer 500 before the
+	// mock recovers (api.github.com's intermittent 500 on a long head);
+	// checkRunsCalls counts every GET /check-runs.
+	checkRunsFailures int
+	checkRunsCalls    int
 }
 
 func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
@@ -83,6 +99,11 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 		case r.Method == http.MethodGet && (strings.HasSuffix(path, "/collaborators/writer/permission") || strings.HasSuffix(path, "/collaborators/someone/permission")):
 			_, _ = io.WriteString(w, `{"permission":"write"}`)
 		case r.Method == http.MethodPost && strings.Contains(path, "/statuses/"):
+			if m.statusError != 0 {
+				w.WriteHeader(m.statusError)
+				_, _ = io.WriteString(w, `{"message":"Resource not accessible by integration"}`)
+				return
+			}
 			_, _ = io.WriteString(w, `{}`)
 		case r.Method == http.MethodGet && strings.HasSuffix(path, "/collaborators/reader/permission"):
 			_, _ = io.WriteString(w, `{"permission":"read"}`)
@@ -91,7 +112,11 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 			for _, label := range m.issueLabels {
 				labels = append(labels, map[string]string{"name": label})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": "open", "title": m.issueTitle, "body": m.issueBody, "labels": labels, "user": map[string]any{"login": "hive[bot]", "type": "Bot"}})
+			state := m.issueState
+			if state == "" {
+				state = "open"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": state, "title": m.issueTitle, "body": m.issueBody, "labels": labels, "user": map[string]any{"login": "hive[bot]", "type": "Bot"}})
 		case r.Method == http.MethodGet && (strings.HasSuffix(path, "/issues/8") || strings.HasSuffix(path, "/issues/9")):
 			n := 8
 			if strings.HasSuffix(path, "/issues/9") {
@@ -141,8 +166,12 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 			if m.prFork {
 				headRepo = "someone/testrepo"
 			}
+			headSHA := m.prHeadSHA
+			if headSHA == "" {
+				headSHA = "feedfacefeedfacefeedfacefeedfacefeedface"
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"number": n, "state": "open", "body": m.prBody, "labels": prLabels, "user": author, "mergeable": mergeState != "dirty", "mergeable_state": mergeState, "maintainer_can_modify": !m.prNoMaintainerEdits,
-				"head": map[string]any{"sha": "feedfacefeedfacefeedfacefeedfacefeedface", "repo": map[string]any{"full_name": headRepo}},
+				"head": map[string]any{"sha": headSHA, "repo": map[string]any{"full_name": headRepo}},
 				"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "testorg/testrepo"}}})
 		case r.Method == http.MethodGet && strings.Contains(path, "/compare/"):
 			files := []map[string]string{}
@@ -159,7 +188,7 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			m.merges = append(m.merges, body)
 			_, _ = io.WriteString(w, `{"sha":"0ddba11","merged":true,"message":"Pull Request successfully merged"}`)
-		case r.Method == http.MethodGet && strings.HasSuffix(path, "/pulls/8/reviews"):
+		case r.Method == http.MethodGet && (strings.HasSuffix(path, "/pulls/8/reviews") || strings.HasSuffix(path, "/pulls/9/reviews")):
 			_, _ = io.WriteString(w, `[]`)
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/pulls/8/reviews"):
 			var body map[string]any
@@ -178,6 +207,13 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 				_, _ = io.WriteString(w, `{"state":"success","statuses":[{"context":"ci/test","state":"success"}]}`)
 			}
 		case r.Method == http.MethodGet && strings.HasSuffix(path, "/commits/feedfacefeedfacefeedfacefeedfacefeedface/check-runs"):
+			m.checkRunsCalls++
+			if m.checkRunsFailures > 0 {
+				m.checkRunsFailures--
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `[]`)
+				return
+			}
 			_, _ = io.WriteString(w, `{"total_count":0,"check_runs":[]}`)
 		case r.Method == http.MethodGet && strings.Contains(path, "/commits/") && !strings.HasSuffix(path, "/status") && !strings.HasSuffix(path, "/check-runs"):
 			sha := path[strings.LastIndex(path, "/")+1:]
@@ -206,8 +242,17 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 			}
 			_ = json.NewEncoder(w).Encode(prior)
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/comments"):
+			if m.commentError != 0 {
+				http.Error(w, `{"message":"comment denied"}`, m.commentError)
+				return
+			}
 			var c map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&c)
+			if m.commentBlockText != "" && strings.Contains(c["body"], m.commentBlockText) {
+				close(m.commentStarted)
+				<-r.Context().Done()
+				return
+			}
 			m.comments = append(m.comments, c["body"])
 			_, _ = io.WriteString(w, `{"id":1}`)
 		case r.Method == http.MethodGet && strings.Contains(path, "/labels/"):
@@ -223,9 +268,14 @@ func newRepoItemDecisionServer(t *testing.T, m *repoItemDecisionMock) *Server {
 			m.removed = append(m.removed, path[strings.LastIndex(path, "/")+1:])
 			_, _ = io.WriteString(w, `{}`)
 		case r.Method == http.MethodPatch && strings.Contains(path, "/issues/"):
+			if m.editError != 0 {
+				http.Error(w, `{"message":"close denied"}`, m.editError)
+				return
+			}
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			m.edits = append(m.edits, body)
+			m.editPaths = append(m.editPaths, path)
 			_, _ = io.WriteString(w, `{}`)
 		default:
 			t.Logf("unexpected GitHub API request: %s %s", r.Method, path)
@@ -305,7 +355,7 @@ func TestRepoItemApproveResultWording(t *testing.T) {
 			name:    "sentinel released, lane merges",
 			facts:   repoItemApproveFacts{User: "clubanderson", Released: []string{"approval-recorded", "sentinel-label", "sentinel-acknowledged", "admitted"}, SentinelLabel: "sentinel-alert", SoakMinutes: 30},
 			outcome: "Approved #510 as @clubanderson · sentinel alert cleared by your review.",
-			next:    "Hive's merge sweep merges it on its next pass once CI is green and the head has soaked (≈30 min).",
+			next:    "Hive merges it on its next merge pass once CI is green and the head has soaked (≈30 min).",
 			posted:  "`/lgtm` posted|`/approve` posted|`sentinel-alert` label removed|head admitted as-is on your approval",
 			cleared: true,
 		},
@@ -313,7 +363,7 @@ func TestRepoItemApproveResultWording(t *testing.T) {
 			name:      "sentinel still open",
 			facts:     repoItemApproveFacts{User: "clubanderson", Released: []string{"approval-recorded"}, SentinelOpen: true, SentinelLabel: "sentinel-alert", SoakMinutes: 30},
 			outcome:   "Approved #510 as @clubanderson · sentinel alert still open.",
-			next:      "The `sentinel-alert` label is still on the PR: a maintainer must review the flagged head and take the label off on GitHub before hive's merge sweep will touch it.",
+			next:      "The `sentinel-alert` label is still on the PR: a maintainer must review the flagged head and take the label off on GitHub before hive's next merge pass will touch it.",
 			posted:    "`/lgtm` posted|`/approve` posted",
 			stillOpen: true,
 		},
@@ -328,14 +378,14 @@ func TestRepoItemApproveResultWording(t *testing.T) {
 			name:    "prow-managed repo: approval recorded, not claimed approved for prow",
 			facts:   repoItemApproveFacts{User: "clubanderson", Released: []string{"approval-recorded"}, SoakMinutes: 3, Prow: true},
 			outcome: "Approval of #510 recorded in hive as @clubanderson.",
-			next:    "Prow approval still needs an OWNERS reviewer: the relayed `/approve` came from hive's account, which Prow does not count. Hive's merge sweep merges it on its next pass once CI is green and the head has soaked (≈3 min).",
+			next:    "Prow approval still needs an OWNERS reviewer: the relayed `/approve` came from hive's account, which Prow does not count. Hive merges it on its next merge pass once CI is green and the head has soaked (≈3 min).",
 			posted:  "`/lgtm` posted|`/approve` posted",
 		},
 		{
 			name:    "no user, no soak figure",
 			facts:   repoItemApproveFacts{Released: []string{"approval-recorded"}},
 			outcome: "Approved #510.",
-			next:    "Hive's merge sweep merges it on its next pass once CI is green and the head has soaked.",
+			next:    "Hive merges it on its next merge pass once CI is green and the head has soaked.",
 			posted:  "`/lgtm` posted|`/approve` posted",
 		},
 	}
@@ -351,8 +401,8 @@ func TestRepoItemApproveResultWording(t *testing.T) {
 			if got.SentinelCleared != tc.cleared || got.SentinelOpen != tc.stillOpen {
 				t.Fatalf("sentinel flags cleared=%v open=%v", got.SentinelCleared, got.SentinelOpen)
 			}
-			for _, bad := range []string{"released:", "merges nothing", "merge gate takes it"} {
-				if strings.Contains(got.Outcome+got.Next, bad) {
+			for _, bad := range []string{"released:", "merges nothing", "merge gate takes it", "sweep"} {
+				if strings.Contains(strings.ToLower(got.Outcome+got.Next), bad) {
 					t.Fatalf("old wording %q survives: %+v", bad, got)
 				}
 			}
@@ -364,5 +414,55 @@ func TestRepoItemApproveResultWording(t *testing.T) {
 	// The legacy builder keeps the same shape for callers without facts.
 	if got := repoItemDecisionResult("o/r", 1, "pr", repoItemDecisionApprove, "", "", "", nil); got.Outcome != "Approved #1." {
 		t.Fatalf("legacy = %+v", got)
+	}
+}
+
+// TestRepoItemDecisionWordingNeverSaysSweep is the ratchet for
+// hivecommons/hive#15575's follow-up: "sweep" is the lane's internal name for
+// its pass and never reaches a person. The ⋯ decision `Next` sentences, the
+// "Approve and let hive merge" consequence and the GitHub approval note all
+// say "merge pass" instead.
+func TestRepoItemDecisionWordingNeverSaysSweep(t *testing.T) {
+	var texts []string
+	for _, decision := range []string{repoItemDecisionApprove, repoItemDecisionQueueMerge, repoItemDecisionMergeNow, repoItemDecisionAdopt, repoItemDecisionReauthor, repoItemDecisionDirection, repoItemDecisionCloseSuperseded} {
+		for _, facts := range []repoItemApproveFacts{
+			{User: "clubanderson", Released: []string{"approval-recorded", "admitted"}, SoakMinutes: 10},
+			{User: "clubanderson", Released: []string{"approval-recorded"}, Prow: true, SoakMinutes: 3},
+			{User: "clubanderson", Released: []string{"approval-recorded"}, SentinelLabel: "sentinel-alert", SentinelOpen: true},
+		} {
+			got := repoItemDecisionResultWith("hivecommons/dibs", 510, "pr", decision, "", "", "", facts)
+			texts = append(texts, decision+": "+got.Outcome+" "+got.Next+" "+strings.Join(got.Posted, " "))
+		}
+	}
+	in := delegatedecision.Input{Repo: "hivecommons/dibs", Kind: delegatedecision.KindPR, Number: 510}
+	approve := delegatedecision.Decision{Verdict: delegatedecision.VerdictApprove, Rule: "approve-human-merge", Text: "approve #510"}
+	for _, notes := range [][]string{nil, {"`/lgtm` + `/approve` recorded"}, {"queued for auto-merge"}} {
+		got := delegatedRowActionResult(in, approve, notes)
+		texts = append(texts, "delegated: "+got.Outcome+" "+got.Next)
+	}
+	for _, opt := range delegatedHumanMergeOptions(in, 510, true) {
+		texts = append(texts, "option "+opt.Action+": "+opt.Consequence)
+	}
+	texts = append(texts, "note: "+renderRepoItemDecisionQueueNote("clubanderson", ""))
+	for _, text := range texts {
+		if strings.Contains(strings.ToLower(text), "sweep") {
+			t.Errorf("user-facing decision text says \"sweep\" (hivecommons/hive#15575): %s", text)
+		}
+	}
+}
+
+// A Prow rejection of the relayed commands must not read as "approved"
+// (hivecommons/hive#17475).
+func TestRepoItemApproveResultSurfacesProwRejection(t *testing.T) {
+	out := &RowActionResult{}
+	repoItemApproveResult(out, 17359, repoItemApproveFacts{User: "alice", ProwRejected: true})
+	if strings.HasPrefix(out.Outcome, "Approved #") || !strings.Contains(out.Outcome, "recorded in hive") {
+		t.Fatalf("outcome = %q, want the hive-only approval wording", out.Outcome)
+	}
+	if got := strings.Join(out.Posted, "\n"); !strings.Contains(got, "Prow rejected") || strings.Contains(got, "`/lgtm` posted") {
+		t.Fatalf("posted = %q, want Prow's rejection named", got)
+	}
+	if !strings.Contains(out.Next, "OWNERS reviewer") {
+		t.Fatalf("next = %q, want the OWNERS note", out.Next)
 	}
 }

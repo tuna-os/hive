@@ -35,6 +35,7 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	// Issue claims (hivecommons/hive#8380). Routes register unconditionally;
 	// handlers answer "not enabled" when deps.IssueClaims is nil.
 	s.registerClaimsRoutes()
+	s.registerWorkflowRoutes()
 	// Approval desk (RFC #4000). Routes register unconditionally; the handlers
 	// report "not enabled" when deps.ApprovalInbox is nil, so a disabled desk is
 	// an honest 200 the panel can render rather than a 404 that looks broken.
@@ -53,6 +54,8 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("GET /api/config/export.json", s.handleConfigExport)
 	s.mux.HandleFunc("GET /api/config/provenance", s.handleConfigProvenance)
 	s.mux.HandleFunc("GET /api/config/variables", s.handleVariablesList)
+	s.mux.HandleFunc("GET /api/config/triggers", s.handleEventTriggersGet)
+	s.mux.HandleFunc("PUT /api/config/triggers", s.handleEventTriggersPut)
 	s.mux.HandleFunc("GET /api/config/authorized-users", s.handleAuthorizedUsersList)
 	s.mux.HandleFunc("GET /api/config/dashboard/theme", s.handleDashboardThemeGet)
 	s.mux.HandleFunc("PUT /api/config/dashboard/theme", s.handleDashboardThemePut)
@@ -70,6 +73,7 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("POST /api/presence", s.handlePresence)
 	s.mux.HandleFunc("GET /api/prompt-history", s.handlePromptHistory)
 	s.mux.HandleFunc("POST /api/self-upgrade", s.handleSelfUpgrade)
+	s.mux.HandleFunc("POST /api/upgrade/announce", s.handleUpgradeAnnounce)
 	s.mux.HandleFunc("POST /api/release-channel", s.handleReleaseChannelSwitch)
 	// Self-service, owner-only spoke backup (encrypted; includes the bead
 	// ledger the fleet-wide hub backup excludes — see issue #2318).
@@ -198,6 +202,7 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.registerCopilotAuthRoutes()
 	s.mux.HandleFunc("GET /api/summaries", s.handleSummaries)
 	s.mux.HandleFunc("GET /api/stage-tracker", s.handleStageTracker)
+	s.mux.HandleFunc("GET /api/matrix/lines", s.handleMatrixLines)
 	s.mux.HandleFunc("POST /api/prs/{owner}/{repo}/{number}/queue-automerge", s.handleQueuePRAutoMerge)
 
 	s.mux.HandleFunc("GET /api/config/agent/{name}", s.handleAgentConfigGet)
@@ -217,6 +222,7 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("GET /api/config/stat-sources", s.handleStatSources)
 
 	s.mux.HandleFunc("GET /api/config/governor", s.handleGovernorConfigGet)
+	s.mux.HandleFunc("PATCH /api/config/governor", s.handleGovernorMergeTrainPatch)
 	s.mux.HandleFunc("GET /api/config/dashboard", s.handleDashboardSettingsGet)
 	s.mux.HandleFunc("PUT /api/config/dashboard", s.handleDashboardSettingsPut)
 	s.mux.HandleFunc("PUT /api/config/governor/sensing", s.handleGovernorSensing)
@@ -262,11 +268,13 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	// lives on the governor Features tab — see api_config_automerge.go.
 	s.mux.HandleFunc("GET /api/config/auto-merge", s.handleAutoMergeGet)
 	s.mux.HandleFunc("PUT /api/config/auto-merge", s.handleAutoMergePut)
+	s.mux.HandleFunc("PATCH /api/config/auto-merge", s.handleAutoMergePut)
 	// convergence is a top-level Config field (not GovernorConfig); its UI
 	// lives on the governor Features tab — see api_config_convergence.go
 	// (#4263 off/shadow/enforce rollout). The soak endpoint is the
 	// fixed-commit telemetry read path (convergence_soak.go).
 	s.mux.HandleFunc("GET /api/config/convergence", s.handleConvergenceConfigGet)
+	s.registerIntegrationRoutes()
 	s.mux.HandleFunc("PUT /api/config/convergence", s.handleConvergenceConfigPut)
 	s.mux.HandleFunc("GET /api/config/sla", s.handleSLAConfigGet)
 	s.mux.HandleFunc("PUT /api/config/sla", s.handleSLAConfigPut)
@@ -358,11 +366,18 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("GET /api/repos/{owner}/{repo}/items/{number}", s.handleRepoItemDetail)
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/hold", s.recordOperatorAction(s.handleRepoItemHold))
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/decision", s.recordOperatorAction(s.handleRepoItemDecision))
+	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/sentinel-confirm", s.recordOperatorAction(s.handleRepoItemSentinelConfirm))
+	// Per-item maintainer notes shared across the hive's maintainers
+	// (api_maintainer_notes.go); never written to GitHub.
+	s.mux.HandleFunc("GET /api/notes", s.handleMaintainerNotesList)
+	s.mux.HandleFunc("POST /api/notes", s.handleMaintainerNotesAdd)
+	s.mux.HandleFunc("DELETE /api/notes/{id}", s.handleMaintainerNotesDelete)
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/decide-delegated", s.recordOperatorAction(s.handleRepoItemDecideDelegated))
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/issues/{number}/release", s.recordOperatorAction(s.handleRepoIssueRelease))
 	s.mux.HandleFunc("GET /api/repos/{owner}/{repo}/items/{number}/decide-delegated", s.handleRepoItemDecideDelegatedStatus)
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/decide-delegated/plan", s.handleRepoItemDecideDelegatedPlan)
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/blocker/recheck", s.handleRepoItemBlockerRecheck)
+	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/blocker/handoff", s.handleRepoItemBlockerHandoff)
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/blocker/close-partial", s.handleRepoItemBlockerClosePartial)
 
 	s.mux.HandleFunc("GET /api/acmm/evaluation", s.handleACMMEvaluation)
@@ -392,8 +407,9 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("GET /api/knowledge/effective", s.handleKnowledgeEffective)
 	s.mux.HandleFunc("GET /api/knowledge/entry/{id}", s.handleKnowledgeEntry)
 	s.mux.HandleFunc("PUT /api/knowledge/entry/{id}/state", s.handleKnowledgeEntryState)
-	// Anonymous, owner-switched, read-only MCP surface (#10615). POST only —
-	// the mux answers other verbs with 405, and there is no SSE stream.
+	s.mux.HandleFunc("POST /api/knowledge/cli-memory/drain-legacy", s.handleKnowledgeDrainLegacyMemory)
+	// Anonymous, owner-switched, read-only MCP surface (#10615). POST only, no SSE stream; the handler answers a GET 405.
+	s.mux.HandleFunc("GET /mcp/knowledge", s.handlePublicKnowledgeMCP)
 	s.mux.HandleFunc("POST /mcp/knowledge", s.handlePublicKnowledgeMCP) // path == publicKnowledgeMCPPath
 	s.mux.HandleFunc("GET /api/knowledge/public", s.handlePublicKnowledgeGet)
 	s.mux.HandleFunc("PUT /api/knowledge/public", s.handlePublicKnowledgePut)
@@ -436,6 +452,7 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("GET /api/knowledge/git-sources", s.handleGitSourcesList)
 	s.mux.HandleFunc("POST /api/knowledge/git-sources", s.handleGitSourcesConnect)
 	s.mux.HandleFunc("DELETE /api/knowledge/git-sources", s.handleGitSourcesDisconnect)
+	s.mux.HandleFunc("PUT /api/knowledge/git-sources", s.handleGitSourcesUpdate)
 	s.mux.HandleFunc("POST /api/knowledge/obsidian/sync", s.handleObsidianSync)
 	s.mux.HandleFunc("GET /api/knowledge/documents", s.handleDocumentsList)
 	s.mux.HandleFunc("POST /api/knowledge/documents", s.handleDocumentsImport)
@@ -546,6 +563,7 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	// consulted by any merge decision.
 	s.mux.HandleFunc("GET /api/evidence/summary", s.handleEvidenceSummary)
 	s.mux.HandleFunc("GET /api/repos/{owner}/{repo}/health", s.handleRepoHealth)
+	s.mux.HandleFunc("GET /api/benchmarks/export", s.handleBenchmarksExport)
 	// write_surface is a top-level Config field; the lane write allowlist
 	// editor lives on the governor Security tab (#9587, api_config_write_surface.go).
 	s.mux.HandleFunc("GET /api/config/write-surface", s.handleWriteSurfaceGet)
@@ -557,11 +575,16 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	// and the sentinel findings held internally, written or not.
 	s.mux.HandleFunc("GET /api/writeback/suppressed", s.handleWritebackSuppressed)
 	s.mux.HandleFunc("GET /api/sentinel", s.handleSentinel)
+	// Issues close-on-merge closed on a PR that left them open
+	// (api_close_on_merge_audit.go): a read-only list to reopen by hand.
+	s.mux.HandleFunc("GET /api/close-on-merge/wrong-closes", s.handleCloseOnMergeWrongCloses)
 	// Merge-hotspot advisor (api_hotspots.go): files repeatedly touched by
 	// concurrent PRs and the modularize issues filed for them.
 	s.mux.HandleFunc("GET /api/hotspots", s.handleHotspots)
 	// Knowledge connector status + manual sync (#11069, api_knowledge_connectors.go).
 	s.registerKnowledgeConnectorRoutes()
+	s.registerKnowledgeConnectorAuthRoutes()
+	s.registerInboxRoutes()
 	s.mux.HandleFunc("POST /api/system-alerts/dismiss", s.handleSystemAlertDismiss)
 	// Per-agent Variables tab (#11458, api_variables.go).
 	s.registerAgentVariableRoutes()
@@ -569,6 +592,8 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.registerDiagRoutes()
 	// Activity monitor row menu: Accept triage (api_repo_item_accept_triage.go).
 	s.mux.HandleFunc("POST /api/repos/{owner}/{repo}/items/{number}/accept-triage", s.recordOperatorAction(s.handleRepoItemAcceptTriage))
+	// "Let hive decide" settings, decisions.delegate (api_config_decisions_delegate.go).
+	s.registerDecisionsDelegateRoutes()
 }
 
 var (
@@ -914,6 +939,15 @@ func (s *Server) sentinelLabel() string {
 		return config.DefaultSentinelLabel
 	}
 	return s.deps.Config.Sentinel.LabelOrDefault()
+}
+
+// hiveSupersedingAutoMerge is the live hive-superseding auto-merge switch
+// (config.HiveSupersedingAutoMergeConfig; nil config = on).
+func (s *Server) hiveSupersedingAutoMerge() bool {
+	if s == nil || s.deps == nil || s.deps.Config == nil {
+		return true
+	}
+	return s.deps.Config.AutoMerge.HiveSuperseding.AutoMergeEnabled()
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -1455,7 +1489,7 @@ func (s *Server) prQueueRepoAllowed(repo string) bool {
 	}
 	for _, configured := range s.deps.Config.Project.Repos {
 		full := configured
-		if !strings.Contains(full, "/") {
+		if s.deps.Config.Project.Org != "" && !strings.Contains(full, "/") {
 			full = s.deps.Config.Project.Org + "/" + full
 		}
 		if strings.EqualFold(full, repo) {

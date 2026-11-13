@@ -176,8 +176,16 @@ type DispatchOptions struct {
 	CombinedPerspectives bool
 	ReviewerAgents       []string
 	FixerAgent           string
-	ProjectOrg           string
-	AIAuthor             string
+	FixerFallbackAgents  []string
+	// FixerAvailable optionally filters repair candidates by runtime liveness.
+	// Nil preserves the existing capability-only selection.
+	FixerAvailable func(string) bool
+	ProjectOrg     string
+	AIAuthor       string
+	// AppLogin is this hive's GitHub App bot login ("<slug>[bot]", "" when
+	// no App is installed). With AIAuthor it is what a PR opened by the hive
+	// itself carries, so neither is ever another bot (otherBotAuthor).
+	AppLogin string
 	// PostComments carries config.ReviewConfig.PostComments into the prompt
 	// builder, so reviewers are told to publish their verdict on the PR.
 	PostComments bool
@@ -231,6 +239,16 @@ type DispatchOptions struct {
 	// before the PR is held for a human instead of re-kicked. Zero means
 	// DefaultMaxRedispatch.
 	MaxRedispatch int
+	// AgentGitHubRefusal, when set, is the hive GitHub proxy's record of the
+	// agents it refused for agents.github_api_hourly_cap or
+	// github.agent_reserve_floor. An expiry whose every row went to an agent
+	// refused after the row was sent is the cap's doing, not the
+	// reviewer's: it waits for the refusal to clear and counts against
+	// MaxCapRedispatch instead of MaxRedispatch (see expireCapCaused).
+	AgentGitHubRefusal AgentGitHubRefusal
+	// MaxCapRedispatch caps the expiries the agent cap caused for one head.
+	// Zero means DefaultMaxCapRedispatch.
+	MaxCapRedispatch int
 	// PendingFixTTL is how long a pending fix row stays authoritative with
 	// no new head before the next bounded attempt replaces it
 	// (review.pending_fix_ttl). Zero means
@@ -253,6 +271,15 @@ type DispatchOptions struct {
 	DeltaMaxAge       time.Duration
 	Agents            []AgentCapability
 	Now               time.Time
+
+	// AnsweredHeadsOnly plans the heads a trusted maintainer answered
+	// (PullRequest.HumanChangeRequest on the current head) even when review
+	// dispatch is off (RequireApproval or FanOut unset): the answer is
+	// handed to the author agent as a fix kick, and nothing else is planned,
+	// reviewed or pruned. Without it a `/hive decision <instruction>` on a
+	// hive that does not require review approval was recorded, the PR moved
+	// to 070-fixing, and no agent was ever told (Danathar/dns-failover#155).
+	AnsweredHeadsOnly bool
 }
 
 type DispatchState struct {
@@ -272,6 +299,11 @@ type DispatchState struct {
 	// bounded number of retries and then a human hold, rather than either an
 	// indefinite stall or an endless re-kick.
 	Redispatches []RedispatchCount `json:"redispatches,omitempty"`
+	// CapRedispatches counts, per head, the expiries the agent GitHub API
+	// cap caused (expireCapCaused). They are kept apart from Redispatches so
+	// a reviewer capped for a few hours does not spend max_redispatch and
+	// ask a person, while a reviewer capped for good still ends in a hold.
+	CapRedispatches []RedispatchCount `json:"cap_redispatches,omitempty"`
 	// Review heads (hivecommons/hive#13542). HeadRetries counts each
 	// (PR head, perspective, head)'s expiries against review.head_max_retries;
 	// MissingHeads are the heads that ran out while another head answered,
@@ -357,8 +389,12 @@ type ExpiredPending struct {
 	Agent       string
 	Dispatched  time.Time
 	Age         time.Duration
-	// Count is the head's expiry count after this one.
+	// Count is the head's expiry count after this one: its max_redispatch
+	// count, or its cap count when CapCaused.
 	Count int
+	// CapCaused marks an expiry the agent GitHub API cap caused; it counts
+	// against MaxCapRedispatch, not MaxRedispatch.
+	CapCaused bool
 }
 
 // WithheldFix is a fix kick the planner declined to dispatch. It carries what
@@ -376,11 +412,19 @@ type WithheldFix struct {
 	SettingEnabled bool      `json:"setting_enabled,omitempty"`
 	Reason         string    `json:"reason"`
 	Withheld       time.Time `json:"withheld_at"`
+	// CarriedFrom is the earlier head whose verdict a delta re-stamp carried
+	// onto this one without a review session. Nothing was published for
+	// this head; the review the author can read is the one on CarriedFrom.
+	CarriedFrom string `json:"carried_from,omitempty"`
 }
 
 // WithheldFixSetting names the config key an operator turns on to let the
 // fixer push to PRs the hive did not open. It is what the audit entry cites.
 const WithheldFixSetting = "review.fix_human_prs"
+
+// WithheldFixBotSetting is the setting an other-bot withholding cites: the
+// review.bot_authors list that named the PR's author as another bot.
+const WithheldFixBotSetting = "review.bot_authors"
 
 type PendingReview struct {
 	Repo        string      `json:"repo"`
@@ -432,6 +476,7 @@ type RecentReview struct {
 	DeltaPreviousHead string      `json:"delta_previous_head,omitempty"`
 	Dispatched        time.Time   `json:"dispatched_at,omitempty"`
 	Confirmed         time.Time   `json:"confirmed_at"`
+	Priority          string      `json:"priority,omitempty"`
 }
 
 type PendingFix struct {
@@ -497,6 +542,9 @@ type DispatchKick struct {
 	// DeltaPreviousHead is set when this kick is a delta re-review against
 	// that head (review.delta_rereview); empty for a full review.
 	DeltaPreviousHead string
+	// Priority is why the PR was placed where it was in this cycle's
+	// dispatch order (ReviewPriority*), for the dispatch log.
+	Priority string
 }
 
 // SkippedReviewModel is a perspective kick the planner withheld because the
@@ -513,9 +561,10 @@ type SkippedReviewModel struct {
 }
 
 type DispatchPlan struct {
-	ReviewKicks []DispatchKick
-	FixKicks    []DispatchKick
-	NewHuman    []HumanReviewHold
+	ReviewKicks    []DispatchKick
+	FixKicks       []DispatchKick
+	NewHuman       []HumanReviewHold
+	SettledReviews int
 	// SkippedReviewModels are perspective kicks withheld under a "skip"
 	// review_models fallback this cycle.
 	SkippedReviewModels []SkippedReviewModel
@@ -608,6 +657,10 @@ const (
 	// to the reviewers instead of the fixer this cycle (hivecommons/hive#14665).
 	FixDispatchExcludedRevisitBodyEdited = "verdict-revisit:body-edited"
 	FixDispatchExcludedRevisitStale      = "verdict-revisit:stale-reviewer"
+	// FixDispatchExcludedOtherBotAuthor is a PR another bot opened and
+	// keeps regenerating (otherBotAuthor): a fix pushed there is
+	// overwritten on the bot's next run, so it spends no fix attempt.
+	FixDispatchExcludedOtherBotAuthor = "other-bot-author"
 )
 
 func LoadDispatchState(path string) (DispatchState, error) {
@@ -663,6 +716,9 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	if (!opts.RequireApproval || !opts.FanOut) && opts.AnsweredHeadsOnly {
+		return planAnsweredHeads(prs, artifact, state, opts, now)
+	}
 	state.GeneratedAt = now
 	state = pruneState(state, prs, opts.ProjectOrg)
 	state.Pending = pruneUnconfiguredAgents(state.Pending, opts.Agents)
@@ -670,6 +726,11 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 	if !opts.RequireApproval || !opts.FanOut {
 		return plan
 	}
+	// Release completed kicks before priority ordering: a later PR's delivered
+	// result must not make its reviewer look busy to every earlier PR.
+	pendingBefore := len(plan.State.Pending)
+	plan.State.Pending = removeCompletedReviews(plan.State.Pending, artifact)
+	plan.SettledReviews = pendingBefore - len(plan.State.Pending)
 	capable := reviewCapableAgents(opts)
 	heads, reviewers := dispatchReviewers(capable)
 	headsMode := len(heads) > 0
@@ -679,6 +740,7 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 	}
 	availableSlots := maxParallel
 	prs, plan.Promoted = promoteStarvedWaits(prs, plan.State.Waits, opts.ProjectOrg)
+	prs = orderByReviewPriority(prs, plan.Promoted, opts.ProjectOrg, lastReviewWasPreparation(plan.State.Recent))
 	for _, pr := range prs {
 		pr.Repo = fullRepoName(pr.Repo, opts.ProjectOrg)
 		if pr.Number <= 0 || pr.Repo == "" {
@@ -693,20 +755,8 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 		var delivered map[Perspective]Verdict
 		var deliveredHeads map[Perspective][]string
 		var awaiting *Aggregate
-		if req := pr.HumanChangeRequest; req != nil && SameHeadSHA(req.HeadSHA, pr.HeadSHA) {
-			// A trusted maintainer answered this head — a changes_requested
-			// review or `/hive decision <text>` — so whatever the swarm said
-			// about it is superseded (hivecommons/hive#13041). Hand the
-			// instruction to the author agent; the swarm re-reviews the head
-			// the fix pushes. One kick per head: dispatchFix's pending check.
-			plan.State.Pending = removePendingForHead(plan.State.Pending, pr)
-			plan.State.Human = removeHumanForHead(plan.State.Human, pr)
-			agg, _ := artifact.AggregateForBody(pr.Repo, pr.Number, pr.HeadSHA, pr.BodyDigest)
-			if fixPushAllowed(pr, opts) {
-				plan.dispatchFix(pr, agg, opts, now)
-			} else {
-				plan.withholdFix(pr, opts, now)
-			}
+		if answeredHead(pr) {
+			plan.answerHead(pr, artifact, opts, now)
 			continue
 		}
 		if agg, ok := artifact.AggregateForBody(pr.Repo, pr.Number, pr.HeadSHA, pr.BodyDigest); ok {
@@ -742,12 +792,13 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 					// (their reports exist) and let the normal missing-
 					// perspective path below re-ask only for the rest, under
 					// the same TTL and max_redispatch budget as any head.
-					plan.State.Pending = removePendingForPerspectivesAndHeads(plan.State.Pending, pr, agg.Perspectives, agg.Heads)
-					delivered = agg.Perspectives
-					deliveredHeads = agg.Heads
-					if agg.AwaitingDecision {
-						a := agg
-						awaiting = &a
+					if strings.TrimSpace(agg.BodyDigest) == strings.TrimSpace(pr.BodyDigest) {
+						delivered = agg.Perspectives
+						deliveredHeads = agg.Heads
+						if agg.AwaitingDecision {
+							a := agg
+							awaiting = &a
+						}
 					}
 					if plan.redispatchExhausted(pr) {
 						continue
@@ -770,7 +821,7 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 						if fixPushAllowed(pr, opts) {
 							plan.dispatchFix(pr, agg, opts, now)
 						} else {
-							plan.withholdFix(pr, opts, now)
+							plan.withholdFix(pr, agg, opts, now)
 						}
 					case VerdictRequiresHuman, VerdictReject:
 						plan.holdForHuman(pr, agg, now)
@@ -907,6 +958,7 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 				Revise:                revisiting,
 				Perspectives:          opts.Perspectives,
 				ProposeFixesOnly:      !fixPushAllowed(pr, opts),
+				ProposeFixesBotAuthor: proposeFixesBotAuthor(pr, opts),
 				WritingGuideSection:   opts.WritingGuideSection,
 				ReviewBotLogins:       opts.ReviewBotLogins,
 				ReviewBotMinPriority:  opts.ReviewBotMinPriority,
@@ -914,7 +966,7 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 				ReviewModel:           choice.Model,
 				Delta:                 delta,
 			})
-			plan.ReviewKicks = append(plan.ReviewKicks, DispatchKick{Agent: agent, Message: msg, PRRef: fmt.Sprintf("%s#%d", pr.Repo, pr.Number), Kind: "review", Repo: pr.Repo, Number: pr.Number, HeadSHA: pr.HeadSHA, BodyDigest: pr.BodyDigest, Perspective: missing[0], Perspectives: missing, AuthorAgent: pr.AuthorAgent, HiveAuthored: hiveAuthored(pr, opts), AuthorModel: pr.AuthorModel, ReviewBackend: choice.Backend, ReviewModel: choice.Model, ReviewModelFallback: choice.Fallback, BotAuthorRouted: botRouted, DeltaPreviousHead: deltaPreviousHead(delta)})
+			plan.ReviewKicks = append(plan.ReviewKicks, DispatchKick{Agent: agent, Message: msg, PRRef: fmt.Sprintf("%s#%d", pr.Repo, pr.Number), Kind: "review", Repo: pr.Repo, Number: pr.Number, HeadSHA: pr.HeadSHA, BodyDigest: pr.BodyDigest, Perspective: missing[0], Perspectives: missing, AuthorAgent: pr.AuthorAgent, HiveAuthored: hiveAuthored(pr, opts), AuthorModel: pr.AuthorModel, ReviewBackend: choice.Backend, ReviewModel: choice.Model, ReviewModelFallback: choice.Fallback, BotAuthorRouted: botRouted, DeltaPreviousHead: deltaPreviousHead(delta), Priority: pr.Priority})
 			for _, p := range missing {
 				plan.State.Pending = append(plan.State.Pending, PendingReview{Repo: pr.Repo, Number: pr.Number, HeadSHA: pr.HeadSHA, BodyDigest: pr.BodyDigest, Perspective: p, Agent: agent, AuthorAgent: pr.AuthorAgent, HiveAuthored: hiveAuthored(pr, opts), AuthorModel: pr.AuthorModel, ReviewModel: stampedReviewModel(reviewer, choice), DeltaPreviousHead: deltaPreviousHead(delta), Dispatched: now})
 			}
@@ -977,6 +1029,7 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 				Revise:                revisiting,
 				Perspectives:          opts.Perspectives,
 				ProposeFixesOnly:      !fixPushAllowed(pr, opts),
+				ProposeFixesBotAuthor: proposeFixesBotAuthor(pr, opts),
 				WritingGuideSection:   opts.WritingGuideSection,
 				ReviewBotLogins:       opts.ReviewBotLogins,
 				ReviewBotMinPriority:  opts.ReviewBotMinPriority,
@@ -984,7 +1037,7 @@ func PlanDispatch(prs []PullRequest, artifact Artifact, state DispatchState, opt
 				ReviewModel:           choice.Model,
 				Delta:                 delta,
 			})
-			plan.ReviewKicks = append(plan.ReviewKicks, DispatchKick{Agent: agent, Message: msg, PRRef: fmt.Sprintf("%s#%d", pr.Repo, pr.Number), Kind: "review", Repo: pr.Repo, Number: pr.Number, HeadSHA: pr.HeadSHA, BodyDigest: pr.BodyDigest, Perspective: perspective, AuthorAgent: pr.AuthorAgent, HiveAuthored: hiveAuthored(pr, opts), AuthorModel: pr.AuthorModel, ReviewBackend: choice.Backend, ReviewModel: choice.Model, ReviewModelFallback: choice.Fallback, BotAuthorRouted: botRouted, DeltaPreviousHead: deltaPreviousHead(delta)})
+			plan.ReviewKicks = append(plan.ReviewKicks, DispatchKick{Agent: agent, Message: msg, PRRef: fmt.Sprintf("%s#%d", pr.Repo, pr.Number), Kind: "review", Repo: pr.Repo, Number: pr.Number, HeadSHA: pr.HeadSHA, BodyDigest: pr.BodyDigest, Perspective: perspective, AuthorAgent: pr.AuthorAgent, HiveAuthored: hiveAuthored(pr, opts), AuthorModel: pr.AuthorModel, ReviewBackend: choice.Backend, ReviewModel: choice.Model, ReviewModelFallback: choice.Fallback, BotAuthorRouted: botRouted, DeltaPreviousHead: deltaPreviousHead(delta), Priority: pr.Priority})
 			plan.State.Pending = append(plan.State.Pending, PendingReview{Repo: pr.Repo, Number: pr.Number, HeadSHA: pr.HeadSHA, BodyDigest: pr.BodyDigest, Perspective: perspective, Agent: agent, AuthorAgent: pr.AuthorAgent, HiveAuthored: hiveAuthored(pr, opts), AuthorModel: pr.AuthorModel, ReviewModel: stampedReviewModel(reviewer, choice), DeltaPreviousHead: deltaPreviousHead(delta), Dispatched: now})
 			availableSlots--
 		}
@@ -1405,7 +1458,9 @@ func (o DispatchOptions) effectiveMaxRedispatch() int {
 // them, and reports whether it dropped any. Each cycle that drops something
 // counts one expiry against the head; once the count reaches MaxRedispatch
 // the entries are left in place (so nothing is re-kicked) and the PR is held
-// for a human with a HoldReasonDispatchExhausted reason.
+// for a human with a HoldReasonDispatchExhausted reason. An expiry the agent
+// GitHub API cap caused waits for the cap and counts against
+// MaxCapRedispatch instead (capCausedExpiry, expireCapCaused).
 //
 // An entry with no dispatched_at has no measurable age and is never expired.
 func (p *DispatchPlan) expirePending(pr PullRequest, opts DispatchOptions, now time.Time) bool {
@@ -1426,6 +1481,12 @@ func (p *DispatchPlan) expirePending(pr PullRequest, opts DispatchOptions, now t
 	}
 	if len(expired) == 0 {
 		return false
+	}
+	if capCaused, wait := capCausedExpiry(expired, opts, ttl, now); capCaused {
+		if wait {
+			return false
+		}
+		return p.expireCapCaused(pr, expired, opts, ttl, now)
 	}
 	idx := redispatchIndex(p.State.Redispatches, pr)
 	if idx < 0 {
@@ -1450,6 +1511,13 @@ func (p *DispatchPlan) expirePending(pr PullRequest, opts DispatchOptions, now t
 		p.Exhausted = append(p.Exhausted, hold)
 		return false
 	}
+	p.dropExpiredPending(pr, ttl, now)
+	return true
+}
+
+// dropExpiredPending removes this head's pending entries that outlived ttl,
+// so pendingMissingPerspectives asks those perspectives again.
+func (p *DispatchPlan) dropExpiredPending(pr PullRequest, ttl time.Duration, now time.Time) {
 	kept := p.State.Pending[:0]
 	for _, e := range p.State.Pending {
 		if samePRHead(e.Repo, e.Number, e.HeadSHA, pr.Repo, pr.Number, pr.HeadSHA) && !e.Dispatched.IsZero() && now.Sub(e.Dispatched) >= ttl {
@@ -1458,7 +1526,6 @@ func (p *DispatchPlan) expirePending(pr PullRequest, opts DispatchOptions, now t
 		kept = append(kept, e)
 	}
 	p.State.Pending = kept
-	return true
 }
 
 // redispatchExhausted reports whether this head already spent its
@@ -1536,8 +1603,54 @@ func hiveAuthored(pr PullRequest, opts DispatchOptions) bool {
 // The one person-login exception is a PR the stage reconciler adopted in
 // place (`stage/074-adopted-by-hive`): adoption is the explicit decision that the
 // hive owns the branch and fixes it there (hivecommons/hive#12987).
+//
+// A bot-shaped login is not enough on its own: a PR another bot opened
+// (otherBotAuthor) is that bot's branch, regenerated and force-pushed on its
+// next run, so a fix pushed there is lost and can leave the PR red until
+// then. The hive does not push to it; the finding belongs on the base branch.
 func fixPushAllowed(pr PullRequest, opts DispatchOptions) bool {
-	return fixPushAuthorOK(pr.Author) || hasLabelFold(pr.Labels, stagelabels.AdoptedByHive.Label())
+	if hasLabelFold(pr.Labels, stagelabels.AdoptedByHive.Label()) {
+		return true
+	}
+	return fixPushAuthorOK(pr.Author) && !otherBotAuthor(pr, opts)
+}
+
+// otherBotAuthor reports whether pr was opened by a bot other than this hive:
+// its login matches review.bot_authors (the list the bot-author model route
+// already uses, `*[bot]` by default), it is not this hive's ai_author or App
+// login, and nothing ties the PR to this hive (no agent attribution, no
+// attribution trailer). Such a bot owns its branch: GitHub Actions
+// promotion and release PRs, Dependabot and Renovate all rewrite it on their
+// next run. An operator who lists no bots (`review.bot_authors: []`) keeps
+// the bot-login rule alone.
+func otherBotAuthor(pr PullRequest, opts DispatchOptions) bool {
+	if strings.TrimSpace(pr.AuthorAgent) != "" || pr.HiveAttributed {
+		return false
+	}
+	author := ownLoginKey(pr.Author)
+	for _, own := range []string{opts.AIAuthor, opts.AppLogin} {
+		if k := ownLoginKey(own); k != "" && k == author {
+			return false
+		}
+	}
+	return IsBotAuthor(pr.Author, opts.BotAuthorRoute.Authors, opts.AIAuthor)
+}
+
+// ownLoginKey folds a login for comparing it with this hive's own: case and
+// the App's `[bot]` suffix are ignored, so an ai_author of `hive-bot` still
+// owns the PRs its App opens as `hive-bot[bot]`.
+func ownLoginKey(login string) string {
+	login = strings.ToLower(strings.TrimSpace(login))
+	return strings.TrimSuffix(login, "[bot]")
+}
+
+// proposeFixesBotAuthor is the PromptOptions.ProposeFixesBotAuthor value for
+// pr: its author's login when that is another bot, else "".
+func proposeFixesBotAuthor(pr PullRequest, opts DispatchOptions) string {
+	if hasLabelFold(pr.Labels, stagelabels.AdoptedByHive.Label()) || !otherBotAuthor(pr, opts) {
+		return ""
+	}
+	return strings.TrimSpace(pr.Author)
 }
 
 // fixPushAuthorOK admits only bot-shaped logins, the ones the squash check
@@ -1547,11 +1660,55 @@ func fixPushAuthorOK(author string) bool {
 	return strings.HasSuffix(strings.TrimSpace(author), "[bot]")
 }
 
+// answeredHead reports whether a trusted maintainer answered pr's current
+// head: a changes_requested review or `/hive decision <text>` recorded
+// against exactly that head.
+func answeredHead(pr PullRequest) bool {
+	req := pr.HumanChangeRequest
+	return req != nil && SameHeadSHA(req.HeadSHA, pr.HeadSHA)
+}
+
+// answerHead plans an answered head: whatever the swarm said about it is
+// superseded (hivecommons/hive#13041), so the instruction goes to the author
+// agent and the swarm re-reviews the head the fix pushes. One kick per head:
+// dispatchFix's pending check.
+func (p *DispatchPlan) answerHead(pr PullRequest, artifact Artifact, opts DispatchOptions, now time.Time) {
+	p.State.Pending = removePendingForHead(p.State.Pending, pr)
+	p.State.Human = removeHumanForHead(p.State.Human, pr)
+	agg, _ := artifact.AggregateForBody(pr.Repo, pr.Number, pr.HeadSHA, pr.BodyDigest)
+	if fixPushAllowed(pr, opts) {
+		p.dispatchFix(pr, agg, opts, now)
+	} else {
+		p.withholdFix(pr, agg, opts, now)
+	}
+}
+
+// planAnsweredHeads is PlanDispatch while review dispatch is off
+// (DispatchOptions.AnsweredHeadsOnly): only the answered heads among prs are
+// planned, as the full planner plans them, and the state of every other PR
+// is left exactly as loaded (prs is not the open set, so nothing is
+// pruned). The state is stamped only when a head was planned, so an idle
+// cycle writes nothing.
+func planAnsweredHeads(prs []PullRequest, artifact Artifact, state DispatchState, opts DispatchOptions, now time.Time) DispatchPlan {
+	plan := DispatchPlan{State: state}
+	for _, pr := range prs {
+		pr.Repo = fullRepoName(pr.Repo, opts.ProjectOrg)
+		if pr.Number <= 0 || pr.Repo == "" || !answeredHead(pr) {
+			continue
+		}
+		plan.State.GeneratedAt = now
+		plan.answerHead(pr, artifact, opts, now)
+	}
+	return plan
+}
+
 // withholdFix records that a changes_requested PR got no fix kick because
 // fixPushAllowed refused it. Once per head: the state entry is what stops
 // the next cycle re-reporting the same refusal, and the plan entry is what
-// the caller audits this cycle.
-func (p *DispatchPlan) withholdFix(pr PullRequest, opts DispatchOptions, now time.Time) {
+// the caller audits this cycle. agg is the head's verdict (zero when there is
+// none); a delta re-stamp's previous head is recorded as CarriedFrom, since
+// nothing was published for this head.
+func (p *DispatchPlan) withholdFix(pr PullRequest, agg Aggregate, opts DispatchOptions, now time.Time) {
 	for _, w := range p.State.Withheld {
 		if samePRHead(w.Repo, w.Number, w.HeadSHA, pr.Repo, pr.Number, pr.HeadSHA) {
 			return
@@ -1561,23 +1718,36 @@ func (p *DispatchPlan) withholdFix(pr PullRequest, opts DispatchOptions, now tim
 	if opts.FixHumanPRs {
 		reason = "PR's login author is not a bot login, so a squash would attribute it to a person; a hive-signed fix commit would fail the squash sign-off gate, so the fix was proposed in the review, not pushed"
 	}
+	setting, enabled, excluded := WithheldFixSetting, opts.FixHumanPRs, FixDispatchExcludedNotHiveAuthored
+	if opts.FixHumanPRs {
+		excluded = FixDispatchExcludedNotHiveAuthoredDCO
+	}
+	if bot := proposeFixesBotAuthor(pr, opts); bot != "" {
+		reason = "PR was opened by another bot (" + bot + "), which regenerates its branch, so a pushed fix would be overwritten; the finding belongs on the base branch, so review published, fix not pushed"
+		setting, enabled, excluded = WithheldFixBotSetting, true, FixDispatchExcludedOtherBotAuthor
+	}
 	w := WithheldFix{
 		Repo:           pr.Repo,
 		Number:         pr.Number,
 		HeadSHA:        pr.HeadSHA,
 		Author:         strings.TrimSpace(pr.Author),
-		Setting:        WithheldFixSetting,
-		SettingEnabled: opts.FixHumanPRs,
+		Setting:        setting,
+		SettingEnabled: enabled,
 		Reason:         reason,
 		Withheld:       now,
 	}
+	if agg.Delta != nil && agg.Delta.Trivial && SameHeadSHA(agg.HeadSHA, pr.HeadSHA) {
+		w.CarriedFrom = strings.TrimSpace(agg.Delta.PreviousHead)
+		carried := "verdict carried from " + shortSHA(w.CarriedFrom) + " without a review (nothing published for this head)"
+		if strings.Contains(w.Reason, "review published") {
+			w.Reason = strings.Replace(w.Reason, "review published", carried, 1)
+		} else {
+			w.Reason += "; " + carried
+		}
+	}
 	p.State.Withheld = append(p.State.Withheld, w)
 	p.WithheldFixes = append(p.WithheldFixes, w)
-	reason = FixDispatchExcludedNotHiveAuthored
-	if opts.FixHumanPRs {
-		reason = FixDispatchExcludedNotHiveAuthoredDCO
-	}
-	p.recordFixExclusion(pr, reason, 0)
+	p.recordFixExclusion(pr, excluded, 0)
 }
 
 func (p *DispatchPlan) dispatchFix(pr PullRequest, agg Aggregate, opts DispatchOptions, now time.Time) {
@@ -1606,7 +1776,14 @@ func (p *DispatchPlan) dispatchFix(pr PullRequest, agg Aggregate, opts DispatchO
 	agent := selectFixerAgent(pr, opts)
 	if agent == "" {
 		p.recordFixExclusion(pr, FixDispatchExcludedNoEnabledFixer, attempts)
-		p.addHuman(pr, "no enabled kick-capable fixer agent is available", now)
+		// Temporary runtime backpressure must remain retryable rather than
+		// becoming a maintainer decision. Preserve the configuration hold only
+		// when no candidate is capable even without the liveness filter.
+		capabilityOnly := opts
+		capabilityOnly.FixerAvailable = nil
+		if selectFixerAgent(pr, capabilityOnly) == "" {
+			p.addHuman(pr, "no enabled kick-capable fixer agent is available", now)
+		}
 		return
 	}
 	attempts++
@@ -1678,8 +1855,9 @@ func hasLabelFold(labels []string, want string) bool {
 
 func selectFixerAgent(pr PullRequest, opts DispatchOptions) string {
 	candidates := []string{strings.TrimSpace(opts.FixerAgent), strings.TrimSpace(pr.Lane), DefaultFixerAgent}
+	candidates = append(candidates, opts.FixerFallbackAgents...)
 	for _, candidate := range candidates {
-		if candidate == "" {
+		if candidate == "" || (opts.FixerAvailable != nil && !opts.FixerAvailable(candidate)) {
 			continue
 		}
 		for _, a := range opts.Agents {
@@ -1714,7 +1892,7 @@ func ConfirmDelivered(state DispatchState, planned, delivered []DispatchKick) Di
 			// first perspective alone would leave every other verdict in the
 			// array with nothing to bind to once its pending entry is gone.
 			for _, p := range kickPerspectives(k) {
-				state.Recent = upsertRecentReview(state.Recent, RecentReview{Repo: k.Repo, Number: k.Number, HeadSHA: k.HeadSHA, BodyDigest: k.BodyDigest, Perspective: p, Agent: k.Agent, Head: k.Head, Decision: k.Decision, AuthorAgent: k.AuthorAgent, HiveAuthored: k.HiveAuthored, AuthorModel: k.AuthorModel, ReviewModel: k.ReviewModel, DeltaPreviousHead: k.DeltaPreviousHead, Confirmed: now})
+				state.Recent = upsertRecentReview(state.Recent, RecentReview{Repo: k.Repo, Number: k.Number, HeadSHA: k.HeadSHA, BodyDigest: k.BodyDigest, Perspective: p, Agent: k.Agent, Head: k.Head, Decision: k.Decision, AuthorAgent: k.AuthorAgent, HiveAuthored: k.HiveAuthored, AuthorModel: k.AuthorModel, ReviewModel: k.ReviewModel, DeltaPreviousHead: k.DeltaPreviousHead, Confirmed: now, Priority: k.Priority})
 			}
 		}
 	}
@@ -1977,7 +2155,8 @@ func hasReviewCapability(a AgentCapability) bool {
 func pendingMissingPerspectives(state DispatchState, pr PullRequest, perspectives []Perspective, delivered map[Perspective]Verdict) []Perspective {
 	pending := map[Perspective]bool{}
 	for _, p := range state.Pending {
-		if samePRHead(p.Repo, p.Number, p.HeadSHA, pr.Repo, pr.Number, pr.HeadSHA) {
+		if samePRHead(p.Repo, p.Number, p.HeadSHA, pr.Repo, pr.Number, pr.HeadSHA) &&
+			strings.TrimSpace(p.BodyDigest) == strings.TrimSpace(pr.BodyDigest) {
 			pending[p.Perspective] = true
 		}
 	}
@@ -1994,6 +2173,65 @@ func pendingMissingPerspectives(state DispatchState, pr PullRequest, perspective
 		}
 	}
 	return missing
+}
+
+func removeCompletedReviews(pending []PendingReview, artifact Artifact) []PendingReview {
+	out := pending[:0]
+	for _, p := range pending {
+		if !PendingReviewCompleted(p, artifact) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// PendingReviewCompleted is the dispatch ledger's completion rule, shared
+// with display consumers. Another agent's same-perspective report is not a
+// receipt for this assignment.
+func PendingReviewCompleted(p PendingReview, artifact Artifact) bool {
+	agg, ok := artifact.AggregateForBody(p.Repo, p.Number, p.HeadSHA, p.BodyDigest)
+	if !ok || strings.TrimSpace(agg.BodyDigest) != strings.TrimSpace(p.BodyDigest) ||
+		(!agg.RecordedAt.IsZero() && agg.RecordedAt.Before(p.Dispatched)) {
+		return false
+	}
+	_, reported := agg.Perspectives[p.Perspective]
+	if p.Decision {
+		reported = reported && agg.Decided && agg.Verdict != VerdictIncomplete
+	} else if p.Head != "" {
+		reported = containsHead(agg.Heads[p.Perspective], p.Head)
+	}
+	if !reported {
+		return false
+	}
+	for _, receipt := range agg.ReportReceipts {
+		if receipt.Agent != "" && receipt.Agent == p.Agent &&
+			receipt.Perspective == p.Perspective && receipt.Head == p.Head &&
+			receipt.Decided == p.Decision && !receipt.ReceivedAt.IsZero() &&
+			!receipt.ReceivedAt.Before(p.Dispatched) {
+			return true
+		}
+	}
+	return false
+}
+
+// PendingReviewerOccupancy counts durable dispatch bookkeeping, not running
+// processes. Confirmation means kick delivery, never review completion.
+func PendingReviewerOccupancy(state DispatchState) (records, agents, confirmedAgents int) {
+	pending := map[string]bool{}
+	confirmed := map[string]bool{}
+	for _, p := range state.Pending {
+		pending[p.Agent] = true
+		for _, r := range state.Recent {
+			if r.Agent == p.Agent && r.Perspective == p.Perspective && r.Head == p.Head &&
+				r.Decision == p.Decision && r.BodyDigest == p.BodyDigest &&
+				samePRHead(r.Repo, r.Number, r.HeadSHA, p.Repo, p.Number, p.HeadSHA) &&
+				!r.Confirmed.IsZero() && !r.Confirmed.Before(p.Dispatched) {
+				confirmed[p.Agent] = true
+				break
+			}
+		}
+	}
+	return len(state.Pending), len(pending), len(confirmed)
 }
 
 // revisitInFlight reports whether this head already has a review dispatched
@@ -2088,6 +2326,13 @@ func pruneState(state DispatchState, prs []PullRequest, org string) DispatchStat
 		}
 	}
 	state.Redispatches = redispatches
+	var capRedispatches []RedispatchCount
+	for _, r := range state.CapRedispatches {
+		if openHeads[reviewKey(r.Repo, r.Number, r.HeadSHA, "")] {
+			capRedispatches = append(capRedispatches, r)
+		}
+	}
+	state.CapRedispatches = capRedispatches
 	var starved []RevisitStarvation
 	for _, s := range state.RevisitStarved {
 		if openHeads[reviewKey(s.Repo, s.Number, s.HeadSHA, "")] {

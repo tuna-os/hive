@@ -27,6 +27,7 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_SOFT_LINK_TIP"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED"),
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS"),
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION"),
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN"),
 		jsConstLine(t, html, "STAGE_TRACKER_PRE_MERGE_SOAK"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTIVE_WORD"),
@@ -74,6 +75,7 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_NOBODY_LEAD"),
 		jsFunc(t, html, "stageTrackerStageActor"),
 		jsFunc(t, html, "stageTrackerActorKind"),
+		jsFunc(t, html, "stageTrackerExternalPRWork"),
 		jsFunc(t, html, "stageTrackerActorTip"),
 		jsConstLine(t, html, "STAGE_TRACKER_HIVE_PREFIXES"),
 		jsConstLine(t, html, "STAGE_TRACKER_CLAIMANT_SOURCE"),
@@ -83,6 +85,9 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerClaimantIconKind"),
 		jsFunc(t, html, "stageTrackerClaimantShort"),
 		jsFunc(t, html, "stageTrackerClaimantLine"),
+		jsConstLine(t, html, "STAGE_TRACKER_PR_PROGRESS_WORD"),
+		jsConstLine(t, html, "STAGE_TRACKER_PR_PROGRESS_KINDS"),
+		jsFunc(t, html, "stageTrackerPRProgressActor"),
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_STATIC"),
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_ACTIVE"),
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_HUMAN"),
@@ -96,6 +101,25 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerTrainIconHtml"),
 		jsFunc(t, html, "stageTrackerHoldLabels"),
 		jsFunc(t, html, "stageTrackerSoakLeft"),
+		jsFunc(t, html, "stageTrackerWaitingOnPerson"),
+		jsFunc(t, html, "stageTrackerTrackRunning"),
+		jsFunc(t, html, "stageTrackerHiveOwnsRepair"),
+		jsConstLine(t, html, "STAGE_TRACKER_WORKFLOW_APPROVAL_BLOCKER"),
+		jsConstLine(t, html, "STAGE_TRACKER_WORKFLOW_APPROVAL_TIP"),
+		jsFunc(t, html, "stageTrackerWorkflowApprovalPending"),
+		jsConstLine(t, html, "STAGE_TRACKER_RING_SEGMENT_GAP_MAX"),
+		jsConstLine(t, html, "STAGE_TRACKER_RING_RADIUS"),
+		jsConstLine(t, html, "STAGE_TRACKER_RING_GAP_DEG"),
+		jsFunc(t, html, "stageTrackerRingSvg"),
+		jsFunc(t, html, "stageTrackerStalledTrack"),
+		jsFunc(t, html, "stageTrackerQueueAheadWord"),
+		jsFunc(t, html, "stageTrackerStageTrack"),
+		jsFunc(t, html, "stageTrackerTrackWouldLight"),
+		jsFunc(t, html, "stageTrackerLeadTrack"),
+		jsFunc(t, html, "stageTrackerQueuedTrackNote"),
+		jsFunc(t, html, "stageTrackerTrackWord"),
+		jsFunc(t, html, "stageTrackerAgoWord"),
+		jsFunc(t, html, "stageTrackerActivityTrackHtml"),
 		jsFunc(t, html, "stageTrackerStripItems"),
 		jsFunc(t, html, "stageTrackerCurrentStageHtml"),
 		jsFunc(t, html, "stageTrackerStageWord"),
@@ -108,17 +132,29 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerHopName"),
 		jsFunc(t, html, "stageTrackerTrailText"),
 		jsFunc(t, html, "stageTrackerTooltip"),
+		jsConstLine(t, html, "STAGE_TRACKER_BLOCKED_WORD"),
+		jsFunc(t, html, "stageTrackerBlockerWord"),
+		jsConstBlock(t, html, "STAGE_TRACKER_NEEDS_HUMAN_SHORT"),
+		jsConstLine(t, html, "STAGE_TRACKER_NEEDS_HUMAN_SHORT_MAX"),
+		jsConstLine(t, html, "STAGE_TRACKER_NEEDS_HUMAN_WORD"),
+		jsFunc(t, html, "stageTrackerNeedsHumanShort"),
+		jsFunc(t, html, "stageTrackerNeedsHumanWord"),
+		jsFunc(t, html, "stageTrackerBlockedForDecisionPR"),
 		jsFunc(t, html, "stageTrackerChipsHtml"),
+		stageTrackerHumanGateJS(t, html),
 		jsFunc(t, html, "stageTrackerHeadColsHtml"),
 		jsFunc(t, html, "stageTrackerSinceHtml"),
 		jsFunc(t, html, "stageTrackerSubRowHtml"),
 		jsFunc(t, html, "stageTrackerPRPillsHtml"),
+		jsFunc(t, html, "stageTrackerBasePillHtml"),
 		jsFunc(t, html, "stageTrackerAgoText"),
 		jsConstBlock(t, html, "STAGE_TRACKER_LINEAGE_REASON_TIP"),
 		jsFunc(t, html, "stageTrackerLineageText"),
 		jsFunc(t, html, "stageTrackerSupersededOriginalClause"),
 		jsFunc(t, html, "stageTrackerLineageTip"),
 		jsFunc(t, html, "stageTrackerLineageChipHtml"),
+		jsFunc(t, html, "stageTrackerAlsoClosesChipHtml"),
+		jsFunc(t, html, "stageTrackerLinkedChipsHtml"),
 		jsFunc(t, html, "stageTrackerLinkedPRItem"),
 		jsFunc(t, html, "stageTrackerLinkedPROpen"),
 		jsFunc(t, html, "stageTrackerNestedOpenPRs"),
@@ -131,6 +167,7 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerLinkedSupersededGone"),
 		jsFunc(t, html, "stageTrackerLinkedSupersededTip"),
 		jsFunc(t, html, "stageTrackerLinkedSorted"),
+		jsFunc(t, html, "stageTrackerLinkedRiding"),
 		stageTrackerTierJS(t, html),
 		jsConstLine(t, html, "STAGE_TRACKER_COVERED_BY_PR"),
 		jsFunc(t, html, "stageTrackerLeadStage"),
@@ -163,6 +200,8 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerNeedsAttention"),
 		jsFunc(t, html, "stageTrackerVisible"),
 		jsFunc(t, html, "stageTrackerIsReviewNote"),
+		jsFunc(t, html, "stageTrackerIsStandingMeta"),
+		jsFunc(t, html, "stageTrackerStandingCount"),
 		jsFunc(t, html, "stageTrackerFoldedReviewNotes"),
 		jsFunc(t, html, "stageTrackerReviewNotesHtml"),
 		jsFunc(t, html, "stageTrackerFoldedCount"),
@@ -193,18 +232,72 @@ var _stageTracker = { stages };
 // needs-rebase always lands a PR in 070/071/072 (automerge_stage_labels.go), so a
 // fixture pairing it with 050/060 would draw a contradictory row.
 const rebaseCoherent = (it) => { if ((it.modifiers || []).includes('needs-rebase')) assert.ok(![50, 60].includes(Number(it.stage)), 'fixture #' + it.number + ' pairs needs-rebase with stage ' + it.stage); (it.linked_prs || []).forEach(rebaseCoherent); };
+// hivecommons/hive#16540 / #17335: no strip ever lights more than ONE chevron.
+// Lit = the stage chevron's active fill (a settled-current one is not amber)
+// or a CI / Review track in the active class. Checked on every fixture rendered.
+const litChevrons = (html) => (html.match(/class="ham-seg active(?! [^"]*ham-settled-current)|class="ham-seg ham-activity-track active\b/g) || []).length;
+// hivecommons/hive#16599 (canonical) as tightened by #17335: exactly one
+// active chevron — the stage column is always filled (a settled-current one
+// counts as filled), a track only while it is the row's lead track (running,
+// or the stage's own / stalled track); and words ride ONLY active chevrons —
+// an inactive CI / Review track is its icon alone, plus a muted queued note
+// (ham-track-note) when it would have lit behind the lead.
+const filledChevrons = (html) => litChevrons(html) + (html.match(/class="ham-seg active [^"]*ham-settled-current/g) || []).length;
+const trackCopyText = (li) => ((/<span class="ham-chevron-copy[^"]*">([\s\S]*?)<\/span>(?:<svg|<span id=|<span class="ham-track-note")/.exec(li) || [])[1] || '').replace(/<svg[\s\S]*?<\/svg>/g, '').replace(/<[^>]+>/g, '').trim();
+const wordsOnlyWhenActive = (item, s) => Array.from(s.matchAll(/<li class="ham-seg ham-activity-track ([^"]*)"[\s\S]*?<\/li>/g)).forEach(m => {
+  const words = trackCopyText(m[0]);
+  if (/\bactive\b/.test(m[1])) assert.ok(words, 'fixture #' + item.number + ' active track without words: ' + m[0]);
+  else assert.strictEqual(words, '', 'fixture #' + item.number + ' inactive track carries words: ' + m[0]);
+  // A demoted track is dim, still, and says it is queued; an active one never wears the note.
+  if (/ham-track-queued/.test(m[1])) assert.ok(!/\bactive\b/.test(m[1]) && !/data-motion=/.test(m[0]) && /<span class="ham-track-note">[^<]+<\/span>/.test(m[0]), 'fixture #' + item.number + ' queued track is not dim-with-note: ' + m[0]);
+  else assert.ok(!/ham-track-note/.test(m[0]), 'fixture #' + item.number + ' non-queued track wears a queued note: ' + m[0]);
+  // hivecommons/hive#16643: a text-bearing track is active and nothing
+  // else — no muted / pending / settled class may dim its one amber fill.
+  if (words) assert.ok(/\bactive\b/.test(m[1]) && !/\b(?:pending|todo|done|failing|ham-settled-current)\b/.test(m[1]), 'fixture #' + item.number + ' text-bearing track is not plainly active: ' + m[1]);
+});
+// hivecommons/hive#16643 / #17335: a lit stage chevron (PR in progress,
+// Merge queue …) is the row's one active chevron, never beside a running
+// track, and it carries no CI / review verdict in its words.
+const stageLitChevrons = (html) => (html.match(/class="ham-seg active(?! [^"]*ham-settled-current)/g) || []).length;
+const onlyTracksPair = (item, s, i) => {
+  const lit = litChevrons(s);
+  if (lit > 1) assert.strictEqual(stageLitChevrons(s), 0, 'fixture ' + (item.repo || '') + '#' + item.number + ' strip ' + i + ' lights a stage chevron beside a running track: ' + s);
+  Array.from(s.matchAll(/<li class="ham-seg active(?! [^"]*ham-settled-current)[^"]*"[\s\S]*?<\/li>/g)).forEach(m => {
+    const words = ((/<span class="ham-chevron-copy">([\s\S]*?)<\/span>/.exec(m[0]) || [])[1] || '').replace(/<[^>]+>/g, '');
+    assert.ok(!/\b(CI failing|CI \d+\/\d+|Changes requested)\b/.test(words), 'fixture ' + (item.repo || '') + '#' + item.number + ' strip ' + i + ' stage chevron speaks a track verdict: ' + words);
+  });
+};
+// hivecommons/hive#16661: a CI / Review tooltip states what the track waits
+// on; "activity unknown" / "CI unknown" / "Review unknown" never appear.
+const neverActivityUnknown = (item, s, i) => Array.from(s.matchAll(/<li class="ham-seg ham-activity-track [^"]*"[\s\S]*?<\/li>/g)).forEach(m => {
+  const tip = ((/role="tooltip">([\s\S]*?)<\/span>/.exec(m[0]) || [])[1] || '').replace(/<[^>]+>/g, '');
+  assert.ok(!/activity unknown|\b(?:CI|Review) unknown\b/.test(tip), 'fixture ' + (item.repo || '') + '#' + item.number + ' strip ' + i + ' track tooltip says unknown: ' + tip);
+});
+const atMostTwoLit = (item, row) => row.split('aria-label="Pipeline progress"').slice(1).forEach((s, i) => {
+  // Exactly one lit stage per row (hivecommons/hive#17335).
+  assert.ok(litChevrons(s) <= 1, 'fixture ' + (item.repo || '') + '#' + item.number + ' strip ' + i + ' lights ' + litChevrons(s) + ' chevrons: ' + s);
+  onlyTracksPair(item, s, i);
+  if (s.includes('aria-current="step"')) assert.ok(filledChevrons(s) >= 1, 'fixture ' + (item.repo || '') + '#' + item.number + ' strip ' + i + ' has no filled chevron: ' + s);
+  wordsOnlyWhenActive(item, s);
+  neverActivityUnknown(item, s, i);
+});
 const rawRowHtml = stageTrackerRowHtml;
-stageTrackerRowHtml = (item, stages, ctx) => { rebaseCoherent(item); return rawRowHtml(item, stages, ctx); };
+stageTrackerRowHtml = (item, stages, ctx) => { rebaseCoherent(item); const row = rawRowHtml(item, stages, ctx); atMostTwoLit(item, row); return row; };
 // A row is a title line, its strip, then zero or more nested PR sub-rows.
 const strips = (row) => row.split('aria-label="Pipeline progress"').slice(1);
 const strip = (row) => strips(row)[0].split('<div class="ham-sub"')[0];
 const subs = (row) => row.split('<div class="ham-sub"').slice(1);
-const segStates = (html) => Array.from(strip(html).matchAll(/<li class="ham-seg ([^"]*)"/g)).map(m => m[1]);
+// These route fixtures pin the native aggregate stage geometry. Track-specific
+// physical columns and simultaneous activity are covered by stage_tracker_activity.test.js.
+const segStates = (html) => Array.from(strip(html).matchAll(/<li class="ham-seg ([^"]*)"([^>]*)/g))
+  .filter(m => !m[2].includes('data-track="review"'))
+  .map(m => m[2].includes('data-track="ci"') ? (/data-route-state="([^"]*)"/.exec(m[2]) || [])[1] : m[1]);
 // Visible title occurrences (element text only; title="" attrs excluded).
 const titles = (html, t) => (html.match(new RegExp('>' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '<', 'g')) || []).length;
 const prCol = (html) => Array.from(html.slice(0, html.indexOf('aria-label="Pipeline progress"')).matchAll(/<a class="ham-pr-ref"[^>]*>(.*?)<\/a>/g)).map(m => m[1]);
 const B = 'blank';
-const text = (h) => h.replace(/<[^>]+>/g, '').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+const visibleMarkup = (h) => h.replace(/<span[^>]*class="config-tooltip ham-chevron-tip"[^>]*>[^<]*<\/span>/g, '');
+const text = (h) => visibleMarkup(h).replace(/<[^>]+>/g, '').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
 // The row tooltip rides the issue's #N link on an issue row and the PR link
 // (after "PR title · ") on a PR row; the issue slot of a PR row carries none.
 const tooltip = (row) => (/<a class="ham-ref"[^>]*title="([^"]*)"/.exec(row) || /<a class="ham-pr-ref"[^>]*title="([^"]*)"/.exec(row))[1];

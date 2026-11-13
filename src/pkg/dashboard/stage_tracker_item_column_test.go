@@ -139,3 +139,94 @@ func TestStageTrackerFixingAfterMergeFailedColumn(t *testing.T) {
 		t.Fatalf("linked_prs payload lacks left_train:\n%s", raw)
 	}
 }
+
+// TestStageTrackerPersonActsOnPRColumn replays hive's own #16524: a PR
+// parked at 085 under hive:unauthorized (a maintainer must rerun shared
+// CI on GitHub) with CI unknown and review findings open. The ask is a
+// person's move ON THE PR, so its chevron is the PR's REAL stage — the
+// CI / Review column — and the Merge queue column is empty: the gate is
+// only for rows queued / merging / merged, or a merge-ready PR parked on
+// a merge decision. The human gate itself is the needs-decision pill,
+// never a PR in progress chevron (hivecommons/hive#17453, replaying
+// #17442: 085 with CI running and the review verdict pending).
+func TestStageTrackerPersonActsOnPRColumn(t *testing.T) {
+	head := "7879a51f276a0f9aa5adc995d9d09a74487bbcf4"
+	ci := func(state string) *StageTrackerActivity { return &StageTrackerActivity{Head: head, State: state} }
+	review := func(state string) *StageTrackerActivity { return &StageTrackerActivity{Head: head, State: state} }
+	live := func() StageTrackerItem {
+		return StageTrackerItem{Repo: "hivecommons/hive", Number: 16524, Kind: "pr", Stage: stagelabels.NeedsDecision.Number(), Head: head,
+			Reason: "unauthorized:rerun-shared-ci", UnauthorizedStep: "rerun shared ci",
+			CIActivity: ci("unknown"), ReviewActivity: review("changes_requested")}
+	}
+	cases := []struct {
+		name string
+		mut  func(*StageTrackerItem)
+		want int
+	}{
+		{"#16524 as served", func(*StageTrackerItem) {}, trackerColumnReview},
+		{"unauthorized step, no track evidence", func(it *StageTrackerItem) { it.CIActivity, it.ReviewActivity = nil, nil }, trackerColumnReview},
+		{"unauthorized step on a merge-ready head", func(it *StageTrackerItem) { it.CIActivity, it.ReviewActivity = ci("passing"), review("approved") }, trackerColumnMergeGate},
+		{"decision with review findings open", func(it *StageTrackerItem) { it.Reason, it.UnauthorizedStep = "", "" }, trackerColumnReview},
+		{"decision with CI red, review approved", func(it *StageTrackerItem) {
+			it.Reason, it.UnauthorizedStep, it.CIActivity, it.ReviewActivity = "", "", ci("failing"), review("approved")
+		}, trackerColumnReview},
+		{"#17442: decision with CI running, review verdict pending (#17453)", func(it *StageTrackerItem) {
+			it.Number, it.Reason, it.UnauthorizedStep, it.CIActivity, it.ReviewActivity = 17442, "", "", ci("running"), review("human_decision")
+		}, trackerColumnReview},
+		{"approved decision with CI running on the head is at CI, not the gate (#17453)", func(it *StageTrackerItem) {
+			it.Reason, it.UnauthorizedStep, it.CIActivity, it.ReviewActivity = "", "", ci("running"), review("approved")
+		}, trackerColumnReview},
+		{"approved decision with CI queued on the head is at CI, not the gate (#17453)", func(it *StageTrackerItem) {
+			it.Reason, it.UnauthorizedStep, it.CIActivity, it.ReviewActivity = "", "", ci("queued"), review("approved")
+		}, trackerColumnReview},
+		{"bare 085 decision keeps the gate (#14821)", func(it *StageTrackerItem) {
+			it.Reason, it.UnauthorizedStep, it.CIActivity, it.ReviewActivity = "", "", nil, nil
+		}, trackerColumnMergeGate},
+		{"merge-ready decision keeps the gate", func(it *StageTrackerItem) {
+			it.Reason, it.UnauthorizedStep, it.CIActivity, it.ReviewActivity = "", "", ci("passing"), review("approved")
+		}, trackerColumnMergeGate},
+		{"stale track evidence on another head is not evidence", func(it *StageTrackerItem) {
+			it.Reason, it.UnauthorizedStep = "", ""
+			it.CIActivity.Head, it.ReviewActivity.Head = "old", "old"
+		}, trackerColumnMergeGate},
+		{"a seated train member is a Merge queue matter", func(it *StageTrackerItem) {
+			it.MergeTrain = &StageTrackerMergeTrain{ID: "v5#1", State: MergeGateStateQueuedBehind, Front: 1, Position: 2, Size: 2}
+		}, trackerColumnMergeGate},
+		{"a live merge attempt is a Merge queue matter", func(it *StageTrackerItem) { it.MergeGate = &StageTrackerMergeGate{State: MergeGateStateMerging} }, trackerColumnMergeGate},
+		{"an issue at 085 is unchanged", func(it *StageTrackerItem) { it.Kind = "issue" }, stageTrackerColumn(stagelabels.NeedsDecision)},
+		{"070 fixing is untouched", func(it *StageTrackerItem) { it.Stage = stagelabels.Fixing.Number() }, trackerColumnReview},
+	}
+	for _, tc := range cases {
+		it := live()
+		tc.mut(&it)
+		if got := stageTrackerItemColumn(&it); got != tc.want {
+			t.Errorf("%s: column %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	// The caption names the step as the person's move on GitHub, never as
+	// a merge-queue wait.
+	caption, actor := stageTrackerCaption(stagelabels.NeedsDecision, "unauthorized:rerun-shared-ci", "clubanderson", "pr", false, stagelabels.Record{}, false, 0, head)
+	if !strings.Contains(caption, "Waiting for a maintainer · rerun shared ci on GitHub") || strings.Contains(caption, "Awaiting human") || actor != "maintainer" {
+		t.Fatalf("caption %q actor %q", caption, actor)
+	}
+	// The ask rides as the needs-decision pill once the head's tracks are
+	// known (hivecommons/hive#17453): added when a person acts on the PR,
+	// never duplicated, and left alone on a merge-ready or queued row.
+	pill := live()
+	pill.Number, pill.Reason, pill.UnauthorizedStep, pill.CIActivity, pill.ReviewActivity = 17442, "", "", ci("running"), review("human_decision")
+	pill.Modifiers = []string{modStalled}
+	stageTrackerApplyPersonActsOnPRPill(&pill)
+	if strings.Join(pill.Modifiers, ",") != modStalled+","+modNeedsDecision {
+		t.Fatalf("#17442 modifiers %v, want [%s %s]", pill.Modifiers, modStalled, modNeedsDecision)
+	}
+	stageTrackerApplyPersonActsOnPRPill(&pill)
+	if strings.Join(pill.Modifiers, ",") != modStalled+","+modNeedsDecision {
+		t.Fatalf("#17442 modifiers duplicated: %v", pill.Modifiers)
+	}
+	ready := live()
+	ready.Reason, ready.UnauthorizedStep, ready.CIActivity, ready.ReviewActivity = "", "", ci("passing"), review("approved")
+	stageTrackerApplyPersonActsOnPRPill(&ready)
+	if len(ready.Modifiers) != 0 {
+		t.Fatalf("merge-ready 085 grew modifiers %v", ready.Modifiers)
+	}
+}

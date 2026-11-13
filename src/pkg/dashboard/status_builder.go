@@ -475,7 +475,7 @@ func BuildFrontendStatus(
 		ReleaseLineLag:        buildReleaseLineLag(),
 		Providers:             buildProviderStatus(agents, cfg),
 	}
-
+	payload.ListedAt = statusListedAt(actionable)
 	return payload
 }
 
@@ -1202,11 +1202,13 @@ func buildAgentsWithHidden(statuses map[string]*crux.Process, cfg *config.Config
 			Sandboxed:       agentCfg.SandboxEnabled(cfg.AgentSandbox),
 			SandboxRun:      sandboxRun,
 			SandboxRuntime:  effectiveSandboxRuntime(agentCfg, cfg),
+			SandboxWarnings: config.SandboxPreflightWarningsFor(effectiveSandboxRuntime(agentCfg, cfg)),
 			Session:         name,
 			State:           string(proc.State),
 			Starting:        proc.Starting && proc.State != crux.StateRunning,
 			Busy:            busy,
 			AwaitingCI:      awaitingCI,
+			CodeWork:        proc.CodeWork,
 			Paused:          proc.Paused,
 			PausedAt:        formatOptionalTime(proc.PausedAt),
 			PausedReason:    redactTokens(proc.PausedReason),
@@ -1279,6 +1281,14 @@ func buildAgentsWithHidden(statuses map[string]*crux.Process, cfg *config.Config
 		a.RepeatFailureCheck = string(proc.RepeatFailure.Check)
 		a.RepeatFailureCheckMessage = proc.RepeatFailure.Check.Message()
 		a.RepeatFailureNote = redactTokens(proc.RepeatFailure.Note)
+		if a.CodeWork != nil {
+			if proc.LastKick == nil || !proc.LastKick.Equal(a.CodeWork.KickAt) {
+				a.CodeWork = nil
+			} else {
+				observation := *a.CodeWork
+				a.CodeWork = &observation
+			}
+		}
 		// #7421: how the last kicked turn ended, so the card can say "asked
 		// the operator what to do" or "stood down" instead of implying work.
 		if proc.KickOutcome.Settled(proc.LastKick) {
@@ -1412,6 +1422,7 @@ func buildAgentsWithHidden(statuses map[string]*crux.Process, cfg *config.Config
 		// (BackendRequiresInteractiveAuth) so the badge and control only
 		// ever appear for a backend where a login URL is a real possibility.
 		a.NeedsLogin = proc.NeedsLogin && crux.BackendRequiresInteractiveAuth(cli)
+		a.CredentialBridgeBroken = proc.CredentialBridgeBroken
 		// Per-agent probe FIRST: it resolves this agent's own per-UID HOME and
 		// answers "does this backend even have an interactive login?" before
 		// looking at any file. The backend-level probe (shared legacy path
@@ -1814,6 +1825,11 @@ func openPRIsMergeable(pr any) bool {
 type FrontendPR struct {
 	github.PullRequest
 	MergeVerdict *github.MergeVerdict `json:"merge_verdict,omitempty"`
+	// SuppressedStage is the stage label the hive holds this PR at but the
+	// write-back gate kept off GitHub, with the gate's reason
+	// (attachSuppressedStages); "" when the labels carry the stage.
+	SuppressedStage       string `json:"suppressed_stage,omitempty"`
+	SuppressedStageReason string `json:"suppressed_stage_reason,omitempty"`
 }
 
 // AttachMergeVerdicts stamps the governor's per-PR merge verdicts onto the
@@ -2153,6 +2169,7 @@ func buildGovernorWithLaneDepths(state governor.State, cfg *config.Config, laneD
 		SuppressedLanes:  cloneStringSlice(state.SuppressedLanes),
 		LaneQueueDepths:  cloneStatusIntMap(laneDepths),
 		LanePauseReasons: cloneStringStringMap(state.LanePauseReasons),
+		CoveredLanes:     frontendLaneCoverage(state.CoveredLanes),
 		NextKickAt:       nextKickAt,
 		NextKickIn:       nextKickIn,
 		NextAgents:       append([]string(nil), state.PendingKicks...),
@@ -2235,6 +2252,11 @@ func governorStatusEvalInterval(cfg *config.Config, apiBudget ...map[string]any)
 		if cfg.Governor.EvalIntervalMaxS > 0 && effective > cfg.Governor.EvalIntervalMaxS {
 			effective = cfg.Governor.EvalIntervalMaxS
 		}
+	}
+	// API budget pacing (governor.api_budget_pacing) only ever lengthens the
+	// interval; while it holds a stretch the next kick is that far away.
+	if p := github.APIBudgetPacingSnapshot(); p.Active && p.EffectiveIntervalS > effective {
+		effective = p.EffectiveIntervalS
 	}
 	return time.Duration(effective) * time.Second
 }
@@ -2482,11 +2504,14 @@ func buildRepos(cfg *config.Config, actionable *github.ActionableResult, govStat
 func buildReposWithForge(cfg *config.Config, actionable *github.ActionableResult, govState governor.State, forge forgeOpenCounter) []FrontendRepo {
 	repos := make([]FrontendRepo, 0, len(cfg.Project.Repos))
 	repoRows := make(map[string]string, len(cfg.Project.Repos)*2)
-	for _, repoName := range cfg.Project.Repos {
-		full := repoName
-		if !strings.Contains(repoName, "/") {
-			full = cfg.Project.Org + "/" + repoName
+	qualify := func(repoName string) string {
+		if cfg.Project.Org != "" && !strings.Contains(repoName, "/") {
+			return cfg.Project.Org + "/" + repoName
 		}
+		return repoName
+	}
+	for _, repoName := range cfg.Project.Repos {
+		full := qualify(repoName)
 		repoRows[repoName] = repoName
 		repoRows[full] = repoName
 	}
@@ -2549,10 +2574,7 @@ func buildReposWithForge(cfg *config.Config, actionable *github.ActionableResult
 		// Prefixing the org unconditionally turned the latter into
 		// "laredo/laredo/cuga-agent" in the REPOSITORIES card and in every
 		// GitHub link built from it.
-		full := repoName
-		if !strings.Contains(repoName, "/") {
-			full = cfg.Project.Org + "/" + repoName
-		}
+		full := qualify(repoName)
 
 		issueCount := 0
 		prCount := 0
@@ -3199,9 +3221,13 @@ func buildGHRateLimits(ghClient *github.Client, ctx context.Context, cfg *config
 			}
 			result["core"] = core
 			result["etag_cache"] = map[string]any{
-				"hits":    limits.ETagCache.Hits,
-				"misses":  limits.ETagCache.Misses,
-				"entries": limits.ETagCache.Entries,
+				"hits":        limits.ETagCache.Hits,
+				"misses":      limits.ETagCache.Misses,
+				"entries":     limits.ETagCache.Entries,
+				"bytes":       limits.ETagCache.Bytes,
+				"max_bytes":   limits.ETagCache.MaxBytes,
+				"max_entries": limits.ETagCache.MaxEntries,
+				"evictions":   limits.ETagCache.Evictions,
 			}
 			top := make([]map[string]any, 0, len(limits.TopConsumers))
 			for _, c := range limits.TopConsumers {
@@ -3218,6 +3244,9 @@ func buildGHRateLimits(ghClient *github.Client, ctx context.Context, cfg *config
 			result["top_consumers"] = top
 		}
 	}
+	// Per-agent proxy caps and calls in the current hour (github_api_cap_view.go).
+	// Config and proxy only: present even before the first rate-limit reading.
+	result["agent_caps"] = buildAgentGitHubCaps(cfg)
 
 	return result
 }

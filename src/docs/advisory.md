@@ -18,6 +18,7 @@ governor:
     staleness_days: 7
     pr_autoclose: true
     update_interval_s: 0  # 0 = default (~60s cycle); 30–3600 to slow the refresh
+    digest_min_interval: 1h  # a CHANGED digest is rewritten at most this often; 0 = every changed cycle
     target: github        # github (default) | linear
     linear_issue: ""      # required when target is linear, e.g. ONB-123
 ```
@@ -289,10 +290,17 @@ quietly:
   post error naming the remedy: enable Issues in the repo's **Settings >
   General > Features**, or point the hive at the upstream repo. This is not an
   App-permission problem; the App banner stays down.
-- **Someone closed the pinned issue.** The hive reopens the existing issue rather
+- **Someone closed the pinned issue.** When a bot (or the hive itself) closed it,
+  or GitHub does not say who did, the hive reopens the existing issue rather
   than filing a new one. Filing a new one splits the digest: the hive writes to
   the new issue while everyone subscribed to the old one watches a comment that
-  never changes again — which looks exactly like a wedged digest. If a repo
+  never changes again — which looks exactly like a wedged digest. When a
+  **person** closed it, that is a decision: the hive leaves it closed and files
+  a new advisory issue that opens with "This replaces #N, which X closed…",
+  says the hive does not reopen an issue a person closed, and names
+  `advisory.target: linear` (with `advisory.linear_issue`) as the way to keep
+  the digest off GitHub. To go back to the old issue, reopen it and close the
+  new one. If a repo
   already has several `🐝 Hive Advisory Report` issues from before this behavior,
   close the stale duplicates and keep the one the hive is currently updating (the
   one with the newest digest comment).
@@ -362,6 +370,23 @@ Details worth knowing:
   stalled digest.
 - Values outside the band are rejected by the dashboard API and clamped (with
   a one-time warning in the hive log) when hand-edited into `hive.yaml`.
+
+### One comment, rewritten at most hourly
+
+The digest lives in exactly one comment per advisory issue, anchored by an
+`<!-- hive:advisory-digest updates=N -->` marker and closed by an
+`Updated N times · last <timestamp>` footer; the counter is read back from the
+comment itself, so it continues across restarts. `update_interval_s` paces how
+often the hive *checks*; `governor.advisory.digest_min_interval` (default `1h`,
+**Settings → Advisory → Rewrite floor for a changed digest**) bounds how often
+a *changed* body is actually written. Live counts in the Advice block drift on
+every eval cycle, which used to rewrite the comment every ~5 minutes; now the
+first change after the window is written and later drift waits for the next
+window. An unchanged digest never writes. The baseline is the comment's own
+`updated_at` on GitHub, so a restarted governor never reposts inside the
+window; `0` disables the floor. The governor log line
+`advisory digest comment written` marks the cycles that really reached GitHub
+(`posted advisory digest` is logged for every healthy cycle, skipped or not).
 
 ## Where the digest is posted
 

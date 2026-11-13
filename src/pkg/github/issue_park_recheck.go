@@ -4,7 +4,9 @@ package github
 // parked on a premise — "#722 is in progress, agents leave it alone", "the
 // precedent has not been set", "whether to adopt ruff and type checking".
 // The park text is written once, usually by a contributor relay under its
-// own account, and nothing re-read it when the work it named moved on. A
+// own account (only hive accounts, park-text contributors and trusted
+// maintainers count as park-text authors, for comments and the issue body),
+// and nothing re-read it when the work it named moved on. A
 // maintainer then decides from a premise that no longer holds, and agents
 // stay off work that is unblocked (projectbluefin/server#385,
 // projectbluefin/utah#13, projectbluefin/website#926).
@@ -33,6 +35,19 @@ package github
 // un-parks: leaving 045 stays a maintainer's reply (labels-and-control-
 // signals.md), and a park can rest on a maintainer's explicit request that
 // no merged PR answers (website#926 cited one).
+//
+// The note goes through the write-back gate as needs_decision_comment. When
+// every label parking the issue on a person was applied by the hive (a
+// contributor relay applies the park label with a hub-minted token, so its
+// actor is the App bot), the re-check says so
+// (writeback.Item.HiveAppliedPark) and the gate does not hold the note back
+// for want of the review opt-in label or because the issue predates the
+// hive's write access: the hive's own label is already on the issue. A park
+// that rests on a label a person applied (their `needs-spec`, a park label
+// they re-added) is asked as before. A note allowed only for that reason
+// lists only the changes the park text names and the pull requests the
+// project's own repositories merged (issue_park_recheck_fact.go). A refused
+// note is logged once per issue and reason (issue_park_recheck_held.go).
 
 import (
 	"context"
@@ -106,14 +121,23 @@ type parkRef struct {
 // parkChange is one thing that moved after the park began.
 type parkChange struct {
 	ref   string // "#409", or "owner/repo#N" outside the issue's repo
+	repo  string // owner/repo the item is in; a copy's is its original's
 	verb  string // "merged", "was closed without merging", "was closed"
 	at    time.Time
 	named bool // the park text names it; else it refers to the issue
 	// copyOf is set when ref is the hive's adoption copy of that PR.
 	copyOf string
 	// by, quote and link are the closing note a person left when the copy
-	// closed unmerged, if any.
+	// closed unmerged, if any. closerKnown says GitHub named who closed the
+	// copy, so the note is that account's; when it is false the note is the
+	// latest comment by any person around the close.
 	by, quote, link string
+	closerKnown     bool
+	// landedBy is the merged PR whose patch removes a line the park quotes,
+	// in landedFile, a file the park names (issue_park_recheck_landed.go):
+	// the park's change landed. landedBy equals ref when the named item is
+	// that PR.
+	landedBy, landedFile string
 }
 
 // RecheckParkedIssues posts or refreshes the re-check note on every open
@@ -126,6 +150,9 @@ func (c *Client) RecheckParkedIssues(ctx context.Context, cfg ParkRecheckConfig)
 	result := &ParkRecheckResult{}
 	label := c.needsDecisionLabel()
 	var firstErr error
+	// listed and parked are what the refused-note memory is pruned against:
+	// the repos whose parked issues were read this pass, and those issues.
+	listed, parked := map[string]bool{}, map[string]bool{}
 	for _, repoRef := range cfg.Repos {
 		owner, repo := c.splitRepo(repoRef)
 		if owner == "" || repo == "" {
@@ -138,10 +165,12 @@ func (c *Client) RecheckParkedIssues(ctx context.Context, cfg ParkRecheckConfig)
 			}
 			continue
 		}
+		listed[parkRecheckHeldRepo(owner, repo)] = true
 		for _, issue := range issues {
 			if issue == nil || issue.IsPullRequest() {
 				continue
 			}
+			parked[parkRecheckHeldKey(owner, repo, issue.GetNumber())] = true
 			if err := c.recheckParkedIssue(ctx, owner, repo, issue, label, result); err != nil {
 				if c.logger != nil {
 					c.logger.Warn("park re-check skipped issue", "repo", repo, "issue", issue.GetNumber(), "error", err)
@@ -150,6 +179,7 @@ func (c *Client) RecheckParkedIssues(ctx context.Context, cfg ParkRecheckConfig)
 			}
 		}
 	}
+	c.retainParkRecheckHeld(listed, parked)
 	return result, firstErr
 }
 
@@ -159,8 +189,9 @@ func (c *Client) recheckParkedIssue(ctx context.Context, owner, repo string, iss
 	if err != nil {
 		return err
 	}
-	start := parkStartFrom(events, c.isDecisionParkLabel)
+	start, parkedBy := parkStartFrom(events, c.isDecisionParkLabel)
 	if start.IsZero() {
+		c.forgetParkRecheckHeld(owner, repo, number)
 		result.Skipped++
 		return nil
 	}
@@ -169,7 +200,11 @@ func (c *Client) recheckParkedIssue(ctx context.Context, owner, repo string, iss
 		return err
 	}
 	refs := parkRefsFromTimeline(events)
-	named := parkNamedRefs(parkText(issue, comments, start), owner+"/"+repo, number)
+	text := c.parkText(issue, comments, start)
+	named := parkNamedRefs(text, owner+"/"+repo, number)
+	if acted := parkOptionRefs(text, owner+"/"+repo, number); len(acted) > 0 {
+		named = acted
+	}
 	lookups := 0
 	for _, key := range named {
 		if _, ok := refs[key]; ok || lookups >= parkRecheckMaxNamedLookups {
@@ -185,24 +220,40 @@ func (c *Client) recheckParkedIssue(ctx context.Context, owner, repo string, iss
 		changes = append(changes, copies...)
 		sortParkChanges(changes)
 	}
+	item := c.WritebackItemForIssue(Issue{Number: number, Author: safeGetLogin(issue.GetUser()), Labels: issueLabelNames(issue.Labels), CreatedAt: issue.GetCreatedAt().Time})
+	// The fact the gate cannot read for itself: every label parking this
+	// issue on a person is the hive's (issue_park_recheck_fact.go).
+	item.HiveAppliedPark = c.parkHiveApplied(parkedBy, item.Labels, events)
+	// A note the gate allows only because of that fact lists only what the
+	// park text names and what the project's own repositories merged, and
+	// says "the change landed" only for an item in those repositories.
+	landable := named
+	if len(changes) > 0 && c.parkNoteOnlyByFact(owner+"/"+repo, item) {
+		changes = c.parkProjectChanges(changes, owner+"/"+repo, number)
+		landable = c.parkProjectNamed(named, owner+"/"+repo)
+	}
 	if len(changes) == 0 {
+		c.forgetParkRecheckHeld(owner, repo, number)
 		result.Skipped++
 		return nil
 	}
+	c.markParkLandings(ctx, text, refs, landable, owner+"/"+repo, start, changes)
 	note := parkRecheckNote(label, start, changes)
-	item := c.WritebackItemForIssue(Issue{Number: number, Author: safeGetLogin(issue.GetUser()), Labels: issueLabelNames(issue.Labels), CreatedAt: issue.GetCreatedAt().Time})
 	for _, cm := range comments {
 		if cm == nil || !c.isHiveAccount(cm.GetUser()) || !strings.Contains(cm.GetBody(), parkRecheckMarker) {
 			continue
 		}
 		if cm.GetBody() == note {
+			c.forgetParkRecheckHeld(owner, repo, number)
 			result.Skipped++
 			return nil
 		}
 		if d := c.WritebackAllowed(owner+"/"+repo, item, writeback.KindNeedsDecisionComment, note); !d.Allowed {
+			c.noteParkRecheckHeld(ctx, owner, repo, number, parkedBy, item.HiveAppliedPark, d)
 			result.Skipped++
 			return nil
 		}
+		c.forgetParkRecheckHeld(owner, repo, number)
 		if _, _, err := c.client.Issues.EditComment(ctx, owner, repo, cm.GetID(), &gh.IssueComment{Body: gh.Ptr(note)}); err != nil { // writeback:gated
 			return fmt.Errorf("editing park re-check note on %s/%s#%d: %w", owner, repo, number, err)
 		}
@@ -211,9 +262,11 @@ func (c *Client) recheckParkedIssue(ctx context.Context, owner, repo string, iss
 		return nil
 	}
 	if d := c.WritebackAllowed(owner+"/"+repo, item, writeback.KindNeedsDecisionComment, note); !d.Allowed {
+		c.noteParkRecheckHeld(ctx, owner, repo, number, parkedBy, item.HiveAppliedPark, d)
 		result.Skipped++
 		return nil
 	}
+	c.forgetParkRecheckHeld(owner, repo, number)
 	if _, _, err := c.client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(note)}); err != nil { // writeback:gated
 		return fmt.Errorf("posting park re-check note on %s/%s#%d: %w", owner, repo, number, err)
 	}
@@ -270,9 +323,15 @@ func (c *Client) readParkRef(ctx context.Context, key string) (parkRef, bool) {
 // parkStartFrom returns when the issue's current park began: the first park
 // label of the run that is still on the issue, bridging label swaps shorter
 // than parkRelabelGap. Zero when the timeline shows no park in force.
-func parkStartFrom(events []*gh.Timeline, isPark func(string) bool) time.Time {
+//
+// It also returns the login that applied the label the park is dated from,
+// "" when that event names no actor. A label swap that parkRelabelGap
+// bridges does not change who began the park: a park a person began stays
+// theirs after the hive renames its label.
+func parkStartFrom(events []*gh.Timeline, isPark func(string) bool) (time.Time, string) {
 	present := map[string]bool{}
 	var start, emptySince time.Time
+	actor := ""
 	for _, ev := range events {
 		if ev == nil || ev.Label == nil {
 			continue
@@ -286,6 +345,7 @@ func parkStartFrom(events []*gh.Timeline, isPark func(string) bool) time.Time {
 		case "labeled":
 			if len(present) == 0 && (start.IsZero() || emptySince.IsZero() || at.Sub(emptySince) > parkRelabelGap) {
 				start = at
+				actor = strings.TrimSpace(ev.GetActor().GetLogin())
 			}
 			present[name] = true
 		case "unlabeled":
@@ -296,24 +356,48 @@ func parkStartFrom(events []*gh.Timeline, isPark func(string) bool) time.Time {
 		}
 	}
 	if len(present) == 0 {
-		return time.Time{}
+		return time.Time{}, ""
 	}
-	return start
+	return start, actor
 }
 
 // parkText is the text the park rests on: the issue body when the issue was
 // filed parked, and every comment posted in the window before the park
-// label. The hive's own notices are not park text.
-func parkText(issue *gh.Issue, comments []*gh.IssueComment, start time.Time) string {
+// label — in both cases only when the author is a hive account, a park-text
+// contributor or a trusted maintainer. The hive's own notices are not park
+// text, and neither an untrusted commenter nor an untrusted reporter whose
+// issue was parked straight after filing can steer which patches get read.
+//
+// Contributor provenance is the durable embedder-supplied predicate
+// (SetParkTextContributor), not the live relay claim alone. The relay posts
+// the park comment under the contributor's own account with
+// author_association NONE and the claim expires with the task lease; the
+// re-check runs days later and must still read that comment as park text.
+//
+// Every in-window body or comment the gate drops is logged with its author,
+// so a park whose refs rested on a since-expired claim-only relay, or on an
+// author the embedder no longer admits, is observable rather than silently
+// matching nothing.
+func (c *Client) parkText(issue *gh.Issue, comments []*gh.IssueComment, start time.Time) string {
 	inWindow := func(at time.Time) bool {
 		return !at.IsZero() && !at.After(start) && start.Sub(at) <= parkTextWindow
 	}
 	var parts []string
 	if inWindow(issue.GetCreatedAt().Time) {
-		parts = append(parts, issue.GetBody())
+		if c.parkTextAuthorTrusted(issue.GetUser(), issue.GetAuthorAssociation()) {
+			parts = append(parts, issue.GetBody())
+		} else if c.logger != nil {
+			c.logger.Info("park re-check excluded issue body from untrusted reporter", "issue", issue.GetHTMLURL(), "login", issue.GetUser().GetLogin(), "association", issue.GetAuthorAssociation())
+		}
 	}
 	for _, cm := range comments {
 		if cm == nil || !inWindow(cm.GetCreatedAt().Time) {
+			continue
+		}
+		if !c.parkTextAuthorTrusted(cm.GetUser(), cm.GetAuthorAssociation()) {
+			if c.logger != nil {
+				c.logger.Info("park re-check excluded pre-park comment from untrusted author", "issue", issue.GetHTMLURL(), "comment", cm.GetID(), "login", cm.GetUser().GetLogin(), "association", cm.GetAuthorAssociation())
+			}
 			continue
 		}
 		body := cm.GetBody()
@@ -323,6 +407,14 @@ func parkText(issue *gh.Issue, comments []*gh.IssueComment, start time.Time) str
 		parts = append(parts, body)
 	}
 	return strings.Join(parts, "\n")
+}
+
+// parkTextAuthorTrusted reports whether text user wrote (an issue body or a
+// pre-park comment) may be park text: a hive account, a park-text
+// contributor, or an author the reporter-trust predicate trusts.
+func (c *Client) parkTextAuthorTrusted(user *gh.User, association string) bool {
+	login := user.GetLogin()
+	return c.isHiveAccount(user) || c.isParkTextContributor(login) || c.reporterIsTrusted(login, association)
 }
 
 // parkRefRE matches "#N" and "owner/repo#N" references.
@@ -349,6 +441,31 @@ func parkNamedRefs(text, issueRepo string, number int) []string {
 		}
 	}
 	return out
+}
+
+// parkOptionRefs returns the references the park's lettered options name:
+// each option line and the lines under it, up to a blank line or the next
+// option. A park that offers options waits on what they act on; the rest of
+// its text is evidence. projectbluefin/server#614 parked on #583 (both
+// options merge it) and listed #584 and #588 among the PRs its red check
+// touched; the re-check reported those two merging as "the park reason names
+// it" while #583 was still open. nil when the park lists no options, so a
+// park without options keeps every named reference.
+func parkOptionRefs(text, issueRepo string, number int) []string {
+	var block []string
+	inOption := false
+	for _, line := range strings.Split(text, "\n") {
+		switch {
+		case unparkOptionLetter(line) != "":
+			inOption = true
+			block = append(block, line)
+		case strings.TrimSpace(line) == "":
+			inOption = false
+		case inOption:
+			block = append(block, line)
+		}
+	}
+	return parkNamedRefs(strings.Join(block, "\n"), issueRepo, number)
 }
 
 func parkRefKey(repo string, n int) string {
@@ -443,14 +560,14 @@ func parkChanges(refs map[string]parkRef, named []string, issueRepo string, numb
 		case isNamed[key]:
 			switch {
 			case ref.isPR && ref.mergedAt.After(start):
-				out = append(out, parkChange{ref: render(ref), verb: "merged", at: ref.mergedAt, named: true})
+				out = append(out, parkChange{ref: render(ref), repo: ref.repo, verb: "merged", at: ref.mergedAt, named: true})
 			case ref.isPR && ref.mergedAt.IsZero() && strings.EqualFold(ref.state, "closed") && ref.closedAt.After(start):
-				out = append(out, parkChange{ref: render(ref), verb: "was closed without merging", at: ref.closedAt, named: true})
+				out = append(out, parkChange{ref: render(ref), repo: ref.repo, verb: "was closed without merging", at: ref.closedAt, named: true})
 			case !ref.isPR && strings.EqualFold(ref.state, "closed") && ref.closedAt.After(start):
-				out = append(out, parkChange{ref: render(ref), verb: "was closed", at: ref.closedAt, named: true})
+				out = append(out, parkChange{ref: render(ref), repo: ref.repo, verb: "was closed", at: ref.closedAt, named: true})
 			}
 		case ref.isPR && ref.mergedAt.After(start) && parkRefersTo(ref.body, ref.repo, issueRepo, number):
-			out = append(out, parkChange{ref: render(ref), verb: "merged", at: ref.mergedAt})
+			out = append(out, parkChange{ref: render(ref), repo: ref.repo, verb: "merged", at: ref.mergedAt})
 		}
 	}
 	sortParkChanges(out)
@@ -526,7 +643,7 @@ func (c *Client) parkCopyChanges(ctx context.Context, refs map[string]parkRef, n
 		if !ok {
 			continue
 		}
-		ch := parkChange{ref: parkRefDisplay(cp, issueRepo), copyOf: parkRefDisplay(orig, issueRepo), named: isNamed[key]}
+		ch := parkChange{ref: parkRefDisplay(cp, issueRepo), repo: cp.repo, copyOf: parkRefDisplay(orig, issueRepo), named: isNamed[key]}
 		switch {
 		case seen[ch.ref]:
 			continue
@@ -534,8 +651,9 @@ func (c *Client) parkCopyChanges(ctx context.Context, refs map[string]parkRef, n
 			ch.verb, ch.at = "merged", cp.mergedAt
 		case cp.mergedAt.IsZero() && strings.EqualFold(cp.state, "closed") && cp.closedAt.After(start):
 			ch.verb, ch.at = "was closed without merging", cp.closedAt
-			if note := c.parkCopyClosingNote(ctx, owner, repo, cp); note != nil {
+			if note, closerKnown := c.parkCopyClosingNote(ctx, owner, repo, cp); note != nil {
 				ch.by, ch.quote, ch.link = note.GetUser().GetLogin(), parkCopyQuote(note.GetBody()), note.GetHTMLURL()
+				ch.closerKnown = closerKnown
 			}
 			if ch.quote == "" && !ch.named {
 				continue
@@ -579,18 +697,20 @@ func (c *Client) parkAdoptionCopy(events []*gh.Timeline, orig parkRef) (parkRef,
 // parkCopyClosingNote returns the comment a person left closing the copy:
 // the latest one within parkCopyNoteWindow of the close by the account that
 // closed it, or by any person when the closer cannot be read. A copy the
-// hive or another bot closed has no such note.
-func (c *Client) parkCopyClosingNote(ctx context.Context, owner, repo string, cp parkRef) *gh.IssueComment {
+// hive or another bot closed has no such note. The second result reports
+// whether the closer was read, so a caller can tell the closer's own note
+// from the fallback.
+func (c *Client) parkCopyClosingNote(ctx context.Context, owner, repo string, cp parkRef) (*gh.IssueComment, bool) {
 	var closer *gh.User
 	if issue, _, err := c.client.Issues.Get(ctx, owner, repo, cp.number); err == nil && issue != nil {
 		closer = issue.ClosedBy
 	}
 	if closer != nil && !c.isHumanAuthor(closer) {
-		return nil
+		return nil, true
 	}
 	comments, err := c.listIssueCommentsSince(ctx, owner, repo, cp.number, cp.closedAt.Add(-parkCopyNoteWindow))
 	if err != nil {
-		return nil
+		return nil, closer != nil
 	}
 	var note *gh.IssueComment
 	for _, cm := range comments {
@@ -609,9 +729,9 @@ func (c *Client) parkCopyClosingNote(ctx context.Context, owner, repo string, cp
 		}
 	}
 	if note == nil || parkCopyQuote(note.GetBody()) == "" {
-		return nil
+		return nil, closer != nil
 	}
-	return note
+	return note, closer != nil
 }
 
 // parkCopyQuote is the first paragraph of a closing note as one line, cut to
@@ -638,7 +758,7 @@ func parkRecheckNote(label string, start time.Time, changes []parkChange) string
 	var b strings.Builder
 	b.WriteString(parkRecheckMarker)
 	fmt.Fprintf(&b, "\n**The reason this issue is parked may be out of date.** It has been parked for a maintainer (`%s`) since %s, and since then:\n\n", label, start.UTC().Format("2006-01-02"))
-	noted := false
+	noted, landedBy := false, ""
 	for _, ch := range changes {
 		if ch.copyOf != "" {
 			fmt.Fprintf(&b, "- %s (the hive's copy of %s) %s on %s", ch.ref, ch.copyOf, ch.verb, ch.at.UTC().Format("2006-01-02"))
@@ -656,10 +776,24 @@ func parkRecheckNote(label string, start time.Time, changes []parkChange) string
 		if ch.named {
 			why = "the park reason names it"
 		}
-		fmt.Fprintf(&b, "- %s %s on %s (%s).\n", ch.ref, ch.verb, ch.at.UTC().Format("2006-01-02"), why)
+		landed := ""
+		switch {
+		case ch.landedBy == "":
+		case ch.landedBy == ch.ref:
+			landed = fmt.Sprintf(", changing the lines this issue asks to change in `%s`", ch.landedFile)
+		default:
+			landed = fmt.Sprintf(" by merged %s, which changed the lines this issue asks to change in `%s`", ch.landedBy, ch.landedFile)
+		}
+		if landedBy == "" && ch.landedBy != "" {
+			landedBy = ch.landedBy
+		}
+		fmt.Fprintf(&b, "- %s %s on %s%s (%s).\n", ch.ref, ch.verb, ch.at.UTC().Format("2006-01-02"), landed, why)
 	}
 	b.WriteString("\nThe park reason was written before these changes. Re-read it against the current state before deciding. This note does not un-park the issue: it stays with a maintainer, and Hive updates this note if more of the referenced work moves.")
-	if noted {
+	switch {
+	case landedBy != "":
+		fmt.Fprintf(&b, "\n\n**The change this issue asks for has landed in %s.** If that settles it, a maintainer can reply `/fixed` to close this issue as completed, or `/hive decision <your instructions>` to un-park it.\n%s%s -->", landedBy, parkRecheckLandedPrefix, landedBy)
+	case noted:
 		b.WriteString("\n\nIf the closing note quoted above settles the question, a maintainer can reply `/fixed` to close this issue as completed, or `/hive decision <your instructions>` to un-park it.")
 	}
 	return b.String()

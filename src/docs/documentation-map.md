@@ -17,6 +17,7 @@ Documentation for the current Hive line (branch `v5`; the code and docs live und
 ### First installation
 
 - [Hosted Hive Hub onboarding](hosted-hub.md) — signing in at `https://hive.hivecommons.dev`, requesting a hosted hive, installing the GitHub App, configuring model gateways and Copilot login, reading `/fleet`, and fixing common setup problems.
+- [Hub Fleet activity page](hub-fleet-activity.md) — the read-only `/activity` board of open issues and PRs across the hives you can see: per-viewer scoping, hive chips, group-by-hive freshness headers, always-visible truncation and stale-source disclosures, 15-second ETag polling, and display mode (`?kiosk=1`, `?display=1`, `am.*` views and `hub-activity` playlists).
 - [Docker Compose quick start](quickstart-docker-compose.md) — default standalone installation, prerequisites, and verification.
 - [Podman quick start](quickstart-podman.md) — standalone Quadlet/systemd installation, with rootless/rootful prerequisites.
 - [Kubernetes deployment](kubernetes-deployment.md) — standalone cluster installation, storage, authentication, and dashboard access. Related: [health checks](health-checks.md).
@@ -71,6 +72,7 @@ Documentation for the current Hive line (branch `v5`; the code and docs live und
 
 - [DiskPressure recovery runbook](diskpressure-recovery-runbook.md) — diagnose storage eviction, recover safely, and expand or migrate volumes.
 - [Agent backend-auth failure recovery runbook](backend-auth-recovery-runbook.md) — identify affected agents, re-authenticate the backend, and clear recovered fleet reports.
+- [Fork PR stalled on Prow presubmits recovery runbook](fork-pr-presubmit-stall-runbook.md) — start missing presubmits with `/ok-to-test` and apply `/lgtm` and `/approve` as a person when relayed ones are rejected.
 - [Troubleshooting](troubleshooting.md) — container logs, config validation, agent tmux sessions, dashboard auth, GitHub credential checks, and GitHub App workflow-permission push rejections.
 - [Admin MCP reference](https://github.com/hivecommons/hive/blob/v6/src/docs/admin-mcp.md) (v6) — diagnostic reads for logs, startup output, request logs, agent terminals and kick logs, and crash/restart/memory evidence via the admin MCP: `log_sources`, `log_read` and its diagnostic read companions, and what still needs a host shell.
 - [Community and support](community.md) — Discord, contributor portal, issue tracker, and where to ask Hive Commons questions.
@@ -106,6 +108,7 @@ Documentation for the current Hive line (branch `v5`; the code and docs live und
 - [Security notes](security.md) — log scrubbing and secret redaction guarantees/limits.
 - [Token collection and usage tracking](token-tracking.md) — session JSONL, `/api/cost`, and hub usage rollups.
 - [Notifications](notifications.md) — ntfy, Slack, and Discord alert channels, plus the two-way [Discord bot](notifications.md#discord-webhook-vs-discord-bot) and the [Slack Socket Mode / Telegram / Matrix / Teams bots](notifications.md#chat-bots-slack-socket-mode-telegram-matrix-teams).
+- [Attention episodes](attention-episodes.md) — single-admitter condition episodes, flap window, and the `github.attention` rollout controls.
 - [State-triggered hooks](hooks.md) — declarative `transition → action` rules, the transition catalog, the vetted action set, and the security model (RFC #4001).
 - [GitHub Actions trigger](github-actions-trigger.md) — call a hive from a workflow via the v6 comment-relay composite action, with examples for PR review and scheduled status kicks.
 - [CEL-based agent triggers](cel-triggers.md) — the `triggers:` config key: declarative CEL rules that kick an agent on a normalized source-control event, additive to built-in label/governor triggering, the `event.*` field reference, and the fail-closed compile/runtime contract.
@@ -125,6 +128,8 @@ Documentation for the current Hive line (branch `v5`; the code and docs live und
 - [`bd` beads CLI](beads-cli.md) — work-ledger and knowledge command reference for operators and contributors.
 - [`crux` CLI](crux-cli.md) — run, list, tail, kick and stop agents through `crux.Runtime` with no governor or dashboard; definition formats, the control socket served by `crux run`, and why the runtime being in-process shapes it.
 - [`crux serve`: the runtime over a local API](crux-serve.md) — **Developer:** operate the runtime server through its authenticated API, event stream, CLI, or Go client.
+- [Crux work services: integration guide](crux-integration-guide.md) — **Developer:** wire an orchestrator (hive, Nous v2, a fourth consumer) onto the work services of hivecommons/crux#114 end to end — checkout → run/session → agent step → command log and signals → gate → saved results and restart — with `curl` and `crux` forms, config keys, both auth flavours, failure drills and a symptom → saved-record map.
+- [Crux durable lanes](crux-lanes.md) — **Developer/operator; opt-in:** configure forge-neutral JetStream-backed events and work, project capabilities, replay, leases and explicit recovery through the Crux API; connect Hive as an ordinary participant.
 - [Publishing Crux](crux-publish.md) — how `hivecommons/crux` is produced from `src/crux` (plain copy, module path rewritten, fast-forward commits), what is preserved there, the `CRUX_SYNC_TOKEN` credential, manual sync and how a `crux/vX.Y.Z` tag becomes a release.
 ### Backup and API reference
 
@@ -164,10 +169,13 @@ Documentation for the current Hive line (branch `v5`; the code and docs live und
 - [Telemetry agent](telemetry.md) — the L5/L6-only opt-in observability agent, ACMM level gating, and the `project_observability` opt-in flow.
 - [NPS feedback prompt](nps.md) - the dashboard's opt-in NPS question: what is collected (no user identity), how it reaches the hub (directly, or through the opt-in relay for standalone hives), why only hub admins can read it, and the `hub.nps_enabled` / `HIVE_NPS_ENABLED` switch.
 - [Operations agent](operations.md) — the L5/L6-only opt-in operational-readiness agent (health checks, SLOs, runbooks), ACMM level gating, and the `project_observability` opt-in flow.
+- [Red-team agent](redteam.md) — the L5/L6-only opt-in lane that plays a malicious contributor (human, AI, or one posing as the other) and extends the `ioscan` red-team corpus in hold-labelled PRs; refused every repository until its `repos:` scope is set.
 - [Custom dashboard stylesheets](custom-stylesheets.md) — operator-supplied CSS for the dashboard and public snapshot.
 - [Branding a hive](branding.md) — persistent per-deployment name, mark, and colours via `<data>/branding/branding.json` and `custom.css` (`HIVE_BRANDING_JSON`/`HIVE_BRANDING_CSS`); distinct from the per-request `?style=` stylesheets above.
 - [Portable AgentDefinition format](../AGENT-DEFINITION.md) — standalone YAML schema for importing/exporting agent definitions.
+- [How Hive injects knowledge and memory into agents](agent-knowledge-and-memory.md) — the three context layers (Hive knowledge primer, CLI conversation, CLI persistent memory), the kick-primer path and its scoping/caps, why repo `AGENTS.md` is injected rather than read natively, which per-agent home directories are fleet-shared, and what survives a kick, `/clear`, pod restart or a new agent.
 - [Knowledge connectors](knowledge-connectors.md) — **Owner configuration:** connect, validate, and sync external document/wiki sources; includes scope and API reference.
+- [Inbox and voice sources](inbox-voice-sources.md) — triage Plaud/Wispr Flow recordings into spektacular RFCs, dibs ideas, or knowledge only; hosted-hive Plaud sign-in.
 - [Knowledge curator](knowledge-curator.md) — configure fact extraction, sources, vaults, document imports, code maps, and retention.
 - [Knowledge confidence scoring](knowledge-confidence.md) — interpret confidence badges and score explanations.
 - [Knowledge lifecycle states](knowledge-lifecycle.md) — approve, deprecate, or supersede facts and keep stale knowledge out of prompts.
@@ -191,10 +199,12 @@ Documentation for the current Hive line (branch `v5`; the code and docs live und
 - [Review swarm](review-swarm.md) — the five review perspectives, the verdict collector and its report contract, and the opt-in merge-gate integration and bounded auto-fix cycle for review findings.
 - [Swarm mode](swarm.md) — focusing the hive on one repository for a bounded window: Discord announcements, theming (`swarm:` config, `HIVE_SWARM_EVENT_NAME` / `HIVE_SWARM_CALL_TO_ARMS`), the `/api/leaderboard/swarm` endpoint and scoring.
 - [Review evidence bundle](review-evidence.md) — the per-PR evidence bundle schema (v1), canonical hash, Ed25519 signing, offline verification, and retention design.
+- [Benchmarks](benchmarks.md) — default-on, anonymized per-PR agent/model/runtime records (opt-out `benchmarks.publish`, public-repo attribution via `benchmarks.repo_consent`), the hourly spoke→hub→hivecommons/benchmarks cadence, and the `/api/benchmarks/export`, `/api/benchmarks/ingest` and `/api/hub/benchmarks` endpoints.
 - [Evidence reporting](evidence.md) — the guarded control-arm (`control_window: on|off`) evidence report: per-repository outcome comparison, the minimum-denominator rule, and why it is reporting groundwork rather than an enabled experiment.
 - [Portfolio search](search.md) — the opt-in (`search.enabled`) spoke-local search index over evidence, findings, sentinel hits, beads and facts: every `search.*` config key, `GET /api/search`, the report-only repo health score, and the `hivectl search` / `hivectl repo health` commands.
 - [SOC 2 control mapping (not a compliance claim)](soc2-control-mapping.md) — maps common auditor change-management questions to bundle fields, with sample policy language and the gaps Hive does not cover.
 - [Duplicate PR sweep](duplicate-sweep.md) — **Opt-in; recommendations only:** identify overlapping PRs and suggest which to keep. Never closes them automatically.
+- [Code scanning issues](code-scanning.md) — the opt-in `code_scanning` block (per-repo `enabled`, `min_severity`, `include_tools`, `exclude_rules`, `max_new_issues_per_run`): the severity scale, the default OSSF Scorecard posture exclusions, how alerts group into one-PR issues, the hidden `hive:code-scanning` marker, closing on fixed/dismissed, the `security_events` App permission and its dashboard notice, and the `/api/status` `code_scanning` block.
 - [Upstream watch](upstream-watch.md) — the opt-in `upstream_watch` block (per-repo `upstream` or the GitHub fork parent, `sources`, `pr_labels`, `max_issues_per_run`, `label`, `start_from`) and the poll loop it drives: the first-pass start point (fork point or `start_from`), the truncated-listing rule, classification, fork applicability, labelled `upstream:` issues with a hidden `upstream-ref` marker, dedupe and dismissal, and the `/data/upstream-watch.json` state file.
 - [Hold-gated review queue triage](review-queue-triage.md) — the triage-class policy for the human review queue (T0 fixes, T1 behavior-adjacent, T2 additive), the shipped `review_class` presentational sort in `last-actionable.json` and the dashboard PR list, and the open mechanism options awaiting maintainer decisions (#6183).
 - [Retro lane](retro-lane.md) — the opt-in (`retro.enabled`) post-completion pass that reconstructs a record for each closed bead and flags patterns such as excessive fix attempts or kicks; deterministic by default, with LLM analysis separately opt-in.
@@ -226,7 +236,7 @@ Documentation for the current Hive line (branch `v5`; the code and docs live und
 - [Automatic repo ACMM onboarding reconciler](design/repo-acmm-onboarding.md) — proposed design for per-repo ACMM targets, gap-to-work reconciliation, human hand-off, waivers, and anti-gaming controls (RFC #6235).
 - [Hive federation design](../../docs/federation-design.md) — the multi-hive registry: live `/api/hives` endpoints, project onboarding, contributor flow across hubs, and what remains future design work.
 - [Public roadmap](roadmap.md) — available foundations, current/future direction, release-line status, completed work, and dated decision evidence. Not a delivery promise.
-- [Integrations](integrations.md) — one page of logos and status (Supported / Opt-in / Planned) for agent backends, work sources, forges, sandboxes and upstream projects.
+- [Integrations](integrations.md) — one page of logos and status (Supported / Opt-in / In progress / Planned) for agent backends, work sources, forges, sandboxes and upstream projects.
 - [Landscape and positioning](landscape.md) — how Hive's operations-plane design compares to nearby agentic orchestration tools, with public references per project. Explicitly time-sensitive; check the conducted date in its header before quoting product details.
 - [CNCF sandbox onboarding status](cncf-sandbox-onboarding.md) — repo-local map of the onboarding tracker and repository evidence (LICENSE, governance, security, OWNERS, DCO).
 - [CNCF reference architecture](cncf-reference-architecture.md) — CNCF submission/reference template.

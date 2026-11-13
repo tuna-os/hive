@@ -37,6 +37,9 @@ func buildProposeOnlyInstruction(pr PullRequest, opts PromptOptions) string {
 	if !opts.ProposeFixesOnly {
 		return ""
 	}
+	if bot := strings.TrimSpace(opts.ProposeFixesBotAuthor); bot != "" {
+		return buildBotAuthorProposeOnlyInstruction(pr, bot)
+	}
 	var b strings.Builder
 	b.WriteString("\nPROPOSE FIXES, DO NOT PUSH THEM.\n")
 	fmt.Fprintf(&b, "PR %s#%d was opened by someone this hive does not speak for, so NO agent will push to its branch after your review, whatever review.fix_human_prs says: a commit signed off by the hive instead of the PR author fails the squash sign-off gate, and only the author could clear it. Do not check out, commit to, or push to this PR's branch yourself, and do not open a replacement PR.\n", pr.Repo, pr.Number)
@@ -48,6 +51,20 @@ func buildProposeOnlyInstruction(pr PullRequest, opts PromptOptions) string {
 		b.WriteString("For every finding you would have asked an agent to fix, put the fix in the review comment so the author can apply it: a ```suggestion block for a change that fits in a few lines at one location, or a ```diff patch block for anything larger. A finding without a concrete fix is a request for the author's time; a finding with one is an offer of yours.\n")
 	}
 	b.WriteString("changes_requested still means what it says — the verdict is recorded and the PR waits on the author, not on the hive.\n")
+	return b.String()
+}
+
+// buildBotAuthorProposeOnlyInstruction is buildProposeOnlyInstruction for a
+// PR another bot opened (a workflow's promotion or release PR, a dependency
+// bump). That bot regenerates the branch, so nobody applies a fix there:
+// not the hive, and not the bot. A finding the PR inherits from its base is
+// a finding about the base branch, and the reviewer says so.
+func buildBotAuthorProposeOnlyInstruction(pr PullRequest, bot string) string {
+	var b strings.Builder
+	b.WriteString("\nFINDINGS GO TO THE BASE BRANCH, NOT THIS PR.\n")
+	fmt.Fprintf(&b, "PR %s#%d was opened by %s, a bot that regenerates this branch on its own schedule: a commit pushed here is overwritten on its next run, and the bot cannot apply a suggestion. NO agent will push to this PR's branch after your review. Do not check out, commit to, or push to it yourself, and do not open a replacement PR.\n", pr.Repo, pr.Number, bot)
+	b.WriteString("Judge the change this PR makes. When a finding is about code the PR carries over unchanged from the branch it copies (a promotion or sync PR usually changes nothing of its own), say that in the finding: the defect is on the base branch and has to be fixed there, after which the bot's next run brings the fix into this PR. Put the concrete fix in the finding (the exact replacement lines, or a unified diff) so a maintainer can apply it on the base branch.\n")
+	b.WriteString("Do not ask the PR's author for a change: it is a bot. changes_requested still means this head should not merge as it is; a maintainer decides where the fix lands.\n")
 	return b.String()
 }
 
@@ -79,6 +96,10 @@ func buildReadInstruction(pr PullRequest) string {
 	b.WriteString("Read widely; report narrowly. Only defects this diff introduces or exposes are in scope — pre-existing problems it does not touch stay out, however tempting. Reading the surrounding code tells you whether the change is safe; it is not an invitation to review the file.\n")
 	if pr.HeadSHA != "" {
 		fmt.Fprintf(&b, "Every citation must be code you actually read at head %s — in the diff or in the files around it. If the PR has moved on since, review the current head and say which revision you read.\n", pr.HeadSHA)
+		// projectbluefin/homebrew-tap#60: a review of 95440f7 said a check
+		// "fails on this head (job 127519980309)"; that job ran on the
+		// previous head, d892290, and the new head fixed it.
+		fmt.Fprintf(&b, "CI evidence follows the same rule: a check run, job or log speaks for this head only when its head_sha is %s (`gh api repos/%s/actions/jobs/<job id> --jq .head_sha`). A run on an earlier head says nothing about this one: leave it out, or name the head it ran on.\n", pr.HeadSHA, pr.Repo)
 	}
 	// Phrased to avoid the substrings in FatalNetworkErrorPatterns:
 	// "fetch failed" in this very sentence was echoed into the reviewer pane

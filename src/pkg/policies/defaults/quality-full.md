@@ -245,7 +245,7 @@ ${ISSUE_LIST}
 ACTIONABLE PRs:
 ${PR_LIST}
 
-⛔ The PRs/issues for this kick are listed in this prompt by the governor. Do not run `gh pr list`, `gh issue list`, or `gh search` to discover work — these are blocked by the hive proxy for agents and only waste a turn. Use `gh pr view <n>` on supplied PR numbers and `gh issue view <n> --comments` only on supplied GitHub issue numbers, so you read each issue with its comments. Prefer the compact form `hive-gh pr view <n>` / `hive-gh pr checks <n>` / `hive-gh issue view <n>` (fixed --json projection that keeps labels, author, head SHA, merge state, review decision and check conclusions; issue comments still come from `gh issue view <n> --comments`); add `--full` only when you need the complete record.
+⛔ The PRs/issues for this kick are listed in this prompt by the governor. Do not run `gh pr list`, `gh issue list`, or `gh search` to discover work. Use `gh pr view <n>` on supplied PR numbers and `gh issue view <n> --comments` only on supplied GitHub issue numbers, so you read each issue with its comments. For merged PR history only, `gh pr list --state merged` (no `--search` or `-S`) may be used only when the wrapper permits it for your tier; this does not authorize open-work discovery. If refused, do not retry or bypass the restriction. Prefer the compact form `hive-gh pr view <n>` / `hive-gh pr checks <n>` / `hive-gh issue view <n>` (fixed --json projection that keeps labels, author, head SHA, merge state, review decision and check conclusions; issue comments still come from `gh issue view <n> --comments`); add `--full` only when you need the complete record.
 
 ## After You Push: Do Not Wait for CI (MANDATORY)
 
@@ -292,6 +292,10 @@ command or step the owner must run, and park the issue in the same request:
 When that owner-only remainder is a release, the same command MUST include
 `--step-kind release --release-tag <tag> --release-target <full-commit-sha>` so
 Hive keeps the typed release step in "Your turn" until the owner answers.
+Write every command you ask the owner to run so it works from any
+directory: give each `gh` command `-R <owner/repo>` (for example
+`gh workflow run release.yml -R <owner/repo> --ref main`), or name the web
+path instead (Actions → <workflow> → Run workflow).
 Hive applies its configured needs-decision label itself, so the issue leaves
 the work queue and reaches the owner's "Your turn" inbox. The label relay
 refuses `needs-human` and `needs-decision` from agents, so use this flag

@@ -248,11 +248,15 @@
     /* .config-save / .config-cancel — primary/ghost buttons (system recipe) */
 
     .config-field { margin-bottom: 14px; }
+    .event-trigger-expression { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .event-trigger-form { margin-top: var(--sp-4); }
     .am-trusted-bots { margin-top: 12px; }
     .am-bot-row { margin-top: 6px; }
     .am-bot-source { color: var(--muted); font-weight: 400; }
     #am-trusted-authors { margin-top: var(--sp-5); border-top: 1px solid var(--border); }
     .am-trusted-authors-note { font-size: var(--fs-xs); color: var(--muted); margin: var(--sp-2) var(--sp-0) var(--sp-0); }
+    .am-pin-only-row .am-pin-only-opt { display: inline-flex; align-items: center; gap: var(--sp-1); margin: var(--sp-1) var(--sp-3) var(--sp-1) var(--sp-0); font-size: var(--fs-xs); }
+    .am-pin-only-row input[type="text"] { margin-top: var(--sp-1); }
     .rv-reviewer-list { padding: var(--sp-2) var(--sp-3); border: 1px solid var(--border); border-radius: var(--r); }
     .rv-reviewer-row { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-sm); padding: var(--sp-1) var(--sp-0); cursor: pointer; }
     .rv-reviewer-row.rv-reviewer-unavailable { opacity: 0.6; }
@@ -428,6 +432,7 @@
     .cmp-banner { border: 1px solid color-mix(in srgb, var(--yellow) 45%, transparent); background: color-mix(in srgb, var(--yellow) 8%, transparent); border-radius: var(--r); padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-6); font-size: var(--fs-sm); }
     .cmp-banner strong { color: var(--text); }
     .cmp-banner-detail { color: var(--muted); margin-top: var(--sp-2); }
+    ul.cmp-banner-detail { margin: var(--sp-2) 0 0 var(--sp-5); }
     .cmp-framework { display: flex; gap: var(--sp-4); align-items: flex-start; padding: var(--sp-3) var(--sp-0); cursor: pointer; }
     .cmp-framework input { width: auto; margin-top: var(--sp-1); }
     .cmp-framework-name { font-weight: 600; color: var(--text); }
@@ -520,6 +525,9 @@
     /* The author `display: block` above outranks the UA `[hidden] { display: none }`
        rule, so without this the portal stayed on screen after `portal.hidden = true`. */
     .config-tooltip-portal[hidden] { display: none; }
+    .contributor-online-tooltip { max-height: calc(100vh - var(--sp-8)); overflow-y: auto; pointer-events: auto; overflow-wrap: anywhere; }
+    .contributor-online-ids { display: block; list-style: none; margin: var(--sp-2) 0 0; padding: 0; }
+    .contributor-online-ids li { display: block; }
     .config-info:hover .config-tooltip, .config-info:focus-within .config-tooltip { display: none; }
     .section-help-mark { text-decoration: none; }
     .section-help-mark .section-help-tip-action { display: block; margin-top: var(--sp-2); color: var(--muted); }
@@ -647,4 +655,3 @@
       .config-body { --config-body-pad: 14px; padding: var(--sp-0) var(--config-body-pad) var(--config-body-pad); }
       .config-field-row, .config-field-row4 { grid-template-columns: 1fr; }
     }
-

@@ -71,8 +71,9 @@ func IsContentReason(reason string) bool {
 // ContentDedupeKinds are the kinds whose preview is a comment body the
 // content layer may dedupe. Kinds that re-run their gate check every tick
 // with a constant preview and keep their own idempotence (hold_gate_notice,
-// the closes, parent_issue_edit, ci_rerun), the label kinds and issue_file
-// (no existing item) are deliberately absent.
+// the closes, parent_issue_edit, ci_rerun, base_refresh, bot_rebase_request,
+// human_merge_path_release),
+// the label kinds and issue_file (no existing item) are deliberately absent.
 var ContentDedupeKinds = map[Kind]bool{
 	KindSentinel:             true,
 	KindNeedsDecisionComment: true,
@@ -83,6 +84,10 @@ var ContentDedupeKinds = map[Kind]bool{
 	KindClaimComment:         true,
 	KindGateComment:          true,
 	KindWelcomeComment:       true,
+	// The repair's note is one constant body: the burst hold is what keeps
+	// a repo with many marker-less blocks from getting them all in one
+	// sweep, as it did while the note went out under gate_comment.
+	KindBlockedRepair: true,
 }
 
 // RateCapExemptKinds are never held by the hourly cap: everything on the

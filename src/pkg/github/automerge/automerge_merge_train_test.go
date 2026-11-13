@@ -20,17 +20,20 @@ import (
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
+// mtMember is a ready member (green, reviewed on its head): the only kind
+// that takes a seat (hivecommons/hive#15825).
 func mtMember(n int, state string, created time.Time, files ...string) mergeTrainMember {
-	return mergeTrainMember{Number: n, Base: "v5", HeadSHA: "sha" + strconv.Itoa(n), Files: files, CreatedAt: created, MergeableState: state}
+	return mergeTrainMember{Number: n, Base: "v5", HeadSHA: "sha" + strconv.Itoa(n), Files: files, CreatedAt: created, MergeableState: state, Readiness: mergeTrainReadinessReady}
 }
 
 func TestGroupMergeTrains(t *testing.T) {
 	t0 := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
 	cases := []struct {
-		name    string
-		members []mergeTrainMember
-		want    [][]int
-		overlap []string
+		name       string
+		members    []mergeTrainMember
+		want       [][]int
+		candidates [][]int
+		overlap    []string
 	}{
 		{
 			name: "disjoint files form no train",
@@ -88,13 +91,14 @@ func TestGroupMergeTrains(t *testing.T) {
 			overlap: []string{"a.go"},
 		},
 		{
-			name: "a mergeable head fronts over an older blocked one",
+			name: "a blocked head is a candidate, not a member; the mergeable one fronts alone",
 			members: []mergeTrainMember{
 				blocked(mtMember(1, "clean", t0, "x.go")),
 				mtMember(2, "clean", t0.Add(time.Minute), "x.go"),
 			},
-			want:    [][]int{{2, 1}},
-			overlap: []string{"x.go"},
+			want:       [][]int{{2}},
+			candidates: [][]int{{1}},
+			overlap:    []string{"x.go"},
 		},
 		{
 			name: "every member blocked holds nobody back (fail-open)",
@@ -105,40 +109,62 @@ func TestGroupMergeTrains(t *testing.T) {
 		},
 		{
 			// hivecommons/hive#15741 at CI / Review led #15748 and #15755,
-			// both green at 080, and nothing merged.
-			name: "ready members lead an older one still at CI / Review",
+			// both green at 080, and nothing merged. Items that have not
+			// passed the review or CI is not green should not be in a
+			// merge train (hivecommons/hive#15825): #15741 is a candidate.
+			name: "not green or reviewed is not a member: ready members ride, the one at CI / Review is a candidate",
 			members: []mergeTrainMember{
 				readiness(mtMember(15741, "clean", t0, "x.go"), mergeTrainReadinessUnready),
 				readiness(mtMember(15748, "clean", t0.Add(time.Minute), "x.go"), mergeTrainReadinessReady),
 				readiness(mtMember(15755, "clean", t0.Add(2*time.Minute), "x.go"), mergeTrainReadinessReady),
 			},
-			want:    [][]int{{15748, 15755, 15741}},
-			overlap: []string{"x.go"},
+			want:       [][]int{{15748, 15755}},
+			candidates: [][]int{{15741}},
+			overlap:    []string{"x.go"},
 		},
 		{
-			name: "an unevaluated head leads an unready one, ready beats both; readiness outranks mergeable state",
+			name: "an unevaluated head is a candidate too; only the ready head rides",
 			members: []mergeTrainMember{
 				readiness(mtMember(1, "clean", t0, "x.go"), mergeTrainReadinessUnready),
 				readiness(mtMember(2, "behind", t0.Add(time.Minute), "x.go"), mergeTrainReadinessReady),
-				mtMember(3, "clean", t0.Add(2*time.Minute), "x.go"),
+				readiness(mtMember(3, "clean", t0.Add(2*time.Minute), "x.go"), mergeTrainReadinessUnknown),
 			},
-			want:    [][]int{{2, 3, 1}},
-			overlap: []string{"x.go"},
+			want:       [][]int{{2}},
+			candidates: [][]int{{3, 1}},
+			overlap:    []string{"x.go"},
 		},
 		{
-			name: "all unready keeps the age tiebreak (a provisional front)",
+			name: "all unready forms no train (nobody is ready to front it)",
 			members: []mergeTrainMember{
 				readiness(mtMember(2, "clean", t0.Add(time.Minute), "x.go"), mergeTrainReadinessUnready),
 				readiness(mtMember(1, "clean", t0, "x.go"), mergeTrainReadinessUnready),
 			},
-			want:    [][]int{{1, 2}},
+		},
+		{
+			name: "a blocked head never rides even when ready-tier",
+			members: []mergeTrainMember{
+				blocked(readiness(mtMember(1, "clean", t0, "x.go"), mergeTrainReadinessReady)),
+				readiness(mtMember(2, "clean", t0.Add(time.Minute), "x.go"), mergeTrainReadinessReady),
+			},
+			want:       [][]int{{2}},
+			candidates: [][]int{{1}},
+			overlap:    []string{"x.go"},
+		},
+		{
+			name: "the earliest seat leads; a member back from ejection re-enters at the back",
+			members: []mergeTrainMember{
+				seated(mtMember(1, "clean", t0, "x.go"), time.Time{}),
+				seated(mtMember(2, "clean", t0.Add(time.Minute), "x.go"), t0.Add(10*time.Minute)),
+				seated(mtMember(3, "clean", t0.Add(2*time.Minute), "x.go"), t0.Add(5*time.Minute)),
+			},
+			want:    [][]int{{3, 2, 1}},
 			overlap: []string{"x.go"},
 		},
 		{
-			name: "a blocked head trails even a ready-tier sort",
+			name: "a conflict the train is repairing trails every head that merges as is",
 			members: []mergeTrainMember{
-				blocked(readiness(mtMember(1, "clean", t0, "x.go"), mergeTrainReadinessReady)),
-				readiness(mtMember(2, "clean", t0.Add(time.Minute), "x.go"), mergeTrainReadinessUnready),
+				seated(mtMember(1, "dirty", t0, "x.go"), t0),
+				seated(mtMember(2, "clean", t0.Add(time.Minute), "x.go"), t0.Add(time.Minute)),
 			},
 			want:    [][]int{{2, 1}},
 			overlap: []string{"x.go"},
@@ -147,12 +173,18 @@ func TestGroupMergeTrains(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			groups := groupMergeTrains(tc.members)
-			var got [][]int
+			var got, cands [][]int
 			for _, g := range groups {
 				got = append(got, g.Order)
+				if len(g.Candidates) > 0 {
+					cands = append(cands, g.Candidates)
+				}
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("orders = %v, want %v", got, tc.want)
+			}
+			if !reflect.DeepEqual(cands, tc.candidates) {
+				t.Fatalf("candidates = %v, want %v", cands, tc.candidates)
 			}
 			if len(groups) == 1 && !reflect.DeepEqual(groups[0].OverlapFiles, tc.overlap) {
 				t.Fatalf("overlap = %v, want %v", groups[0].OverlapFiles, tc.overlap)
@@ -174,6 +206,7 @@ type mergeTrainAPI struct {
 	files   map[int][]string
 	state   map[int]string
 	heads   map[int]string
+	refs    map[int]string
 	closed  map[int]bool
 	updates []int
 	gets    int
@@ -206,8 +239,12 @@ func newMergeTrainServer(t *testing.T, api *mergeTrainAPI) *httptest.Server {
 			if head == "" {
 				head = "sha" + strconv.Itoa(n)
 			}
+			ref := api.refs[n]
+			if ref == "" {
+				ref = "feat/" + strconv.Itoa(n)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"number": n, "state": state, "mergeable_state": api.state[n],
-				"head": map[string]any{"sha": head, "ref": "feat/" + strconv.Itoa(n), "repo": map[string]any{"full_name": "acme/widget"}},
+				"head": map[string]any{"sha": head, "ref": ref, "repo": map[string]any{"full_name": "acme/widget"}},
 				"base": map[string]any{"ref": "v5", "repo": map[string]any{"full_name": "acme/widget"}}})
 		case r.Method == http.MethodPut && len(parts) == 2 && parts[1] == "update-branch":
 			api.updates = append(api.updates, n)
@@ -247,6 +284,7 @@ func TestPlanMergeTrainsSiblingsAndFront(t *testing.T) {
 	c, logs := newMergeTrainEngine(t, srv.URL, DefaultMergeTrainPolicy, nil)
 	// The list API carries no mergeable state; the planner reads it.
 	prs := []*gh.PullRequest{mtPR(13, t0, ""), mtPR(11, t0.Add(time.Minute), ""), mtPR(10, t0.Add(2*time.Minute), ""), mtPR(12, t0.Add(3*time.Minute), ""), mtPR(14, t0.Add(4*time.Minute), "")}
+	mtReady(c, "self", prs...)
 	prefilter := func(pr *gh.PullRequest) string {
 		if pr.GetNumber() == 11 {
 			return "label:needs-rebase" // admitted: a merely-behind head is what the train updates
@@ -349,6 +387,7 @@ func TestMergeTrainAfterFrontMergeBehindAndDirty(t *testing.T) {
 	})
 	c, _ := newMergeTrainEngine(t, srv.URL, DefaultMergeTrainPolicy, resolver)
 	prs := []*gh.PullRequest{mtPR(20, t0, ""), mtPR(21, t0.Add(time.Minute), ""), mtPR(22, t0.Add(2*time.Minute), ""), mtPR(23, t0.Add(3*time.Minute), "")}
+	mtReady(c, "self", prs...)
 	plan := c.planMergeTrains(context.Background(), "self", "acme/widget", "acme", "widget", prs, func(*gh.PullRequest) string { return "" })
 	if !plan.isFront(20) {
 		t.Fatalf("front = %v", plan.groups)
@@ -379,6 +418,89 @@ func TestMergeTrainAfterFrontMergeBehindAndDirty(t *testing.T) {
 	}
 }
 
+// TestMergeTrainLeavesDependencyBotBranchesToTheBot pins
+// projectbluefin/utah#1097 on the merge train: once the front merges, a
+// Renovate sibling — behind or dirty — gets neither update-branch nor a
+// fixer rebase request, and a dirty Renovate front falls through to the
+// lane's conflicting path without a rebase request. Ordinary siblings are
+// still updated and rebased.
+func TestMergeTrainLeavesDependencyBotBranchesToTheBot(t *testing.T) {
+	t0 := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
+	api := &mergeTrainAPI{
+		files: map[int][]string{40: {"a.go"}, 41: {"a.go"}, 42: {"a.go"}, 43: {"a.go"}, 44: {"a.go"}},
+		state: map[int]string{40: "clean", 41: "clean", 42: "clean", 43: "clean", 44: "clean"},
+		refs:  map[int]string{42: "renovate/actions-checkout-5.x", 43: "renovate/go-deps"},
+	}
+	srv := newMergeTrainServer(t, api)
+	defer srv.Close()
+	var mu sync.Mutex
+	var requests []RebaseRequest
+	resolver := RebaseResolverFunc(func(_ context.Context, req RebaseRequest) error {
+		mu.Lock()
+		defer mu.Unlock()
+		requests = append(requests, req)
+		return nil
+	})
+	c, logs := newMergeTrainEngine(t, srv.URL, DefaultMergeTrainPolicy, resolver)
+	prs := []*gh.PullRequest{mtPR(40, t0, ""), mtPR(41, t0.Add(time.Minute), ""), mtPR(42, t0.Add(2*time.Minute), ""), mtPR(43, t0.Add(3*time.Minute), ""), mtPR(44, t0.Add(4*time.Minute), "")}
+	mtReady(c, "self", prs...)
+	plan := c.planMergeTrains(context.Background(), "self", "acme/widget", "acme", "widget", prs, func(*gh.PullRequest) string { return "" })
+	if !plan.isFront(40) {
+		t.Fatalf("front = %v", plan.groups)
+	}
+	// The front merged: #41 (ordinary) and #42 (Renovate) are behind, #43
+	// (Renovate) and #44 (ordinary) are dirty.
+	api.mu.Lock()
+	api.state[41], api.state[42], api.state[43], api.state[44] = "behind", "behind", "dirty", "dirty"
+	api.mu.Unlock()
+	c.mergeTrainAfterFrontMerge(context.Background(), plan, 40)
+	api.mu.Lock()
+	updates := append([]int(nil), api.updates...)
+	api.mu.Unlock()
+	if !reflect.DeepEqual(updates, []int{41}) {
+		t.Fatalf("update-branch on %v, want only the ordinary #41", updates)
+	}
+	mu.Lock()
+	got := append([]RebaseRequest(nil), requests...)
+	mu.Unlock()
+	if len(got) != 1 || got[0].Number != 44 {
+		t.Fatalf("rebase requests = %+v, want only the ordinary #44", got)
+	}
+	if !strings.Contains(logs.String(), "leaving the base sync to the bot") || !strings.Contains(logs.String(), "head_ref=renovate/go-deps") {
+		t.Fatalf("missing dependency-bot skip log\n%s", logs.String())
+	}
+
+	// A dirty Renovate front still riding the train under repair (an
+	// episode opened before this guard): no rebase request, the lane's
+	// conflicting path takes it.
+	frontAPI := &mergeTrainAPI{
+		files: map[int][]string{50: {"a.go"}, 51: {"a.go"}},
+		state: map[int]string{50: "dirty", 51: "dirty"},
+		refs:  map[int]string{50: "renovate/go-deps"},
+	}
+	frontSrv := newMergeTrainServer(t, frontAPI)
+	defer frontSrv.Close()
+	fc, _ := newMergeTrainEngine(t, frontSrv.URL, MergeTrainPolicy{Enabled: true, MaxRebaseAttempts: 2}, resolver)
+	fronts := []*gh.PullRequest{mtPR(50, t0, ""), mtPR(51, t0.Add(time.Minute), "")}
+	fronts[0].Head.Ref = gh.Ptr("renovate/go-deps")
+	mtReady(fc, "self", fronts...)
+	fc.noteMergeTrainFrontMerged("acme", "widget", "v5", 49)
+	fc.bumpMergeTrainAttempts("acme", "widget", 50, 49)
+	fc.bumpMergeTrainAttempts("acme", "widget", 51, 49)
+	frontPlan := plan0(fc, fronts)
+	if !frontPlan.isFront(50) {
+		t.Fatalf("front = %+v, want #50", frontPlan.groups)
+	}
+	if reason, handled := fc.mergeTrainFront(context.Background(), frontPlan, fronts[0]); handled || reason != "" {
+		t.Fatalf("dirty Renovate front handled=%v reason=%q, want the lane's conflicting path", handled, reason)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 1 {
+		t.Fatalf("rebase requests after the Renovate front = %+v, want none added", requests)
+	}
+}
+
 func TestMergeTrainFrontRebaseLoopGuard(t *testing.T) {
 	t0 := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
 	api := &mergeTrainAPI{
@@ -397,6 +519,7 @@ func TestMergeTrainFrontRebaseLoopGuard(t *testing.T) {
 	})
 	c, logs := newMergeTrainEngine(t, srv.URL, MergeTrainPolicy{Enabled: true, MaxRebaseAttempts: 2}, resolver)
 	prs := []*gh.PullRequest{mtPR(30, t0, ""), mtPR(31, t0.Add(time.Minute), "")}
+	mtReady(c, "self", prs...)
 	// Two heads that arrived conflicting on their own are nobody's train:
 	// the planner carries neither (hivecommons/hive#15395, #15307).
 	if plan := plan0(c, prs); plan.isFront(30) || plan.isSibling(31) || len(plan.groups) != 0 {
@@ -468,6 +591,7 @@ func TestPlanMergeTrainsExcludesReturnedAndConflicting(t *testing.T) {
 	returned := mtPR(15430, t0.Add(2*time.Minute), "")
 	returned.Labels = []*gh.Label{{Name: gh.Ptr(stagelabels.ReturnedToContributor.Label())}}
 	prs := []*gh.PullRequest{mtPR(15424, t0, ""), mtPR(15307, t0.Add(time.Minute), ""), returned, mtPR(15431, t0.Add(3*time.Minute), "")}
+	mtReady(c, "self", prs...)
 	plan := plan0(c, prs)
 	for _, n := range []int{15307, 15430, 15431} {
 		if plan.isSibling(n) || plan.isFront(n) {
@@ -509,6 +633,7 @@ func TestMergeTrainFrontNoResolverFallsThroughOnce(t *testing.T) {
 	defer srv.Close()
 	c, logs := newMergeTrainEngine(t, srv.URL, DefaultMergeTrainPolicy, nil)
 	prs := []*gh.PullRequest{mtPR(40, t0, ""), mtPR(41, t0.Add(time.Minute), "")}
+	mtReady(c, "self", prs...)
 	// Without a resolver no dirty head is under repair, so two conflicting
 	// heads are no train at all and the lane's conflicting path takes them.
 	for i := 0; i < 2; i++ {
@@ -572,6 +697,19 @@ func blocked(m mergeTrainMember) mergeTrainMember {
 
 func readiness(m mergeTrainMember, tier int) mergeTrainMember {
 	m.Readiness = tier
+	return m
+}
+
+// mtReady records the lane's "would merge" verdict for each PR's current
+// head (sha<n>): the readiness a seat requires (hivecommons/hive#15825).
+func mtReady(c *Engine, lane string, prs ...*gh.PullRequest) {
+	for _, pr := range prs {
+		c.noteMergeTrainOutcome(lane, "acme", "widget", pr.GetNumber(), pr.GetHead().GetSHA(), "")
+	}
+}
+
+func seated(m mergeTrainMember, since time.Time) mergeTrainMember {
+	m.SeatedSince = since
 	return m
 }
 
@@ -714,6 +852,7 @@ func TestMergeTrainHumanMergeNeverMember(t *testing.T) {
 	defer srv.Close()
 	c, _ := newMergeTrainEngine(t, srv.URL, DefaultMergeTrainPolicy, nil)
 	prs := []*gh.PullRequest{mtPR(60, t0, "clean"), mtPR(61, t0.Add(time.Minute), "clean"), mtPR(62, t0.Add(2*time.Minute), "clean")}
+	mtReady(c, "self", prs...)
 	// The oldest, cleanest PR is an untrusted author's: the lane said so.
 	c.noteMergeTrainOutcome("self", "acme", "widget", 60, "sha60", prstage.ContributorLaneReasonNoLinkedIssue)
 	plan := plan0(c, prs)
@@ -725,14 +864,18 @@ func TestMergeTrainHumanMergeNeverMember(t *testing.T) {
 	}
 	// The same verdict from another lane does not touch this lane's train.
 	c2, _ := newMergeTrainEngine(t, srv.URL, DefaultMergeTrainPolicy, nil)
+	mtReady(c2, "self", prs...)
 	c2.noteMergeTrainOutcome("trusted", "acme", "widget", 60, "sha60", "untrusted-author-role")
 	if plan := plan0(c2, prs); !plan.isFront(60) {
 		t.Fatal("another lane's verdict must not evict the member from this lane's train")
 	}
-	// A new head starts clean: the lane re-judges it.
+	// A clean verdict re-admits the PR — at the back: #61 and #62 hold
+	// the earlier seats (hivecommons/hive#15825).
 	c.noteMergeTrainOutcome("self", "acme", "widget", 60, "sha60", "")
-	if plan := plan0(c, prs); !plan.isFront(60) {
-		t.Fatal("a clean verdict re-admits the PR")
+	if plan := plan0(c, prs); !plan.isFront(61) || !plan.isSibling(60) {
+		t.Fatalf("a clean verdict re-admits the PR behind the seated members: %+v", plan.groups)
+	} else if g, _ := plan.group(60); g.Position(60) != 3 {
+		t.Fatalf("re-admitted PR position = %d, want 3 (the back)", g.Position(60))
 	}
 }
 
@@ -757,6 +900,7 @@ func TestPlanMergeTrainsExcludesUnderRepair(t *testing.T) {
 	needsAuthor := mtPR(15408, t0.Add(3*time.Minute), "")
 	needsAuthor.Labels = []*gh.Label{{Name: gh.Ptr(stagelabels.NeedsAuthor.Label())}}
 	prs := []*gh.PullRequest{fixing, mtPR(15406, t0.Add(time.Minute), ""), mtPR(15407, t0.Add(2*time.Minute), ""), needsAuthor}
+	mtReady(c, "self", prs...)
 	plan := plan0(c, prs)
 	for _, n := range []int{15405, 15407, 15408} {
 		if plan.isSibling(n) || plan.isFront(n) {

@@ -18,6 +18,14 @@ Hive has two release lines. **v5** is the stable line. **v6** is the newer line.
 
 For short definitions of the names the dashboard uses, see the [dashboard glossary](dashboard-glossary.md). For how the dashboard is built, see the [spoke dashboard guide](dashboard.md).
 
+### Live sidebar count feedback
+
+The Hive activity monitor, Contributors and Knowledge navigation pills briefly show an upward or downward arrow and the actual signed count change. The number remains readable and the link works as before. Reduced-motion preferences keep the feedback static; there is no extra polling or repeated announcement on unchanged refreshes.
+
+The tracker’s gold pill counts default-view **rows** (issues, except folded review notes and standing meta issues, plus PRs not drawn under an issue); its orange pill counts **waiting-on-you items**. These are not separate issue and PR totals. Contributors animates only **online** in online/registered, using the existing registered-profile heartbeat window, not connected sockets or changes in registered totals. Knowledge counts **facts**, the sum of layer `total_pages` values, when enabled; its disabled zero does not mean stored facts were deleted. If a remote layer is unhealthy, Knowledge still loads its available facts, marks the count as partial in its accessible label and tooltip, and suppresses delta feedback until a complete count is known again.
+
+Initial or unknown counts and route/filter redraws do not animate. After reconnection, feedback describes only the observed net numeric change, not whether an item was merged, closed or otherwise removed.
+
 ## Words used on this page
 
 These words have a special meaning in Hive. Each entry explains them again the first time it uses them.
@@ -25,11 +33,12 @@ These words have a special meaning in Hive. Each entry explains them again the f
 - **Autonomy level:** how much Hive may do on its own, from L1 (watch only) to L6 (works and merges on its own). Hive calls this the ACMM level.
 - **Tracked:** an issue or pull request that Hive has put on its work list after its filters ran.
 - **Actionable:** a tracked item that Hive could work on now, because nothing is waiting on a person.
+- **Tracking:** an actionable issue that was split into child issues and still has some open. The activity monitor lights its Actionable step as `Tracking · 3/4` (children done / total) instead of *Actionable*, and its caption names the open children: the scanner leaves such a parent to its children, so the time on the step is not scanner delay ([#16481](https://github.com/hivecommons/hive/issues/16481)).
 - **Held:** an item someone parked on purpose by adding a hold label, such as `hold` or `on-hold`. Hive leaves it alone.
 - **Outside:** an open item that Hive's filters kept off its work list, for example because of a label.
 - **Band:** a group the dashboard puts an issue or pull request in, named after what it needs next. Bands are for display only.
 - **Needs-human:** waiting on a person, for example for a decision or a review. It is also the name of a label.
-- **Merge-eligible:** a pull request that passed every check Hive uses before it may merge it.
+- **Merge-eligible:** a pull request that passed every check Hive uses before it may merge it, and that Hive will merge: never one whose verdict is blocked or outstanding, or whose repo has auto-merge off. The auto-merge label counts only before the sweep has a verdict, and only when nothing blocks the pull request.
 
 **Who is who in the activity monitor** ([#15394](https://github.com/hivecommons/hive/issues/15394)). Every hover, menu and caption uses these five nouns and no others:
 
@@ -180,6 +189,11 @@ Full entry: [Knowledge](dashboard-sections/workflow-and-agents.md#knowledge).
 Find past pull requests, issues, review records and findings across your projects by keyword, with a link to each one.
 
 Full entry: [Search](dashboard-sections/workflow-and-agents.md#search).
+## Inbox
+
+Voice recordings and dictations waiting for you to file them as an RFC, send to dibs, or keep as knowledge.
+
+Full entry: [Inbox](dashboard-sections/workflow-and-agents.md#inbox).
 
 ## Contributors
 

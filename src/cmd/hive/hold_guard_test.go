@@ -41,6 +41,11 @@ func newTestHoldGuardStore(t *testing.T) *holdguard.Store {
 	t.Helper()
 	s := holdguard.Load(filepath.Join(t.TempDir(), "hold-guard.json"))
 	swapHoldGuardStore(t, s)
+	// A fresh ledger is a fresh process: forget the held-PR update stops
+	// already announced, or a repo#number/head reused across tests inherits
+	// an earlier test's WARN and note dedupe.
+	heldPRUpdateStopAnnounced.Clear()
+	t.Cleanup(heldPRUpdateStopAnnounced.Clear)
 	// Keep the hold-guard's hold-source record off the real data dir.
 	oldSources := github.HoldSourcesPath
 	github.HoldSourcesPath = filepath.Join(t.TempDir(), github.HoldSourcesFile)
@@ -1180,7 +1185,7 @@ func TestEnforceHoldGuardOperatorApprovalCarriesOverHiveBaseRefresh(t *testing.T
 			fake.pulls = map[int]map[string]any{7: {"number": 7, "head": map[string]any{"sha": "m1"}, "base": map[string]any{"ref": "main"}}}
 			fake.commitBySHA = map[string]map[string]any{"m1": {
 				"sha": "m1", "author": map[string]any{"login": tc.mergeAuthor}, "committer": map[string]any{"login": "web-flow"},
-				"parents": []map[string]any{{"sha": "c1"}, {"sha": "b1"}},
+				"commit": map[string]any{"verification": map[string]any{"verified": true}}, "parents": []map[string]any{{"sha": "c1"}, {"sha": "b1"}},
 			}}
 			fake.compareResult = map[string]map[string]any{
 				"main...c1": {"status": "ahead", "merge_base_commit": map[string]any{"sha": "b0"}, "files": files("blob1")},
@@ -1221,14 +1226,16 @@ func TestEnforceHoldGuardOperatorApprovalCarriesOverHiveBaseRefresh(t *testing.T
 }
 
 // The approval must name the head on the branch now: one recorded on the
-// pre-push head, or by someone outside the merger tier, is not a review of
-// the current tree and the drift path stands.
+// pre-push head, carried from an adopted PR, or by someone outside the merger
+// tier is not a review of the current tree and the drift path stands.
 func TestEnforceHoldGuardOperatorApprovalMustCoverCurrentHeadByTrustedMerger(t *testing.T) {
 	cases := []struct {
 		name, head, actor string
+		body              string
 		users             []string
 	}{
 		{name: "approval on the old head", head: "c1", actor: "clubanderson", users: []string{"clubanderson:owner"}},
+		{name: "carried approval on the current head", head: "p1", actor: "clubanderson", body: "approve (carried from #6 head original)", users: []string{"clubanderson:owner"}},
 		{name: "approver below merger tier", head: "p1", actor: "visitor", users: []string{"visitor:read-write"}},
 		{name: "approver not authorized", head: "p1", actor: "stranger", users: []string{"clubanderson:owner"}},
 	}
@@ -1236,7 +1243,16 @@ func TestEnforceHoldGuardOperatorApprovalMustCoverCurrentHeadByTrustedMerger(t *
 		t.Run(tc.name, func(t *testing.T) {
 			store := newTestHoldGuardStore(t)
 			decisions := swapHoldGuardHumanChangeRequests(t)
-			recordHoldGuardDecision(t, decisions, tc.head, tc.actor, review.HumanChangeRequestKindApprove)
+			body := tc.body
+			if body == "" {
+				body = review.HumanChangeRequestKindApprove
+			}
+			if err := decisions.Record(review.HumanChangeRequest{
+				Repo: "acme/widgets", Number: 7, HeadSHA: tc.head, Source: review.HumanChangeRequestSourceDecision,
+				SourceID: 1, Actor: tc.actor, Body: body, Kind: review.HumanChangeRequestKindApprove,
+			}); err != nil {
+				t.Fatal(err)
+			}
 			fake := &holdGuardServer{commits: map[int][]map[string]any{
 				7: {ghCommit("c1", "odttlnt", "deploy: monitoring"), ghCommit("p1", "odttlnt", "deploy: patch secret")},
 			}}

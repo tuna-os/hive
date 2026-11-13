@@ -60,9 +60,9 @@ func decisionForUnauthorized(it StageTrackerItem, held bool) *StageTrackerDecisi
 	step := strings.TrimSpace(it.UnauthorizedStep)
 	if step == "" {
 		_, tip := stageTrackerUnauthorized(it.Reason)
-		d.Question = "The hive's GitHub App lacks a permission for the next step. " + tip
+		d.Question = "The hive bot lacks a permission for the next step. " + tip
 	} else {
-		d.Question = "The hive's GitHub App may not " + unauthorizedStepWords(step) + " here. Do that step on GitHub, then re-evaluate so the hive picks it up."
+		d.Question = "The hive bot's GitHub App is missing the permission to " + unauthorizedStepWords(step) + " here. Do that step on GitHub, then re-evaluate so the hive picks it up."
 	}
 	d.Blocker = strings.TrimSpace(it.Unauthorized)
 	if d.Blocker == "" {
@@ -200,7 +200,8 @@ func decisionLaneRule(base string) bool {
 	lower := strings.ToLower(strings.TrimSpace(base))
 	switch lower {
 	case stageengineprstage.ContributorLaneReasonWorkflowPath, stageengineprstage.ContributorLaneReasonTestsRemoved,
-		stageengineprstage.ContributorLaneReasonNoReviewer, stageengineprstage.ContributorLaneReasonReporterTrustHold,
+		stageengineprstage.ContributorLaneReasonNoReviewer, stageengineprstage.ContributorLaneReasonReviewOff,
+		stageengineprstage.ContributorLaneReasonReporterTrustHold,
 		stageengineprstage.ContributorLaneReasonNoAppBotLogin, stageengineprstage.ContributorLaneReasonFilesEvidence,
 		stageengineprstage.AutoMergeReasonHumanMergePath, stageengineprstage.AutoMergeReasonHumanMergePathEvidence,
 		stageengineprstage.AutoMergeReasonIntentUnauthorized, stageengineprstage.AutoMergeReasonIntentEvidence,
@@ -221,6 +222,8 @@ func decisionPlainReason(base string) string {
 		return "it removes tests"
 	case stageengineprstage.ContributorLaneReasonNoReviewer:
 		return "no reviewer is configured for this repo"
+	case stageengineprstage.ContributorLaneReasonReviewOff:
+		return "it needs a reviewer verdict and this hive's review swarm is off, so no reviewer will be asked"
 	case stageengineprstage.ContributorLaneReasonReporterTrustHold:
 		return "the hive held it for the trust level of the linked issue's reporter"
 	case stageengineprstage.ContributorLaneReasonNoAppBotLogin, stageengineprstage.AutoMergeReasonNoAppBotLogin:

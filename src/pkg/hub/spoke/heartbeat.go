@@ -23,9 +23,11 @@ import (
 	"time"
 
 	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/crux/egressmark"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/fleetreport"
 	"github.com/hivecommons/hive/pkg/hivestate"
+	"github.com/hivecommons/hive/pkg/hubactivity"
 	"github.com/hivecommons/hive/pkg/inferencehealth"
 	"github.com/hivecommons/hive/pkg/nous"
 	spokesig "github.com/hivecommons/hive/pkg/spoke"
@@ -567,6 +569,7 @@ type LeaderboardEntry struct {
 	TrustTier      string `json:"trust_tier"`
 	TasksCompleted int    `json:"tasks_completed"`
 	TasksFailed    int    `json:"tasks_failed"`
+	Abandoned      int    `json:"abandoned"`
 	Active         bool   `json:"active"`
 	CurrentTask    string `json:"current_task,omitempty"`
 	HiveName       string `json:"hive_name,omitempty"`
@@ -859,7 +862,14 @@ type HeartbeatPayload struct {
 	// a hive's GitHub can differ from its cluster's default, so the cluster
 	// default is only ever a fallback for spokes too old to report this.
 	// Empty on such spokes — the hub falls back rather than guessing.
-	GitHubHost         string `json:"github_host,omitempty"`
+	GitHubHost string `json:"github_host,omitempty"`
+	// ForgeUnreachable is true when the spoke's last forge probe (the
+	// github_auth token check in Health) timed out or failed at the transport
+	// layer: GitHubHost cannot be reached from the pod. The probe runs under
+	// its own sub-budget so a dead forge no longer makes every beat stale;
+	// this field tells the hub why instead (#17427). Omitted when reachable
+	// and on older spokes.
+	ForgeUnreachable   bool   `json:"forge_unreachable,omitempty"`
 	Timestamp          string `json:"timestamp"`
 	GitHubAppRequired  bool   `json:"github_app_required,omitempty"`
 	GitHubAppPermIssue string `json:"github_app_perm_issue,omitempty"`
@@ -1063,6 +1073,13 @@ type HeartbeatPayload struct {
 	// its cluster. The hub honours it as an override: a deliberate per-hive
 	// credential is never overwritten by the cluster default.
 	GitHubAppKeyPerHive bool `json:"github_app_key_per_hive,omitempty"`
+	// WebhookRelayKeyFingerprint is the NON-SECRET "sha256:<hex>" of the hub
+	// webhook relay key this spoke holds (github.WebhookRelayKeyFingerprint).
+	// The hub delivers the key only while this does not match its record, so
+	// a missing or rotated-out key is repaired on the next beat. Empty means
+	// no key (or a spoke too old to report one); the key itself never travels
+	// spoke → hub.
+	WebhookRelayKeyFingerprint string `json:"webhook_relay_key_fingerprint,omitempty"`
 	// GitHubAppID is the App ID this spoke believes it is authenticating AS —
 	// cfg.GitHub.AppID, non-secret. It exists to make one specific distinction
 	// decidable on the hub: a per-hive key that is WRONG versus a per-hive key
@@ -1177,6 +1194,11 @@ type HeartbeatPayload struct {
 	FreshAgentStats bool `json:"fresh_agent_stats,omitempty"`
 	// SelfExperimentsOptIn is local consent; absent or false means opted out.
 	SelfExperimentsOptIn bool `json:"self_experiments_opt_in,omitempty"`
+	// Activity is the optional bounded activity digest for the hub-wide
+	// Activity Monitor (#15861/#15951), attached by the activity publisher
+	// (#15963) at send time; nil when hub.activity is off or the tracker has
+	// nothing yet, an etag-only marker when the hub holds it already.
+	Activity *hubactivity.Digest `json:"activity,omitempty"`
 }
 
 const (
@@ -1395,6 +1417,8 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 	var onBreaker BreakerCallback
 	var freshCollect FreshStatusCollector
 	var onUpgradePolicy UpgradePolicyCallback
+	var onUpgradeAnnounce UpgradeAnnounceCallback
+	var activitySrc *ActivitySource
 	for _, cb := range callbacks {
 		switch fn := cb.(type) {
 		case UpgradeCallback:
@@ -1425,12 +1449,33 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 			freshCollect = fn
 		case UpgradePolicyCallback:
 			onUpgradePolicy = fn
+		case UpgradeAnnounceCallback:
+			onUpgradeAnnounce = fn
+		case ActivitySource:
+			activitySrc = &fn
 		}
+	}
+
+	// A timeout cannot cancel a collector blocked on a mutex or NFS. Keep
+	// subsequent beats from starting more copies of that same blocked work.
+	collect = nonOverlappingHeartbeatCollector(collect)
+	if freshCollect != nil {
+		freshCollect = FreshStatusCollector(nonOverlappingHeartbeatCollector(StatusCollector(freshCollect)))
 	}
 
 	logger.Info("hub heartbeat enabled", "url", hubURL, "interval", interval)
 
 	waitForReady(ctx, logger)
+
+	if activitySrc != nil {
+		pub := newActivityPublisher(*activitySrc, hubURL, logger)
+		activityPub.Store(pub)
+		defer activityPub.CompareAndSwap(pub, nil)
+		go pub.run(ctx)
+		if activitySrc.Subscribe != nil {
+			activitySrc.Subscribe(pub.notify)
+		}
+	}
 
 	processHeartbeatResponse := func(resp *HeartbeatResponse) {
 		if resp == nil {
@@ -1445,6 +1490,7 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 			onSwitchBranch(resp.SwitchToTag)
 		} else if resp.UpgradeTo != "" && onUpgrade != nil {
 			setUpgradeInterrupt(resp.UpgradeInterrupt)
+			setUpgradeChannelTag(resp.UpgradeTo, resp.UpgradeChannelTag)
 			onUpgrade(resp.UpgradeTo)
 		}
 		if resp.GitHubAppConfig != nil && onGitHubAppConfig != nil {
@@ -1480,6 +1526,9 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 		}
 		// Descriptive only (#7262): the hub's upgrade posture for this spoke,
 		// rendered by the dashboard. nil means the hub does not manage us.
+		if resp.UpgradeAnnounce != nil && onUpgradeAnnounce != nil {
+			onUpgradeAnnounce(resp.UpgradeAnnounce)
+		}
 		if resp.UpgradePolicy != nil && onUpgradePolicy != nil {
 			onUpgradePolicy(resp.UpgradePolicy)
 		}
@@ -1504,9 +1553,36 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 			logger.Info("hub heartbeat stopped")
 			return
 		case <-ticker.C:
+			if heartbeatUnprovisionedBackoffActive(time.Now()) {
+				// Keep the attempt clock advancing so /api/livez does not
+				// read the deliberate pause as a stalled loop.
+				recordHeartbeatAttempt()
+				continue
+			}
 			processHeartbeatResponse(sendHeartbeat(ctx, hubURL, collect, logger, freshCollect))
 		}
 	}
+}
+
+// heartbeatUnprovisionedBackoff is how long the loop pauses after the hub
+// answers 403 "hosted/saas hive IDs can only be created via provisioning".
+// The hub never auto-creates hosted IDs, so retrying every tick cannot
+// succeed until an operator provisions (or the hive is re-IDed); a slow probe
+// still notices when that happens. A var so tests can shorten it.
+var heartbeatUnprovisionedBackoff = 10 * time.Minute
+
+// heartbeatUnprovisionedUntil is the UnixNano deadline of that pause (0 = none).
+var heartbeatUnprovisionedUntil atomic.Int64
+
+func heartbeatUnprovisionedBackoffActive(now time.Time) bool {
+	until := heartbeatUnprovisionedUntil.Load()
+	return until != 0 && now.UnixNano() < until
+}
+
+// hubHeartbeatRejectsUnprovisioned reports whether the hub refused the beat
+// because it does not know this hosted/saas hive ID (a permanent condition).
+func hubHeartbeatRejectsUnprovisioned(status int, body string) bool {
+	return status == http.StatusForbidden && strings.Contains(body, "can only be created via provisioning")
 }
 
 // waitForReady's knobs are vars (not consts) for the same reason as
@@ -1782,6 +1858,15 @@ func postHeartbeatToHub(ctx context.Context, hubURL string, payload *HeartbeatPa
 	if !payload.SelfExperimentsOptIn {
 		nous.SelfExperiments.Apply(false, nil)
 	}
+	// The activity digest is built at send time and its acknowledgement
+	// applied under the publisher's lock, so an out-of-band update cannot
+	// interleave between this beat and its response.
+	pub := activityPub.Load()
+	if pub != nil {
+		pub.mu.Lock()
+		defer pub.mu.Unlock()
+		payload.Activity = pub.heartbeatDigestLocked(ctx)
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		logger.Warn("hub heartbeat marshal failed", "error", err)
@@ -1810,6 +1895,12 @@ func postHeartbeatToHub(ctx context.Context, hubURL string, payload *HeartbeatPa
 
 	if resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if hubHeartbeatRejectsUnprovisioned(resp.StatusCode, string(respBody)) {
+			heartbeatUnprovisionedUntil.Store(time.Now().Add(heartbeatUnprovisionedBackoff).UnixNano())
+			logger.Warn("hub heartbeat rejected: hive id is not provisioned on the hub — backing off",
+				"status", resp.StatusCode, "body", string(respBody), "retry_in", heartbeatUnprovisionedBackoff.String())
+			return nil
+		}
 		logger.Warn("hub heartbeat rejected", "status", resp.StatusCode, "body", string(respBody))
 		if hubHeartbeatStatusIsDefect(resp.StatusCode) {
 			fleetreport.Observe(fleetreport.ClassUnexpectedHub5xx, "heartbeat", fmt.Sprintf("hub heartbeat returned HTTP %d", resp.StatusCode), string(respBody))
@@ -1817,6 +1908,7 @@ func postHeartbeatToHub(ctx context.Context, hubURL string, payload *HeartbeatPa
 		return nil
 	}
 	fleetreport.Clear(fleetreport.ClassUnexpectedHub5xx, "heartbeat")
+	heartbeatUnprovisionedUntil.Store(0)
 
 	// The hub accepted the beat (status < 300) — this is what /api/livez
 	// treats as "the heartbeat goroutine is alive and doing its job", so
@@ -1854,6 +1946,10 @@ func postHeartbeatToHub(ctx context.Context, hubURL string, payload *HeartbeatPa
 				"app_id", hbResp.GitHubAppConfig.AppID,
 				"installation_id", hbResp.GitHubAppConfig.InstallationID,
 			)
+		}
+		if pub != nil {
+			pub.acknowledgeLocked(hbResp.ActivityETag)
+			pub.acknowledgeEventsLocked(hbResp.ActivityEventsAck)
 		}
 		return &hbResp
 	}
@@ -1930,7 +2026,8 @@ func collectWithTimeout(ctx context.Context, collect StatusCollector, timeout ti
 			// outcome. Here we only note the timeout itself, then name the
 			// sections that consumed the budget.
 			logger.Warn("hub heartbeat collect timed out; loop keeps ticking so liveness stays green",
-				"timeout", timeout.String())
+				"timeout", timeout.String(),
+				"slowest", timings.summary(collectTimingTopN))
 			logCollectTimeoutBreakdown(logger, timings, timeout)
 		}
 		return nil
@@ -2242,6 +2339,7 @@ func inClusterHTTPClient(cfg *inClusterConfig) (*http.Client, error) {
 		Timeout: routeExistenceProbeTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+			DialContext:     egressmark.Dialer(0).DialContext,
 		},
 	}, nil
 }
@@ -2679,6 +2777,15 @@ type HeartbeatGitHubAppConfig struct {
 	// nil for every hive without a SecondaryAppID, which is the entire fleet
 	// today, so the heartbeat payload is byte-identical for them.
 	SecondaryKey *HeartbeatAppKey `json:"secondary_key,omitempty"`
+	// WebhookRelayKey is this hive's OWN key for verifying the signature the
+	// hub adds to every GitHub webhook it relays here (hivecommons/hive#17911).
+	// It is per hive and is never the GitHub App webhook secret, so it cannot
+	// sign anything another spoke would accept. Secret — never logged; the
+	// spoke persists it 0600 (github.AdoptWebhookRelayKey).
+	//
+	// Empty means "leave the spoke's key unchanged" — never a way to blank a
+	// working key.
+	WebhookRelayKey string `json:"webhook_relay_key,omitempty"`
 }
 
 // HeartbeatAppKey is one (app_id, private key) pair the hub delivers alongside
@@ -2778,10 +2885,17 @@ type HeartbeatResponse struct {
 	UpgradeTo string `json:"upgrade_to,omitempty"`
 	// UpgradeInterrupt rides with UpgradeTo when the owner asked the upgrade
 	// to proceed without draining in-flight agent turns (#14950).
-	UpgradeInterrupt bool   `json:"upgrade_interrupt,omitempty"`
-	HubGitHash       string `json:"hub_git_hash,omitempty"`
-	LatestSHA        string `json:"latest_sha,omitempty"`
-	LatestTag        string `json:"latest_tag,omitempty"`
+	UpgradeInterrupt bool `json:"upgrade_interrupt,omitempty"`
+	// UpgradeChannelTag rides with UpgradeTo when the spoke follows a release
+	// channel whose tag already carries the target (or a newer build), naming
+	// that channel (#17978). The spoke then rolls once on the channel tag
+	// instead of pinning to the target's SHA tag, which the hub would switch
+	// straight back. Empty (an older hub, or a channel that lags the target)
+	// keeps the #10719 behaviour: pin to the immutable SHA tag.
+	UpgradeChannelTag string `json:"upgrade_channel_tag,omitempty"`
+	HubGitHash        string `json:"hub_git_hash,omitempty"`
+	LatestSHA         string `json:"latest_sha,omitempty"`
+	LatestTag         string `json:"latest_tag,omitempty"`
 	// SwitchToTag instructs the spoke to change its own deployment image to
 	// ghcr.io/hivecommons/hive:<SwitchToTag> and restart. Used for branch
 	// switches on clusters the hub can't reach over kubectl — the spoke has
@@ -2850,6 +2964,12 @@ type HeartbeatResponse struct {
 	// on every beat for any hive the hub has an upgrade opinion about; nil
 	// means "the hub does not manage this hive's upgrades".
 	UpgradePolicy *HeartbeatUpgradePolicy `json:"upgrade_policy,omitempty"`
+	// UpgradeAnnounce rides on every beat while the hub holds an open
+	// upgrade latch for a hub-managed hive it is about to roll (or has
+	// rolled) itself, so the spoke dashboard shows the upgrade animation
+	// before the kill instead of a bare "reconnecting" (#15788). Absent on
+	// the self-upgrade path, where UpgradeTo already says it.
+	UpgradeAnnounce *UpgradeAnnounce `json:"upgrade_announce,omitempty"`
 	// SigHiveID / SigSeq / SigSignedAt are authenticated by the detached
 	// hub->spoke heartbeat response signature. They bind the response to this
 	// hive and a monotonic sequence so signed responses cannot be replayed
@@ -2860,6 +2980,12 @@ type HeartbeatResponse struct {
 	SigVersion  int    `json:"sig_v,omitempty"`
 	// SelfExperimentFlag is authoritative: nil/absent withdraws any prior assignment.
 	SelfExperimentFlag *nous.SelfFlagAssignment `json:"self_experiment_flag,omitempty"`
+	// ActivityETag is the activity digest etag the hub acknowledged ("" =
+	// it holds none), decoded from hub.HeartbeatResponse.ActivityETag.
+	ActivityETag string `json:"activity_etag,omitempty"`
+	// ActivityEventsAck is the highest activity event sequence number the
+	// hub acknowledged, decoded from hub.HeartbeatResponse.ActivityEventsAck.
+	ActivityEventsAck uint64 `json:"activity_events_ack,omitempty"`
 }
 
 // HubBanner is a message from the hub admin displayed on spoke dashboards.
@@ -2968,6 +3094,10 @@ const (
 // UpgradePolicyCallback is called on every beat whose response carries an
 // UpgradePolicy. nil is never delivered.
 type UpgradePolicyCallback func(p *HeartbeatUpgradePolicy)
+
+// UpgradeAnnounceCallback is called on every beat whose response carries an
+// UpgradeAnnounce (#15788). nil is never delivered.
+type UpgradeAnnounceCallback func(a *UpgradeAnnounce)
 
 // taskPushInterval is how often the spoke pushes task status to the hub. A var
 // (not a const) so tests can drive a single push quickly; production keeps the

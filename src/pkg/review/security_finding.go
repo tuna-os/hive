@@ -87,17 +87,8 @@ func IsSecuritySensitiveFinding(r PerspectiveReport, sensitivePaths []string) (s
 	if class, risk := DecisionQuestionRiskClassFor(r.DecisionQuestion, r.PermissionsTighteningOnly); risk && securitySensitiveClasses[class] {
 		return class + " question from the " + string(r.Perspective) + " review", true
 	}
-	paths := sensitivePaths
-	if paths == nil {
-		paths = SecuritySensitivePaths(nil)
-	}
-	for _, f := range r.Findings {
-		if !InScopeFinding(f) {
-			continue
-		}
-		if file := strings.TrimSpace(f.File); file != "" && intent.PathMatchesAny(file, paths) {
-			return fmt.Sprintf("sensitive path %s: %s finding %q", file, r.Perspective, strings.TrimSpace(f.Title)), true
-		}
+	if finding, ok := sensitivePathFinding(r, sensitivePaths); ok {
+		return finding, true
 	}
 	for _, f := range r.Findings {
 		if !InScopeFinding(f) {
@@ -109,6 +100,24 @@ func IsSecuritySensitiveFinding(r PerspectiveReport, sensitivePaths []string) (s
 	}
 	if securityTermIn(r.Summary, r.PermissionsTighteningOnly) {
 		return "the " + string(r.Perspective) + " review flags insecure behaviour", true
+	}
+	return "", false
+}
+
+// sensitivePathFinding names r's first in-scope finding on a sensitive path
+// (nil paths means the defaults).
+func sensitivePathFinding(r PerspectiveReport, sensitivePaths []string) (string, bool) {
+	paths := sensitivePaths
+	if paths == nil {
+		paths = SecuritySensitivePaths(nil)
+	}
+	for _, f := range r.Findings {
+		if !InScopeFinding(f) {
+			continue
+		}
+		if file := strings.TrimSpace(f.File); file != "" && intent.PathMatchesAny(file, paths) {
+			return fmt.Sprintf("sensitive path %s: %s finding %q", file, r.Perspective, strings.TrimSpace(f.Title)), true
+		}
 	}
 	return "", false
 }
@@ -186,7 +195,9 @@ func contributorDecisionAdvisory(questions []string) string {
 // no security finding backs: to the fixer lane when the review left
 // something to fix (the clanker / adoption path is the mover), otherwise
 // to approve so the PR reaches the merge gate, where a person decides.
-// Either way nobody is asked while the PR is in CI/Review.
+// Approve needs every required perspective to have reported; short of that
+// the head is incomplete. Either way nobody is asked while the PR is in
+// CI/Review.
 func contributorHandsFreeAggregate(agg Aggregate, opts AggregateOptions, needsFix bool, maxFix int, advisory []string) Aggregate {
 	if needsFix {
 		if opts.FixAttempts >= maxFix {
@@ -204,9 +215,22 @@ func contributorHandsFreeAggregate(agg Aggregate, opts AggregateOptions, needsFi
 		agg.FixCycle = true
 		markRequiresHumanPerspectivesAsChangesRequested(&agg)
 	} else {
+		markRequiresHumanPerspectivesAsApprove(&agg)
+		if len(agg.Perspectives) < requiredPerspectiveCount(opts.MaxPerspectivesPerPR, opts.Perspectives.Len()) {
+			// An approve needs the coverage the all-approve path needs. A
+			// perspective that never reported (a dead kick, or a rate-
+			// limited security review the relay dropped, #16994) judged
+			// nothing, so the head is still under review: incomplete, and
+			// the planner asks for the missing perspectives.
+			agg.Verdict = VerdictIncomplete
+			agg.RequiresHuman = false
+			agg.DecisionRequested = false
+			agg.DecisionQuestion = ""
+			agg.Reasons = []string{incompleteCoverageReason(agg.Perspectives, opts)}
+			return agg
+		}
 		agg.Verdict = VerdictApprove
 		agg.MergeEligible = true
-		markRequiresHumanPerspectivesAsApprove(&agg)
 		agg.Reasons = nil
 	}
 	agg.RequiresHuman = false

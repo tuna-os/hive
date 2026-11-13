@@ -85,6 +85,38 @@ func parkedIssueLinkedPRs(repo FrontendRepo, repoName string, number int) []gith
 	return linked
 }
 
+// hiveClosingPRFor returns the first open or held pull request of repo,
+// authored by this hive's App, whose GitHub closing references name issue
+// number, or 0. A reference found only in the text (Refs, a mention) does
+// not count: it does not close the issue on merge.
+func hiveClosingPRFor(repo FrontendRepo, repoName string, number int) int {
+	return closingPRFor(repo, repoName, number, true)
+}
+
+// openClosingPRFor is hiveClosingPRFor for a pull request by any author: the
+// first open or held pull request of repo whose GitHub closing references
+// name issue number, or 0.
+func openClosingPRFor(repo FrontendRepo, repoName string, number int) int {
+	return closingPRFor(repo, repoName, number, false)
+}
+
+func closingPRFor(repo FrontendRepo, repoName string, number int, hiveOnly bool) int {
+	for _, rows := range [][]any{repo.OpenPrs, repo.HeldPrs} {
+		for _, raw := range rows {
+			entry, ok := frontendPullRequest(raw)
+			if !ok || (hiveOnly && !entry.pr.AppAuthored) {
+				continue
+			}
+			for _, closes := range entry.pr.LinkedIssues {
+				if closes.Number == number && closes.Via == "" && (closes.Repo == "" || strings.EqualFold(closes.Repo, repoName)) {
+					return entry.pr.Number
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // statusWithOverviewBands copies response containers, leaving the cached typed
 // items untouched for concurrent readers and the export endpoints.
 func (s *Server) statusWithOverviewBands(status *StatusPayload, now time.Time) *StatusPayload {
@@ -134,7 +166,7 @@ func (s *Server) statusWithOverviewBands(status *StatusPayload, now time.Time) *
 			issue.Repo = nonEmpty(issue.Repo, repoName)
 			info := IssueBand(issue, held, cfg, now, selfAuthorizationHoldActive)
 			if held {
-				info.HoldReason = heldReason(issue.Labels, false, status.HiveID)
+				info.HoldReason = heldReason(issue.Labels, false, status.HiveID, nil)
 			}
 			countSlice(out.OverviewBands.Issues, info.Band)
 			ownership := ownershipFor(decisions, ownershipKindIssue, issue.Number)
@@ -196,7 +228,7 @@ func (s *Server) statusWithOverviewBands(status *StatusPayload, now time.Time) *
 			slice := overviewPRChartSlice(entry.pr, entry.verdict, ownership, autoMergeLabel)
 			term := overviewPRTerm(ownership, held || len(holdLabels(entry.pr.Labels, status.HiveID)) > 0, entry.pr, entry.verdict, autoMergeLabel)
 			countSlice(slices.PRs, slice)
-			result = append(result, overviewStatusPR{FrontendPR{entry.pr, entry.verdict}, info, ownership, slice, term, criticalPathFor(paths, ownershipKindPR, entry.pr.Number)})
+			result = append(result, overviewStatusPR{entry.wire, info, ownership, slice, term, criticalPathFor(paths, ownershipKindPR, entry.pr.Number)})
 		}
 		return result
 	}
@@ -208,6 +240,11 @@ func (s *Server) statusWithOverviewBands(status *StatusPayload, now time.Time) *
 		repo.NonActionableIssues = nonActionable(repo.NonActionableIssues, *repo, repoName)
 		repo.OpenPrs = prs(repo.OpenPrs, false, repo.Ownership, repo.CriticalPath)
 		repo.HeldPrs = prs(repo.HeldPrs, true, repo.Ownership, repo.CriticalPath)
+		// Drafts are sidelined, not listed with the PRs above; count them in
+		// their band so the Draft band is not always 0.
+		for _, entry := range frontendRepoDraftPRs(*repo) {
+			countSlice(out.OverviewBands.PRs, prBand(entry.pr, nil, false, cfg, now, autoMergeLabel, status.HiveID).Band)
+		}
 	}
 	out.OverviewTotals = overviewTotals(status)
 	var fullCfg *config.Config

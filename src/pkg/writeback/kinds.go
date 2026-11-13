@@ -41,7 +41,11 @@ const (
 	// the stage engine writes on an item.
 	KindStageLabel Kind = "stage_label"
 	// KindNeedsDecisionComment is the `hive:stage-needs-decision` / 085
-	// park comment and label on an item a person must decide on.
+	// park comment and label on an item a person must decide on. The park
+	// re-check asks for its note under this kind and states when the hive
+	// itself applied the park (Item.HiveAppliedPark); the gate then skips
+	// the backfill guard and the opt-in label for that one write
+	// (ReasonHiveAppliedPark). Every other caller is gated as before.
 	KindNeedsDecisionComment Kind = "needs_decision_comment"
 	// KindSupersessionNotice is the supersession notice on a contributor PR
 	// whose claimed issue a merged PR already closed.
@@ -50,7 +54,9 @@ const (
 	// grace period.
 	KindSupersessionClose Kind = "supersession_close"
 	// KindDuplicateFixNotice is the `<!-- hive:duplicate-fix -->` comment on
-	// the later of two PRs fixing one issue.
+	// the later of two PRs fixing one issue, and the
+	// `<!-- hive:create-pr-duplicate-guard -->` note on an issue whose
+	// agent's PR the overlapping-files guard refused.
 	KindDuplicateFixNotice Kind = "duplicate_fix_notice"
 	// KindReporterTrustHold is the reporter-trust notice and needs-human
 	// label on a PR whose linked issue reporter is untrusted.
@@ -84,6 +90,33 @@ const (
 	KindIssueFile Kind = "issue_file"
 	// KindCIRerun re-runs a workflow or posts `/ok-to-test` on a PR.
 	KindCIRerun Kind = "ci_rerun"
+	// KindBaseRefresh merges the base branch into a red PR that is behind
+	// it, when every failing check on the PR is green on the base tip: the
+	// base has fixed what the PR's CI tripped on, and only a new head runs
+	// that check again. It pushes a merge commit and posts nothing.
+	KindBaseRefresh Kind = "base_refresh"
+	// KindBotRebaseRequest asks a dependency bot to rebase its own PR
+	// through the bot's own mechanism, once per PR head: it ticks Renovate's
+	// rebase/retry box in the PR description (editing only that line).
+	// Dependabot is never asked, because it refuses comment commands from a
+	// GitHub App. The bot then regenerates the branch;
+	// the hive never pushes to it. Used only on a PR whose bot has stopped
+	// rebasing (see cmd/hive/dependency_bot_rebase_request.go).
+	KindBotRebaseRequest Kind = "bot_rebase_request"
+	// KindHumanMergePathRelease removes the `hold` the hive itself set for
+	// auto_merge.human_merge_paths, and leaves one notice per head, once the
+	// PR's current head touches none of those paths (a dependency bot moved
+	// the file to another PR, a contributor dropped the change). A hold a
+	// person set, or one with another hold source, is never removed.
+	KindHumanMergePathRelease Kind = "human_merge_path_release"
+	// KindBlockedRepair turns a `blocked` label the hive itself applied, with
+	// nothing naming what the issue waits on, into a needs-human ask: it
+	// adds `needs-human`, removes `blocked` and posts one note saying what
+	// was missing and the two ways out. The caller states that the label is
+	// the hive's on the item (Item.HiveAppliedBlock); the gate then skips the
+	// backfill guard and the opt-in label for it (ReasonHiveAppliedBlock).
+	// A person's `blocked` is never repaired and never reaches the gate.
+	KindBlockedRepair Kind = "blocked_repair"
 )
 
 // KindPolicy is the per-kind rule. A write of this kind on an item the hive
@@ -140,6 +173,21 @@ func DefaultKinds() map[Kind]KindPolicy {
 		KindWelcomeComment:       {MinLevel: 5, RequireLabel: true, UnlabeledMinLevel: 6},
 		KindIssueFile:            {MinLevel: 3},
 		KindCIRerun:              {MinLevel: 6, RequireLabel: true},
+		KindBaseRefresh:          {MinLevel: 6, RequireLabel: true},
+		KindBotRebaseRequest:     {MinLevel: 6, RequireLabel: true},
+		// Same floor as the 085 park comment that told a maintainer the PR
+		// changes a human-merge path: wherever the hive could say so, it can
+		// take the hold back when that stops being true.
+		KindHumanMergePathRelease: {MinLevel: 5, RequireLabel: true},
+		// The label this kind repairs is put on by a contributor relay with
+		// a hub-minted task token: a write no ACMM level and no write-back
+		// kind gates, so a marker-less hive `blocked` can sit on an issue at
+		// any level. The floor is therefore the lowest level there is:
+		// wherever the hive's label could land, its repair can follow, and
+		// an unset level still refuses. RequireLabel governs only a call
+		// that does not state Item.HiveAppliedBlock (none does today), so a
+		// caller that forgets the fact is held like any other gated kind.
+		KindBlockedRepair: {MinLevel: 1, RequireLabel: true},
 	}
 }
 

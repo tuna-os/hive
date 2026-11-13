@@ -3,7 +3,8 @@
 The `triggers:` config key lets an operator declare CEL ([Common Expression
 Language](https://github.com/cel-expr/cel-spec)) rules that decide when an
 agent should be kicked for an incoming event — issue opened, issue labeled,
-PR opened, a comment posted, and so on — without writing code.
+PR opened, a comment posted, CI failing on a default branch, and so on —
+without writing code.
 
 ```yaml
 triggers:
@@ -56,16 +57,16 @@ The reachable fields, taken from the `cel:"..."` struct tags on
 | CEL field | Go type | Meaning |
 | --- | --- | --- |
 | `event.kind` | string | Event kind — see the `Kind*` constants below. |
-| `event.repo` | string | Fully-qualified repository, e.g. `"org/name"`. |
+| `event.repo` | string | Repository spelling from `project.repos`, e.g. `"name"` or `"org/name"`; use the configured spelling, not necessarily the qualified display label. |
 | `event.labels` | list of string | Labels on the issue/PR. |
-| `event.title` | string | Issue/PR title. |
+| `event.title` | string | Issue/PR title; for `ci.failed`, the check name. |
 | `event.author` | string | Login/handle of the actor that produced the event. |
 | `event.body` | string | Issue/PR/comment body. |
 | `event.is_draft` | bool | Whether a PR is a draft. |
-| `event.number` | int | Issue/PR number. |
-| `event.state` | string | Current state, e.g. `"open"`/`"closed"`. |
+| `event.number` | int | Issue/PR number; `0` for `ci.failed`. |
+| `event.state` | string | Current state, e.g. `"open"`/`"closed"`; for `ci.failed`, the conclusion (`"failure"` or `"timed_out"`). |
 | `event.base_branch` | string | Target branch for a PR. |
-| `event.head_branch` | string | Source branch for a PR. |
+| `event.head_branch` | string | Source branch for a PR; for `ci.failed`, the repository's default branch. |
 | `event.assignees` | list of string | Currently-assigned logins. |
 | `event.comment` | string | Body of the triggering comment (for `comment.created`). |
 
@@ -87,7 +88,119 @@ pr.ready_for_review
 pr.closed
 pr.merged
 comment.created
+ci.failed
 ```
+
+`issue.opened` and `pr.opened` are edge-triggered: the eval cycle emits them
+once per issue/PR (keyed `repo#number`) per hive process, the first time the
+item is enumerated, not on every cycle while it stays actionable. The seen-set
+is in memory, so a hive restart re-emits currently actionable items once.
+
+`ci.failed` is described in
+[Kick an agent when default-branch CI fails](#kick-an-agent-when-default-branch-ci-fails).
+
+### Run the scanner for newly seen GitHub issues
+
+Open **Settings → Features → Work intake & issue lifecycle → Event triggers**,
+or use the **Event triggers** button in **Agent → Configuration → Channels**.
+Owner access is required. Choose **Run scanner when an issue is first seen**,
+enter a rule name, select the existing scanner agent and **one managed
+repository**, then use **Save Event trigger**. No YAML editing is required.
+The repository picker displays qualified labels but saves the exact configured
+repository spelling used by evaluation; there is no all-repositories default.
+
+Existing rules can be edited with **Advanced CEL**, preserving their expression,
+order, target and priority unless explicitly changed. Higher priority sorts
+first; ties retain declaration order. There is no `enabled` field: remove a rule
+to stop its routing. These operations do not change unrelated settings or
+default governor behavior.
+
+The editor validates the complete rule list, including CEL compilation and a
+boolean result, before persistence. New or edited rules must name an existing
+agent. Save errors keep the draft visible; a revision conflict requires
+reloading the latest rules instead of overwriting another operator's changes.
+**Reload (discard draft)** explicitly discards the pending edit. This editor
+has its own save button; the dialog's **Save & close** does not save its draft.
+Successful saves are durable and apply on the **next event evaluation**, with
+no restart required; saving does not immediately kick an agent. Updating rules
+does not reset already-seen item history.
+
+Agent → Configuration → Channels is **not** a GitHub webhook installer.
+Only the governor `kick` channel has a supported runtime; the old `webhook`,
+`discord`, `schedule`, and `bead` channel runtimes were removed.
+For file-based configuration, the equivalent is a top-level rule in
+`hive.yaml` (keep existing rules):
+
+```yaml
+triggers:
+  - name: scanner-new-issue
+    expr: event.kind == "issue.opened" && event.repo == "org/repo"
+    agent: scanner
+```
+
+Replace `org/repo` with the exact spelling from `project.repos` and ensure the
+scanner is enabled. Normal pause, budget, and on-demand gates still apply.
+This means **first seen actionable issue**, not exclusively an issue created
+after the rule was installed: existing actionable issues match once, and
+restart replays them once as described above.
+
+For prompt delivery rather than waiting for reconciliation, use the existing
+signed GitHub webhook receiver and subscribe to `issues`:
+[operator setup](operator-reference.md#webhook-driven-pr-cache-invalidation).
+Hosted hives normally receive the GitHub App's signed deliveries through the
+hub relay; stand-alone hives use `POST /api/webhook/github`.
+The receiver requires `GITHUB_WEBHOOK_SECRET` and a matching HMAC signature.
+Saving a channel or adding a CEL rule neither registers a webhook nor
+configures its secret. Delivery wakes an early governor evaluation subject
+to debounce/minimum-gap pacing; it does not bypass agent execution gates.
+
+### Kick an agent when default-branch CI fails
+
+`ci.failed` lets an operator say "kick `ci-maintainer` when main goes red"
+instead of waiting for that agent's next cadence slot:
+
+```yaml
+triggers:
+  - name: main-red
+    expr: event.kind == "ci.failed"
+    agent: ci-maintainer
+```
+
+Add `&& event.repo == "org/repo"` (the `project.repos` spelling) to watch one
+repository, or `&& event.title == "build"` to watch one check.
+The dashboard's **Default-branch CI failed** preset writes the per-repository
+form.
+
+What fires it:
+
+- The source is the red-main sweep (`SweepRedMain`, `src/pkg/github/red_main.go`),
+  which already reads every active repository's default branch tip every
+  10 minutes. There is no separate poller and no webhook involved, so it
+  works on hives with webhooks off. Detection lags a failure by up to one
+  sweep interval. The sweep has no opt-in setting; like the other unstick
+  sweeps it is skipped only while the GitHub API budget is critical.
+- It fires when the newest completed run of a check on the default branch
+  tip concluded `failure` or `timed_out`. `cancelled`, `skipped`, `neutral`,
+  `action_required` and `stale` do not fire, and a check still running on
+  the tip waits for the next sweep. Every check counts, not only required
+  ones, so a post-merge build or publish job is covered.
+- Only runs whose check suite was created for the default branch count; a
+  pull request's run that happens to share the tip commit does not.
+- It is edge-triggered: once per repository, check name and head SHA. A
+  later push that fails again fires again; the same red SHA does not. The
+  seen-set is in memory, so a hive restart may fire once more for a SHA
+  that is still red.
+- Fields set: `event.kind` = `"ci.failed"`, `event.repo` (configured
+  spelling), `event.title` (check name), `event.head_branch` (default
+  branch), `event.state` (`"failure"` or `"timed_out"`), `event.number` =
+  `0`. The kick message names the check, the commit and the run URL.
+- Only rules whose expression contains the text `ci.failed` are evaluated
+  for it. An existing rule that never tests the kind, such as
+  `event.repo == "org/repo"`, keeps routing only issues and PRs. With no
+  rule naming `ci.failed`, the sweep makes no extra GitHub reads.
+- The usual gates still apply: the agent must exist, be enabled and not be
+  paused, and the governor must allow a kick (cadence pause, budget,
+  on-demand, kick channel).
 
 ### Available functions
 

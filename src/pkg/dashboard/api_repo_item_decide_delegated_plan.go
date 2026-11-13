@@ -6,14 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	gh "github.com/google/go-github/v72/github"
+
+	"github.com/hivecommons/hive/pkg/blocker"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/delegatedecision"
+	ghpkg "github.com/hivecommons/hive/pkg/github"
 )
 
 // The "Let hive decide" preview (hivecommons/hive#15126). The owner pressed
@@ -67,6 +73,14 @@ type delegatedDecisionPlan struct {
 	// then says so and the primary button re-runs it.
 	Prior *time.Time `json:"prior,omitempty"`
 	Notes []string   `json:"notes,omitempty"`
+	// Saw is every fact the decision rules read, for the dialog's "What
+	// hive saw"; RulePlain and Rationale are the rule that decided and its
+	// whole reason; WhyNot is the ladder's ruled-out options with the fact
+	// that ruled each out. All four sit under Details.
+	Saw       []delegatedecision.Fact   `json:"saw,omitempty"`
+	RulePlain string                    `json:"rule_plain,omitempty"`
+	Rationale string                    `json:"rationale,omitempty"`
+	WhyNot    []delegatedecision.WhyNot `json:"why_not,omitempty"`
 }
 
 // delegatedPlanAlternativeLabel is the preview's merge button: the
@@ -88,7 +102,7 @@ func (s *Server) handleRepoItemDecideDelegatedPlan(w http.ResponseWriter, r *htt
 		return
 	}
 	if s.deps == nil || s.deps.GHClient == nil || s.deps.GHClient.GoGitHub() == nil {
-		jsonError(w, "GitHub client not configured", http.StatusServiceUnavailable)
+		writeDelegatedPlanFailure(w, delegatedPlanFailureFor(errDelegatedPlanNoGitHub, repoFull, number, 0, 0, s.publicHiveName()))
 		return
 	}
 	var body delegatedDecisionRequest
@@ -106,12 +120,285 @@ func (s *Server) handleRepoItemDecideDelegatedPlan(w http.ResponseWriter, r *htt
 	if s.deps.Ctx != nil {
 		ctx = s.deps.Ctx
 	}
-	plan, err := s.planDelegatedDecision(ctx, repoFull, number, itemType, mergerRole, body)
-	if err != nil {
-		jsonError(w, err.Error(), http.StatusBadGateway)
-		return
+	// The plan gathers the item live from GitHub (2–6 s for a PR). A
+	// prefetch fired when the row's decision options are revealed and the
+	// click that follows share one answer for delegatedPlanCacheTTL
+	// (hivecommons/hive#15773).
+	start := time.Now()
+	key := delegatedPlanCacheKey(repoFull, number, itemType, mergerRole, body)
+	cache := "hit"
+	plan, ok := s.delegatedJobs.plans.get(key, start)
+	if !ok {
+		cache = "miss"
+		var err error
+		var attempts int
+		plan, attempts, err = s.planDelegatedDecisionWithRetry(ctx, repoFull, number, itemType, mergerRole, body)
+		if err != nil {
+			failure := delegatedPlanFailureFor(err, repoFull, number, attempts, time.Since(start), s.publicHiveName())
+			if s.logger != nil {
+				s.logger.Warn("decide-delegated plan failed", "repo", repoFull, "number", number, "type", itemType, "reason", failure.Reason, "attempts", attempts, "retryable", failure.Retryable, "status", failure.status, "duration_ms", time.Since(start).Milliseconds(), "error", err)
+			}
+			writeDelegatedPlanFailure(w, failure)
+			return
+		}
+		s.delegatedJobs.plans.put(key, plan, time.Now())
+	}
+	dur := time.Since(start)
+	w.Header().Add("Server-Timing", delegatedPlanServerTiming(cache, dur))
+	if s.logger != nil {
+		s.logger.Debug("decide-delegated plan", "repo", repoFull, "number", number, "type", itemType, "cache", cache, "prefetch", r.Header.Get(delegatedPlanPrefetchHeader) == "1", "duration_ms", dur.Milliseconds())
 	}
 	jsonResponse(w, plan)
+}
+
+const (
+	// delegatedPlanCacheTTL bounds how stale a served preview can be; the
+	// key carries the PR head, and recording a decision drops the entry.
+	delegatedPlanCacheTTL = 45 * time.Second
+	// delegatedPlanCacheMax caps the entries kept; the oldest goes first.
+	delegatedPlanCacheMax = 256
+	// delegatedPlanPrefetchHeader marks the SPA's prefetch (log only).
+	delegatedPlanPrefetchHeader = "X-Hive-Prefetch"
+	// delegatedPlanRetries is how many more times the plan re-reads the
+	// item after a transient GitHub failure (5xx, rate limit, timeout)
+	// before the preview gives up; delegatedPlanRetryBackoff is the pause
+	// before the first retry, doubled for the next. The plan is a handful
+	// of sequential GitHub reads and api.github.com answers one of them
+	// with an intermittent 500 often enough (check-runs on a 70-check head,
+	// observed live 2026-11-05) that a single attempt failed the preview
+	// for the owner several times a day.
+	delegatedPlanRetries      = 2
+	delegatedPlanRetryBackoff = 750 * time.Millisecond
+)
+
+// delegatedPlanRetrySleep is the retry pause; tests replace it.
+var delegatedPlanRetrySleep = func(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// planDelegatedDecisionWithRetry is planDelegatedDecision retried on a
+// transient GitHub failure. It returns the plan, how many attempts ran and
+// the last error.
+func (s *Server) planDelegatedDecisionWithRetry(ctx context.Context, repoFull string, number int, itemType string, mergerRole bool, req delegatedDecisionRequest) (*delegatedDecisionPlan, int, error) {
+	backoff := delegatedPlanRetryBackoff
+	for attempt := 1; ; attempt++ {
+		plan, err := s.planDelegatedDecision(ctx, repoFull, number, itemType, mergerRole, req)
+		if err == nil {
+			return plan, attempt, nil
+		}
+		if attempt > delegatedPlanRetries || !ghpkg.IsRetryableError(err) || delegatedPlanRateLimited(err) {
+			// A quota refusal lifts in minutes, not in the retry's seconds:
+			// answer 429 with the wait instead of burning attempts.
+			return nil, attempt, err
+		}
+		if s.logger != nil {
+			s.logger.Debug("decide-delegated plan: transient GitHub failure, retrying", "repo", repoFull, "number", number, "attempt", attempt, "error", err)
+		}
+		if serr := delegatedPlanRetrySleep(ctx, backoff); serr != nil {
+			return nil, attempt, err
+		}
+		backoff *= 2
+	}
+}
+
+// delegatedItemNotOpenError is gatherDelegatedInput's answer for an item
+// GitHub reports closed or merged: there is nothing to decide, and the
+// row the operator clicked is simply older than the merge.
+type delegatedItemNotOpenError struct {
+	Ref   string
+	State string
+}
+
+func (e *delegatedItemNotOpenError) Error() string { return e.Ref + " is not open" }
+
+// errDelegatedPlanNoGitHub is the plan's answer on a hive with no GitHub
+// client: it can neither preview nor decide.
+var errDelegatedPlanNoGitHub = errors.New("GitHub client not configured")
+
+// The plan's failure reasons, keyed off by the SPA's inline error
+// (tracker-actions.js stageTrackerDelegatePlanFailureLines).
+const (
+	delegatedPlanReasonNotOpen = "not-open"
+	delegatedPlanReasonGitHub  = "github"
+	delegatedPlanReasonConfig  = "config"
+	delegatedPlanReasonPlan    = "plan"
+)
+
+// delegatedPlanFailure is the wire shape of a failed POST
+// …/decide-delegated/plan: ok:false and error as every dashboard error
+// carries, plus what the SPA needs to say something actionable — which
+// hive answered, why it could not preview, whether Retry is worth
+// pressing, and how many GitHub attempts over how long it already made.
+//
+// Its status is never 502 or 503: the Ingress in front of a hosted hive
+// intercepts both (custom-http-errors "401,502,503", saas_provision.go)
+// and replaces this body with the generic "hive unavailable" page, which
+// is how a merged PR and an intermittent GitHub 500 both read as "the hive
+// is down" for weeks (the same trap as #16652's SSO 503). A failure the
+// operator can act on is a 4xx: 409 when the item is no longer open, 424
+// when a read the plan depends on (GitHub) failed or is not configured.
+type delegatedPlanFailure struct {
+	OK        bool   `json:"ok"`
+	Error     string `json:"error"`
+	Reason    string `json:"reason"`
+	Retryable bool   `json:"retryable"`
+	Attempts  int    `json:"attempts,omitempty"`
+	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
+	Hive      string `json:"hive,omitempty"`
+	Hint      string `json:"hint"`
+	status    int
+	// retryAfter is the Retry-After the answer carries when GitHub refused
+	// for quota (429): how long until the refusal lifts.
+	retryAfter time.Duration
+}
+
+// delegatedPlanRateLimited reports whether err is GitHub refusing for
+// quota (primary or secondary limit) or the hive's own pacer shedding the
+// request while one is in force.
+func delegatedPlanRateLimited(err error) bool {
+	_, limited := ghpkg.RateLimitRetryDelay(err, time.Now())
+	return limited || errors.Is(err, ghpkg.ErrPacingShed)
+}
+
+// writeDelegatedPlanFailure answers with the failure's status and body,
+// naming the wait on a quota refusal.
+func writeDelegatedPlanFailure(w http.ResponseWriter, failure delegatedPlanFailure) {
+	if failure.retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(failure.retryAfter.Seconds()))))
+	}
+	jsonStatusResponse(w, failure.status, failure)
+}
+
+// delegatedPlanFailureFor classifies a plan error into the response the
+// SPA renders. hive is the display name of the hive that answered.
+func delegatedPlanFailureFor(err error, repoFull string, number int, attempts int, elapsed time.Duration, hive string) delegatedPlanFailure {
+	ref := fmt.Sprintf("%s#%d", repoFull, number)
+	f := delegatedPlanFailure{Error: err.Error(), Reason: delegatedPlanReasonPlan, Attempts: attempts, ElapsedMS: elapsed.Milliseconds(), Hive: hive, status: http.StatusFailedDependency}
+	var notOpen *delegatedItemNotOpenError
+	switch {
+	case delegatedPlanRateLimited(err):
+		// Out of quota: 429 with when it lifts (delegatedGatherErrorStatus),
+		// never the 502 the hosted Ingress swaps for "hive unavailable"
+		// (projectbluefin, 2026-11-06: half an hour of unreadable previews).
+		f.status, f.Error, f.retryAfter = delegatedGatherErrorStatus(err, time.Now())
+		f.Reason = delegatedPlanReasonGitHub
+		f.Retryable = true
+		f.Hint = "GitHub is refusing this hive's requests for quota; the preview works again once the limit resets — Retry then."
+	case errors.As(err, &notOpen):
+		f.Reason = delegatedPlanReasonNotOpen
+		f.status = http.StatusConflict
+		state := notOpen.State
+		if state == "" {
+			state = "closed"
+		}
+		f.Hint = fmt.Sprintf("%s is %s on GitHub — it was merged or closed after this row loaded, so there is nothing left to decide. Refresh the activity monitor.", ref, state)
+	case errors.Is(err, errDelegatedPlanNoGitHub):
+		f.Reason = delegatedPlanReasonConfig
+		f.Hint = "This hive has no GitHub client configured, so it can neither preview nor record a decision. The hive operator needs to finish the GitHub App setup."
+	case ghpkg.IsRetryableError(err):
+		f.Reason = delegatedPlanReasonGitHub
+		f.Retryable = true
+		f.Hint = fmt.Sprintf("GitHub's API failed a read the preview needs on each of %d attempts over %.0fs; this is usually transient on GitHub's side — Retry.", attempts, elapsed.Seconds())
+	case isGitHubAPIError(err):
+		f.Reason = delegatedPlanReasonGitHub
+		f.Hint = fmt.Sprintf("GitHub refused a read the preview of %s needs. Check the hive's GitHub App access to %s.", ref, repoFull)
+	default:
+		f.Hint = "The hive could not build the preview from what GitHub returned; Retry once, then report it if it persists."
+		f.Retryable = true
+	}
+	return f
+}
+
+// isGitHubAPIError reports whether err wraps a GitHub API error response
+// of any status (the retryable 5xx/429 are classified first).
+func isGitHubAPIError(err error) bool {
+	var ghErr *gh.ErrorResponse
+	return errors.As(err, &ghErr)
+}
+
+// delegatedPlanServerTiming is the plan's Server-Timing metric: its
+// duration in milliseconds and whether the cache answered.
+func delegatedPlanServerTiming(cache string, d time.Duration) string {
+	return fmt.Sprintf("decide_plan;desc=%q;dur=%.1f", cache, float64(d.Microseconds())/1000)
+}
+
+// delegatedPlanCacheKey is (repo, number, type, head, request): every
+// input planDelegatedDecision reads from the request, plus the caller's
+// merge role (it decides the merge alternatives). Chosen and Force never
+// reach a plan.
+func delegatedPlanCacheKey(repo string, number int, itemType string, mergerRole bool, req delegatedDecisionRequest) string {
+	parts := []string{delegatedJobKey(repo, number), itemType, strings.TrimSpace(req.Head), strconv.FormatBool(mergerRole), req.Reason, req.Caption, req.SentinelReason}
+	for _, n := range req.PRs {
+		parts = append(parts, strconv.Itoa(n))
+	}
+	return strings.Join(parts, "\x00")
+}
+
+type delegatedPlanCacheEntry struct {
+	plan *delegatedDecisionPlan
+	at   time.Time
+}
+
+// delegatedPlanCache is the bounded, short-TTL cache of previews.
+type delegatedPlanCache struct {
+	mu      sync.Mutex
+	entries map[string]delegatedPlanCacheEntry
+}
+
+func (c *delegatedPlanCache) get(key string, now time.Time) (*delegatedDecisionPlan, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	if now.Sub(e.at) >= delegatedPlanCacheTTL {
+		delete(c.entries, key)
+		return nil, false
+	}
+	return e.plan, true
+}
+
+func (c *delegatedPlanCache) put(key string, plan *delegatedDecisionPlan, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]delegatedPlanCacheEntry)
+	}
+	for k, e := range c.entries {
+		if now.Sub(e.at) >= delegatedPlanCacheTTL {
+			delete(c.entries, k)
+		}
+	}
+	for len(c.entries) >= delegatedPlanCacheMax {
+		oldest, at := "", now
+		for k, e := range c.entries {
+			if oldest == "" || e.at.Before(at) {
+				oldest, at = k, e.at
+			}
+		}
+		delete(c.entries, oldest)
+	}
+	c.entries[key] = delegatedPlanCacheEntry{plan: plan, at: now}
+}
+
+// forget drops every cached preview of repo#number.
+func (c *delegatedPlanCache) forget(repo string, number int) {
+	prefix := delegatedJobKey(repo, number) + "\x00"
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.entries {
+		if strings.HasPrefix(k, prefix) {
+			delete(c.entries, k)
+		}
+	}
 }
 
 // planDelegatedDecision runs the same gather + decide as
@@ -122,7 +409,22 @@ func (s *Server) planDelegatedDecision(ctx context.Context, repoFull string, num
 	if err != nil {
 		return nil, err
 	}
-	plan := &delegatedDecisionPlan{Repo: repoFull, Number: number, Type: itemType, Title: strings.TrimSpace(in.Title)}
+	plan := &delegatedDecisionPlan{Repo: repoFull, Number: number, Type: itemType, Title: strings.TrimSpace(in.Title), Saw: in.Facts()}
+	if in.Kind == delegatedecision.KindIssue {
+		if b := s.delegatedBlocker(ctx, repoFull, number, s.delegatedCommentTexts(ctx, repoFull, number)); b != nil && blocker.Kind(b.Kind) == blocker.CapabilityWorkflowsPermission {
+			held := len(holdLabels(in.Labels, s.delegateHiveID())) > 0
+			if !held {
+				if lane, _ := s.workflowsHandoffState(ctx, repoFull, in.Labels); lane != "" {
+					plan.Would = string(delegatedecision.VerdictDirection)
+					plan.Rule = "workflows-handoff"
+					plan.Summary = "Hand the workflow change to `" + lane + "`."
+					plan.Why = "That lane can push workflow files in this repository."
+					plan.Consequences = []string{"Record the decision and unpark the issue.", "Route it to `" + lane + "` on the next scheduler pass."}
+					return plan, nil
+				}
+			}
+		}
+	}
 	var d delegatedecision.Decision
 	if out, ok := s.delegatedHumanMergeOutcome(repoFull, number, itemType, "", mergerRole, in, req); ok {
 		// The 090 shortcut: the plan is the shortcut's own answer, with
@@ -151,7 +453,8 @@ func (s *Server) planDelegatedDecision(ctx context.Context, repoFull string, num
 	}
 	plan.Summary, plan.Consequences = delegatedPlanWording(in, d)
 	plan.Why = delegatedPlanWhy(in, d)
-	plan.Ladder = d.Ladder
+	plan.RulePlain, plan.Rationale = delegatedPlanRule(in, d, plan.Why)
+	plan.Ladder, plan.WhyNot = d.Ladder, d.Ladder.WhyNot()
 	plan.MergeableAsIs = delegatedPlanMergeableAsIs(in, d)
 	if plan.Alternatives == nil {
 		plan.Alternatives = delegatedPlanAlternatives(in, d, mergerRole)
@@ -170,6 +473,23 @@ func (s *Server) planDelegatedDecision(ctx context.Context, repoFull string, num
 	}
 	plan.Alternatives = kept
 	return plan, nil
+}
+
+// delegatedPlanOptionName names the chosen option for the plan sentence.
+// A reporter-authored option (Option.Untrusted) names itself by label alone
+// in the recorded decision, but the owner still needs to see what they are
+// approving: its summary is shown as a quoted, one-line preview of the
+// issue's own words, never as hive's description of the option.
+func delegatedPlanOptionName(o delegatedecision.Option) string {
+	name := strings.TrimSuffix(o.Name(), ".")
+	if !o.Untrusted {
+		return name
+	}
+	s := strings.TrimSuffix(strings.Join(strings.Fields(o.Summary), " "), ".")
+	if s == "" {
+		return name
+	}
+	return name + " (the issue's words: “" + s + "”)"
 }
 
 // delegatedPlanWording is the one decision sentence and the (at most
@@ -204,6 +524,12 @@ func delegatedPlanWording(in delegatedecision.Input, d delegatedecision.Decision
 				"Hive opens its copy of " + ref + ", lets it soak, and merges it.",
 				ref + " is closed as superseded; the author keeps the credit.",
 			}
+	case d.Verdict == delegatedecision.VerdictApprove && in.Kind == delegatedecision.KindIssue && d.Option != nil:
+		// The issue offered a choice: the plan names the option, so
+		// approving never leaves the pick to the claiming agent
+		// (projectbluefin/utah#920).
+		return "Go with " + delegatedPlanOptionName(*d.Option) + " — the option " + ref + " recommends — and let the hive build it.",
+			[]string{"Hive records option " + d.Option.Label + " as the decision and removes the needs-decision hold.", "An agent claims " + ref + " on the next cycle and builds option " + d.Option.Label + "."}
 	case d.Verdict == delegatedecision.VerdictApprove && in.Kind == delegatedecision.KindIssue:
 		// An issue has no commit to approve and nothing to merge
 		// (hivecommons/hive#15754): approval is the direction, and an
@@ -225,7 +551,7 @@ func delegatedPlanWording(in delegatedecision.Input, d delegatedecision.Decision
 		return "Close " + ref + " as superseded by #" + strconv.Itoa(target) + ".", []string{ref + " is closed with a comment pointing at #" + strconv.Itoa(target) + "."}
 	case d.Verdict == delegatedecision.VerdictCloseDuplicate, d.Verdict == delegatedecision.VerdictCloseSuperseded:
 		return "Close " + ref + ".", []string{ref + " is closed with a comment saying why."}
-	case d.Verdict == delegatedecision.VerdictDirection && in.AdoptedByHive:
+	case d.Verdict == delegatedecision.VerdictDirection && in.AdoptedByHive && d.Rule == delegatedecision.RuleAdoptedFixer:
 		// The hive adopted the PR in place: it is the author now, so the
 		// instruction is its own fixer's, not the contributor's
 		// (hivecommons/hive#15722).
@@ -234,6 +560,13 @@ func delegatedPlanWording(in delegatedecision.Input, d delegatedecision.Decision
 	case d.Verdict == delegatedecision.VerdictDirection:
 		return "Send " + ref + " back to its author with one instruction: " + delegatedPlanInstruction(in, d) + ".",
 			[]string{"Hive posts that instruction on " + ref + ".", "The author pushes a fix; the row updates when it lands."}
+	case d.Verdict == delegatedecision.VerdictRefused && d.Rule == delegatedecision.RuleCompetingOptions:
+		labels := make([]string, 0, len(in.Options))
+		for _, o := range in.Options {
+			labels = append(labels, o.Label)
+		}
+		return fmt.Sprintf("Leave the choice to you: %s asks a person to choose between %d options (%s) and recommends none.", ref, len(in.Options), strings.Join(labels, ", ")),
+			[]string{"Nothing changes; " + ref + " stays waiting for you.", "Use Give direction to name the option the hive should build."}
 	case d.Verdict == delegatedecision.VerdictRefused:
 		return "Do nothing: " + delegatedPlanPlain(d.Rationale) + ".", []string{"Nothing changes; " + ref + " stays waiting for you."}
 	case d.Verdict == delegatedecision.VerdictOwnerOnly:
