@@ -774,9 +774,25 @@ func (c *Client) fetchPRs(ctx context.Context, repo string) (actionable []PullRe
 	return actionable, held, staleDrafts, totalPRs, nil
 }
 
-// EnrichCIStatus fetches check-run results for each PR's HEAD commit
-// and sets the CIStatus field to "success", "failure", or "pending".
-// The "tide" check is skipped — it reports Prow merge-bot state, not CI.
+// EnrichCIStatus fetches check-run AND commit-status results for each PR's
+// HEAD commit and sets the CIStatus field to "success", "failure", or
+// "pending". The "tide"/"enforce-guardrails"/deploy-preview family (see
+// isMetaCheck) is skipped on both sources — those are merge-gate or
+// deploy-status mirrors, not CI.
+//
+// It previously walked ONLY check runs, so a repo whose CI reports through
+// the legacy Statuses API (CircleCI, Jenkins, etc.) never surfaced here —
+// commitGreen (automerge_sweep.go) and EvaluateCommitCI (commit_ci.go, the
+// shared CI-evaluation core those use) always walk both sources, so the
+// dashboard could show "pending" on a commit automerge already considered
+// green. This walks commit statuses the same way check runs are walked,
+// with the same isMetaCheck filter, to close that gap.
+//
+// This intentionally does NOT delegate to EvaluateCommitCI: that core
+// additionally gates on a repo's REQUIRED-checks set (config or branch
+// protection), which is the right notion for "may this merge" but wrong for
+// "is anything red" — the dashboard must still flag a failing non-required
+// check (e.g. a failing CodeQL scan) that the merge gate is free to ignore.
 func (c *Client) EnrichCIStatus(ctx context.Context, prs []PullRequest) {
 	if c == nil {
 		return
@@ -803,39 +819,56 @@ func (c *Client) EnrichCIStatus(ctx context.Context, prs []PullRequest) {
 			prs[i].Mergeable = mergeableFromState(full.GetMergeableState(), full.Mergeable)
 		}
 
-		checkRuns, _, err := c.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, prs[i].HeadSHA, &gh.ListCheckRunsOptions{
-			ListOptions: gh.ListOptions{PerPage: 100},
-		})
-		if err != nil {
-			c.logger.Warn("failed to fetch check runs", "repo", prs[i].Repo, "pr", prs[i].Number, "error", err)
-			prs[i].CIStatus = ciStatusPending
-			continue
-		}
-		if checkRuns.GetTotal() == 0 {
-			prs[i].CIStatus = ciStatusPending
-			continue
-		}
 		hasFail := false
 		allDone := true
 		ciChecksFound := 0
 		var failingNames []string
 		var failingIDs []int64
-		for _, cr := range checkRuns.CheckRuns {
-			if isMetaCheck(cr.GetName()) {
-				continue
-			}
-			ciChecksFound++
-			if cr.GetStatus() != "completed" {
-				allDone = false
-				continue
-			}
-			conclusion := cr.GetConclusion()
-			if conclusion == "failure" || conclusion == "action_required" {
-				hasFail = true
-				failingNames = append(failingNames, cr.GetName())
-				failingIDs = append(failingIDs, cr.GetID())
+
+		checkRuns, _, err := c.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, prs[i].HeadSHA, &gh.ListCheckRunsOptions{
+			ListOptions: gh.ListOptions{PerPage: 100},
+		})
+		if err != nil {
+			c.logger.Warn("failed to fetch check runs", "repo", prs[i].Repo, "pr", prs[i].Number, "error", err)
+		} else {
+			for _, cr := range checkRuns.CheckRuns {
+				if isMetaCheck(cr.GetName()) {
+					continue
+				}
+				ciChecksFound++
+				if cr.GetStatus() != "completed" {
+					allDone = false
+					continue
+				}
+				conclusion := cr.GetConclusion()
+				if conclusion == "failure" || conclusion == "action_required" {
+					hasFail = true
+					failingNames = append(failingNames, cr.GetName())
+					failingIDs = append(failingIDs, cr.GetID())
+				}
 			}
 		}
+
+		combined, _, err := c.client.Repositories.GetCombinedStatus(ctx, owner, repoName, prs[i].HeadSHA, &gh.ListOptions{PerPage: 100})
+		if err != nil {
+			c.logger.Warn("failed to fetch commit statuses", "repo", prs[i].Repo, "pr", prs[i].Number, "error", err)
+		} else {
+			for _, s := range combined.Statuses {
+				if isMetaCheck(s.GetContext()) {
+					continue
+				}
+				ciChecksFound++
+				switch s.GetState() {
+				case "success":
+				case "pending":
+					allDone = false
+				default: // "failure", "error"
+					hasFail = true
+					failingNames = append(failingNames, s.GetContext())
+				}
+			}
+		}
+
 		if ciChecksFound == 0 {
 			prs[i].CIStatus = ciStatusPending
 			continue
