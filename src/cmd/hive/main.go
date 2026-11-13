@@ -7876,10 +7876,12 @@ func escalationRepo(cfg *config.Config, repo string) string {
 
 // repoWideFailingChecks identifies required checks whose failure is shared by
 // every PR in a repo for which CI has reached a conclusion. Requiring at least
-// two PRs and both an agent and a non-agent control keeps this conservative: a
-// check red only on hive changes remains attributable to those changes. A
-// shared failure, however, is base-branch or CI infrastructure evidence, not a
-// reason to spend an individual PR's fix budget or hand that PR to a human.
+// two PRs, a Hive-authored PR, and an independently human-authored control
+// keeps this conservative: bot or anonymous PRs cannot confirm a repository
+// outage, and a check red only on Hive changes remains attributable to those
+// changes. A shared failure, however, is base-branch or CI infrastructure
+// evidence, not a reason to spend an individual PR's fix budget or hand that
+// PR to a human.
 func repoWideFailingChecks(cfg *config.Config, actionable *github.ActionableResult) map[string]map[string]bool {
 	type repoEvidence struct {
 		conclusive      int
@@ -7917,7 +7919,7 @@ func repoWideFailingChecks(cfg *config.Config, actionable *github.ActionableResu
 		e.conclusive++
 		if isHiveAgentAuthor(cfg, pr.Author) {
 			e.hasAgentControl = true
-		} else {
+		} else if isIndependentCIControlAuthor(cfg, pr.Author) {
 			e.hasHumanControl = true
 		}
 	}
@@ -7992,6 +7994,14 @@ func isHiveAgentAuthor(cfg *config.Config, author string) bool {
 		return true
 	}
 	return strings.HasSuffix(author, "[bot]") && !dependencyBots[author]
+}
+
+// isIndependentCIControlAuthor reports whether author is a person outside the
+// Hive agent fleet. Anonymous observations and bot accounts, including the
+// dependency bots deliberately excluded by isHiveAgentAuthor, are not
+// independent human evidence of a repository-wide CI failure.
+func isIndependentCIControlAuthor(cfg *config.Config, author string) bool {
+	return author != "" && !isHiveAgentAuthor(cfg, author) && !strings.HasSuffix(author, "[bot]")
 }
 
 // recordRedStaleness updates the shared staleness clock (first-seen-red per red

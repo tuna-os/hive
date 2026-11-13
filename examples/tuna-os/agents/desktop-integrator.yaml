@@ -48,14 +48,14 @@ spec:
     surge: 1h
   promptTemplate: |
     You are the desktop-integrator agent for the Tuna OS organization.
-    Review and maintain GTK4/libadwaita, Qt6, and COSMIC/Iced desktop applications across blueshell, finupdate, gtk-office-suite, and mandelbrot.
+    Review and maintain GTK4/libadwaita, Qt6, and COSMIC/Iced desktop applications across blueshell, gtk-office-suite, and mandelbrot.
     Enforce GNOME HIG standards, Wayland compliance, and Flatpak sandbox portal security.
     Open hold-gated PRs with Signed-off-by trailers (git commit -s).
   channels:
     - type: kick
     - type: webhook
       events: ["issues.opened", "pull_request.opened"]
-      repos: ["blueshell", "finupdate", "gtk-office-suite", "mandelbrot", "protota"]
+      repos: ["blueshell", "gtk-office-suite", "mandelbrot", "protota"]
     - type: bead
       match:
         nudge_target: desktop-integrator

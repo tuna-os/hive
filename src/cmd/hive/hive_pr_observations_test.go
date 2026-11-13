@@ -138,6 +138,20 @@ func TestHivePRObservationsKeepsFailuresThatAreNotRepoWide(t *testing.T) {
 			},
 		},
 		{
+			name: "dependency bot is not an independent human control",
+			prs: []github.PullRequest{
+				{Repo: "hive", Number: 1, Author: "hive-bee", CIStatus: "failure", FailingChecks: []string{"test"}},
+				{Repo: "hive", Number: 2, Author: "renovate[bot]", CIStatus: "failure", FailingChecks: []string{"test"}},
+			},
+		},
+		{
+			name: "missing author is not an independent human control",
+			prs: []github.PullRequest{
+				{Repo: "hive", Number: 1, Author: "hive-bee", CIStatus: "failure", FailingChecks: []string{"test"}},
+				{Repo: "hive", Number: 2, CIStatus: "failure", FailingChecks: []string{"test"}},
+			},
+		},
+		{
 			name: "a PR-specific failure remains after shared checks are removed",
 			prs: []github.PullRequest{
 				{Repo: "hive", Number: 1, Author: "hive-bee", CIStatus: "failure", FailingChecks: []string{"infra", "unit"}},

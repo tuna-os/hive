@@ -1,0 +1,1 @@
+- Store the SaaS dashboard as an embedded HTML asset instead of a Go string literal.

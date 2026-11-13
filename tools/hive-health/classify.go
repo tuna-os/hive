@@ -262,6 +262,18 @@ func evaluate(raw Raw, prev *HiveReport, th Thresholds, now time.Time) HiveRepor
 	if c, ok := productionCheck(lastOut, hubNote, raw.Hub, th, now); ok {
 		h.add(c)
 	}
+
+	// 12. Model discovery, new models, and configured models the backend no
+	// longer offers (session tier: GET /api/config/backends). See models.go.
+	var modelAgents []StatusAgent
+	if st != nil {
+		modelAgents = st.Agents
+	}
+	census, mc := modelChecks(raw.Backends, raw.BackendsFetch, modelAgents, prev)
+	h.Models = census
+	for _, c := range mc {
+		h.add(c)
+	}
 	return h
 }
 

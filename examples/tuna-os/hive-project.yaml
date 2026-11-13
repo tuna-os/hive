@@ -12,7 +12,6 @@ project:
     - tuna-os/tunaos-packages
     - tuna-os/wootc
     - tuna-os/blueshell
-    - tuna-os/finupdate
     - tuna-os/corral
     - tuna-os/tromso
     - tuna-os/xfce-linux
