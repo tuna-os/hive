@@ -24,7 +24,7 @@ The Tuna OS Hive fleet manages 62 repositories covering immutable container OS i
  └──────┬───────┘        └──────┬───────┘        └──────┬───────┘
         │                       │                       │
         ▼                       ▼                       ▼
-  tunaOS, tromso,         tunaos-packages,        blueshell, finupdate,
+  tunaOS, tromso,         tunaos-packages,        blueshell,
   xfce-linux, remora      debian-copr, flatpak    gtk-office, mandelbrot
         │                       │                       │
  ┌──────┴───────┐        ┌──────┴───────┐        ┌──────┴───────┐
