@@ -25,7 +25,8 @@ It is a standalone Go module (standard library only) so it adds nothing to
 | `GET /api/health/deep` | public | readiness, GitHub auth, governor mode and queue, per-agent state / last kick / pause, stall detection, hub heartbeat |
 | `GET /api/contribute/status`, `/api/contribute/activity` | public | served build SHA, contributor activity |
 | `https://hub.tunaos.org/activity.json` | public | recent beads per agent, per-agent GitHub output (the "is it producing" signal) |
-| `GET /api/status` | **session** | per-agent cadence (so cadence-paused lanes are known, not guessed), `needsLogin`, watchdog conditions, `BLOCKED` evidence (crash loops), system alerts, held PRs, GitHub rate limit |
+| `GET /api/status` | **session** | per-agent cadence (so cadence-paused lanes are known, not guessed), `needsLogin`, watchdog conditions, `BLOCKED` evidence (crash loops), system alerts, held PRs, GitHub rate limit, per-agent backend and model |
+| `GET /api/config/backends` | **session** | what each CLI backend offers right now, from the Hive's own discovery (`src/pkg/dashboard/cli_models.go`) — the model checks below |
 
 The public tier is useful on its own: it catches an unreachable Hive, a dead
 governor, agents that stopped, stale kicks and a Hive that stopped producing.
@@ -43,7 +44,7 @@ Every Hive gets: `reachability`, `deep-health`, `governor`, `governor-kicks`
 (newest kick to any active agent), `backlog` (and `backlog-spike` against the
 previous run's report), `production` (newest output in the hub snapshot), and
 per-agent checks `agent/<name>/{state,kick,output,needs-login,blocked,not-ready}`.
-Session tier adds `alert/<id>` and `github-rate-limit`.
+Session tier adds `alert/<id>`, `github-rate-limit` and the model checks below.
 
 Deliberately-off agents are never evaluated: operator-paused, disabled in
 config, cadence `paused` in the current mode, or on-demand. Watchdog "alive
@@ -54,6 +55,41 @@ CronJobs) are `info`, not a failure.
 
 Thresholds live in `config.go` (`DefaultThresholds`) and can be overridden
 per run in `targets.json` under `"thresholds"`.
+
+### Model checks
+
+A Hive picks each agent's model from a table someone maintains by hand, and
+the refresher meant to keep it current needs a third-party benchmark API key.
+Without one it does nothing, quietly, so a newer model only ever enters
+rotation when a human notices ([#6](https://github.com/tuna-os/hive/issues/6)).
+The Hive already knows better than the table does, with no extra key: every
+CLI backend is asked what it offers. The session tier reads that list and
+reports — it never changes a model, and nothing here promotes one:
+
+- `model-discovery` — `warn` when a backend **agents actually run on** served
+  the Hive's built-in static list, which means that backend's discovery probe
+  failed (absent or expired CLI credentials). While that is true, no model
+  table built on it can be current, so the check must not read as a pass. A
+  backend no agent uses is not counted. `warn` when the endpoint itself
+  cannot be read; `pass` when discovery answered live.
+- `model-new` — `info`, the models offered now that were not at the previous
+  run, per backend. Reported only: a model that reads as an upgrade can
+  benchmark worse for agent work, so adoption stays an operator decision.
+- `model-drift/<agent>` — `warn` when an agent's configured model is absent
+  from its backend's live list on **two consecutive runs**, which is usually a
+  renamed or retired model id — caught here rather than at that agent's next
+  start. One sample is never enough: the Copilot models endpoint is
+  nondeterministic mid-rollout.
+
+Nothing is diffed against a list that proves nothing: a static fallback, an
+empty list, or the `vllm` / `llm-d` / `litellm` entries, which this endpoint
+serves without a fallback flag. Spelling drift is not drift — `claude-opus-4.6`
+matches `claude-opus-4-6`, and `gpt-5` matches `openai/gpt-5`.
+
+Each run's per-backend census is carried in the JSON report (`models`), which
+is what the next run diffs against. The probe asks for the list once per Hive
+per run; the Hive answers from a 30 s cache and does its own discovery, so a
+run costs at most one discovery sweep per Hive.
 
 ## The issue
 
@@ -100,8 +136,9 @@ only credential the Hive itself scopes to read-only (non-GET requests are
 refused for role `read`). **Never put `HIVE_DASHBOARD_TOKEN` in an Actions
 secret.**
 
-The probe only sends the cookie on `GET /api/status` to the configured host,
-refuses cross-host redirects, never reads the pane tail (`liveSummary`),
+The probe only sends the cookie on `GET /api/status` and
+`GET /api/config/backends` on the configured host, refuses cross-host
+redirects, never reads the pane tail (`liveSummary`),
 redacts everything it writes (report, summary, issues are all public), and
 scrubs the configured session value from every output.
 
@@ -112,3 +149,6 @@ kubectl -n hive exec deploy/hive -- curl -sS -H "X-Hive-Internal: $TOKEN" \
   http://127.0.0.1:3002/api/status > school-status.json
 go run . -only school -status-file school=school-status.json   # from tools/hive-health
 ```
+
+A status file carries no model catalog, so the model checks are skipped on
+that path.
