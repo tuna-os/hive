@@ -48,6 +48,14 @@ For each red check:
      a fix, plus `hold` when `hold` is true. It also comments on the culprit
      with a link.
 
+Both the confirming rerun and the held revert proposal consult the shared
+writeback gate under `ci_rerun`, using the culprit PR's author, labels and
+creation time. Operator-paused or writeback-off repositories stay untouched.
+For foreign PRs, the normal ACMM and review opt-in rules still apply; listing
+a repository under `revert_sheriff.repos` does not bypass them. The gate is
+checked again before proposing a revert, so disabling writes while a rerun is
+in flight prevents the proposal and its follow-up labels/comment.
+
 Every decision is written to the audit log as `revert-sheriff`, with
 `action=` one of:
 

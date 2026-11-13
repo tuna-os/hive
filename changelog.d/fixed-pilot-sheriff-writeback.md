@@ -1,0 +1,1 @@
+- The tuna fork's revert sheriff now honors the shared `ci_rerun` writeback policy before rerunning a failing job and again before opening a held revert, including operator pauses and per-repository write restrictions.
