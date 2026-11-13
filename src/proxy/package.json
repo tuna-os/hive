@@ -2,7 +2,7 @@
   "name": "hive-dashboard-proxy",
   "version": "2.0.0",
   "private": true,
-  "description": "Thin proxy: auth + static files \u2192 Go binary API",
+  "description": "Thin proxy: auth + static files → Go binary API",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "express": "^5.2.0",
-    "http-proxy-middleware": "^4.0.0"
+    "http-proxy-middleware": "^4.2.0"
   },
   "devDependencies": {
     "ws": "^8.21.3"
