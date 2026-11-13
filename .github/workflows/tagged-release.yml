@@ -163,13 +163,18 @@ jobs:
     # workflow_run: only a successful docker.yml build of a real v4 push (a
     # workflow_dispatch build is the scratch-branch gate dance this workflow
     # itself starts — releasing off it would be releasing off our own tail).
+    # The push and head-repository tests keep out fork pull requests: their
+    # docker.yml `gate` run succeeds, and head_branch is a name the fork
+    # picks, so `v4` alone would check out and run fork code with this
+    # workflow's write token (#11).
     # schedule/workflow_dispatch: the #5318 backstop, which has no triggering
     # run to qualify and instead resolves v4's current tip below.
     if: >-
       github.event_name != 'workflow_run' || (
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'v4' &&
-      github.event.workflow_run.event != 'workflow_dispatch' )
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'v4' )
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.derive.outputs.release }}
