@@ -13,6 +13,7 @@ import (
 
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/redmain"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // sheriffServer serves acme/widget: main is c3 -> c2 -> c1, "unit" red on c3
@@ -266,5 +267,39 @@ func TestRevertSheriffIgnoresUnwatchedAndGreenRepos(t *testing.T) {
 	c.ObserveRedMain("acme/widget", "main", nil, t0)
 	if events := sheriffSweep(t, c, config.RevertSheriffPropose, t0); len(events) != 0 || len(s.reruns) != 0 {
 		t.Fatalf("green main acted on: %+v", events)
+	}
+}
+
+func TestRevertSheriffWritebackOffPreventsRerun(t *testing.T) {
+	c, s, done := sheriffSetup(t)
+	defer done()
+	c.SetWritebackGate(writeback.New(writeback.Config{
+		PerRepo: map[string]writeback.RepoOverride{"acme/widget": {Mode: writeback.RepoModeOff}},
+	}, writeback.Deps{}, ""))
+	now := time.Date(2026, 10, 30, 11, 10, 0, 0, time.UTC)
+	ev := onlyAction(t, sheriffSweep(t, c, config.RevertSheriffPropose, now), "refused")
+	if !strings.Contains(ev.Reason, "off") {
+		t.Fatalf("missing operator-off refusal: %+v", ev)
+	}
+	if len(s.reruns) != 0 || len(s.graphql) != 0 || len(s.labels) != 0 || len(s.comments) != 0 {
+		t.Fatalf("writeback-off repo mutated: reruns=%v reverts=%v labels=%v comments=%v", s.reruns, s.graphql, s.labels, s.comments)
+	}
+}
+
+func TestRevertSheriffRechecksWritebackBeforeProposal(t *testing.T) {
+	c, s, done := sheriffSetup(t)
+	defer done()
+	now := time.Date(2026, 10, 30, 11, 10, 0, 0, time.UTC)
+	onlyAction(t, sheriffSweep(t, c, config.RevertSheriffPropose, now), "rerun")
+	s.setCulpritRun(23, "failure", now.Add(time.Minute).Format(time.RFC3339))
+	c.SetWritebackGate(writeback.New(writeback.Config{
+		PerRepo: map[string]writeback.RepoOverride{"acme/widget": {Mode: writeback.RepoModeOff}},
+	}, writeback.Deps{}, ""))
+	ev := onlyAction(t, sheriffSweep(t, c, config.RevertSheriffPropose, now.Add(10*time.Minute)), "refused")
+	if !strings.Contains(ev.Reason, "off") || len(s.reruns) != 1 {
+		t.Fatalf("changed policy not honored after confirmation: %+v, reruns=%v", ev, s.reruns)
+	}
+	if len(s.graphql) != 0 || len(s.labels) != 0 || len(s.comments) != 0 {
+		t.Fatalf("revert or follow-up written after operator disabled writeback: reverts=%v labels=%v comments=%v", s.graphql, s.labels, s.comments)
 	}
 }
