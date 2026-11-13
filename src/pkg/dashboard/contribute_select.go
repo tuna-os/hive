@@ -986,6 +986,9 @@ func (h *ContributeWSHub) selectTaskPass(c *ContributorConnection, skippedUnmint
 					h.logger.Info("[contribute-ws] claim skipped: open PR already linked",
 						"repo", repo.Full, "number", number,
 						"pr", decision.openPR.PRNumber, "pr_url", decision.openPR.PRURL, "pr_author", decision.openPR.PRAuthor)
+				case contributorAdmissionReasonOpenPRGuardRateLimited:
+					// Not logged per item: the client warns once per repo
+					// per rate-limit window, and every candidate shares it.
 				case contributorAdmissionReasonIssueClaim:
 					// #8380: someone claimed the issue on the issue itself; the
 					// claim expires on its own, so the log names when.

@@ -240,6 +240,26 @@ func withheldCases() []withheldCase {
 			},
 		},
 		{
+			// A rate-limited open-PR listing cannot rule out a linking PR,
+			// so the candidate is deferred to the reset, not dispatched.
+			name:   "open-PR guard rate-limited",
+			reason: contributorAdmissionReasonOpenPRGuardRateLimited,
+			arrange: func(t *testing.T, hub *ContributeWSHub, s *Server) {
+				s.deps.IssueClaimed = func(string, int) (ghpkg.IssueClaim, bool) { return ghpkg.IssueClaim{}, false }
+				s.deps.OpenPRLinkingIssue = func(repo string, number int, labels []string) (ghpkg.OpenPRLink, bool) {
+					if number == 601 {
+						return ghpkg.OpenPRLink{Issue: 601, RateLimitedUntil: time.Now().Add(30 * time.Minute)}, true
+					}
+					return ghpkg.OpenPRLink{}, false
+				}
+			},
+			evidence: func(t *testing.T, item AdmissionWithheldItem) {
+				if item.ClaimURL != "" || !strings.Contains(item.Detail, "deferred until") {
+					t.Errorf("claim_url = %q detail = %q; want no PR and the reset time", item.ClaimURL, item.Detail)
+				}
+			},
+		},
+		{
 			// #8003: chairlift#55 — fixed by merged #133 four days ago, still
 			// open, re-offered every 72h. Withheld under its own reason that
 			// asks the maintainer to close it, not as "an open PR claims it".

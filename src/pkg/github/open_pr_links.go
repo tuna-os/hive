@@ -37,6 +37,12 @@ const (
 	// issue an open PR already links: "open PR already linked: #14775".
 	ClaimBlockReasonOpenPRPrefix = "open PR already linked: #"
 
+	// ClaimBlockReasonOpenPRRateLimited is the IssueDispatchBlockReason while
+	// GitHub rate-limits the guard's open-PR listing: the guard cannot tell
+	// whether a PR already links the issue, so the dispatch is deferred until
+	// the limit resets rather than admitted blind.
+	ClaimBlockReasonOpenPRRateLimited = "open-PR guard deferred: GitHub rate limit"
+
 	// openPRLinkCacheTTL bounds how long one repo's open-PR listing answers
 	// the guard. A sweep (contributor selectTask pass, eval-cycle claim
 	// burst) finishes well inside it, so the listing is paid once per sweep;
@@ -48,7 +54,11 @@ const (
 	// openPRLinkFailureTTL is how long a failed listing answers the guard
 	// for its repo: a surge of claims fails open at once instead of each one
 	// re-running a listing that just timed out and re-logging the warning.
+	// It is also the backoff for a rate limit whose reset time is unknown.
 	openPRLinkFailureTTL = time.Minute
+	// openPRLinkRateLimitMaxBackoff caps how long a rate-limited listing
+	// answers the guard; GitHub's primary window resets within the hour.
+	openPRLinkRateLimitMaxBackoff = time.Hour
 )
 
 // errOpenPRListingBackedOff marks an error replayed from the failure cache.
@@ -59,8 +69,23 @@ type openPRLinkFailure struct {
 	until time.Time
 }
 
+// openPRListingRateLimitedError is a listing GitHub refused for its primary
+// or secondary rate limit. until is when the guard lists again: the limit's
+// reset (Rate.Reset / Retry-After), or openPRLinkFailureTTL when unknown.
+type openPRListingRateLimitedError struct {
+	until time.Time
+	err   error
+}
+
+func (e *openPRListingRateLimitedError) Error() string {
+	return fmt.Sprintf("open-PR listing rate-limited until %s: %v", e.until.UTC().Format(time.RFC3339), e.err)
+}
+
+func (e *openPRListingRateLimitedError) Unwrap() error { return e.err }
+
 // OpenPRLink is one open pull request that links an issue with a closing
-// keyword, as the guard found it.
+// keyword, as the guard found it — or, when RateLimitedUntil is set, the
+// guard's refusal for an issue it could not check (no PR fields are set).
 type OpenPRLink struct {
 	// Repo is the issue's repository in the configured spelling.
 	Repo string
@@ -74,7 +99,14 @@ type OpenPRLink struct {
 	// CreatedAt is when the PR was opened; with several open PRs linking
 	// one issue the earliest is reported.
 	CreatedAt time.Time
+	// RateLimitedUntil is non-zero when GitHub rate-limited the open-PR
+	// listing: no PR is known to link the issue, but the guard refuses the
+	// dispatch until this time rather than admitting it blind.
+	RateLimitedUntil time.Time
 }
+
+// RateLimited reports whether l is a rate-limit deferral rather than a PR.
+func (l OpenPRLink) RateLimited() bool { return !l.RateLimitedUntil.IsZero() }
 
 // openPRLinkIndex is one repo's open PRs indexed by the issue they close.
 type openPRLinkIndex struct {
@@ -91,7 +123,8 @@ type openPRLinkIndex struct {
 type openPRLinkCache struct {
 	mu    sync.Mutex
 	repos map[string]*openPRLinkIndex
-	// failures holds each repo's last listing failure for openPRLinkFailureTTL.
+	// failures holds each repo's last listing failure until its until:
+	// openPRLinkFailureTTL, or a rate limit's reset.
 	failures map[string]openPRLinkFailure
 	// disabled is scanner.skip_issues_with_open_pr: false.
 	disabled bool
@@ -154,6 +187,12 @@ func (c *Client) canonicalRepo(repo string) string {
 }
 
 // openPRIndexFor returns the (possibly cached) open-PR link index for repo.
+// A failed listing is remembered per canonical repo and replayed without a
+// GitHub call until it expires: openPRLinkFailureTTL for an ordinary
+// failure, the limit's reset for a rate limit (wrapped in
+// openPRListingRateLimitedError). go-github answers every call made under
+// an exhausted limit with a local RateLimitError, so without the replay each
+// claim candidate re-ran the listing and re-logged the failure.
 func (c *Client) openPRIndexFor(ctx context.Context, repo string) (*openPRLinkIndex, error) {
 	repo = c.canonicalRepo(repo)
 	cache := c.openPRLinks()
@@ -175,7 +214,13 @@ func (c *Client) openPRIndexFor(ctx context.Context, repo string) (*openPRLinkIn
 	prs, err := c.listOpenPRsForSupersessionSweep(listCtx, owner, repoName)
 	if err != nil {
 		cache.mu.Lock()
-		cache.failures[repo] = openPRLinkFailure{err: err, until: cache.now().Add(openPRLinkFailureTTL)}
+		failedAt := cache.now()
+		until := failedAt.Add(openPRLinkFailureTTL)
+		if isRateLimitErr(err) {
+			until = failedAt.Add(retryableGitHubDelay(err, failedAt, openPRLinkFailureTTL, openPRLinkFailureTTL, openPRLinkRateLimitMaxBackoff))
+			err = &openPRListingRateLimitedError{until: until, err: err}
+		}
+		cache.failures[repo] = openPRLinkFailure{err: err, until: until}
 		cache.mu.Unlock()
 		return nil, err
 	}
@@ -251,10 +296,19 @@ func (c *Client) OpenPRLinkingIssue(ctx context.Context, repo string, number int
 // the issue HasOpenPRLabel when it does not carry it yet (label created on
 // first use) and logs `claim skipped: open PR already linked`. ok is false
 // when the guard is off (scanner.skip_issues_with_open_pr: false), no open
-// PR links the issue, or the listing failed — a failure fails OPEN with a
-// warning: the ledger-backed guards downstream still stand, and a flaky
-// listing must not stall every claim in the hive. labels are the issue's
-// current labels as the caller read them (nil when unknown).
+// PR links the issue, or the listing failed for any reason but a rate
+// limit — such a failure fails OPEN with one warning per repo per backoff
+// window: the ledger-backed guards downstream still stand, and a flaky
+// listing must not stall every claim in the hive.
+//
+// A rate-limited listing fails CLOSED instead: ok is true and the link
+// carries only RateLimitedUntil (no PR fields, no label written). While the
+// installation's limit is exhausted the guard cannot see a PR that already
+// links the issue, and the work a dispatch starts needs the same exhausted
+// limit anyway, so deferring to the reset costs nothing; admitting handed
+// already-linked issues out again. The limit is warned about once per repo
+// per window. labels are the issue's current labels as the caller read them
+// (nil when unknown).
 func (c *Client) OpenPRLinkGuard(ctx context.Context, repo string, number int, labels []string) (OpenPRLink, bool) {
 	if c == nil || !c.SkipIssuesWithOpenPR() {
 		return OpenPRLink{}, false
@@ -262,7 +316,18 @@ func (c *Client) OpenPRLinkGuard(ctx context.Context, repo string, number int, l
 	link, ok, err := c.OpenPRLinkingIssue(ctx, repo, number)
 	if err != nil {
 		// A replayed failure was already warned about when it happened.
-		if c.logger != nil && !errors.Is(err, errOpenPRListingBackedOff) {
+		warn := c.logger != nil && !errors.Is(err, errOpenPRListingBackedOff)
+		var limited *openPRListingRateLimitedError
+		if errors.As(err, &limited) {
+			if warn {
+				c.logger.Warn("open-PR guard: open-PR listing rate-limited, deferring claims until the limit resets",
+					slog.String("repo", repo), slog.Int("issue", number),
+					slog.String("reason", "open-pr-listing-rate-limited"),
+					slog.Time("retry_at", limited.until), slog.String("error", err.Error()))
+			}
+			return OpenPRLink{Repo: c.canonicalRepo(repo), Issue: number, RateLimitedUntil: limited.until}, true
+		}
+		if warn {
 			reason := "open-pr-listing-failed"
 			if errors.Is(err, context.DeadlineExceeded) {
 				reason = "open-pr-listing-timeout"
@@ -286,11 +351,16 @@ func (c *Client) OpenPRLinkGuard(ctx context.Context, repo string, number int, l
 }
 
 // openPRLinkBlockReason is the IssueClaimBlockReason step for the guard:
-// the refusal reason for an issue an open PR already links, "" otherwise.
+// the refusal reason for an issue an open PR already links, or
+// ClaimBlockReasonOpenPRRateLimited while the listing is rate-limited; ""
+// otherwise.
 func (c *Client) openPRLinkBlockReason(ctx context.Context, repo string, number int, labels []string) string {
 	link, ok := c.OpenPRLinkGuard(ctx, repo, number, labels)
 	if !ok {
 		return ""
+	}
+	if link.RateLimited() {
+		return ClaimBlockReasonOpenPRRateLimited
 	}
 	return fmt.Sprintf("%s%d", ClaimBlockReasonOpenPRPrefix, link.PRNumber)
 }

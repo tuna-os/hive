@@ -261,7 +261,9 @@ type Dependencies struct {
 	// refreshed by the eval cycle, so a PR a person opened by hand stayed
 	// invisible to the contribute lane until the next scan and the issue was
 	// dispatched again in that window. labels are the issue's current labels
-	// so the label write is idempotent. Nil disables the live check; the
+	// so the label write is idempotent. ok with link.RateLimited() means
+	// GitHub rate-limited the listing and the candidate is deferred until
+	// link.RateLimitedUntil. Nil disables the live check; the
 	// client honours the scanner open-PR switch itself.
 	OpenPRLinkingIssue func(repo string, number int, labels []string) (ghpkg.OpenPRLink, bool)
 

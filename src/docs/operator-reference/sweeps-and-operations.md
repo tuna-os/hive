@@ -424,9 +424,15 @@ between. Two mechanisms close that gap
   already links this issue (claim skipped)* with the PR as evidence
   (reason `open_pr_linked`). A failed listing fails **open**: the
   ledger-backed guards still apply, and a flaky listing must not stall every
-  claim. The gate also refuses an issue the confirming read says is already
-  **closed** (`issue closed`), so an issue closed between enumerations is
-  never dispatched from the cached snapshot.
+  claim; the failure is remembered per repo for a minute, so the listing is
+  not retried and the warning not repeated per candidate. A **rate-limited**
+  listing fails **closed** instead: the guard cannot see an already-linked
+  PR, so every candidate in the repo is deferred until the limit resets
+  (dispatch reason `open-PR guard deferred: GitHub rate limit`, withheld
+  reason `open_pr_guard_rate_limited`), with no GitHub call and one
+  warning per repo until then. The gate also refuses an issue the
+  confirming read says is already **closed** (`issue closed`), so an issue
+  closed between enumerations is never dispatched from the cached snapshot.
 - **Webhook claim linking.** A `pull_request` delivery (opened, reopened,
   edited, synchronize, ready-for-review, draft, closed) is parsed with the
   same closing-keyword and branch-name grammar and written into the claim

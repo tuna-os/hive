@@ -100,7 +100,8 @@ type contributorAdmissionDecision struct {
 	reason   string
 	claim    ghpkg.IssueClaim
 	// openPR carries the live open PR behind an open_pr_linked refusal
-	// (hivecommons/hive#14799). Zero for every other reason.
+	// (hivecommons/hive#14799), or the reset time behind an
+	// open_pr_guard_rate_limited one. Zero for every other reason.
 	openPR ghpkg.OpenPRLink
 	// churn carries the pull-request history behind an issue_churn refusal
 	// (#7995): which PRs merged, which closed unmerged. Zero-valued for every
@@ -127,6 +128,11 @@ const (
 	// It is what open_pr_claim becomes once the ledger catches up; the
 	// distinct code tells an operator the guard, not the ledger, caught it.
 	contributorAdmissionReasonOpenPRLinked = "open_pr_linked"
+	// contributorAdmissionReasonOpenPRGuardRateLimited: GitHub rate-limited
+	// the guard's open-PR listing, so it cannot tell whether a PR already
+	// links this issue. The candidate is deferred until the limit resets
+	// rather than dispatched blind.
+	contributorAdmissionReasonOpenPRGuardRateLimited = "open_pr_guard_rate_limited"
 	// contributorAdmissionReasonIssueClaim: someone has claimed the issue on
 	// the issue itself — a `hive:claim` marker comment or an assignee — and
 	// the claim has not expired (hivecommons/hive#8380). It covers the window
@@ -215,8 +221,12 @@ func (h *ContributeWSHub) evaluateContributorNeutralAdmission(sweep *contributor
 	// a PR opened since is only visible on the forge. One listing per repo
 	// per sweep, cached by the client.
 	if link, ok := h.openPRLinkingIssue(candidate); ok {
+		reason := contributorAdmissionReasonOpenPRLinked
+		if link.RateLimited() {
+			reason = contributorAdmissionReasonOpenPRGuardRateLimited
+		}
 		return contributorAdmissionDecision{
-			reason: contributorAdmissionReasonOpenPRLinked,
+			reason: reason,
 			openPR: link,
 		}
 	}
@@ -333,8 +343,10 @@ func mergedReferenceClaim(c ghpkg.IssueClaim) bool {
 // openPRLinkingIssue asks the Dependencies.OpenPRLinkingIssue hook whether an
 // open PR already links the candidate (hivecommons/hive#14799). Repo
 // spellings are tried in the same order and for the same reason as
-// issueClaimedByOpenPR. No hook wired (tests, or a hive booted without
-// GitHub credentials) reports no link and selection proceeds as before.
+// issueClaimedByOpenPR; a rate-limit deferral on the first spelling answers
+// for both (one canonical listing backs them). No hook wired (tests, or a
+// hive booted without GitHub credentials) reports no link and selection
+// proceeds as before.
 func (h *ContributeWSHub) openPRLinkingIssue(candidate contributorAdmissionCandidate) (ghpkg.OpenPRLink, bool) {
 	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.OpenPRLinkingIssue == nil {
 		return ghpkg.OpenPRLink{}, false
