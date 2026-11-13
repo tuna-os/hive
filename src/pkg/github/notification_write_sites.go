@@ -95,6 +95,7 @@ var notificationWriteSites = map[string]NotificationWriteSite{
 	"github.(*Client).createIssue":                           {Class: NotificationClassAttention},
 	"github.(*Client).handleOneIssueRequestFrom":             {Class: NotificationClassAttention},
 	"github.(*Client).parkClankerRequestedPR":                {Class: NotificationClassAttention},
+	"github.(*Client).openRevertPR":                          {Class: NotificationClassAttention},
 	"github.(*Client).parkUnansweredNoPRIssue":               {Class: NotificationClassAttention},
 	"github.(*Client).redirectToExistingPR":                  {Class: NotificationClassAttention},
 	"github.(*Client).noteDuplicateGuardOnIssues":            {Class: NotificationClassAttention},
