@@ -138,6 +138,40 @@ hand:
 
 Add `--enable-linger` to fix that last one during the install rather than after.
 
+### Read the setup output
+
+The installer prints its mode, config and unit directories, then runs nine
+numbered steps. `PASS` means the step completed; `WARN` is non-blocking and
+must still be read; `FAIL` normally stops the install. Rootless lingering-off
+is reported separately: the deployment is healthy now, but reboot persistence
+is not verified and the exit code remains `0`.
+Preflight output is forwarded unchanged so its remediation remains the source
+of truth.
+
+Successful output ends with a `Hive is running` summary containing:
+
+- dashboard URL, config path, secrets path, and token file;
+- `hivectl` path, or a warning if the running image predates `hivectl`;
+- reboot persistence status (rootless lingering is called out explicitly);
+- update/rollback, teardown-plan, and full-guide pointers.
+
+The command does not create a separate installer log. Keep its terminal output;
+after a unit-state failure, use the printed service status and journal
+suggestions before rerunning.
+
+#### Exit codes and failure handling
+
+| Code | Meaning | Operator action |
+| ---: | --- | --- |
+| `0` | Install completed and the gateway health check passed. Rootless lingering may still be off; the summary says when reboot persistence is not verified. | Read every `WARN`, then edit the reported config or follow the printed remediation. |
+| `64` | Invalid options or incompatible runtime flags. | Rerun with `--rootless` or `--rootful` and valid options. |
+| `70` | Repository/unit assumption is broken. | Preserve output for maintainers; do not replace shipped units by hand. |
+| `78` | A preflight, configuration, unit, start, gateway, or requested lingering step failed. | Fix the named cause and rerun. |
+
+Failures print `FAILED at step`, leave partial state in place for inspection, and
+do not roll anything back. `--force` can replace the example config files on a
+later run, but it never overwrites `secrets/`.
+
 ### Or, by hand
 
 Worth reading even if you use the script: the comments below are where the traps
