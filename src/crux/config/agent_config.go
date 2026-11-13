@@ -1,114 +1,6 @@
 package config
 
-import (
-	"strings"
-	"time"
-)
-
-// Sandbox runtimes. SandboxRuntimePodman is the default when nothing is set.
-const (
-	SandboxRuntimePodman = "podman"
-	SandboxRuntimeJob    = "job"
-)
-
-// ValidSandboxRuntimes is the closed set a config may name.
-var ValidSandboxRuntimes = map[string]bool{SandboxRuntimePodman: true, SandboxRuntimeJob: true}
-
-// SandboxJobConfig is everything the Job runtime needs beyond the image
-// (#6311). The pod-template fields pass through to Kubernetes verbatim.
-//
-// The workspace is shared between hive and the Job by mounting the SAME
-// PersistentVolumeClaim in both: WorkspaceClaim names it, and
-// WorkspaceClaimMount is where hive sees it (default /data, where the
-// standalone and hub-provisioned deployments mount hive-data). The sandbox
-// workspace root must live under that mount. When the Job lands on a
-// different node than hive, the claim has to be ReadWriteMany.
-//
-// EnvFromSecrets is the ONLY credential path into the Job. Hive's brokered
-// GitHub token never enters it; hive pushes and opens the PR from the
-// workspace after the Job exits, exactly as it does for the Podman runtime.
-type SandboxJobConfig struct {
-	WorkspaceClaim      string                 `yaml:"workspace_claim,omitempty" json:"workspace_claim,omitempty"`
-	WorkspaceClaimMount string                 `yaml:"workspace_claim_mount,omitempty" json:"workspace_claim_mount,omitempty"`
-	NodeSelector        map[string]string      `yaml:"node_selector,omitempty" json:"node_selector,omitempty"`
-	Tolerations         []SandboxJobToleration `yaml:"tolerations,omitempty" json:"tolerations,omitempty"`
-	Resources           SandboxJobResources    `yaml:"resources,omitempty" json:"resources,omitempty"`
-	ServiceAccount      string                 `yaml:"service_account,omitempty" json:"service_account,omitempty"`
-	// SchedulerName sets the pod's schedulerName. Accelerator clusters often
-	// gate device-requesting pods behind a custom scheduler via an admission
-	// webhook (e.g. `A pod must use "schedulerName: spyre-scheduler"`);
-	// without this the Job create is denied before any pod exists.
-	SchedulerName  string             `yaml:"scheduler_name,omitempty" json:"scheduler_name,omitempty"`
-	EnvFromSecrets []string           `yaml:"env_from_secrets,omitempty" json:"env_from_secrets,omitempty"`
-	Volumes        []SandboxJobVolume `yaml:"volumes,omitempty" json:"volumes,omitempty"`
-	TTLSeconds     int                `yaml:"ttl_seconds,omitempty" json:"ttl_seconds,omitempty"`
-}
-
-// SandboxJobToleration mirrors the subset of a Kubernetes toleration an
-// operator writes by hand.
-type SandboxJobToleration struct {
-	Key      string `yaml:"key,omitempty" json:"key,omitempty"`
-	Operator string `yaml:"operator,omitempty" json:"operator,omitempty"`
-	Value    string `yaml:"value,omitempty" json:"value,omitempty"`
-	Effect   string `yaml:"effect,omitempty" json:"effect,omitempty"`
-}
-
-// SandboxJobResources mirrors Kubernetes resource requirements with string
-// quantities so a device limit (`<vendor>.com/<device>: "2"`) passes through.
-type SandboxJobResources struct {
-	Limits   map[string]string `yaml:"limits,omitempty" json:"limits,omitempty"`
-	Requests map[string]string `yaml:"requests,omitempty" json:"requests,omitempty"`
-}
-
-// SandboxJobVolume is an additional PVC mounted into the Job (a compile
-// cache, a model store).
-type SandboxJobVolume struct {
-	Name      string `yaml:"name,omitempty" json:"name,omitempty"`
-	Claim     string `yaml:"claim" json:"claim"`
-	MountPath string `yaml:"mount_path" json:"mount_path"`
-	ReadOnly  bool   `yaml:"read_only,omitempty" json:"read_only,omitempty"`
-}
-
-// SandboxRuntime returns the per-agent runtime override, then the global
-// runtime, then SandboxRuntimePodman. The value is returned as written; the
-// manager rejects one outside ValidSandboxRuntimes at kick time.
-func (a *AgentConfig) SandboxRuntime(global AgentSandboxConfig) string {
-	if a != nil && a.Sandbox != nil && strings.TrimSpace(a.Sandbox.Runtime) != "" {
-		return strings.TrimSpace(a.Sandbox.Runtime)
-	}
-	if strings.TrimSpace(global.Runtime) != "" {
-		return strings.TrimSpace(global.Runtime)
-	}
-	return SandboxRuntimePodman
-}
-
-// SandboxJob returns the effective Job runtime settings. A per-agent job
-// block replaces the global one wholesale for the pod-template fields (node
-// selector, tolerations, resources, secrets, volumes, service account) — an
-// agent that needs an accelerator names its own scheduling. The claim
-// fields and the TTL are cluster facts rather than per-agent choices, so
-// they fall back to the global block when the per-agent one leaves them
-// empty.
-func (a *AgentConfig) SandboxJob(global AgentSandboxConfig) SandboxJobConfig {
-	var g SandboxJobConfig
-	if global.Job != nil {
-		g = *global.Job
-	}
-	if a == nil || a.Sandbox == nil || a.Sandbox.Job == nil {
-		return g
-	}
-	out := *a.Sandbox.Job
-	if strings.TrimSpace(out.WorkspaceClaim) == "" {
-		out.WorkspaceClaim = g.WorkspaceClaim
-	}
-	if strings.TrimSpace(out.WorkspaceClaimMount) == "" {
-		out.WorkspaceClaimMount = g.WorkspaceClaimMount
-	}
-	if out.TTLSeconds == 0 {
-		out.TTLSeconds = g.TTLSeconds
-	}
-	return out
-}
+import "time"
 
 // AgentRuntimeConfig is the top-level hive.yaml surface owned by the agent
 // runtime (Crux, hivecommons/hive#13536, stage 1): the agent definitions,
@@ -135,6 +27,10 @@ type AgentRuntimeConfig struct {
 	// recycle policy (#14842). It is encoded under agents.session_recycle by
 	// Config's YAML hooks, like AgentsGitHubAPIHourlyCap.
 	AgentsSessionRecycle SessionRecycleConfig `yaml:"-" json:"-"`
+	// AgentsCLIMemory is the fleet default for the CLI persistent-memory
+	// policy (hivecommons/hive#17032), encoded under agents.cli_memory by
+	// Config's YAML hooks, like AgentsSessionRecycle.
+	AgentsCLIMemory CLIMemoryConfig `yaml:"-" json:"-"`
 	// Backends is the spoke-wide backend allow/deny list (#11310), enforced
 	// at pack apply and by PUT /api/config/agent/{name}/models.
 	Backends BackendsConfig `yaml:"backends,omitempty" json:"backends,omitempty"`
@@ -330,8 +226,12 @@ type AgentConfig struct {
 	// stamps the fleet block into nil pointers so the agent manager sees one
 	// resolved policy per agent.
 	SessionRecycle *SessionRecycleConfig `yaml:"session_recycle,omitempty" json:"session_recycle,omitempty"`
-	DisplayName    string                `yaml:"display_name" json:"display_name,omitempty"`
-	Description    string                `yaml:"description" json:"description,omitempty"`
+	// CLIMemory overrides the fleet agents.cli_memory policy for this agent
+	// (hivecommons/hive#17032). Nil inherits the fleet value, which
+	// EnabledAgents() stamps into nil pointers like SessionRecycle.
+	CLIMemory   *CLIMemoryConfig `yaml:"cli_memory,omitempty" json:"cli_memory,omitempty"`
+	DisplayName string           `yaml:"display_name" json:"display_name,omitempty"`
+	Description string           `yaml:"description" json:"description,omitempty"`
 	// Bob holds bob-backend-only per-agent options. Empty is default-off.
 	Bob AgentBobConfig `yaml:"bob,omitempty" json:"bob,omitempty"`
 	// BobDisplayName is the legacy flat spelling for Bob.SessionLabel. It is
@@ -442,6 +342,26 @@ type AgentConfig struct {
 	// src/docs/design/standby-contributors.md.
 	Standby *StandbyConfig `yaml:"standby,omitempty" json:"standby,omitempty"`
 
+	// ContributorFirst makes a connected contributor relay acting as this
+	// agent's role the lane's PRIMARY worker. While such a relay is connected
+	// (fresh heartbeat, not failure-paused) the governor withholds this
+	// agent's kicks — at the same gates that withhold them for an exhausted
+	// budget — so the hive's own inference budget is not spent on work a
+	// contributor is already covering. Standby (the block above) is the
+	// opposite order: it offers paused budget work to volunteers. Off is the
+	// zero value, and an absent key leaves every existing roster unchanged.
+	//
+	// The role must be one contributors may act as
+	// (hub.contribute_delegatable_roles, or the default scanner / quality /
+	// outreach), or the load fails: a contributor-first lane nobody may claim
+	// would sit inert forever.
+	ContributorFirst bool `yaml:"contributor_first,omitempty" json:"contributor_first,omitempty"`
+	// ContributorFirstGrace is how long kicks stay withheld after the last
+	// covering relay disappears, so a routine relay reconnect does not flap
+	// the resident agent. Absent means DefaultContributorFirstGrace (10m);
+	// negative is rejected at load.
+	ContributorFirstGrace time.Duration `yaml:"contributor_first_grace,omitempty" json:"contributor_first_grace,omitempty"`
+
 	// Channels declares how this agent gets triggered. "kick" is the governor
 	// runtime; "mention" is valid only alongside "kick". When nil/empty, the
 	// agent uses governor timer kicks by default (implicit kick channel).
@@ -513,6 +433,10 @@ type AgentSandboxConfig struct {
 	WorkspaceDir string            `yaml:"workspace_dir,omitempty" json:"workspace_dir,omitempty"`
 	Runtime      string            `yaml:"runtime,omitempty" json:"runtime,omitempty"`
 	Job          *SandboxJobConfig `yaml:"job,omitempty" json:"job,omitempty"`
+	// OpenShell holds the settings for sandbox.runtime: openshell (ADR-0026).
+	OpenShell *SandboxOpenShellConfig `yaml:"openshell,omitempty" json:"openshell,omitempty"`
+	// Substrate holds the settings for sandbox.runtime: substrate (ADR-0026 phase 2).
+	Substrate *SandboxSubstrateConfig `yaml:"substrate,omitempty" json:"substrate,omitempty"`
 	// Publish gates what a sandboxed run may publish; see SandboxPublishConfig.
 	Publish *SandboxPublishConfig `yaml:"publish,omitempty" json:"publish,omitempty"`
 }
@@ -526,14 +450,10 @@ type AgentSandboxConfig struct {
 // commits). A non-zero exit from any command withholds the push and the PR
 // and puts the command's output tail on the agent card.
 //
-// A kick template can declare the same list inline so the policy that asks
-// for a card-proven result also says how hive checks it:
-//
-//	<!-- hive:publish.verify
-//	uv run pytest --collect-only -q
-//	-->
-//
-// A template declaration replaces the configured list for that kick.
+// This config is the only source of verify commands. A
+// `<!-- hive:publish.verify … -->` block in a kick message is recognised and
+// logged but never run: the rendered message carries issue and PR titles and
+// other text the hive did not write.
 type SandboxPublishConfig struct {
 	Verify []string `yaml:"verify,omitempty" json:"verify,omitempty"`
 	// VerifyTimeoutS bounds each verify command. Non-positive uses the
@@ -555,6 +475,12 @@ type AgentSandboxOverride struct {
 	TimeoutS     int               `yaml:"timeout_s,omitempty" json:"timeout_s,omitempty"`
 	Runtime      string            `yaml:"runtime,omitempty" json:"runtime,omitempty"`
 	Job          *SandboxJobConfig `yaml:"job,omitempty" json:"job,omitempty"`
+	// OpenShell, when set, overrides the global openshell block field by
+	// field for this agent; see AgentConfig.SandboxOpenShell.
+	OpenShell *SandboxOpenShellConfig `yaml:"openshell,omitempty" json:"openshell,omitempty"`
+	// Substrate, when set, overrides the global substrate block field by
+	// field for this agent; see AgentConfig.SandboxSubstrate.
+	Substrate *SandboxSubstrateConfig `yaml:"substrate,omitempty" json:"substrate,omitempty"`
 	// Publish, when set, replaces the global publish preflight for this
 	// agent; an empty verify list here turns the preflight off for it.
 	Publish *SandboxPublishConfig `yaml:"publish,omitempty" json:"publish,omitempty"`

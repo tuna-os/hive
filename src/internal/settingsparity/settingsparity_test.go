@@ -97,6 +97,10 @@ func TestConfigLeaves(t *testing.T) {
 	}
 	want := []Leaf{
 		{Path: "agents.<key>.model", Type: "string"},
+		{Path: "agents.cli_memory.auto_memory", Type: "*bool"},
+		{Path: "agents.cli_memory.clear_on_kick", Type: "bool"},
+		{Path: "agents.cli_memory.drain_on_write", Type: "bool"},
+		{Path: "agents.cli_memory.drain_to_knowledge", Type: "bool"},
 		{Path: "agents.github_api_hourly_cap", Type: "int"},
 		{Path: "agents.session_recycle.enabled", Type: "*bool"},
 		{Path: "agents.session_recycle.max_age", Type: "time.Duration"},
@@ -159,6 +163,27 @@ func TestConfigLeavesRealRepo(t *testing.T) {
 	}
 }
 
+// github.attention is typed attention.Config (pkg/attention); its sub-keys
+// must be enumerated rather than collapsing into one opaque leaf.
+func TestConfigLeavesRealRepoEnumeratesAttention(t *testing.T) {
+	leaves, err := ConfigLeaves(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatalf("ConfigLeaves on the real repo: %v", err)
+	}
+	got := map[string]bool{}
+	for _, leaf := range leaves {
+		got[leaf.Path] = true
+	}
+	for _, want := range []string{"github.attention.admitter.<key>", "github.attention.flap_window", "github.attention.recipient_budget", "github.attention.digest_recipients[]"} {
+		if !got[want] {
+			t.Errorf("leaf %q must be enumerated", want)
+		}
+	}
+	if got["github.attention"] {
+		t.Error("github.attention must not be an opaque leaf")
+	}
+}
+
 func TestAllowlist(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "allow.txt")
 	writeFile(t, path, "# header comment\n\n  a.b  \nc.d # why it is allowed\n")
@@ -176,5 +201,61 @@ func TestAllowlist(t *testing.T) {
 
 	if _, err := Allowlist(filepath.Join(t.TempDir(), "missing.txt")); err == nil {
 		t.Fatal("want an error for a missing allowlist file")
+	}
+}
+
+// A field typed as another package's Config (config.Config.Writeback is a
+// writeback.Config) must resolve to that package's struct, not back to the
+// root Config by bare name — that collision recursed without bound.
+func TestConfigLeavesQualifiedTypeDoesNotCollideWithRootConfig(t *testing.T) {
+	root := fixtureRepo(t)
+	writeFile(t, filepath.Join(root, "src", "go.mod"), "module example.com/hive\n")
+	writeFile(t, filepath.Join(root, "src", "pkg", "config", "gate.go"), `package config
+
+import (
+	"time"
+
+	"example.com/hive/pkg/writeback"
+	tone "example.com/hive/pkg/dashboard/theme"
+)
+
+type Gate struct {
+	Writeback writeback.Config `+"`yaml:\"writeback\"`"+`
+	Tone      tone.Palette     `+"`yaml:\"tone\"`"+`
+	Clock     time.Duration    `+"`yaml:\"clock\"`"+`
+}
+`)
+	writeFile(t, filepath.Join(root, "src", "pkg", "writeback", "config.go"), `package writeback
+
+type Config struct {
+	Mode string `+"`yaml:\"mode\"`"+`
+}
+`)
+	// Point the fixture Config at Gate so the walk reaches the qualified types.
+	writeFile(t, filepath.Join(root, "src", "pkg", "config", "config.go"), `package config
+
+type Config struct {
+	Gate Gate `+"`yaml:\"gate\"`"+`
+}
+`)
+	leaves, err := ConfigLeaves(root)
+	if err != nil {
+		t.Fatalf("ConfigLeaves: %v", err)
+	}
+	got := map[string]string{}
+	for _, l := range leaves {
+		got[l.Path] = l.Type
+	}
+	for path, typ := range map[string]string{
+		"gate.writeback.mode": "string",
+		"gate.tone.primary":   "string",
+		"gate.clock":          "time.Duration",
+	} {
+		if got[path] != typ {
+			t.Errorf("leaf %q = %q, want %q (all: %v)", path, got[path], typ, leaves)
+		}
+	}
+	if _, ok := got["gate.writeback.gate"]; ok {
+		t.Fatal("writeback.Config resolved to the root Config and recursed")
 	}
 }

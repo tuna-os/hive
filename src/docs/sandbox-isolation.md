@@ -130,6 +130,17 @@ Hive logs an `agent sandbox posture` warning at boot and on every config reload 
 
 The second gate is deliberate rather than an oversight, and it is not safe to simply collapse. A sandboxed agent runs a different execution model — no tmux CLI at all, and every kick is a Podman run against the primary repo — and `startSandboxKickLocked` has **no fallback to the tmux path**: an agent opted in without a resolvable image fails every kick outright rather than degrading. Making the global flag sufficient would therefore convert working agents into permanently failing ones on any hive that set it without an image. Changing that default is a fleet-affecting decision that wants measurement, not a code-reading; the warning above is the part that is safe today.
 
+**Cline's provider capability is separate from the Git workspace.** Its bounded
+worker uses dedicated provider Secrets through existing `job.env_from_secrets`
+for Jobs, or an opaque, per-run selected-provider file mounted `ro,Z` outside
+the workspace for Podman. The latter requires an explicit absolute
+`HIVE_CLINE_CONFIG_DIR`; it does not grant arbitrary host mounts, share the full
+operator config, or change other engines' mounts. Private UID-owned tmpfs state,
+container teardown and staged-file revocation/cleanup are part of that scoped
+capability. GitHub credentials still never enter. No silent tmux fallback,
+expanded credential environment allowlist, or confinement bypass is provided.
+See [Cline sandbox setup](integrations/cline.md#disposable-sandbox-kicks).
+
 For sandboxed agents, a kick now follows this path:
 
 1. Hive prepares a per-kick host workspace under the sandbox workspace root by cloning/fetching the primary repo with hive-owned credentials before the sandbox starts. The clone URL and sandbox environment are sanitized so GitHub/token variables are not carried into the workspace or container.
@@ -137,7 +148,9 @@ For sandboxed agents, a kick now follows this path:
 3. The manager marks the agent busy while the sandbox runs and returns it to idle or failed when the timeout/completion path finishes. Because the agent sits in `idle` between kicks, dashboard health for sandboxed agents comes from the last-run record rather than the session check; see [Health and metrics](#health-and-metrics-for-sandboxed-agents).
 4. Hive collects the transcript at `.hive/sandbox-transcript.log` and any `agent-report*.json` artifact following `pkg/outputschema` conventions. The container's captured stdout/stderr is also archived as the kick's log under the kick-log directory (`<kick_log_dir>/<agent>/<kick-start>-sandbox.log`, same retention as tmux kick logs — see [Agent logging](agent-logging.md#per-kick-log-history)). That archive, not the workspace transcript, is what the card's "full log" / "log text" buttons and the 🕘 kick history serve for a sandboxed agent, because the workspace is swept after two hours and a Job's pod is gone as soon as it completes.
    **Publish gate.** Commits alone do not earn a PR. If the agent's report carries `"status": "failed"` or `"status": "blocked"`, or the sandbox exited non-zero, hive leaves the branch local, opens no PR, records the run as failed with the reason in `prWithheld` (shown on the card as "no PR opened: …"), and writes a `sandbox_pr_withheld` audit line naming the workspace, commit count and branch. The `status` field is optional; a report without one, or no report at all, does not block publishing, so agents that predate the field behave as before. Kick templates for sandboxed agents whose work must build or pass a smoke test before it is worth a PR should tell the agent to write `"status": "failed"` (with the failure in `summary`) instead of committing when that step fails.
-   **Publish preflight (`publish.verify`).** The report gate trusts the agent; the preflight is a determinism/regression check over the agent's own tree. When the run left commits and the gate above passed, hive runs each configured verify command — `sandbox.publish.verify` per agent, `agent_sandbox.publish.verify` globally, or a `<!-- hive:publish.verify … -->` HTML comment in the kick template (one shell command per line; a template block replaces the configured list for that kick) — as `sh -lc <cmd>` in a fresh container/Job of the same image, workspace, env allowlist and network mode, with `HIVE_CHANGED_FILES` and `HIVE_CHANGED_TESTS` (newline-separated paths from the run's commits, base..HEAD) and `HIVE_BASE_SHA` exported. The first non-zero exit, launcher error or timeout (`publish.verify_timeout_s`, default 900 s per command) withholds the push and the PR exactly like a failed report: `prWithheld` reads `verify failed (1/2): <cmd> (exit N)` followed by the command's output tail, the card shows the first line with the tail in its tooltip, and the kick log archive gets a `---- verify: <cmd> (exit N) ----` section with the full output. With no commits there is nothing to publish and the preflight is skipped; with no commands configured it is a no-op. Typical use is a whole-suite `pytest --collect-only -q` plus running the tests the agent added — the two checks that would have caught a test-file basename clash that broke collection for an entire repository ([torch-spyre/spyre-inference#1412](https://github.com/torch-spyre/spyre-inference/pull/1412)):
+   **Publish preflight (`publish.verify`).** The report gate trusts the agent; the preflight is a determinism/regression check over the agent's own tree. When the run left commits and the gate above passed, hive runs each configured verify command — `sandbox.publish.verify` per agent or `agent_sandbox.publish.verify` globally — as `sh -lc <cmd>` in a fresh container/Job of the same image, workspace, env allowlist and network mode, with `HIVE_CHANGED_FILES` and `HIVE_CHANGED_TESTS` (newline-separated paths from the run's commits, base..HEAD) and `HIVE_BASE_SHA` exported. The first non-zero exit, launcher error or timeout (`publish.verify_timeout_s`, default 900 s per command) withholds the push and the PR exactly like a failed report: `prWithheld` reads `verify failed (1/2): <cmd> (exit N)` followed by the command's output tail, the card shows the first line with the tail in its tooltip, and the kick log archive gets a `---- verify: <cmd> (exit N) ----` section with the full output. With no commits there is nothing to publish and the preflight is skipped; with no commands configured it is a no-op. Typical use is a whole-suite `pytest --collect-only -q` plus running the tests the agent added — the two checks that would have caught a test-file basename clash that broke collection for an entire repository ([torch-spyre/spyre-inference#1412](https://github.com/torch-spyre/spyre-inference/pull/1412)):
+   > **Note:** Config is the only source of verify commands. A `<!-- hive:publish.verify … -->` block in a kick message is logged and ignored: the rendered message interpolates issue and PR titles, knowledge facts and delegated prompts, and none of that text may pick the commands that run against the agent's tree before it is pushed.
+   >
    > **Note:** `publish.verify` runs the verify commands in the run's workspace at HEAD, so test-runner configuration the agent committed (conftest.py, pytest.ini, Makefile) is executed as-is. This is a determinism check, not an integrity gate; if stronger guarantees are needed, runner config can be reset to `HIVE_BASE_SHA` before verify in a future hardening.
 
    ```yaml
@@ -192,7 +205,9 @@ agents:
 
 **What the operator sees.** The kick shows on the agent card like any sandboxed kick, with the runtime named in the output buffer and the audit line. The pod log is the transcript — hive collects it before the Job is deleted and archives it as the kick log, so "full log" on the card and the kick history keep working after the Job is gone — the container exit code is the sandbox exit code, and the kick timeout deletes a Job that is still running. A Job that **failed** is left in place until `ttl_seconds` (default one hour) so `kubectl describe job` and `kubectl logs` still work; a completed Job is deleted at once. Jobs carry the label `app.kubernetes.io/managed-by=hive-kubejob`.
 
-**RBAC.** The spoke's ServiceAccount needs a Role for `batch/jobs` (create, get, list, delete) and `pods` plus `pods/log` (get, list). The standalone kustomize base ships it as `sandbox-job-rbac.yaml`, and the hub provisioner grants it to every hosted spoke as `hive-sandbox-jobs`.
+**The terminal pane.** A job-runtime agent has no tmux session in the hive pod, so the dashboard's ▶ terminal does not attach ttyd for it. Instead it opens `/terminal/job/<agent>`, a read-only viewer that streams the newest Job pod's log through the same in-cluster client and RBAC the launcher already uses ([#14798](https://github.com/hivecommons/hive/issues/14798)): it follows the pod while the kick runs (waiting while the pod is `Pending`, e.g. for an accelerator node), prints the container exit code when it ends, and between kicks, when the completed Job has already been deleted, shows the last run's persisted transcript (`<workspace>/.hive/sandbox-transcript.log`, which now ends with an `exit code: N` line) or a clear "no sandbox run yet" state. The pane is observation only; there is no input path into the Job. The same terminal handoff and role check as the tmux pane apply.
+
+**RBAC.** The spoke's ServiceAccount needs a Role for `batch/jobs` (create, get, list, delete) and `pods` plus `pods/log` (get, list); the terminal viewer needs nothing beyond that same `pods/log` grant. The standalone kustomize base ships it as `sandbox-job-rbac.yaml`, and the hub provisioner grants it to every hosted spoke as `hive-sandbox-jobs`.
 
 Hive warns at boot and on reload (`config.AgentSandboxGateWarnings`) when a job-runtime agent resolves no `workspace_claim` or names a runtime hive does not have, and refuses the kick with the same message rather than failing it after the agent is marked running.
 
@@ -227,6 +242,97 @@ The relay touches the spool only through an `os.Root` opened at the workspace. A
 
 Out of scope: the quality and deps lanes are unchanged, and nothing inside a Job writes to GitHub directly.
 
+## Running sandboxed kicks in an OpenShell sandbox
+
+`sandbox.runtime: openshell` runs an agent's sandboxed kicks in an [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandbox instead of a Podman container or a plain Kubernetes Job ([ADR-0026](adr/0026-sandbox-runtime-selection.md), epic [#17642](https://github.com/hivecommons/hive/issues/17642)). OpenShell adds what the other two runtimes lack: the workload runs with no capabilities under Landlock and seccomp mediation, and **egress is default-deny** — every outbound connection goes through the gateway's proxy and is checked against a per-binary policy. Phase 1 is opt-in; nothing changes for a hive that does not select it.
+
+Everything above about the kick path still holds. Hive prepares the workspace on its own data PVC, writes the prompt, and after the sandbox exits reads the commits back and hands them to the push broker and PR path. Only step 2 changes: the launcher is `sandbox.OpenShellLauncher`, which talks to an OpenShell **gateway** over gRPC (`github.com/ai-openshell/sdk-go` v0.1.8); the gateway owns the sandbox pod.
+
+```yaml
+agent_sandbox:
+  enabled: true
+  runtime: openshell
+  openshell:
+    gateway_url: https://openshell-gateway.openshell.svc:8443   # host:port or http(s)://
+    namespace: hive                   # the OpenShell workspace (their term), default "default"
+    token_env: OPENSHELL_TOKEN        # env var holding the gateway bearer token; never the token itself
+    workspace_claim: hive-data        # the PVC hive's /data lives on
+    workspace_claim_mount: /data      # where hive sees it (default)
+    allow_hosts: [litellm.example.com, hub.hivecommons.dev]   # on top of github.com / api.github.com
+    timeout_s: 1800                   # bounds one sandbox from create to delete
+agents:
+  deps:
+    sandbox:
+      enabled: true
+      image: registry.example/project-dev@sha256:…   # digest-pinned
+      openshell:
+        node_selector: { kernel: "6.12" }
+        tolerations:
+          - { key: sandbox, operator: Exists, effect: NoSchedule }
+        binaries: [/usr/bin/git, /usr/lib/git-core/git-remote-https, /usr/local/bin/node]
+```
+
+The gateway, workspace, token, TLS and claim fields are cluster facts and fall back from the per-agent block to the global one; `allow_hosts`, `binaries`, `node_selector`, `tolerations` and `runtime_class_name` are per-agent choices and replace the global values when set.
+
+**Workspace transport is the shared claim again, not a copy.** The SDK's file transfer is single-file and not available on every gateway, so the OpenShell runtime mounts `workspace_claim` at a `sub_path` pointing at the per-kick workspace, at the same `/workspace` mount the other launchers use, through the gateway's Kubernetes driver config. That needs two things on the cluster side: the gateway setting `allow_driver_config = true`, and the claim labelled `openshell.ai/sandbox-attachable: "true"` and `openshell.ai/sandbox-attachable-workspace: "<namespace>"`. The same ReadWriteMany caveat as the Job runtime applies when the sandbox lands on another node, and `agent_sandbox.workspace_dir` must live under `workspace_claim_mount`.
+
+**The egress policy.** Hive derives an OpenShell network policy from the hosts its own proxy brokers for a Podman sandbox: `github.com` read-write (git's fetch-pack is a `POST` even when it only reads) and `api.github.com` **read-only** — a sandbox that somehow obtained a token still could not mutate through the API — plus whatever `allow_hosts` names, as `host` (443) or `host:port`. URLs, userinfo, wildcards and anything but a literal host name are rejected, and a unit-level prover renders the policy for the shipped examples to keep it that way. Everything else is unreachable, including a raw TCP connect to an arbitrary IP. OpenShell matches rules per **real binary path** and allows nothing for an unlisted binary, so the policy is attached to a default set (`git`, `git-remote-https`, `curl`, `node`, `python3`, `crux` at their usual paths) that `binaries` overrides when an image puts them elsewhere; a denied connection shows the path OpenShell identified in the sandbox log. `network_mode: none` drops every rule. `policy_profile` is recorded on the sandbox as the annotation `hive.dev/policy-profile` for gateway admission to act on; the SDK has no create-time profile selection.
+
+**The credential boundary.** Same rule as the Job runtime: environment variables from the allowlist are copied in with the same credential-name filter, hive's brokered GitHub token never enters the sandbox, and hive pushes and opens the PR from the returned workspace. There is **no** Secret-reference path into the sandbox in phase 1, so model credentials have to arrive through an allowlisted non-credential variable pointing at a routable gateway named in `allow_hosts`. The Cline backend, which needs a provider file or Secret, is refused on this runtime.
+
+**Lifecycle.** The sandbox is named `hk-<agent>-<unix, base36>` (at most 19 characters, the gateway's limit for DNS-routable names) and labelled `app.kubernetes.io/managed-by=hive-openshell`. Hive waits for it to become ready, runs the kick command with the sanitized environment in `/workspace`, collects stdout, stderr and the exit code (capped at 16 MiB), and deletes the sandbox — on success, on failure, and on the kick timeout, in which case the kick ends with exit code `-1` and `context deadline exceeded`, exactly like a timed-out Job. Cleanup runs on a fresh, bounded context when the kick's own has expired, so a finished sandbox is not left behind because the deadline fired during log collection.
+
+**What hive checks, and what it cannot.** Hive warns at boot and on reload (`config.AgentSandboxGateWarnings`) when an openshell-runtime agent resolves no `gateway_url` or no `workspace_claim`, and refuses the kick with the same message before the agent is marked running. It also preflights each distinct gateway (`Health().Check` and `Config().GetGateway`, read-only, cached for five minutes, bounded to 30 s) and adds a warning when the gateway is unreachable or unhealthy, `allow_driver_config` is not enabled, or telemetry is on. It cannot see the node kernel, the CNI or the claim's labels from inside its pod; those remain the operator prerequisites in [deploy/openshell.md](../deploy/openshell.md).
+
+**The terminal pane.** An openshell-runtime agent has no tmux session either, so its ▶ terminal opens the same read-only `/terminal/job/<agent>` viewer as a job-runtime agent, behind the same handoff and role check ([#17645](https://github.com/hivecommons/hive/issues/17645)). While a kick runs it follows the newest live `hk-<agent>-<unix, base36>` sandbox's gateway log (`GetLogs`, polled at up to the gateway's 2,000-line buffer per read, scrubbed of token-shaped values like the pod log); between kicks, once the launcher has deleted the sandbox, or when the gateway cannot be listed, it shows the last persisted transcript exactly as the job viewer does. The live view is weaker than the job pod log, and the pane says so: the gateway log carries the sandbox's supervisor, policy (OCSF) and tracing events — the network and filesystem decisions made around the kick — not the kick's stdout, because the kick runs as an exec session and [exec output reaches neither the gateway log nor the container log](https://docs.nvidia.com/openshell/observability/accessing-logs). Likewise the exit code the gateway reports on the sandbox is its main process's, not the kick's; the launcher takes the kick's exit code from the exec result and deletes the sandbox at once. So the pane ends by saying the kick has finished and that its output and exit code are in the transcript, which it shows on the next open. The dashboard reaches the gateway with the agent's own `gateway_url`, `namespace`, `token_env` and `insecure_tls`.
+
+**How to verify.** With a gateway reachable and the claim attachable, run the env-gated integration test from a pod that has the claim mounted: `OPENSHELL_GATEWAY_URL=… OPENSHELL_WORKSPACE_CLAIM=hive-data OPENSHELL_IMAGE=<digest-pinned> go test ./crux/sandbox -run TestOpenShellIntegration -v`. It writes a file through `/workspace`, reads it back on the hive side, and logs the round-trip latency. Then run a kick and confirm in the sandbox log that a `POST` to `api.github.com` is denied while `git fetch` succeeds — that denial is the whole point of the runtime.
+
+**Limitations (phase 1).** Kubernetes driver only (no Podman-driver path for standalone hosts yet); no Secret references into the sandbox; `policy_profile` is advisory; kernel and claim-label prerequisites are not preflighted; latency and image size are not yet measured ([#17643](https://github.com/hivecommons/hive/issues/17643)).
+
+## Running sandboxed kicks in a Substrate actor
+
+`sandbox.runtime: substrate` runs an agent's sandboxed kicks as an [Agent Substrate](https://github.com/agent-substrate/substrate) **actor** ([ADR-0026 phase 2](adr/0026-sandbox-runtime-selection.md#implementation-notes-phase-2-agent-substrate), epic [#17695](https://github.com/hivecommons/hive/issues/17695)). Substrate is a CNCF Sandbox project donated by Google: a `WorkerPool` of pods runs workloads under gVisor (`runsc`) or in a KVM microVM, every actor gets a SPIFFE identity, and all egress leaves through `atenet-router` under an `EgressPolicy`. It is the fourth runtime and, like OpenShell, opt-in; nothing changes for a hive that does not select it.
+
+Everything above about the kick path still holds; only step 2 changes. The launcher is `sandbox.SubstrateLauncher`, which talks to Substrate's gRPC **Control API** (`ate.control.v1`) with a trimmed, wire-compatible client generated in-repo (`crux/sandbox/substrateapi`; the upstream Go module needs a newer Go than hive builds with).
+
+```yaml
+agent_sandbox:
+  runtime: substrate
+  substrate:
+    endpoint: api.ate-system.svc:443       # Control API, host:port or https://
+    atespace: hive                          # Substrate's tenancy unit, default "default"
+    token_env: ATE_TOKEN                    # bearer token env var (or token_file for a projected SA token)
+    ca_file: /var/run/ate/ca.crt            # Control API CA; insecure_tls: true only for a lab
+    router_url: https://atenet-router.ate-system.svc:8444
+    router_client_bundle: /var/run/ate/credential-bundle.pem   # hive's own mTLS client identity
+    router_ca_file: /var/run/ate/router-ca.crt
+    image: ghcr.io/hivecommons/crux-sandbox@sha256:…   # digest-pinned; tags are refused
+    cpu_millicores: 2000
+    memory_bytes: 4294967296
+    worker_selector: {ate.dev/sandboxClass: gvisor}   # pick the pool (gvisor | microvm)
+    snapshot_on_idle: false
+    allow_hosts: [models.example.com, hub.example.com:8443]
+    timeout_s: 1800
+agents:
+  reviewer:
+    sandbox:
+      substrate:
+        snapshot_on_idle: true   # per-agent overrides merge onto the global block
+```
+
+**One actor per kick.** Hive creates an `ActorTemplate` (one container running the bridge command, the workspace as a `durableDir`, the operator's limits and `worker_selector`) and an `Actor` from it, both named `hive-kick-<agent>-<unix>`, attaches the egress policy, waits for the actor to report `RUNNING`, and then talks to a small HTTP **bridge** inside the actor (`crux substrate-bridge`, overridable with `bridge_command`, port `bridge_port`) through the router's mTLS `CONNECT` tunnel: it pushes the workspace as a tar, runs the kick with the sanitized environment, and pulls the workspace back. The hive-side workspace remains the source of truth and feeds the push broker exactly as for Podman. Substrate has no exec API and hive shares no PVC with the worker nodes, which is why the workspace is copied rather than mounted; the copy is bounded by the kick timeout.
+
+**The egress policy.** Hive derives an `atenet-egress` policy from the hosts its proxy brokers for a Podman sandbox — `github.com` and `api.github.com` on 443 — plus `allow_hosts` as `host` or `host:port`, all as TLS passthrough; URLs, userinfo and wildcards are rejected at validation, before any actor is created. Everything else, including all UDP and raw IP connects, is denied. Substrate's policy language has no per-method read-only mode, so `api.github.com` is reachable; the actor holds no token (`SanitizedEnv`) and hive performs every GitHub write itself after the kick. `network_mode: none` drops every rule. Actors run credential-free: there is no `HTTPS_PROXY` or MITM broker inside the actor and no credential enters it, and hive brokers pushes after the kick from the returned workspace (decision on [#17695](https://github.com/hivecommons/hive/issues/17695), [ADR-0026](adr/0026-sandbox-runtime-selection.md)). Substrate's own credential injection is not used; SVID-authenticated broker delegation over the atenet mTLS channel is a future phase 3.
+
+**Lifecycle.** Success, failure and the kick timeout all delete the actor and then its template, on a fresh bounded context when the kick's own has expired, with exit code `-1` and `context deadline exceeded` on timeout, like a timed-out Job. With `snapshot_on_idle: true` the actor is **suspended** (snapshotted to Substrate's object storage) instead of deleted; the template is still deleted and the snapshot is not yet resumed on the next kick ([#17697](https://github.com/hivecommons/hive/issues/17697)). At most one suspended actor is retained per agent per hive process: the previous one is deleted after the next successful suspend (skipped with a warning if the agent's `atespace` changed in between), and actors left by an earlier hive process are not reclaimed because the Control API has no `ListActors`. `policy_profile` is passed to the actor as `HIVE_POLICY_PROFILE` for in-actor tooling; Substrate has no annotations.
+
+**What hive checks, and what it cannot.** At boot and on reload (`config.AgentSandboxGateWarnings`) a substrate-runtime agent is warned about, and its kick refused, when `endpoint` or `router_url` is missing or `image` is not digest-pinned. Hive also preflights each distinct Control API (read-only `ListWorkers`, cached for five minutes, bounded to 30 s) and warns when it is unreachable, has no `ACTIVE` worker matching `worker_selector`, or its workers advertise no sandbox class. It cannot see the CRDs, the operator, the pod-certificate feature gates or `/dev/kvm` from inside its pod; those are the operator prerequisites in [deploy/substrate.md](../deploy/substrate.md) and the prover in [#17698](https://github.com/hivecommons/hive/issues/17698).
+
+**The terminal pane.** A substrate-runtime agent has no tmux session either, so its ▶ terminal opens the same read-only `/terminal/job/<agent>` viewer behind the same handoff and role check ([#17777](https://github.com/hivecommons/hive/issues/17777)). The Control API has no `ListActors` and Substrate has no logs RPC, so the launcher — which runs in the same hive process as the dashboard — records each kick for the pane: the actor's `<atespace>/<name>`, every state it is seen in (`RESUMING`, `RUNNING`, then `SUSPENDED` with `snapshot_on_idle` or `DELETING`), and the worker's SPIFFE id from the actor's worker assignment. The bridge's `POST /run` streams the kick's stdout and stderr when asked (`"stream": true`, newline-delimited `RunResponse` frames; an older bridge answers with one complete response and still works), and the pane follows that output live, scrubbed of token-shaped values like the pod log, with each actor state change as a status line. Unlike OpenShell this is the kick's own output, and the pane ends with the kick's exit code and whether the actor was suspended or deleted. Between kicks it names how the last actor ended above the last persisted transcript; after a hive restart, before the agent's next kick, it shows the transcript alone.
+
+**Limitations (phase 2).** Workspace copied, not shared; `crux substrate-bridge` entrypoint and a published sandbox image land with the prototype ([#17697](https://github.com/hivecommons/hive/issues/17697)); no resume of suspended actors; `api.github.com` not read-only at the policy layer; latency and image size not yet measured.
+
 ## Health and metrics for sandboxed agents
 
 A sandboxed agent (Podman or Job runtime) has no tmux session, no in-pod process and no `pluk` log between kicks: the manager parks it in the `idle` state and each kick runs to completion in a container or Job. The dashboard therefore must not read "not running" as "session down" for these agents, and the token collector cannot find their CLI session files because the CLI's home directory lives in the sandbox, not in the hive pod.
@@ -256,7 +362,7 @@ On-demand agents, paused agents and `pause`/`continuous` cadences are never over
 - The Job runtime is a first slice: one Job per kick, workspace shared through a PVC, no per-kick Secret minting. A clone-inside-the-Job transport for clusters without ReadWriteMany storage is future work.
 - Live Podman execution is covered by skip-when-absent tests; CI still needs a rootless-Podman runner lane for always-on integration coverage.
 - Sandboxed inference depends on an operator-provided restricted network/proxy policy. `none` is stronger but not yet usable for all model backends.
-- A stronger runtime than plain containers is under evaluation: [ADR-0026](adr/0026-sandbox-runtime-selection.md) (Proposed) compares NVIDIA OpenShell and OpenSandbox against this contract.
+- Stronger runtimes than plain containers ship opt-in: [ADR-0026](adr/0026-sandbox-runtime-selection.md) (Accepted) covers NVIDIA OpenShell (phase 1) and Agent Substrate (phase 2); both still need their prototype measurements and cluster preflights.
 
 ## Agent guardrails (defense in depth)
 

@@ -2,11 +2,33 @@
 
 Status: Accepted
 
-Implementation plan: [stage-engine-plan.md](../stage-engine-plan.md).
-Interfaces in this ADR are the contract parallel implementation PRs build
-against; change them here first, then in code.
+## Current state and reading route
+
+One engine derives the stage from observed issue/PR facts; one writer applies
+`stage/*` labels. Unexpected transitions are recorded, not rejected. This
+engine describes lifecycle state; it does not grant merge authority.
+The [scope section](#scope-and-extension-points) also records the later,
+scheduler-owned `stage/017-possible-existing` exception; do not infer that
+the original single-writer decision removed that separate prior-art gate.
+
+- **Normal operation:** `governor.labels.stage.engine.mode: enforce` (default).
+- **Pause engine label writes:** use `shadow`; derivation and observation
+  continue. It does not reactivate legacy writers, stop merges, or disable
+  the separate scheduler-owned prior-art gate.
+- **Not a rollback option:** `off` and the legacy derivation paths were retired.
+  To revert code, use the deployment's normal release rollback procedure.
+- **Implementers:** [Decision](#decision) and [Design](#design) contain the
+  contract; [Review-state fold](#review-state-fold-resolved) describes the
+  resolved review-state rule.
+
+The [implementation plan](../stage-engine-plan.md) and Context below preserve
+the rollout rationale. They are not a list of remaining operator actions.
 
 ## Context
+
+**Original rollout context, with later implementation annotations.** The
+half-centralized design and gaps below motivated the migration; do not read
+the old writers as supported fallback paths.
 
 The owner's intent: *labels applied from a central facility so that managing
 them via a state machine is easier.* Hive is half-way there.
@@ -21,7 +43,8 @@ re-read-then-write `Enforce` that heals duplicate stage pills
 records transitions, regressions and history hops
 (`src/pkg/stagelabels/store.go:397`, `IsRegression` at
 `src/pkg/stagelabels/store.go:540`). The dashboard activity tracker and the
-hub read that store and nothing else (`src/pkg/dashboard/stage_tracker.go:957-962`).
+hub read that store and nothing else (`stageStoreOrShared`,
+`src/pkg/dashboard/stage_tracker_caption.go:951-956`).
 
 **What is not central — three gaps.**
 
@@ -29,14 +52,14 @@ hub read that store and nothing else (`src/pkg/dashboard/stage_tracker.go:957-96
    `SyncIssueStageLabels` (`src/pkg/github/issue_stage_labels.go:205`,
    `src/pkg/github/issue_stage_labels.go:337`) from the enumeration bucket. PRs
    are staged by the automerge engine: each lane calls `recordStage`
-   (`src/pkg/github/automerge/automerge_stage_labels.go:365`), observations are
+   (`src/pkg/github/automerge/automerge_stage_labels.go:555`), observations are
    sorted by `stageLanePrecedence` (self 3 > trusted 2 > contributor 1,
-   `src/pkg/github/automerge/automerge_stage_labels.go:177`), each is classified
-   by `ClassifyStage` (`src/pkg/stageengine/derive_pr_classify.go:261`)
+   `src/pkg/github/automerge/automerge_stage_labels.go:245`), each is classified
+   by `ClassifyStage` (`src/pkg/stageengine/derive_pr_classify.go:344`)
    into a ranked opinion (`prstage.RankNone..prstage.RankOwned`,
-   `src/pkg/stageengine/prstage/types.go:145-148`), and
+   `src/pkg/stageengine/prstage/types.go:216-219`), and
    `ResolveStage` picks the winner
-   (`src/pkg/stageengine/derive_pr_classify.go:454`). These PR helpers now
+   (`src/pkg/stageengine/derive_pr_classify.go:720`). These PR helpers now
    live in the engine (#13779); automerge keeps only gathering-side previews. Shared concepts —
    parking (045/085, `needs-human`, hold labels), author kind (070/071/072),
    adoption (074), terminal states, `origin/*` — are modelled twice with
@@ -61,7 +84,7 @@ hub read that store and nothing else (`src/pkg/dashboard/stage_tracker.go:957-96
    parking stages through the label relay (`agentMayAddLabel`,
    `src/pkg/github/issue_request_label.go:75`), so a clanker can set a stage
    label and only the next sweep's self-heal corrects it. The docs admit the
-   arrangement (`src/docs/labels-and-control-signals.md:313-316`). The PR-D
+   arrangement (`src/docs/labels-and-control-signals/reference.md:313-316`). The PR-D
    vocabulary cleanup makes claim labels and review adoption checks use
    `stagelabels` directly; their fact-submission migration remains separate.
 3. *No explicit transition model.* `Store.Observe` records that a stage
@@ -100,7 +123,7 @@ is computed from `Detail.Verdict`, `HumanApprover`/`HumanApprovalHead`,
    terminal, origin, review); `IssueFacts` / `PRFacts` carry the rest.
    `DeriveIssue` and `DerivePR` are two `Deriver` implementations behind one
    interface — not one function.
-5. **Behaviour first, semantics later.** The automerge lane precedence is
+5. **Rollout invariant: behaviour first, semantics later.** The automerge lane precedence is
    merge-critical. Golden fixtures are captured from the *current* derivation
    before any code moves; the new derivers must reproduce them byte-for-byte
    under `mode: shadow` (compute, diff, log, no writes) with a 0 % mismatch
@@ -402,6 +425,15 @@ enumerator's filtered-reason) the way it reproduces 045 from `needs-spec`,
 and the resume sweep removes it on `/hive decision proceed` / `exists`.
 Leaving 017 for 010 or closed is never a regression.
 
+**Open for discussion (`stage/018-open-for-discussion`, #17150).** Added
+after the epic: an issue-only stage between 017 and 020 with no dwell.
+Unlike 017 it is derived, not written by a gate: `DeriveIssue` returns it
+for an open issue labelled `proposal` or `kind/design` with no live claim
+(`IssueFacts.DiscussionLabel`, resolved in `pkg/github`), reason
+`open for discussion: <label>`. It is not a suppress: the claim gate is
+unchanged and a claim stages 020/030. `040 → 018` under
+`hive/partially-addressed` is progress; leaving 018 is never a regression.
+
 ## Consequences
 
 - A taxonomy change (new stage, renamed stage, new author kind) touches the
@@ -427,7 +459,7 @@ Leaving 017 for 010 or closed is never a regression.
 | Rate-limit cost of re-reads | Writer re-reads only when the hint implies a write (today's `Enforce` rule); facts are assembled from list payloads the sweeps already fetch; shadow mode makes zero extra calls. |
 | In-flight labels during migration | Enforce mode's first pass is a plain reconcile: whatever the legacy writers left is replaced by the derived stage; no label migration script is needed. Legacy spellings keep healing through `Renames`. |
 | Anomaly noise after a Table change | Anomalies are counted and logged once per item per from→to, never block, and the expected-pair table is regenerated from the diagram in the same PR as the Table change. |
-| Rollback | `mode: off` restores the legacy derivation paths until PR-6 deletes them (two releases later); `mode: shadow` is a one-line config change. |
+| Pause writes after rollout | Set `governor.labels.stage.engine.mode: shadow` to derive and observe without writes. `off` no longer restores legacy derivation; those paths were deleted. A code rollback is a separate deployment action. |
 
 ## Alternatives rejected
 

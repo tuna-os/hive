@@ -105,6 +105,11 @@ func loadWithOverrides(path, envPath string, validateOpts ValidateOptions) (*Con
 		}
 	}
 
+	// A rejected overlay above "fell back to base config" — which is no help
+	// when the base entry carries the same stale launch_cmd. Drop it here
+	// rather than let validation exit the process.
+	cfg.DegradeContradictingLaunchCmds()
+
 	if err := cfg.ApplyAgentSpecRepoScopes(); err != nil {
 		return nil, fmt.Errorf("applying agent spec repo scopes: %w", err)
 	}
@@ -438,6 +443,19 @@ func (c *Config) applyBootstrapEnv() {
 	}
 	if v := strings.TrimSpace(os.Getenv(ContributeSkipLabelsEnvVar)); v != "" {
 		c.Hub.ContributeSkipLabels = parseContributeSkipLabels(v)
+	}
+	// Operators size the ETag cache per deployment from the environment; a
+	// value that fails to parse is ignored so a typo cannot stop the boot,
+	// and an out-of-range one is caught by Validate like a file value.
+	if v := strings.TrimSpace(os.Getenv(GitHubETagCacheMaxMBEnv)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.GitHub.ETagCacheMaxMB = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv(GitHubETagCacheMaxEntriesEnv)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.GitHub.ETagCacheMaxEntries = n
+		}
 	}
 }
 

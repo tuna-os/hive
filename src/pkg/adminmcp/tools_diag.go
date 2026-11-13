@@ -63,6 +63,18 @@ func DiagOwnerTool(tool string) bool {
 	return tool == ToolConfigEffectiveRead
 }
 
+// DiagStatusError is a diagnostic read the hive answered with a status other
+// than success or a role refusal. It keeps the status so a caller can tell a
+// 404 from the rest: the stdio binary adds its build-skew notice to a hub 404.
+type DiagStatusError struct {
+	Tool       string
+	StatusCode int
+}
+
+func (e *DiagStatusError) Error() string {
+	return fmt.Sprintf("%s: the hive answered HTTP %d", e.Tool, e.StatusCode)
+}
+
 // DiagHTTPError turns a refused diagnostic read into the same error on both
 // transports. It never carries the hive's response body: that can hold text
 // from logs or agents, which belongs only inside result data.
@@ -73,7 +85,7 @@ func DiagHTTPError(tool string, status int) error {
 		}
 		return fmt.Errorf("%w: %s needs a higher role than this caller has (HTTP %d)", ErrForbidden, tool, status)
 	}
-	return fmt.Errorf("%s: the hive answered HTTP %d", tool, status)
+	return &DiagStatusError{Tool: tool, StatusCode: status}
 }
 
 // DiagReadPath builds the GET request for a diagnostic tool from its
@@ -231,7 +243,7 @@ func diagToolDefs() []struct{ name, desc string } {
 		{ToolRunDetailRead, fmt.Sprintf("Read a run's detail (GET /api/runs/{key}/detail): run, issue, plan, PRs, stages, events and the raw event log, scrubbed. Kept under %d KiB: the raw log and events keep their newest part, and what was trimmed is listed. Pane tails need read-write, as on the dashboard. Read-only.", DiagResultByteCap/1024) + untrusted},
 		{ToolHealthDeepRead, "Read this hive's deep health check (GET /api/health/deep) whole: overall status, each check with pass/fail and detail, and the fail count. Read-only."},
 		{ToolPromptHistoryRead, fmt.Sprintf("Read the prompts recently delivered to agents (GET /api/prompt-history), newest first; optional agent and window_hours (default 24, at most 168). Each prompt is scrubbed and cut at %d KiB; at most %d KiB in total, keeping the newest entries, with truncation disclosed. Requires the read-write role. Read-only.", DiagPromptEntryBytes/1024, DiagResultByteCap/1024) + untrusted},
-		{ToolConfigEffectiveRead, "Read this hive's effective configuration and its provenance: every configured key with the layer that set it and the layers it overrode, whether the dashboard overlay was rejected and why, and whether the last-good configuration was used. Values are shown only for keys and environment names on a documented non-secret list (listed in the result); every other key or name is shown only as set or not set. The raw configuration file is never returned. Page with offset/next_offset. Requires the owner role as verified by this hive. Read-only."},
+		{ToolConfigEffectiveRead, "Read this hive's effective configuration and its provenance: every configured key with the layer that set it and the layers it overrode, whether the dashboard overlay was rejected and why, and whether the last-good configuration was used. Values are shown only for keys and environment names on a documented non-secret list (listed in the result); every other key or name is shown only as set or not set. agent_github_api_hourly_caps gives the API proxy's effective GitHub API hourly cap per agent. The raw configuration file is never returned. Page with offset/next_offset. Requires the owner role as verified by this hive. Read-only."},
 	}
 }
 

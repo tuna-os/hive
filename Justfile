@@ -41,6 +41,53 @@ contributor_cpu_limit := "2"
 default:
     @just --list
 
+# Explicitly verifies streaming tool calls against an already-running local
+# MLX-LM server, then persists only Pi's mlx provider. Never downloads weights.
+[positional-arguments]
+contribute-mlx-setup model verify:
+    node bin/mlx-backend.js configure "$1" "$2"
+
+# Starts only an explicitly chosen, already-downloaded model on Mac loopback.
+[positional-arguments]
+contribute-mlx-serve model:
+    node bin/mlx-backend.js serve "$1"
+
+# Apple MLX is an inference engine for Pi, not a separate coding CLI.
+[positional-arguments]
+contribute-mlx mode="docker":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    _MLX_REQUESTED_MODEL="${AGENT_MODEL:-}"
+    _MLX_REQUESTED_RUNTIME="${HIVE_CONTAINER_RUNTIME:-}"
+    if [[ -f "{{config_dir}}/contributor.env" ]]; then
+      source "{{config_dir}}/contributor.env"
+    fi
+    if [[ -n "$_MLX_REQUESTED_MODEL" ]]; then
+      AGENT_MODEL="$_MLX_REQUESTED_MODEL"
+    fi
+    if [[ -n "$_MLX_REQUESTED_RUNTIME" ]]; then
+      HIVE_CONTAINER_RUNTIME="$_MLX_REQUESTED_RUNTIME"
+    fi
+    if [[ "${AGENT_MODEL:-}" != mlx/* ]]; then
+      echo "ERROR: Select your verified MLX model first: export AGENT_MODEL=mlx/<model-id-or-absolute-path>"
+      echo "  Setup: just contribute-mlx-setup <model-id-or-absolute-path> --verify-tools"
+      exit 1
+    fi
+    case "$1" in
+      docker)
+        if [[ "${HIVE_CONTAINER_RUNTIME:-docker}" != "docker" ]]; then
+          echo "ERROR: Apple MLX requires Docker Desktop 4.34+ host networking, not Podman machine."
+          exit 1
+        fi
+        export HIVE_CONTAINER_RUNTIME=docker
+        ;;
+      local) ;;
+      *) echo "ERROR: MLX mode must be docker or local; Kubernetes cannot reach Mac loopback."; exit 1 ;;
+    esac
+    export AGENT_MODEL
+    export HIVE_MLX_LAUNCH_MODEL="$AGENT_MODEL"
+    just --justfile "{{justfile_directory()}}/Justfile" contribute-hive pi "$1"
+
 # Run the live run-level acceptance test (#8466 layer 2). Requires HIVE_URL and
 # HIVE_TOKEN like the rest of src/test, plus HIVE_RUNS_E2E_KEY or
 # HIVE_RUNS_E2E_REPO/HIVE_RUNS_E2E_ISSUE for the pinned run/spec issue.
@@ -187,6 +234,9 @@ contribute-check-backend backend="claude":
             exit 1
           fi
           echo "HIVE_BACKEND_READINESS=${PI_READINESS}"
+          if [[ "${AGENT_MODEL}" == mlx/* ]]; then
+            node bin/mlx-backend.js check "${AGENT_MODEL}"
+          fi
           echo "  Credential presence is reported as configured_unverified, never as proof of authentication."
         else
           echo "ERROR: Pi CLI not found. Install: curl -fsSL https://pi.dev/install.sh | sh"
@@ -298,6 +348,11 @@ contribute-check-backend backend="claude":
           echo "ERROR: muse CLI not found. Install: curl -fsSL https://dev.meta.ai/install.sh | bash"
           exit 1
         fi
+        ;;
+      cline)
+        echo "Cline requires cline@3.0.74 and a current crux exposing cline-turn."
+        echo "Run cline auth with a dedicated API-key provider, then export AGENT_MODEL=provider/model."
+        "${HIVE_CLINE_RUNNER:-crux}" cline-turn --model "${AGENT_MODEL:-}" --check
         ;;
       omp)
         if command -v omp &>/dev/null; then
@@ -944,6 +999,7 @@ contribute-hive backend="" mode="docker": check-version
       echo "Not set up yet. Run: just contribute-setup <cli>"
       exit 1
     fi
+    _MLX_LAUNCH_MODEL="${HIVE_MLX_LAUNCH_MODEL:-}"
     set -a
     source "{{config_dir}}/gh-auth.env"
     source "{{config_dir}}/contributor.env"
@@ -1065,6 +1121,24 @@ contribute-hive backend="" mode="docker": check-version
         fi
       fi
     fi
+    if [[ "$BACKEND" == "cline" ]]; then
+      export CONTRIBUTOR_MODE=headless
+      if ! command -v "${HIVE_CLINE_RUNNER:-crux}" >/dev/null 2>&1; then
+        echo "ERROR: Cline requires a current crux (or HIVE_CLINE_RUNNER=hive) with cline-turn support."
+        exit 1
+      fi
+      "${HIVE_CLINE_RUNNER:-crux}" cline-turn --model "${AGENT_MODEL:-}" --check
+    fi
+    # MLX-only launch override: preserve an explicit selection over saved profiles.
+    if [[ -n "${_MLX_LAUNCH_MODEL:-}" ]]; then
+      if [[ "$BACKEND" != "pi" || "$_MLX_LAUNCH_MODEL" != mlx/* ]]; then
+        echo "ERROR: MLX launcher requires the Pi backend and an mlx/<model> selection."
+        exit 1
+      fi
+      export AGENT_MODEL="$_MLX_LAUNCH_MODEL"
+    fi
+    unset HIVE_MLX_LAUNCH_MODEL _MLX_LAUNCH_MODEL
+    # End MLX-only launch override.
     # Bob has no headless credential other than its API key — without it the
     # agent would launch and sit at Bob's key prompt forever. Fail fast.
     if [[ "$BACKEND" == "bob" && -z "${BOB_API_KEY:-}" && -z "${BOBSHELL_API_KEY:-}" ]]; then
@@ -1080,6 +1154,9 @@ contribute-hive backend="" mode="docker": check-version
         exit 1
       fi
       echo "HIVE_BACKEND_READINESS=${PI_READINESS}"
+      if [[ "${AGENT_MODEL}" == mlx/* ]]; then
+        node bin/mlx-backend.js check "${AGENT_MODEL}"
+      fi
       # This recipe runs in its own shell, so narrowing the environment does not
       # alter the contributor's login shell. It does ensure both local relay/CLI
       # launches and the container path can see only the selected provider's
@@ -1322,7 +1399,7 @@ contribute-hive backend="" mode="docker": check-version
         codex)
           PERM_FLAG=$(backend_perm_flag_shell "$BACKEND" 2>/dev/null || echo "")
           ;;
-        goose|agy|bob|pi|aider|kilo|omp|openhands|omnigent)
+        goose|agy|bob|pi|aider|kilo|omp|openhands|omnigent|cline)
           # No sandbox, filesystem allowlist, or command deny-list exists for
           # any of these nine (see the "no confinement mechanism at all"
           # block in backends.conf) — refuse to launch unconfined by
@@ -1384,7 +1461,17 @@ contribute-hive backend="" mode="docker": check-version
         # Same canonical selection used by the container entrypoint and every
         # relay restart. %q keeps model IDs with shell metacharacters one argv.
         PERM_FLAG="${PERM_FLAG:+${PERM_FLAG} }--model $(printf %q "$AGENT_MODEL")"
+        if [[ "$AGENT_MODEL" == mlx/* ]]; then
+          PERM_FLAG+=" --extension $(printf %q "{{justfile_directory()}}/bin/mlx-pi-extension.js")"
+        fi
       fi
+
+      # Model and effort, exactly as the relay's own launch builder would add
+      # them (#16222). The relay reuses AGENT_LAUNCH_CMD verbatim on every
+      # relaunch, so a flag missing here is missing for the whole session, and
+      # the relay reports a model or effort to the hub only when this line
+      # carries its flag. %q keeps model IDs with shell metacharacters one argv.
+      SELECTION_FLAGS=$(backend_selection_flags_shell "$BACKEND" "${AGENT_MODEL:-}" "${AGENT_REASONING_EFFORT:-}")
 
       # Create tmux session with the CLI.
       #
@@ -1468,7 +1555,7 @@ contribute-hive backend="" mode="docker": check-version
       BUILD_CACHE_ENV="$BUILD_CACHE_ENV GOTMPDIR=$(printf %q "$HIVE_AGENT_CACHE_DIR/tmp")"
       BUILD_CACHE_ENV="$BUILD_CACHE_ENV TMPDIR=$(printf %q "$HIVE_AGENT_CACHE_DIR/tmp")"
       BUILD_CACHE_ENV="$BUILD_CACHE_ENV CCACHE_DIR=$(printf %q "$HIVE_AGENT_CACHE_DIR/ccache")"
-      export AGENT_LAUNCH_CMD="${LITELLM_ENV:+$LITELLM_ENV }${BUILD_CACHE_ENV} $CMD${PERM_FLAG:+ $PERM_FLAG}"
+      export AGENT_LAUNCH_CMD="${LITELLM_ENV:+$LITELLM_ENV }${BUILD_CACHE_ENV} $CMD${PERM_FLAG:+ $PERM_FLAG}${SELECTION_FLAGS:+ $SELECTION_FLAGS}"
 
       # Registered before anything long-lived is forked below (knowledge
       # refresh, tmux session, quota publisher, relay); the PID variables it
@@ -1502,6 +1589,7 @@ contribute-hive backend="" mode="docker": check-version
       knowledge_export_sync_start "$HIVE_AGENT_MD"
       link_backend_knowledge "$BACKEND" "$HIVE_AGENT_MD" "$HIVE_AGENT_CWD"
 
+      if [[ "$BACKEND" != "cline" ]]; then
       tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
       tmux new-session -d -s "$TMUX_SESSION" -x 200 -y 50 -c "$HIVE_WORKSPACE_DIR"
       tmux send-keys -t "$TMUX_SESSION" "cd $(printf %q "$HIVE_AGENT_CWD") && $AGENT_LAUNCH_CMD" Enter
@@ -1516,6 +1604,7 @@ contribute-hive backend="" mode="docker": check-version
           echo "         Fix it for good with: tmux kill-server   (ends all tmux sessions, then rerun this recipe)" >&2
           ;;
       esac
+      fi
 
       # Start the relay
       export HIVE_AGENT_SESSION="$TMUX_SESSION"
@@ -1867,6 +1956,15 @@ contribute-hive backend="" mode="docker": check-version
       }
       CLI_MOUNTS=""
       case "${BACKEND}" in
+        cline)
+          if ! "${HIVE_CLINE_RUNNER:-crux}" cline-turn --model "${AGENT_MODEL:-}" --stage-config "${CLI_STAGE}/.cline"; then
+            rm -rf "${CLI_STAGE}"
+            exit 1
+          fi
+          CLINE_VOLUMESUF=":ro"
+          if [[ -n "$VOLSUF" ]]; then CLINE_VOLUMESUF="${VOLSUF},ro"; fi
+          CLI_MOUNTS="-v ${CLI_STAGE}/.cline:/home/dev/.cline${CLINE_VOLUMESUF}"
+          ;;
         claude)
           # #7836: an allowlist of ~/.claude, never the directory — see
           # stage_claude_home above for what the directory would have carried.
@@ -1948,6 +2046,11 @@ contribute-hive backend="" mode="docker": check-version
           fi
           ;;
         pi)
+          if [[ "${AGENT_MODEL:-}" == mlx/* && "$(uname -s)" == "Darwin" && "$RUNTIME" != "docker" ]]; then
+            echo "ERROR: MLX container mode on macOS requires Docker Desktop 4.34+ with host networking enabled."
+            echo "  Podman machine host networking reaches its Linux VM, not the Mac's loopback MLX server."
+            exit 1
+          fi
           if [ -d "${HOME}/.pi" ]; then
             stage_copy "${HOME}/.pi" ".pi"
             # Keep only the selected provider's official auth/custom-provider
@@ -2128,10 +2231,40 @@ contribute-hive backend="" mode="docker": check-version
         while IFS= read -r name; do
           if [[ -n "$name" ]]; then add_provider_env "$name"; fi
         done < <(node bin/pi-backend.js --env-names "${AGENT_MODEL}")
+      elif [[ "$BACKEND" == "cline" ]]; then
+        # Authentication comes only from the narrowed provider file.
+        :
       else
         for name in ANTHROPIC_API_KEY OPENROUTER_API_KEY OPENAI_API_KEY OPENAI_HOST OPENAI_BASE_PATH GOOGLE_API_KEY GEMINI_API_KEY DATABRICKS_TOKEN OMNIGENT_API_KEY GOOSE_API_KEY GOOSE_PROVIDER GOOSE_MODEL KIRO_API_KEY BOB_API_KEY BOBSHELL_API_KEY HIVE_LITELLM_ENDPOINT HIVE_LITELLM_API_KEY KILO_AUTH_CONTENT KILO_CONFIG_CONTENT KILO_API_KEY KILO_ORG_ID META_API_KEY LLM_API_KEY LLM_BASE_URL LLM_MODEL; do
           add_provider_env "$name"
         done
+      fi
+      # Quota-guard command path (#6953). `just contribute-quota …` on the host
+      # writes overrides into HIVE_CONTRIBUTOR_QUOTA_POOL_DIR and the relay reads
+      # them there, so the container needs the host directory itself, not just
+      # its name: mount it and point the relay (and the in-container quota
+      # publisher) at the mount. Podman gets the shared `z` label, not the
+      # private `Z` of the other mounts, because the pool is meant to be shared
+      # by every relay on the account and a second container's `Z` relabel would
+      # lock the first one out. krun goes through podman, so it gets the same
+      # mount. The account is part of the pool key, so it travels too, by name
+      # only so the value stays out of the runtime argv.
+      QUOTA_POOL_ARGS=()
+      if [[ -n "${HIVE_CONTRIBUTOR_QUOTA_POOL_DIR:-}" ]]; then
+        QUOTA_POOL_CTR_DIR="/home/dev/.hive-quota-pool"
+        mkdir -p -- "${HIVE_CONTRIBUTOR_QUOTA_POOL_DIR}"
+        # Absolute, or docker would take it for a named volume.
+        QUOTA_POOL_HOST_DIR="$(cd -- "${HIVE_CONTRIBUTOR_QUOTA_POOL_DIR}" && pwd -P)"
+        QUOTA_POOL_SUF=""
+        if [[ "$RUNTIME" == "podman" ]]; then QUOTA_POOL_SUF=":z"; fi
+        QUOTA_POOL_ARGS+=(
+          -v "${QUOTA_POOL_HOST_DIR}:${QUOTA_POOL_CTR_DIR}${QUOTA_POOL_SUF}"
+          -e "HIVE_CONTRIBUTOR_QUOTA_POOL_DIR=${QUOTA_POOL_CTR_DIR}"
+        )
+        if [[ -n "${HIVE_CONTRIBUTOR_QUOTA_POOL_ACCOUNT:-}" ]]; then
+          export HIVE_CONTRIBUTOR_QUOTA_POOL_ACCOUNT
+          QUOTA_POOL_ARGS+=(-e HIVE_CONTRIBUTOR_QUOTA_POOL_ACCOUNT)
+        fi
       fi
       # NOTE: deliberately NOT --rm. With --rm the runtime deletes the
       # container the instant it exits, taking its logs with it — so a
@@ -2209,6 +2342,9 @@ contribute-hive backend="" mode="docker": check-version
         "${PROVIDER_ENV_ARGS[@]}" \
         ${AGENT_MODEL:+-e AGENT_MODEL="${AGENT_MODEL}"} \
         ${AGENT_REASONING_EFFORT:+-e AGENT_REASONING_EFFORT="${AGENT_REASONING_EFFORT}"} \
+        ${HIVE_AGENT_ROLE:+-e HIVE_AGENT_ROLE="${HIVE_AGENT_ROLE}"} \
+        ${HIVE_CONTRIBUTOR_QUOTA_GUARD:+-e HIVE_CONTRIBUTOR_QUOTA_GUARD="${HIVE_CONTRIBUTOR_QUOTA_GUARD}"} \
+        "${QUOTA_POOL_ARGS[@]}" \
         ${CONTRIBUTOR_MODE:+-e CONTRIBUTOR_MODE="${CONTRIBUTOR_MODE}"} \
         ${HIVE_CODEX_AUTO_USE_BANKED_RESET:+-e HIVE_CODEX_AUTO_USE_BANKED_RESET="${HIVE_CODEX_AUTO_USE_BANKED_RESET}"} \
         ${HIVE_SESSION+-e HIVE_SESSION="${HIVE_SESSION}"} \
@@ -2217,6 +2353,12 @@ contribute-hive backend="" mode="docker": check-version
       #   empty string is the relay's opt-out of session labeling and must be
       #   forwarded, while an unset variable must stay unset so the relay
       #   defaults the session to the backend name (kubestellar/hive#5605).
+      # ^ HIVE_AGENT_ROLE (the spoke-agent lane the relay asks for) must be
+      #   forwarded here: contributor-agent.sh sources contributor.env without
+      #   exporting it, so neither a shell export nor a contributor.env line
+      #   would otherwise reach the relay. The hub still checks the role.
+      # ^ HIVE_CONTRIBUTOR_QUOTA_GUARD is forwarded for the same reason: the
+      #   guard banner tells the operator to set it at launch to opt out.
 
       echo "Container: ${CONTAINER_NAME}"
       echo "Limits:    ${CONTAINER_MEMORY} memory, ${CONTAINER_CPUS} CPUs"
@@ -2585,9 +2727,14 @@ contribute-quota action="status":
     set -euo pipefail
     # Inherit the relay's own pool/account/backend config from contributor.env so
     # the derived pool key matches the running relay, not a parse-time default.
+    # set -a exports it to the node process below: contributor.env has no
+    # `export` lines, so a plain source left the pool dir, account and backend
+    # behind in this shell and the control wrote under the wrong pool key.
     if [[ -f "{{config_dir}}/contributor.env" ]]; then
+      set -a
       # shellcheck source=/dev/null
       source "{{config_dir}}/contributor.env"
+      set +a
     fi
     SCRIPT_DIR="{{justfile_directory()}}"
     node "${SCRIPT_DIR}/bin/contributor-quota-control.js" "{{action}}"
@@ -2642,7 +2789,7 @@ contribute-k8s namespace="hive-contributor" outfile="" image_tag="v4":
     # authenticates through an interactive Google OAuth flow with no API-key
     # mode, so a pod has no way to sign in. Do NOT add agy here to "resync" the
     # two lists — a pod would start, fail auth, and crash-loop.
-    readonly HEADLESS_BACKENDS="claude litellm copilot codex goose"
+    readonly HEADLESS_BACKENDS="claude litellm copilot codex goose cline"
     # Memory sizing: the contributor image is ~2.7GiB unpacked and each task
     # spawns a real coding-CLI + a repo build/test, so requests are deliberately
     # generous. Named here so an operator can see and tune them, not magic YAML.
@@ -2734,6 +2881,14 @@ contribute-k8s namespace="hive-contributor" outfile="" image_tag="v4":
     CRED_MISSING=""
     if [[ "$BACKEND_HEADLESS_OK" == true ]]; then
       case "$BACKEND" in
+        cline)
+          if CLINE_CONFIG_JSON=$("${HIVE_CLINE_RUNNER:-crux}" cline-turn --model "${AGENT_MODEL:-}" --export-provider-config); then
+            add_cred "HIVE_CLINE_PROVIDERS_B64" "$(b64 "$(b64 "$CLINE_CONFIG_JSON")")"
+            unset CLINE_CONFIG_JSON
+          else
+            CRED_MISSING="cline requires a current crux with cline-turn and a configured dedicated API-key provider; run cline auth and set AGENT_MODEL=provider/model."
+          fi
+          ;;
         claude)
           # Two routes, explicit key first (operator intent beats a file that
           # happens to exist): ANTHROPIC_API_KEY travels as itself and the CLI

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hivecommons/hive/pkg/delegatedecision"
+	"github.com/hivecommons/hive/pkg/github"
 	stageengineprstage "github.com/hivecommons/hive/pkg/stageengine/prstage"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
@@ -21,8 +22,8 @@ import (
 // then ignores, and the operator would learn that thirty minutes later
 // through the stalled-decision path. So the hive answers at once, in the
 // same no-effect shape the SPA already renders: why it cannot merge this
-// itself, and the buttons that do — Approve & merge as maintainer, Approve
-// — let hive merge — plus how to trust the author next time.
+// itself, and the buttons that do — Approve and let hive merge (lead),
+// Merge now as maintainer — plus how to trust the author next time.
 
 // delegatedHumanMergeRule is the rule slug on the answer; it resolves in
 // the glossary to the plain words the toast head shows.
@@ -41,26 +42,40 @@ func delegatedHumanMergeReason(in delegatedecision.Input, req delegatedDecisionR
 }
 
 // delegatedHumanMergeOptions are the answer's buttons: the two merge
-// actions (merger / owner only), then send back (hive-authored PRs only:
+// actions (merger / owner only; "Approve and let hive merge" leads), then send back (hive-authored PRs only:
 // a direction has no agent to carry it on a person's PR) and close.
 func delegatedHumanMergeOptions(in delegatedecision.Input, number int, mergerRole bool) []StageTrackerDecisionOption {
 	ref := "#" + strconv.Itoa(number)
-	mergeNow := decisionOption(decisionActionMergeNow, "Approve & merge as maintainer", mergerRole, decisionWhyMergerRole)
+	mergeNow := decisionOption(decisionActionMergeNow, decisionMergeNowLabel, mergerRole, decisionWhyMergerRole)
 	mergeNow.Consequence = "merges " + ref + " now via hive's identity, attributed to you"
-	queue := decisionOption(decisionActionQueueMerge, "Approve — let hive merge", mergerRole, decisionWhyMergerRole)
-	queue.Consequence = "records your approval; the hive's merge sweep merges " + ref + " on its next pass once CI is green and the head has soaked"
+	queue := decisionOption(decisionActionQueueMerge, decisionQueueMergeLabel, mergerRole, decisionWhyMergerRole)
+	queue.Consequence = "records your approval; hive merges " + ref + " on its next merge pass once CI is green and the head has soaked"
 	direction := decisionOption(decisionActionDirection, "Send back for a new commit", in.HiveAuthored, "The hive did not open this PR, so it cannot carry a direction to its author; leave a changes-requested review on GitHub")
 	closeSup := decisionOption(decisionActionCloseSuperseded, "Close as superseded", true, "")
-	return []StageTrackerDecisionOption{mergeNow, queue, direction, closeSup}
+	return []StageTrackerDecisionOption{queue, mergeNow, direction, closeSup}
 }
 
 // decisionWhyMergerRole is the plain reason a merge button is greyed.
 const decisionWhyMergerRole = "merger role required"
 
+// delegatedHumanMergeGated reports whether a 090 PR is held by a gate — an
+// open sentinel alert or a hold-class label (hivecommons/hive#17327). The
+// stage is the head's real progress, not a merge licence: neither
+// human-merge shortcut below may approve, admit or adopt it; the policy
+// (sentinel question, rail-hold) answers as it did when the gate pinned 085.
+//
+// A `blocked` PR (held on its Depends-on targets, or by a person) is gated
+// the same way: the shortcuts never merge past it.
+func delegatedHumanMergeGated(in delegatedecision.Input) bool {
+	return in.SentinelAlert || len(stagelabels.Holds(in.Labels)) > 0 || slices.ContainsFunc(in.Labels, func(l string) bool {
+		return strings.EqualFold(strings.TrimSpace(l), github.BlockedLabel)
+	})
+}
+
 // delegatedHumanMergeOutcome answers "Let hive decide" on a PR wearing the
 // 090 label without running the policy. ok=false for anything else.
 func (s *Server) delegatedHumanMergeOutcome(repoFull string, number int, itemType, user string, mergerRole bool, in delegatedecision.Input, req delegatedDecisionRequest) (delegatedOutcome, bool) {
-	if in.Kind != delegatedecision.KindPR || !slices.Contains(in.Labels, stagelabels.ReadyForHumanMerge.Label()) {
+	if in.Kind != delegatedecision.KindPR || !slices.Contains(in.Labels, stagelabels.ReadyForHumanMerge.Label()) || delegatedHumanMergeGated(in) {
 		return delegatedOutcome{}, false
 	}
 	reason := delegatedHumanMergeReason(in, req)
@@ -71,6 +86,9 @@ func (s *Server) delegatedHumanMergeOutcome(repoFull string, number int, itemTyp
 		code = delegatedHumanMergeRule
 	}
 	why := stageTrackerUntrustedAuthorWhy(base, in.Author)
+	if fix := stageTrackerUntrustedAuthorFix(base, in.Author); why != "" && fix != "" {
+		why += ". " + strings.TrimSuffix(fix, ".")
+	}
 	if why == "" {
 		why = decisionPlainReason(base)
 		if base == "" || why == base {
@@ -110,7 +128,7 @@ func (s *Server) delegatedHumanMergeOutcome(repoFull string, number int, itemTyp
 // "Let hive decide" on an untrusted author's 090 PR takes the decision
 // (hivecommons/hive#15173) instead of answering that it cannot merge: when
 // nothing is wrong with the PR the owner's delegate approves it — the same
-// path as "Approve — let hive merge", so the merge sweep merges the PR under
+// path as "Approve and let hive merge", so the merge sweep merges the PR under
 // its own number once the head has soaked — and only a red, conflicting or
 // unreviewed head falls back to adoption in supersede mode.
 const (
@@ -118,6 +136,7 @@ const (
 	delegatedHumanMergeAdoptCIRedRule  = "human-merge-adopt-ci-red"
 	delegatedHumanMergeAdoptRebaseRule = "human-merge-adopt-conflicting"
 	delegatedHumanMergeAdoptReviewRule = "human-merge-adopt-review"
+	delegatedHumanMergeAdoptDCORule    = "human-merge-adopt-dco"
 )
 
 // delegatedHumanMergeDecidedPath is the chosen path and its reason for a
@@ -133,6 +152,10 @@ func delegatedHumanMergeDecidedPath(rule string) string {
 		return "adopt · conflicting, needs rebase"
 	case delegatedHumanMergeAdoptReviewRule:
 		return "adopt · review not passed"
+	case delegatedHumanMergeAdoptDCORule:
+		return "adopt · DCO sign-off missing"
+	case delegatedecision.RuleReturnToAuthor:
+		return "return to author · a person pushed this PR; the hive asked them, not adopted it"
 	}
 	return ""
 }
@@ -159,21 +182,29 @@ func (s *Server) delegatedHumanMergeReviewPassed(in delegatedecision.Input) bool
 
 // delegatedHumanMergeDecision decides a 090 PR held only for its author's
 // trust. ok=false leaves the answer to delegatedHumanMergeOutcome: another
-// 090 reason, a hive-authored PR, a sentinel alert (a person's call), the
-// delegating user's own PR, an approval the user's role cannot give, or an
+// 090 reason, a hive-authored PR, a sentinel alert or hold label (a
+// person's call, hivecommons/hive#17327), the delegating user's own PR, an approval the user's role cannot give, or an
 // adoption this hive has turned off.
 func (s *Server) delegatedHumanMergeDecision(in delegatedecision.Input, req delegatedDecisionRequest, user string, mergerRole bool) (delegatedecision.Decision, []string, bool) {
-	if in.Kind != delegatedecision.KindPR || !slices.Contains(in.Labels, stagelabels.ReadyForHumanMerge.Label()) {
+	if in.Kind != delegatedecision.KindPR || !slices.Contains(in.Labels, stagelabels.ReadyForHumanMerge.Label()) || delegatedHumanMergeGated(in) {
 		return delegatedecision.Decision{}, nil, false
 	}
 	if stageengineprstage.HumanMergeReason(delegatedHumanMergeReason(in, req)) != stageengineprstage.HumanMergeReasonUntrustedAuthor {
 		return delegatedecision.Decision{}, nil, false
 	}
-	if in.HiveAuthored || in.SentinelAlert || strings.EqualFold(strings.TrimSpace(in.Author), strings.TrimSpace(user)) {
+	if in.HiveAuthored || strings.EqualFold(strings.TrimSpace(in.Author), strings.TrimSpace(user)) {
 		return delegatedecision.Decision{}, nil, false
 	}
 	ref := "#" + strconv.Itoa(in.Number)
 	adopt := func(rule, why string) (delegatedecision.Decision, []string, bool) {
+		if in.PersonAuthored() {
+			// A person pushed this PR: it is theirs to fix, never the
+			// hive's to adopt (hivecommons/hive#15202).
+			if d, ok := delegatedecision.ReturnToAuthor(in); ok {
+				return d, []string{"hive decided: return to author · " + why}, true
+			}
+			return delegatedecision.Decision{}, nil, false
+		}
 		if !s.stageAdoptionEnabled() {
 			return delegatedecision.Decision{}, nil, false
 		}
@@ -189,6 +220,8 @@ func (s *Server) delegatedHumanMergeDecision(in delegatedecision.Input, req dele
 	switch {
 	case in.Conflicting:
 		return adopt(delegatedHumanMergeAdoptRebaseRule, "the branch conflicts with the base and needs a rebase")
+	case in.DCOMissing:
+		return adopt(delegatedHumanMergeAdoptDCORule, "the DCO sign-off is missing from its commits")
 	case !in.CIGreen:
 		return adopt(delegatedHumanMergeAdoptCIRedRule, "CI is not green on its head")
 	case !s.delegatedHumanMergeReviewPassed(in):
@@ -196,7 +229,7 @@ func (s *Server) delegatedHumanMergeDecision(in delegatedecision.Input, req dele
 	case !mergerRole:
 		return delegatedecision.Decision{}, nil, false
 	}
-	text := "approve " + ref + ": review passed, CI green and mergeable — the hive's merge sweep merges it under its own number once the head has soaked"
+	text := "approve " + ref + ": review passed, CI green and mergeable — hive merges it under its own number on its next merge pass once the head has soaked"
 	return delegatedecision.Decision{
 		Verdict:   delegatedecision.VerdictApprove,
 		Rule:      delegatedHumanMergeApproveRule,
@@ -208,7 +241,7 @@ func (s *Server) delegatedHumanMergeDecision(in delegatedecision.Input, req dele
 
 // admitDelegatedHumanMergeHead writes the delegating person's approval as
 // the trust override for the PR's current head before the approval lands —
-// what "Approve — let hive merge" writes (hivecommons/hive#15136) — so the
+// what "Approve and let hive merge" writes (hivecommons/hive#15136) — so the
 // adoption engine cannot take the PR over before the sweep merges it.
 func (s *Server) admitDelegatedHumanMergeHead(ctx context.Context, repoFull string, number int, user string) string {
 	state, err := s.deps.GHClient.GetPRState(ctx, repoFull, number)

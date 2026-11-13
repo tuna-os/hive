@@ -2,14 +2,16 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"strings"
 	"time"
 
 	"github.com/hivecommons/hive/crux"
 	"github.com/hivecommons/hive/crux/claude"
 	"github.com/hivecommons/hive/crux/logscrub"
+	"github.com/hivecommons/hive/crux/sharedfile"
 )
 
 // sharedCopilotConfigPath and sharedClaudeCredentialPath are vars (not consts)
@@ -129,9 +131,53 @@ func matchesAuthError(output string) bool {
 	return false
 }
 
+// lockIfDiagnosticCurrent takes m.mu and reports whether ctx, the per-launch
+// context of the session the diagnostic was started for, is still live. On
+// false it has released the lock again.
+//
+// A restart cancels that context under m.mu before it kills the session and
+// launches a new one, so checking it under the same lock is the one reliable
+// way to tell "this is still the hung session" from "a restart already
+// replaced it". The diagnostic must never touch a replaced session: its
+// bare `copilot` has no --allow-all, no --model and no deny flags, and the
+// relaunch it destroyed is never retried.
+func (m *Manager) lockIfDiagnosticCurrent(ctx context.Context, agent *AgentProcess) bool {
+	m.mu.Lock()
+	if ctx.Err() == nil {
+		return true
+	}
+	m.mu.Unlock()
+	m.logger.Info("diagnostic: skipped, the session was relaunched since the hang was seen", "agent", agent.Name)
+	return false
+}
+
+// runCopilotDiagnostic replaces a hung copilot session with a bare `copilot`
+// to read its startup error, then relaunches the agent.
+//
+// ctx is the per-launch context of the poller that saw the hang. Every step
+// that touches the session runs under m.mu after re-checking ctx (see
+// lockIfDiagnosticCurrent). Without that, a poller tick still in flight
+// when a session recycle restarted the agent read the new, still-empty pane
+// against the OLD StartedAt (about 6h, far past the hang timeout), started
+// this diagnostic with an already-cancelled ctx, killed the relaunched
+// session and typed bare `copilot`, and then returned at once on ctx.Done —
+// leaving the agent on a CLI that asks approval for every shell command
+// (live: knuckle architect sat 4h50m at "Do you want to run this command?",
+// 2026-11-08; every copilot agent hit it at each 6h recycle).
 func (m *Manager) runCopilotDiagnostic(ctx context.Context, agent *AgentProcess) {
+	if !m.lockIfDiagnosticCurrent(ctx, agent) {
+		return
+	}
 	m.tmuxSendKeysForAgent(agent, "C-c", "")
+	m.mu.Unlock()
 	time.Sleep(paneCaptureSleep)
+
+	// Kill, recreate and type under the lock, the way launchInTmux does, so a
+	// restart can neither start between the check and the kill nor have its
+	// fresh session killed by this one.
+	if !m.lockIfDiagnosticCurrent(ctx, agent) {
+		return
+	}
 	// Only sweep by UID when isolation gave this agent a real per-agent UID.
 	// agent.UID==0 (isolation off or agent missing from the UID map) would
 	// otherwise ask killAgentProcesses to match root — the internal floor guard
@@ -142,18 +188,21 @@ func (m *Manager) runCopilotDiagnostic(ctx context.Context, agent *AgentProcess)
 	_ = m.tmuxCmd(agent, "kill-session", "-t", agent.tmuxSession).Run()
 
 	if err := m.ensureTmuxSession(agent); err != nil {
+		m.mu.Unlock()
 		m.logger.Warn("diagnostic: failed to create tmux session", "agent", agent.Name, "error", err)
 		return
 	}
 
 	binary, err := backendBinary("copilot")
 	if err != nil {
+		m.mu.Unlock()
 		m.logger.Warn("diagnostic: copilot binary not found", "error", err)
 		return
 	}
 	m.tmuxSendLiteralForAgent(agent, fmt.Sprintf("HOME=/data/home %s", binary))
 	time.Sleep(textToEnterDelay)
 	m.tmuxSendEntersForAgent(agent)
+	m.mu.Unlock()
 
 	m.logger.Info("diagnostic: launched bare copilot to capture error", "agent", agent.Name)
 
@@ -203,6 +252,26 @@ func (m *Manager) runCopilotDiagnostic(ctx context.Context, agent *AgentProcess)
 			output := m.captureTmuxPaneForAgent(agent)
 			if output == "" {
 				continue
+			}
+			if paneShowsExecFormatError(strings.Split(output, "\n")) {
+				// The kernel refused the binary (#17729). No relaunch can fix
+				// that, and the restart-storm breaker would only turn it into
+				// 30-minute silences; park the agent with the remedy instead.
+				agent.LastError = execFormatLastError(binary)
+				m.logger.Error("diagnostic: copilot binary cannot be executed on this kernel (ENOEXEC); not relaunching",
+					"agent", agent.Name, "binary", binary, "output_tail", truncateStr(compactPaneTail(output, 8), 500), "remedy", execFormatRemedy)
+				if agent.UID > 0 {
+					killAgentProcesses(agent.UID, m.logger)
+				}
+				_ = m.tmuxCmd(agent, "kill-session", "-t", agent.tmuxSession).Run()
+				agent.State = StateFailed
+				m.audit(AuditAgentStartFailed, agent.Name, auditFields(
+					"outcome", "failure",
+					"backend", agent.effectiveBackend(),
+					"model", agent.effectiveModel(),
+					"error", agent.LastError,
+				))
+				return
 			}
 			if matchesAuthError(output) {
 				agent.LastError = "auth token expired or invalid"
@@ -284,19 +353,22 @@ func compactPaneTail(output string, maxLines int) string {
 // fixSharedConfigPerms ensures /data/home/.copilot/config.json is group-readable
 // before launching an agent. Copilot CLI rewrites this file with 600 perms on
 // token refresh, locking out other agent UIDs that share the same HOME.
+//
+// The chmod goes through an open descriptor (sharedfile.Chmod), so anything
+// other than a regular file at that path is left alone and logged.
 func (m *Manager) fixSharedConfigPerms(agent *AgentProcess) {
-	info, err := os.Stat(sharedCopilotConfigPath)
-	if err != nil {
+	prev, changed, err := sharedfile.Chmod(sharedCopilotConfigPath, sharedConfigDesiredMode)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return
+	case err != nil:
+		m.logger.Warn("failed to fix config.json perms", "agent", agent.Name, "error", err)
+		return
+	case !changed:
 		return
 	}
-	if info.Mode().Perm() == sharedConfigDesiredMode {
-		return
-	}
-	m.logger.Warn("fixing shared config.json perms before launch",
+	m.logger.Warn("fixed shared config.json perms before launch",
 		"agent", agent.Name,
-		"was", fmt.Sprintf("%04o", info.Mode().Perm()),
+		"was", fmt.Sprintf("%04o", prev),
 		"fix", fmt.Sprintf("%04o", sharedConfigDesiredMode))
-	if err := os.Chmod(sharedCopilotConfigPath, sharedConfigDesiredMode); err != nil {
-		m.logger.Warn("failed to fix config.json perms", "error", err)
-	}
 }

@@ -160,6 +160,16 @@ func (c *Client) enrichStageFacts(ctx context.Context, f stageengine.Facts) (sta
 		f.Issue.Bucket = stageengine.BucketFiltered
 		f.Issue.FilteredReason = issueFilterReason
 	}
+	// A standing meta issue derives no stage out of cycle either, or a
+	// webhook on a Renovate dashboard re-parks it between sweeps.
+	if f.Issue != nil {
+		switch standingMetaIssueKindFor(issue.GetTitle(), issue.GetUser().GetLogin(), labels) {
+		case standingMetaDependencyDashboard:
+			f.Issue.Bucket = stageengine.BucketDependencyDashboard
+		case standingMetaHiveAdvisory:
+			f.Issue.Bucket = stageengine.BucketHiveAdvisory
+		}
+	}
 	if f.Issue != nil {
 		resolveIssueLabelFacts(issueInputFrom(f), &f)
 		f.Issue.Stalled = issueHasLabel(f.Labels, stagelabels.StalledLabel)
@@ -177,6 +187,15 @@ func (c *Client) enrichStageFacts(ctx context.Context, f stageengine.Facts) (sta
 		case c.isKnownNonHumanAuthor(issue.GetUser()):
 			f.Author.Kind = authorkind.Hive
 		}
+	}
+	// A PR fact (a human's CHANGES_REQUESTED review, an un-park) carries no
+	// author kind either; left Unknown, the deriver's 07x split read every
+	// contributor PR as a person's and routed hivecommons/hive#15159 — a
+	// contributor's clanker PR — to 071 needs-author
+	// instead of 072 returned-to-contributor. Resolve it the way the sweep
+	// does: App login, agent/ stamp, body markers.
+	if f.Author.Kind == authorkind.Unknown && f.Ref.Kind == stagelabels.PRItem {
+		f.Author.Kind = authorkind.Detect(authorkind.Input{Author: issue.GetUser().GetLogin(), AppLogin: c.AppBotLogin(), Labels: f.Labels, Body: issue.GetBody(), PRURL: issue.GetHTMLURL()})
 	}
 	return f, nil
 }
@@ -260,7 +279,9 @@ func (c *Client) rememberedCoveringPR(store *stagelabels.Store, issue stageengin
 // cycles planned around them. Only a claim FilterClaimedIssues would
 // suppress the issue for counts (IssueClaim.CoversOpenIssue); the ledger is
 // keyed by the configured repo spelling, so both the bare and the
-// owner-qualified name are tried.
+// owner-qualified name are tried. A contributor lease revoked while the
+// holder's own PR covers the issue now keeps the claim as a PR-held claim
+// (hivecommons/hive#17300); this fallback still covers every other release.
 func (c *Client) ledgerCoveringPR(issue stageengine.Ref) (pr stageengine.Ref, partial bool, ok bool) {
 	claim, found := c.ledgerClaim(issue)
 	if !found || !claim.CoversOpenIssue() {

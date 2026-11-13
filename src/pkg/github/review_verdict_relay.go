@@ -78,6 +78,13 @@ func (c *Client) recordReviewVerdict(ctx context.Context, req ReviewRequest, dir
 	}
 	decisionRequested, decisionQuestion := reviewDecisionRequestFromBody(req.Body)
 	decisionRiskHigh := reviewDecisionRiskHighFromBody(req.Body)
+	redundantOf := reviewRedundantOfNumber(req.Body)
+	if redundantOf == 0 && decisionRequested {
+		// A reviewer that wrote "already landed via #N" but forgot the
+		// marker still named the PR; carry it so the hive's own
+		// already-landed close can act (hivecommons/hive#15647).
+		redundantOf = review.AlreadyLandedPR(0, decisionQuestion)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		c.logger.Warn("review-request watcher: could not create report dir",
 			slog.String("dir", dir), slog.String("error", err.Error()))
@@ -100,7 +107,35 @@ func (c *Client) recordReviewVerdict(ctx context.Context, req ReviewRequest, dir
 			report.DecisionRiskHigh = decisionRiskHigh
 			report.Verdict = review.VerdictRequiresHuman
 		}
+		if redundantOf > 0 {
+			report.RedundantOf = redundantOf
+		}
 		report.PermissionsTighteningOnly = tightening
+		if reason, unread := review.UnreadableReviewReason(report); unread {
+			// A rate limit kept the reviewer from reading the PR: that is
+			// no verdict, not a requires_human. Nothing is recorded, so no
+			// person is asked and no security hold is claimed; the dispatch
+			// row stays open, expires after review.pending_ttl, and the
+			// planner asks again (projectbluefin/testsuite#1116).
+			c.logger.Info("review-request watcher: unreadable review not recorded as a verdict; the perspective is re-asked after the pending TTL",
+				slog.String("repo", req.Repo), slog.Int("number", req.Number),
+				slog.String("perspective", string(report.Perspective)),
+				slog.String("agent", req.Agent), slog.String("reason", reason))
+			continue
+		}
+		if reason, stopped := c.capStoppedReview(req, report, time.Now().UTC()); stopped {
+			// The proxy refused this agent's GitHub reads after the
+			// perspective was asked (its hourly cap or the reserve floor),
+			// so the requires_human is what a cut-short session says, in
+			// whatever words, not a judgement. Set aside like the
+			// unreadable case above: re-asked after review.pending_ttl
+			// (projectbluefin/utah-packages#959).
+			c.logger.Info("review-request watcher: requires_human from a review the GitHub proxy refused reads to is not recorded as a verdict; the perspective is re-asked after the pending TTL",
+				slog.String("repo", req.Repo), slog.Int("number", req.Number),
+				slog.String("perspective", string(report.Perspective)),
+				slog.String("agent", req.Agent), slog.String("reason", reason))
+			continue
+		}
 		if written, ok, dispatched := c.writeOneVerdict(ctx, req, report, dir, prHead, prSnapshot); ok {
 			recorded = append(recorded, written)
 			wake = wake || dispatched
@@ -160,6 +195,15 @@ func (c *Client) canonicalVerdictHead(req ReviewRequest, reported, dispatchHead 
 type reviewedPRSnapshot struct {
 	Head       string
 	BodyDigest string
+	// Author is the PR's login author, for the hive-authored fallback.
+	Author string
+	// Base is the PR's base branch, for the same-patch test across a head
+	// move (hivecommons/hive#15823).
+	Base string
+	// Supersedes is the PR the body declares this one supersedes (0 when
+	// none): with hive authorship it marks the hive's superseding copy,
+	// whose reviewer findings route to the fixer rather than a person.
+	Supersedes int
 }
 
 // reviewedPRSnapshotFunc returns a memoized lookup of req's PR head SHA and
@@ -191,6 +235,9 @@ func (c *Client) reviewedPRSnapshotFunc(ctx context.Context, req ReviewRequest) 
 		snap = reviewedPRSnapshot{
 			Head:       strings.TrimSpace(pr.GetHead().GetSHA()),
 			BodyDigest: review.PullRequestBodyDigest(pr.GetTitle(), pr.GetBody()),
+			Author:     safeGetLogin(pr.GetUser()),
+			Base:       strings.TrimSpace(pr.GetBase().GetRef()),
+			Supersedes: prSupersedesNumberOrZero(pr.GetBody()),
 		}
 		return snap
 	}
@@ -281,6 +328,25 @@ func hiddenMarkerValue(body, prefix string) string {
 	return ""
 }
 
+// reviewRedundantOfNumber reads the PR number from the
+// `<!-- hive-redundant-of: #N -->` marker, 0 when absent or unparseable.
+func reviewRedundantOfNumber(body string) int {
+	v := strings.TrimSpace(hiddenMarkerValue(body, reviewRedundantOfMarker))
+	v = strings.TrimPrefix(v, "#")
+	if i := strings.IndexAny(v, " \t,;)"); i >= 0 {
+		v = v[:i]
+	}
+	// owner/repo#N and .../pull/N both end in the number.
+	if i := strings.LastIndexAny(v, "/#"); i >= 0 {
+		v = v[i+1:]
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
 // decisionQuestionFromBody reads the `<!-- hive-decision-question: ... -->`
 // marker, the single grammar shared by the verdict relay and the comment
 // renderer.
@@ -344,6 +410,21 @@ func maintainerCallQuestion(body string) string {
 	return ""
 }
 
+// logVerdictDispatchRefusal reports a discarded verdict. A self-approval
+// refusal is the guard working as designed, not a runtime fault, so it is
+// logged at INFO to keep it out of the fleet's repeated-error reports.
+func (c *Client) logVerdictDispatchRefusal(ctx context.Context, req ReviewRequest, report review.PerspectiveReport, reason string) {
+	level := slog.LevelWarn
+	if reason == "author_self_approval" {
+		level = slog.LevelInfo
+	}
+	c.logger.Log(ctx, level, "review-request watcher: verdict does not match a review dispatch, discarded",
+		slog.String("reviewed", fmt.Sprintf("%s#%d", req.Repo, req.Number)),
+		slog.String("perspective", string(report.Perspective)),
+		slog.String("agent", req.Agent),
+		slog.String("reason", reason))
+}
+
 // writeOneVerdict commits a single perspective's verdict where review.Collect
 // will find it. One file per perspective, which is what the collector has
 // always read — a combined review changes how verdicts arrive, not how they
@@ -365,13 +446,9 @@ func (c *Client) writeOneVerdict(ctx context.Context, req ReviewRequest, report 
 	// several verdicts, so each element is checked on its own: the dispatch is
 	// recorded per perspective, and a perspective nothing dispatched is refused
 	// here exactly as it would be for a single-object verdict.
-	auth := c.verdictDispatchAuthorized(report, req)
+	auth := c.verdictDispatchAuthorizedAt(ctx, report, req, prSnapshot)
 	if !auth.OK {
-		c.logger.Warn("review-request watcher: verdict does not match a review dispatch, discarded",
-			slog.String("reviewed", fmt.Sprintf("%s#%d", req.Repo, req.Number)),
-			slog.String("perspective", string(report.Perspective)),
-			slog.String("agent", req.Agent),
-			slog.String("reason", auth.Reason))
+		c.logVerdictDispatchRefusal(ctx, req, report, auth.Reason)
 		return report, false, false
 	}
 	// A dispatched verdict is stored under the head its dispatch record names,
@@ -391,6 +468,24 @@ func (c *Client) writeOneVerdict(ctx context.Context, req ReviewRequest, report 
 		report.HeadSHA = c.canonicalVerdictHead(req, report.HeadSHA, auth.HeadSHA, prHead)
 	}
 	report.HiveAuthored = auth.HiveAuthored
+	if prSnapshot != nil && (report.DecisionRequested || report.Verdict == review.VerdictRequiresHuman) {
+		// Only a verdict whose routing depends on authorship pays for the
+		// PR fetch; an approve or changes_requested never does.
+		snap := prSnapshot()
+		if !report.HiveAuthored && c.IsHiveAuthorLogin(snap.Author) {
+			// The App's own PR under a dispatch record that did not carry
+			// authorship (an adoption with no agent attribution, or a record
+			// written before hive_authored existed): the login settles it, so
+			// the aggregate can self-resolve its decision questions and the
+			// stage engine routes it as the hive's (hivecommons/hive#15499).
+			report.HiveAuthored = true
+		}
+		// The hive's superseding copy of another PR ("Supersedes #N" under
+		// the App's login): its requires_human findings — security-sensitive
+		// included — go to the fixer, never to an operator decision
+		// (owner rule, hivecommons/hive: hive superseder auto-merge).
+		report.HiveSuperseding = report.HiveAuthored && snap.Supersedes > 0 && c.IsHiveAuthorLogin(snap.Author)
+	}
 	// The review head, and whether this is the decision step's reconciled
 	// report, come from the dispatch record this verdict bound to, never the
 	// reviewer's own JSON: a head cannot claim to be another head or to have
@@ -398,6 +493,7 @@ func (c *Client) writeOneVerdict(ctx context.Context, req ReviewRequest, report 
 	// (hivecommons/hive#13542). Only a decided report may carry dispositions.
 	report.Head = auth.ReviewHead
 	report.Decided = auth.Decided
+	report.ReporterAgent = strings.TrimSpace(req.Agent)
 	if !report.Decided {
 		report.Dispositions = nil
 	}
@@ -500,13 +596,38 @@ type verdictAuthorization struct {
 	// Decided marks a verdict bound to the review-heads decision step's
 	// dispatch: the reconciled report for its perspective (#13542).
 	Decided bool
+	// HeadMove is set when the verdict bound to a dispatch row for an
+	// earlier head (hivecommons/hive#15823); HeadSHA is then the head it
+	// was accepted for.
+	HeadMove *verdictHeadMove
+}
+
+// dispatchRecordHiveAuthored is the authorship a dispatch record vouches
+// for: the planner's hive_authored flag (hivecommons/hive#15499) or, for
+// records written before it existed, an agent attribution.
+func dispatchRecordHiveAuthored(authorAgent string, hiveAuthored bool) bool {
+	return hiveAuthored || strings.TrimSpace(authorAgent) != ""
 }
 
 func verdictRefused(reason string) verdictAuthorization {
 	return verdictAuthorization{Reason: reason}
 }
 
+// verdictDispatchAuthorized binds a verdict with no PR lookup available:
+// the backlog filer's path, where a head move cannot be resolved and the
+// dispatch rows are matched as written.
 func (c *Client) verdictDispatchAuthorized(report review.PerspectiveReport, req ReviewRequest) verdictAuthorization {
+	return c.verdictDispatchAuthorizedAt(context.Background(), report, req, nil)
+}
+
+// verdictDispatchAuthorizedAt binds a verdict to a dispatch row. Rows are
+// ranked, best first: the row the verdict names exactly (its agent and head);
+// the same head dispatched to another reviewer-role agent (a verdict from a
+// sibling reviewer answers the perspective just as well, hivecommons/hive#15823);
+// and a row for an earlier head when the verdict names the PR's current head
+// or a head carrying the same patch (verdictHeadMove). prSnapshot may be nil,
+// in which case no head move is resolved.
+func (c *Client) verdictDispatchAuthorizedAt(ctx context.Context, report review.PerspectiveReport, req ReviewRequest, prSnapshot func() reviewedPRSnapshot) verdictAuthorization {
 	state, err := review.LoadDispatchState("")
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -515,27 +636,47 @@ func (c *Client) verdictDispatchAuthorized(report review.PerspectiveReport, req 
 		return verdictRefused("dispatch_state_unavailable")
 	}
 	now := time.Now().UTC()
+	reviewerRole := c.isReviewerAgent(req.Agent)
+	moves := c.verdictHeadMover(ctx, req, report, prSnapshot)
+	bestTier := -1
+	var best verdictAuthorization
+	consider := func(tier int, auth verdictAuthorization) {
+		if tier < 0 || (bestTier >= 0 && tier >= bestTier) {
+			return
+		}
+		bestTier, best = tier, auth
+	}
 	for _, p := range state.Pending {
-		if !pendingReviewMatchesVerdict(p, report, req) {
+		tier, move := reviewDispatchRowTier(p.Repo, p.Number, p.HeadSHA, p.Perspective, p.Agent, report, req, reviewerRole, moves)
+		if tier < 0 {
 			continue
 		}
 		if c.sameVerdictAuthor(verdictAuthorAgent(p.AuthorAgent, report), req.Agent) {
 			return verdictRefused("author_self_approval")
 		}
-		return verdictAuthorization{OK: true, Dispatched: true, HeadSHA: p.HeadSHA, BodyDigest: p.BodyDigest, HiveAuthored: strings.TrimSpace(p.AuthorAgent) != "", ReviewHead: strings.TrimSpace(p.Head), Decided: p.Decision}
+		consider(tier, verdictAuthorization{OK: true, Dispatched: true, HeadSHA: p.HeadSHA, BodyDigest: p.BodyDigest, HiveAuthored: dispatchRecordHiveAuthored(p.AuthorAgent, p.HiveAuthored), ReviewHead: strings.TrimSpace(p.Head), Decided: p.Decision, HeadMove: move})
 	}
-	cutoff := now.Add(-review.RecentDispatchTTL)
-	for _, r := range state.Recent {
-		if !recentReviewMatchesVerdict(r, report, req) {
-			continue
+	if bestTier < 0 {
+		cutoff := now.Add(-review.RecentDispatchTTL)
+		for _, r := range state.Recent {
+			tier, move := reviewDispatchRowTier(r.Repo, r.Number, r.HeadSHA, r.Perspective, r.Agent, report, req, reviewerRole, moves)
+			if tier < 0 {
+				continue
+			}
+			if !r.Confirmed.IsZero() && r.Confirmed.Before(cutoff) {
+				continue
+			}
+			if c.sameVerdictAuthor(verdictAuthorAgent(r.AuthorAgent, report), req.Agent) {
+				return verdictRefused("author_self_approval")
+			}
+			consider(tier, verdictAuthorization{OK: true, Dispatched: true, HeadSHA: r.HeadSHA, BodyDigest: r.BodyDigest, HiveAuthored: dispatchRecordHiveAuthored(r.AuthorAgent, r.HiveAuthored), ReviewHead: strings.TrimSpace(r.Head), Decided: r.Decision, HeadMove: move})
 		}
-		if !r.Confirmed.IsZero() && r.Confirmed.Before(cutoff) {
-			continue
+	}
+	if bestTier >= 0 {
+		if best.HeadMove != nil {
+			best = c.acceptVerdictAcrossHeadMove(best, state, report, req)
 		}
-		if c.sameVerdictAuthor(verdictAuthorAgent(r.AuthorAgent, report), req.Agent) {
-			return verdictRefused("author_self_approval")
-		}
-		return verdictAuthorization{OK: true, Dispatched: true, HeadSHA: r.HeadSHA, BodyDigest: r.BodyDigest, HiveAuthored: strings.TrimSpace(r.AuthorAgent) != "", ReviewHead: strings.TrimSpace(r.Head), Decided: r.Decision}
+		return best
 	}
 	// Queue-mode reviewer prompts can reach the relay through the ordinary
 	// PR-list comment path rather than a review-swarm dispatch. That still is
@@ -545,7 +686,116 @@ func (c *Client) verdictDispatchAuthorized(report review.PerspectiveReport, req 
 	// "awaiting review approval", and combined verdict arrays from the
 	// reviewer recorded only the one perspective whose dispatch happened to be
 	// assigned to that same agent.
+	c.logAdvisoryFallbackCandidates(state, report, req)
 	return c.advisoryVerdictAuthorized(report, req)
+}
+
+// verdictHeadMove is how a verdict bound to a dispatch row for an earlier
+// head: the row's head, the head the verdict is recorded under, and why the
+// move was accepted (hivecommons/hive#15823).
+type verdictHeadMove struct {
+	From string
+	To   string
+	Why  string
+}
+
+const (
+	// headMoveReportedCurrent: the reviewer reported the PR's current head —
+	// it reviewed the live PR, which is exactly the verdict wanted.
+	headMoveReportedCurrent = "reported-current-head"
+	// headMoveSamePatch: the dispatched head and the reported head carry the
+	// same patch against the base (a rebase or merge-from-base).
+	headMoveSamePatch = "same-patch"
+)
+
+// verdictHeadMover returns the head-move test for one verdict: given a
+// dispatch row's head and the head the reviewer reported, the move to accept
+// or nil. The PR fetch and the compares run only when a row's head actually
+// differs from a SHA-like reported head, and each pair is tested once.
+func (c *Client) verdictHeadMover(ctx context.Context, req ReviewRequest, report review.PerspectiveReport, prSnapshot func() reviewedPRSnapshot) func(rowHead string) *verdictHeadMove {
+	reported := strings.TrimSpace(report.HeadSHA)
+	if prSnapshot == nil || !verdictHeadLooksLikeSHA(reported) {
+		return func(string) *verdictHeadMove { return nil }
+	}
+	memo := map[string]*verdictHeadMove{}
+	return func(rowHead string) *verdictHeadMove {
+		rowHead = strings.TrimSpace(rowHead)
+		if rowHead == "" || review.SameHeadSHA(rowHead, reported) {
+			return nil
+		}
+		if move, seen := memo[rowHead]; seen {
+			return move
+		}
+		var move *verdictHeadMove
+		snap := prSnapshot()
+		switch {
+		case snap.Head != "" && review.SameHeadSHA(reported, snap.Head):
+			move = &verdictHeadMove{From: rowHead, To: snap.Head, Why: headMoveReportedCurrent}
+		case c.ReviewHeadsSamePatch(ctx, req.Repo, snap.Base, rowHead, reported):
+			move = &verdictHeadMove{From: rowHead, To: reported, Why: headMoveSamePatch}
+		}
+		memo[rowHead] = move
+		return move
+	}
+}
+
+// acceptVerdictAcrossHeadMove records a verdict bound across a head move
+// under the head it was accepted for, and rewrites the in-flight dispatch
+// row to that head so the planner sees the perspective as asked (not owed)
+// at the PR's current head instead of dispatching it again.
+func (c *Client) acceptVerdictAcrossHeadMove(auth verdictAuthorization, state review.DispatchState, report review.PerspectiveReport, req ReviewRequest) verdictAuthorization {
+	move := auth.HeadMove
+	auth.HeadSHA = move.To
+	if rebound, changed := review.RebindPendingHead(state, req.Repo, req.Number, report.Perspective, move.From, move.To); changed {
+		if err := review.WriteDispatchState("", rebound); err != nil {
+			c.logger.Warn("review-request watcher: could not rewrite dispatch row head after head move",
+				slog.String("reviewed", fmt.Sprintf("%s#%d", req.Repo, req.Number)),
+				slog.String("error", err.Error()))
+		}
+	}
+	c.logger.Info("verdict accepted across head move",
+		slog.String("pr", fmt.Sprintf("%s#%d", req.Repo, req.Number)),
+		slog.String("h1", move.From),
+		slog.String("h2", move.To),
+		slog.String("why", move.Why),
+		slog.String("perspective", string(report.Perspective)),
+		slog.String("agent", strings.TrimSpace(req.Agent)))
+	return auth
+}
+
+// logAdvisoryFallbackCandidates records why a verdict from an agent this hive
+// dispatched to for the PR bound to no dispatch row and fell back to advisory:
+// what the verdict claimed, and every row for that repo and number it was
+// compared with (hivecommons/hive#15559). A verdict from an agent with no row
+// for the PR is an ordinary advisory review and logs nothing.
+func (c *Client) logAdvisoryFallbackCandidates(state review.DispatchState, report review.PerspectiveReport, req ReviewRequest) {
+	agent := strings.TrimSpace(req.Agent)
+	var candidates []string
+	agentHasRow := false
+	add := func(kind, repo string, number int, rowAgent string, perspective review.Perspective, headSHA string, decision bool) {
+		if number != report.Number || !strings.EqualFold(strings.TrimSpace(repo), strings.TrimSpace(report.Repo)) {
+			return
+		}
+		if strings.TrimSpace(rowAgent) == agent {
+			agentHasRow = true
+		}
+		candidates = append(candidates, fmt.Sprintf("%s agent=%s perspective=%s head=%s decision=%t", kind, strings.TrimSpace(rowAgent), perspective, strings.TrimSpace(headSHA), decision))
+	}
+	for _, p := range state.Pending {
+		add("pending", p.Repo, p.Number, p.Agent, p.Perspective, p.HeadSHA, p.Decision)
+	}
+	for _, r := range state.Recent {
+		add("recent", r.Repo, r.Number, r.Agent, r.Perspective, r.HeadSHA, r.Decision)
+	}
+	if !agentHasRow || c.logger == nil {
+		return
+	}
+	c.logger.Info("review-request watcher: verdict matched no dispatch row for its agent, falling back to advisory",
+		slog.String("reviewed", fmt.Sprintf("%s#%d", req.Repo, req.Number)),
+		slog.String("agent", agent),
+		slog.String("perspective", string(report.Perspective)),
+		slog.String("reported_head", strings.TrimSpace(report.HeadSHA)),
+		slog.String("candidates", strings.Join(candidates, "; ")))
 }
 
 // advisoryVerdictAuthorized admits a verdict no dispatch row binds. The
@@ -567,21 +817,53 @@ func (c *Client) advisoryVerdictAuthorized(report review.PerspectiveReport, req 
 	return verdictAuthorization{OK: true, HeadSHA: head, BodyDigest: strings.TrimSpace(report.BodyDigest)}
 }
 
-func pendingReviewMatchesVerdict(p review.PendingReview, report review.PerspectiveReport, req ReviewRequest) bool {
-	return reviewDispatchFieldsMatch(p.Repo, p.Number, p.HeadSHA, p.Perspective, p.Agent, report, req)
-}
+// Dispatch row tiers, best first. A verdict binds to the best-ranked row.
+const (
+	rowTierExact        = iota // same agent, same head
+	rowTierReviewerRole        // same head, another reviewer-role agent
+	rowTierHeadMove            // same agent, earlier head (verdictHeadMove)
+	rowTierHeadMoveRole        // another reviewer-role agent, earlier head
+)
 
-func recentReviewMatchesVerdict(r review.RecentReview, report review.PerspectiveReport, req ReviewRequest) bool {
-	return reviewDispatchFieldsMatch(r.Repo, r.Number, r.HeadSHA, r.Perspective, r.Agent, report, req)
-}
-
-func reviewDispatchFieldsMatch(repo string, number int, headSHA string, perspective review.Perspective, agent string, report review.PerspectiveReport, req ReviewRequest) bool {
+// reviewDispatchRowTier ranks one dispatch row against a verdict: -1 when it
+// does not bind, else the tier, with the head move that made it bind when
+// the row's head differs from the verdict's.
+func reviewDispatchRowTier(repo string, number int, headSHA string, perspective review.Perspective, agent string, report review.PerspectiveReport, req ReviewRequest, reviewerRole bool, moves func(rowHead string) *verdictHeadMove) (int, *verdictHeadMove) {
 	if !strings.EqualFold(strings.TrimSpace(repo), strings.TrimSpace(report.Repo)) {
-		return false
+		return -1, nil
 	}
-	if number != report.Number || perspective != report.Perspective || strings.TrimSpace(agent) != strings.TrimSpace(req.Agent) {
-		return false
+	if number != report.Number || perspective != report.Perspective {
+		return -1, nil
 	}
+	sameAgent := strings.TrimSpace(agent) == strings.TrimSpace(req.Agent)
+	// The row's agent need not be the posting one when the poster is a
+	// reviewer-role lane: the perspective was asked, and a verdict from any
+	// lane this hive reviews with answers it (hivecommons/hive#15823). A
+	// non-reviewer still binds only to its own row.
+	if !sameAgent && !reviewerRole {
+		return -1, nil
+	}
+	tier := rowTierExact
+	if !sameAgent {
+		tier = rowTierReviewerRole
+	}
+	if reviewDispatchHeadMatches(headSHA, report) {
+		return tier, nil
+	}
+	if moves == nil {
+		return -1, nil
+	}
+	move := moves(headSHA)
+	if move == nil {
+		return -1, nil
+	}
+	if sameAgent {
+		return rowTierHeadMove, move
+	}
+	return rowTierHeadMoveRole, move
+}
+
+func reviewDispatchHeadMatches(headSHA string, report review.PerspectiveReport) bool {
 	// An abbreviated head from the reviewer still binds to the dispatch that
 	// named the full one (review.SameHeadSHA). A head that is not a SHA at all
 	// (prose, a placeholder) names no revision, so it binds like a blank one

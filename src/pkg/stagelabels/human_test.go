@@ -94,6 +94,16 @@ func TestRouteHumanFixEvidence(t *testing.T) {
 	if r := RouteHuman(e); len(r.Reasons) != 2 || r.LaneReason != LaneReasonChangesRequested {
 		t.Fatalf("multi-reason route = %+v", r)
 	}
+	// Red CI on a clanker's PR goes back to the clanker (072) even when the
+	// reviewer also said requires_human: a failing check is the author's to
+	// fix first and never alone parks the PR at 085 (hivecommons/hive#15722).
+	e = readyEvidence()
+	e.AuthorKind = authorkind.Clanker
+	e.Verdict = VerdictRequiresHuman
+	e.Checks = CheckSummary{Total: 2, Green: 1, Red: []string{"unit"}, Known: true}
+	if r := RouteHuman(e); r.Stage != ReturnedToContributor || r.LaneReason != "check-failing:unit" {
+		t.Fatalf("clanker red CI + requires_human route = %+v", r)
+	}
 }
 
 // TestRouteHumanPendingStaysAtReview: no current-head verdict, or a head
@@ -131,9 +141,12 @@ func TestRouteHumanPendingStaysAtReview(t *testing.T) {
 	}
 }
 
-// TestRouteHumanDecision: sentinel, hold-class labels, no reviewer, or a
-// non-trust human-only lane rule → 085 naming the decision owed.
-func TestRouteHumanDecision(t *testing.T) {
+// TestRouteHumanGates: a sentinel alert or a hold-class label is a gate,
+// not a stage (hivecommons/hive#17327). A green, reviewed head keeps 090
+// with the gate in Reasons and Gates so the entry comment and the
+// decision popover still explain the stop; the lanes refuse the merge on
+// the label itself.
+func TestRouteHumanGates(t *testing.T) {
 	cases := []struct {
 		name   string
 		mutate func(*Evidence)
@@ -143,18 +156,79 @@ func TestRouteHumanDecision(t *testing.T) {
 		{"hold", func(e *Evidence) { e.Holds = Holds([]string{"Hold", "kind/bug"}) }, "the `hold` label is set"},
 		{"do-not-merge family", func(e *Evidence) { e.Holds = Holds([]string{"do-not-merge/work-in-progress"}) }, "the `do-not-merge/work-in-progress` label is set"},
 		{"needs-decision", func(e *Evidence) { e.Holds = Holds([]string{"needs-decision"}) }, "the `needs-decision` label is set"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := readyEvidence()
+			tc.mutate(&e)
+			r := RouteHuman(e)
+			if r.Stage != ReadyForHumanMerge || !containsString(r.Reasons, tc.want) || !containsString(r.Gates, tc.want) {
+				t.Fatalf("route = %+v", r)
+			}
+			got := ReadyComment(r, "`role/newcomer`")
+			if !strings.Contains(got, "Held: "+tc.want+". The hive never merges this head while the gate stands.") || strings.Contains(got, "Blocked only by") {
+				t.Fatalf("ReadyComment = %q", got)
+			}
+			// The gate rides every stage: CI pending keeps 060, no verdict
+			// keeps 050, a changes_requested verdict goes back to the author
+			// without the gate in the author's instruction.
+			pending := e
+			pending.Checks = CheckSummary{Total: 55, Green: 54, Pending: 1, Known: true}
+			if r := RouteHuman(pending); r.Stage != Reviewed || !containsString(r.Reasons, tc.want) {
+				t.Fatalf("pending route = %+v", r)
+			}
+			fresh := e
+			fresh.Verdict = VerdictPending
+			if r := RouteHuman(fresh); r.Stage != ReviewPending || !containsString(r.Reasons, tc.want) {
+				t.Fatalf("fresh route = %+v", r)
+			}
+			red := e
+			red.Verdict = VerdictChangesRequested
+			if r := RouteHuman(red); r.Stage != NeedsAuthor || containsString(r.Reasons, tc.want) || !containsString(r.Gates, tc.want) {
+				t.Fatalf("changes_requested route = %+v", r)
+			}
+		})
+	}
+	e := readyEvidence()
+	e.Sentinel = true
+	e.Holds = []string{"hold"}
+	r := RouteHuman(e)
+	if len(r.Gates) != 2 || !strings.Contains(ReadyComment(r, ""), "Held: a sentinel alert is open on this PR; the `hold` label is set.") {
+		t.Fatalf("multi-gate route = %+v / %q", r, ReadyComment(r, ""))
+	}
+	// A hive superseding PR's own hard stop already names the gate at 085.
+	hs := readyEvidence()
+	hs.Sentinel, hs.HiveSuperseder, hs.HiveSupersederHardStop = true, true, HiveSupersederHardStopSentinel
+	if r := RouteHuman(hs); r.Stage != NeedsDecision || len(r.Gates) != 0 {
+		t.Fatalf("hard-stop route = %+v", r)
+	}
+}
+
+// TestRouteHumanDecision: no reviewer, a requires_human verdict, or a
+// non-trust human-only lane rule → 085 naming the decision owed.
+func TestRouteHumanDecision(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Evidence)
+		want   string
+	}{
 		{"no reviewer", func(e *Evidence) { e.Verdict = VerdictUnavailable }, "no reviewer agent is configured, so this head will never get a swarm verdict"},
 		{"requires_human", func(e *Evidence) { e.Verdict = VerdictRequiresHuman }, "the reviewer swarm returned `requires_human` @abc1234"},
 		{"requires_human question", func(e *Evidence) {
 			e.Verdict = VerdictRequiresHuman
 			e.DecisionQuestion = "@clubanderson should decide whether to land this now."
 		}, "reviewer question: @clubanderson should decide whether to land this now."},
+		{"requires_human finding", func(e *Evidence) {
+			e.Verdict = VerdictRequiresHuman
+			e.DecisionQuestion = "close in favour of #15309?"
+			e.DecisionFinding = "duplicate: the review found this change already landed or open elsewhere"
+		}, "the review found: duplicate: the review found this change already landed or open elsewhere"},
 		{"requires_human summary", func(e *Evidence) {
 			e.Verdict = VerdictRequiresHuman
 			e.HumanSummaries = []string{"security requires human: relay owner should confirm before merge"}
 		}, "reviewer summary: security requires human: relay owner should confirm before merge"},
 		{"lane rule", func(e *Evidence) { e.Cause, e.CauseReason = CauseDecision, "the lane excludes `workflow-paths` edits" }, "the lane excludes `workflow-paths` edits"},
-		{"lane rule unnamed", func(e *Evidence) { e.Cause = CauseDecision }, "the automerge lane will not merge this unattended"},
+		{"lane rule unnamed", func(e *Evidence) { e.Cause = CauseDecision }, decisionConsequenceReason},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -171,7 +245,7 @@ func TestRouteHumanDecision(t *testing.T) {
 		})
 	}
 	e := readyEvidence()
-	e.Sentinel = true
+	e.Verdict = VerdictUnavailable
 	e.Holds = []string{"hold"}
 	r := RouteHuman(e)
 	if len(r.Reasons) != 2 || !strings.Contains(DecisionComment(r), "\n- the `hold` label is set\n") {
@@ -239,13 +313,16 @@ func TestRouteHumanApproved(t *testing.T) {
 			wantReason: "the reviewer swarm returned `requires_human` @abc1234",
 		},
 		{
+			// The gate rides the approved manual-merge route as a pill
+			// (hivecommons/hive#17327); the merge click still waits on it.
 			name: "approved but the sentinel label is still on",
 			mutate: func(e *Evidence) {
 				e.Verdict, e.HumanApprover, e.Sentinel = VerdictRequiresHuman, "octocat", true
 				manual(e)
 			},
-			wantStage:  NeedsDecision,
-			wantReason: "a sentinel alert is open on this PR",
+			wantStage: ReadyForHumanMerge, wantManual: true,
+			wantLaneReason: "contributor-lane:workflow-path" + HumanApprovedReasonSuffix + "octocat",
+			wantReason:     "a sentinel alert is open on this PR",
 		},
 		{
 			name: "approved but a hold label is set",
@@ -253,8 +330,9 @@ func TestRouteHumanApproved(t *testing.T) {
 				e.HumanApprover, e.Holds = "octocat", Holds([]string{"hold"})
 				manual(e)
 			},
-			wantStage:  NeedsDecision,
-			wantReason: "the `hold` label is set",
+			wantStage: ReadyForHumanMerge, wantManual: true,
+			wantLaneReason: "contributor-lane:workflow-path" + HumanApprovedReasonSuffix + "octocat",
+			wantReason:     "the `hold` label is set",
 		},
 		{
 			name:       "approved but no reviewer configured",
@@ -485,20 +563,33 @@ func TestDecisionCommentNamesActionsPerLane(t *testing.T) {
 		t.Fatalf("contributor-lane comment promises a hive push:\n%s", got)
 	}
 
+	// A hold-class label is a gate riding the head's real stage, not an 085
+	// park (hivecommons/hive#17327): the entry comment names each label a
+	// person must lift and never offers an approval as the way out.
 	held := readyEvidence()
 	held.SelfAuthored = true
 	held.Holds = Holds([]string{"hold", "do-not-merge/wip"})
 	r = RouteHuman(held)
-	if got := DecisionComment(r); !strings.Contains(got, "resolve the reason for `do-not-merge/wip` and have a maintainer remove that label") || !strings.Contains(got, "resolve the reason for `hold`") || !strings.Contains(got, "`/hive approve` does not remove it") {
-		t.Fatalf("hold park does not name the labels to clear:\n%s", got)
+	if r.Stage != ReadyForHumanMerge || len(r.Gates) != 2 {
+		t.Fatalf("hold route = %+v", r)
+	}
+	if got := ReadyComment(r, ""); !strings.Contains(got, "Held: the `do-not-merge/wip` label is set; the `hold` label is set.") || !strings.Contains(got, "lift the hold") {
+		t.Fatalf("held comment does not name the labels to clear:\n%s", got)
 	} else if strings.Contains(got, "approve this head") {
-		t.Fatalf("hold park offers an approval as the way out:\n%s", got)
+		t.Fatalf("held comment offers an approval as the way out:\n%s", got)
+	}
+	if got := DecisionComment(r); strings.Contains(got, "approve this head") {
+		t.Fatalf("hold gate offers an approval as the way out:\n%s", got)
 	}
 
 	sentinel := readyEvidence()
 	sentinel.Sentinel = true
-	if got := DecisionComment(RouteHuman(sentinel)); !strings.Contains(got, "**What to do:** resolve the sentinel alert") {
-		t.Fatalf("sentinel park does not name the action:\n%s", got)
+	r = RouteHuman(sentinel)
+	if r.Stage != ReadyForHumanMerge || len(r.Gates) != 1 {
+		t.Fatalf("sentinel route = %+v", r)
+	}
+	if got := ReadyComment(r, ""); !strings.Contains(got, "Held: a sentinel alert is open on this PR.") || !strings.Contains(got, "resolve the sentinel alert") {
+		t.Fatalf("sentinel gate does not name the action:\n%s", got)
 	}
 
 	manual := readyEvidence()
@@ -524,7 +615,7 @@ func TestDecisionCommentNamesActionsPerLane(t *testing.T) {
 	multi := readyEvidence()
 	multi.Verdict = VerdictRequiresHuman
 	multi.Sentinel = true
-	if got := DecisionComment(RouteHuman(multi)); !strings.Contains(got, "**What to do:**\n\n- a trusted merger approves") || !strings.Contains(got, "\n- resolve the sentinel alert") {
+	if got := DecisionComment(RouteHuman(multi)); !strings.Contains(got, "**What to do:**\n\n- a trusted merger approves") || !strings.Contains(got, "\n- one action answers both the approval above and the sentinel alert") {
 		t.Fatalf("multiple steps not listed:\n%s", got)
 	}
 	if got := DecisionActions(Route{Stage: ReadyForHumanMerge, Verdict: VerdictRequiresHuman}); got != "" {
@@ -562,7 +653,9 @@ func TestDecisionActionsWorkflowFenceApprovalReleases(t *testing.T) {
 		"releases the CI workflow-file fence and settles the reviewer's `requires_human` verdict",
 		"the hive merges the PR once the other gates clear",
 		"a `/hive approve` reply does not release the fence",
-		"\n- resolve the sentinel alert and have a maintainer clear its label",
+		"\n- one action answers both the approval above and the sentinel alert: **Approve** on this PR's row in the hive dashboard's Activity monitor",
+		"records the approval and clears the alert's label",
+		"a typed `/hive decision approve` reply approves but leaves the label for a maintainer to remove",
 		"\n- resolve the reason for `hold` and have a maintainer remove that label",
 	} {
 		if !strings.Contains(got, want) {
@@ -683,7 +776,9 @@ func TestDecisionQuestionPlaceholderMention(t *testing.T) {
 // TestRouteHumanForkGuard: a red check that refuses the PR only because it
 // is from a fork is a maintainer's, not the author's: 085 naming the check,
 // never the fixing stage, even before the reviewer answers. Any other red
-// check still sends the PR back to its author (hivecommons/hive#14273).
+// check still sends the PR back to its author (hivecommons/hive#14273). The
+// ask says a run on an earlier head does not cover this one: a rebase with
+// the same patch still changes the base (projectbluefin/utah-packages#917).
 func TestRouteHumanForkGuard(t *testing.T) {
 	e := readyEvidence()
 	e.Cause = CauseDecision
@@ -692,15 +787,22 @@ func TestRouteHumanForkGuard(t *testing.T) {
 	e.Checks = CheckSummary{Total: 5, Green: 4, Red: []string{"Canary"}, Known: true}
 	e.ForkGuard = []string{"Canary"}
 	r := RouteHuman(e)
-	const want = "check `Canary` refuses pull requests from a fork, so neither the author nor the hive can turn it green: a maintainer must push this branch to the repository (or approve the run as the repository requires)"
+	const want = "check `Canary` refuses pull requests from a fork, so neither the author nor the hive can turn it green: a maintainer must push this branch to the repository (or run or approve it for head `abc1234` as the repository requires). A run that passed on an earlier head does not cover `abc1234`, even when the change itself is the same: a rebase or a merge of the base changes the code the check runs. The check's own failure message on this head says what to run"
 	if r.Stage != NeedsDecision || r.LaneReason != "" || !containsString(r.Reasons, want) {
 		t.Fatalf("fork-guard route = %+v", r)
 	}
-	if containsString(r.Reasons, "the automerge lane will not merge this unattended") {
+	if containsString(r.Reasons, decisionConsequenceReason) {
 		t.Fatalf("fork-guard route names the generic lane rule: %+v", r)
 	}
 	if got := DecisionComment(r); !strings.Contains(got, want) {
 		t.Fatalf("DecisionComment = %q", got)
+	}
+	two := e
+	two.ForkGuard = []string{"Canary", "Publish"}
+	two.Checks.Red = []string{"Canary", "Publish"}
+	const wantTwo = "checks `Canary`, `Publish` refuse pull requests from a fork, so neither the author nor the hive can turn them green: a maintainer must push this branch to the repository (or run or approve them for head `abc1234` as the repository requires). A run that passed on an earlier head does not cover `abc1234`, even when the change itself is the same: a rebase or a merge of the base changes the code the checks run. Each check's own failure message on this head says what to run"
+	if r := RouteHuman(two); r.Stage != NeedsDecision || !containsString(r.Reasons, wantTwo) {
+		t.Fatalf("two fork-guard checks route = %+v", r)
 	}
 	e.Checks.Red = []string{"Canary", "unit"}
 	if r := RouteHuman(e); r.Stage != ReturnedToContributor || r.LaneReason != "check-failing:unit" || !containsString(r.Reasons, "red checks: unit") {
@@ -710,5 +812,186 @@ func TestRouteHumanForkGuard(t *testing.T) {
 	e.ForkGuard = nil
 	if r := RouteHuman(e); r.Stage != ReturnedToContributor || r.LaneReason != "check-failing:Canary" {
 		t.Fatalf("no fork-guard evidence route = %+v", r)
+	}
+}
+
+// hivecommons/hive#15202: a requires_human verdict on a PR a person pushed
+// themselves routes to 071 Needs author with the reviewer's question (the
+// human the reviewer wants IS the author), never to 085 and never to
+// adoption. A conflicting head names the rebase. A hive or clanker PR, a
+// trusted approval, a hold, a sentinel or a lane rule keep the 085 route.
+func TestRouteHumanAuthorOwesAnswer(t *testing.T) {
+	human := func(e *Evidence) {
+		e.AuthorKind = authorkind.Human
+		e.Verdict = VerdictRequiresHuman
+		e.Cause, e.CauseReason = CauseDecision, "contributor-lane:decision-requested"
+		e.DecisionQuestion = "@clubanderson should this land before the freeze?"
+	}
+	cases := []struct {
+		name       string
+		mutate     func(*Evidence)
+		wantStage  Stage
+		wantLane   string
+		wantReason string
+	}{
+		{"human author question → 071", func(e *Evidence) {}, NeedsAuthor, LaneReasonReviewerQuestion, "reviewer question: @clubanderson should this land before the freeze?"},
+		{"human author summary → 071", func(e *Evidence) {
+			e.DecisionQuestion = ""
+			e.HumanSummaries = []string{"security requires human: confirm the token scope"}
+		}, NeedsAuthor, LaneReasonReviewerQuestion, "reviewer summary: security requires human: confirm the token scope"},
+		{"human author conflicting → 071 needs rebase", func(e *Evidence) { e.Conflict = true }, NeedsAuthor, LaneReasonConflicting, "merge conflict with the base branch"},
+		{"human author no cause reason → 071", func(e *Evidence) { e.Cause, e.CauseReason = CauseTrust, "" }, NeedsAuthor, LaneReasonReviewerQuestion, "the reviewer asked the author a question @abc1234"},
+		{"clanker author keeps 085", func(e *Evidence) { e.AuthorKind = authorkind.Clanker }, NeedsDecision, "", "the reviewer swarm returned `requires_human` @abc1234"},
+		{"hive author keeps 085", func(e *Evidence) { e.AuthorKind = authorkind.Hive }, NeedsDecision, "", "the reviewer swarm returned `requires_human` @abc1234"},
+		{"self-authored keeps 085", func(e *Evidence) { e.SelfAuthored = true }, NeedsDecision, "", "the reviewer swarm returned `requires_human` @abc1234"},
+		{"hold rides the author route as a gate", func(e *Evidence) { e.Holds = Holds([]string{"hold"}) }, NeedsAuthor, LaneReasonReviewerQuestion, "reviewer question: @clubanderson should this land before the freeze?"},
+		{"sentinel rides the author route as a gate", func(e *Evidence) { e.Sentinel = true }, NeedsAuthor, LaneReasonReviewerQuestion, "reviewer question: @clubanderson should this land before the freeze?"},
+		{"lane rule keeps 085", func(e *Evidence) { e.CauseReason = "the lane excludes `workflow-paths` edits" }, NeedsDecision, "", "the lane excludes `workflow-paths` edits"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := readyEvidence()
+			human(&e)
+			tc.mutate(&e)
+			r := RouteHuman(e)
+			if r.Stage != tc.wantStage || !containsString(r.Reasons, tc.wantReason) {
+				t.Fatalf("route = %+v", r)
+			}
+			if tc.wantLane != "" && r.LaneReason != tc.wantLane {
+				t.Fatalf("lane reason = %q want %q (%+v)", r.LaneReason, tc.wantLane, r)
+			}
+		})
+	}
+	// A trusted merger's approval on the head still settles the verdict
+	// ahead of the author route.
+	e := readyEvidence()
+	human(&e)
+	e.HumanApprover = "clubanderson"
+	e.Cause, e.CauseReason = CauseTrust, ""
+	if r := RouteHuman(e); r.Stage == NeedsAuthor || r.Stage == NeedsDecision {
+		t.Fatalf("approved head routed to %s: %+v", r.Stage, r)
+	}
+}
+
+// TestRouteHumanChangeRequesterWinsOverParks: a trusted maintainer's
+// CHANGES_REQUESTED review on the head is the person's answer to every
+// "needs a human" park on it — the sentinel alert, a hold, a manual-merge
+// lane rule — so the PR goes back to its author (072 for a clanker's, 071
+// for a person's, 070 for the hive's) instead of 085
+// (hivecommons/hive#15159: "Sentinel alert · needs human" re-derived over
+// the owner's 072 every sweep).
+func TestRouteHumanChangeRequesterWinsOverParks(t *testing.T) {
+	e := readyEvidence()
+	e.Sentinel = true
+	e.Cause = CauseDecision
+	e.CauseReason = "contributor-lane:sentinel-blocked"
+	e.Holds = []string{"hold"}
+	e.ManualMergeRule = true
+	if r := RouteHuman(e); r.Stage != NeedsDecision {
+		t.Fatalf("without a review the parks hold: %+v", r)
+	}
+	e.HumanChangeRequester = "@clubanderson"
+	e.AuthorKind = authorkind.Clanker
+	r := RouteHuman(e)
+	if r.Stage != ReturnedToContributor || r.LaneReason != LaneReasonHumanChangesRequested {
+		t.Fatalf("clanker route = %+v", r)
+	}
+	if len(r.Reasons) != 1 || r.Reasons[0] != "@clubanderson requested changes @abc1234" {
+		t.Fatalf("reasons = %q", r.Reasons)
+	}
+	if !strings.Contains(r.Summary, "changes requested by @clubanderson") {
+		t.Fatalf("summary = %q", r.Summary)
+	}
+	e.AuthorKind = authorkind.Human
+	if r := RouteHuman(e); r.Stage != NeedsAuthor {
+		t.Fatalf("human route = %+v", r)
+	}
+	e.SelfAuthored = true
+	if r := RouteHuman(e); r.Stage != Fixing {
+		t.Fatalf("self-authored route = %+v", r)
+	}
+}
+
+// hivecommons/hive#15499: the same reviewer question re-asked on a new head
+// is not a new entry comment; a different question is.
+func TestEntryCommentRepeatsDecisionAcrossHeads(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	st := NewStore(filepath.Join(t.TempDir(), "s.json"), func() time.Time { return now })
+	key := Key("o/r", 15499)
+	st.Observe(key, NeedsDecision, "verdict:decision-requested")
+	st.MarkEntryCommentedCause(key, "h1", EntryCause([]string{"reviewer question: close as a no-op?"}))
+	st.MarkEntryCommentedDecisionKey(key, "redundant-of:15427")
+	rec, _ := st.Get(key)
+	if !rec.EntryCommentRepeatsDecision("redundant-of:15427") || rec.EntryCommentRepeatsDecision("redundant-of:1") || rec.EntryCommentRepeatsDecision("") {
+		t.Fatalf("after first entry: %+v", rec)
+	}
+	// A new head (merge-from-base) resets the per-head cause list but not
+	// the decision identity.
+	st.MarkEntryCommented(key, "h2")
+	if rec, _ = st.Get(key); !rec.EntryCommentRepeatsDecision("redundant-of:15427") {
+		t.Fatalf("new head lost the decision identity: %+v", rec)
+	}
+	// The 50↔85 flap #15499 showed (re-review on each head, then the same
+	// verdict) keeps the identity: it is still the one question.
+	st.Observe(key, ReviewPending, "")
+	st.Observe(key, NeedsDecision, "verdict:decision-requested")
+	if rec, _ = st.Get(key); !rec.EntryCommentRepeatsDecision("redundant-of:15427") {
+		t.Fatalf("stage flap lost the decision identity: %+v", rec)
+	}
+}
+
+func TestAlreadyLandedReasonCaption(t *testing.T) {
+	if got := AlreadyLandedReason(15506); got != "self-authored:already-landed:#15506" {
+		t.Fatalf("reason=%q", got)
+	}
+	if c, ok := AlreadyLandedCaption(AlreadyLandedReason(15506)); !ok || c != "already landed via #15506 — closing as superseded" {
+		t.Fatalf("caption=%q ok=%v", c, ok)
+	}
+	if c, ok := AlreadyLandedCaption(AlreadyLandedReason(0)); !ok || c != "already landed on the base — closing as superseded" {
+		t.Fatalf("bare caption=%q ok=%v", c, ok)
+	}
+	if _, ok := AlreadyLandedCaption("superseded-by-merge"); ok {
+		t.Fatal("other reasons are not already-landed")
+	}
+}
+
+func TestAlreadyLandedAuthorReason(t *testing.T) {
+	if got := AlreadyLandedAuthorReason(authorkind.Human); got != "already-landed:human" {
+		t.Fatalf("human = %q", got)
+	}
+	if got := AlreadyLandedAuthorReason(authorkind.Unknown); got != "already-landed:unknown" {
+		t.Fatalf("unknown = %q", got)
+	}
+}
+
+// projectbluefin/utah#1078 (2026-11-04 01:41Z): the head line said "approved
+// by @Danathar" while the actions still asked a trusted merger to approve
+// that head. With the approval recorded, the actions say it is done and
+// leave the other reasons (here the fork's update-branch refusal) to act on.
+func TestDecisionActionsDoNotReaskARecordedApproval(t *testing.T) {
+	e := readyEvidence()
+	e.Verdict = VerdictRequiresHuman
+	e.ManualMerge = true
+	e.ApprovalReleasesFence = true
+	e.Sentinel = true
+	r := RouteHuman(e)
+	r.HumanApprover = "Danathar"
+	got := DecisionActions(r)
+	if strings.Contains(got, "a trusted merger approves this head") || strings.Contains(got, "approve this head") {
+		t.Fatalf("actions re-ask a recorded approval:\n%s", got)
+	}
+	for _, want := range []string{"nothing more to approve: @Danathar approved this head (`abc1234`)", "the sentinel alert is still open and needs no second approval", "presses **Confirm safe**"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("actions missing %q:\n%s", want, got)
+		}
+	}
+
+	// requires_human alone, approver recorded: no approval ask either.
+	rh := readyEvidence()
+	rh.Verdict = VerdictRequiresHuman
+	rr := RouteHuman(rh)
+	rr.Stage, rr.HumanApprover = NeedsDecision, "@Danathar"
+	if got := DecisionActions(rr); strings.Contains(got, "approves this head") || !strings.Contains(got, "@Danathar approved this head") {
+		t.Fatalf("requires_human actions = %q", got)
 	}
 }

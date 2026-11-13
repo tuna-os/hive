@@ -25,8 +25,15 @@ type FactSink interface {
 	AddressedBy(ctx context.Context, issue Ref, pr Ref) error
 	Uncovered(ctx context.Context, issue Ref, pr Ref) error
 	Parked(ctx context.Context, ref Ref, label string) error // agent escalation (045/085/needs-human)
-	Unparked(ctx context.Context, ref Ref, by string) error  // /hive approve|decision
-	Closed(ctx context.Context, ref Ref) error               // the issue closed; its stage lifts
+	// ReparkedOnNewDecision is Parked for an issue that already wears
+	// `approved-direction` when a newer, different `/hive decision` is
+	// pending on its timeline (the label relay's recorded-decision refusal
+	// let the park through): direction is changing, so the ack is stale
+	// and the park derives 045 with it cleared rather than standing down
+	// on the old decision (hivecommons/hive#16579).
+	ReparkedOnNewDecision(ctx context.Context, ref Ref, label string) error
+	Unparked(ctx context.Context, ref Ref, by string) error // /hive approve|decision
+	Closed(ctx context.Context, ref Ref) error              // the issue closed; its stage lifts
 	// PRDecided is a trusted merger's `/hive decision` answered on a PR
 	// parked at 085: the decision is recorded for Head, so the park lifts
 	// now — in the same breath as the reply — instead of waiting for the
@@ -59,7 +66,8 @@ type NeedsHumanApplier int
 
 const (
 	// NeedsHumanApplierUnknown: no `labeled` event was found or the timeline
-	// could not be read. Not knowing is never permission to lift it.
+	// could not be read. An authorized ordinary un-park still lifts it;
+	// only the reply's attribution is unknown.
 	NeedsHumanApplierUnknown NeedsHumanApplier = iota
 	// NeedsHumanApplierHive: one of the hive's accounts (an agent's `label
 	// needs-human` + `/unclaim`, the relay, the task-list sweep).
@@ -191,19 +199,31 @@ func (s *factSink) Uncovered(ctx context.Context, issue Ref, pr Ref) error {
 // Parked implements FactSink: an agent (or a person) parked the item on a
 // human with label → 045 on an issue, 085 on a PR.
 func (s *factSink) Parked(ctx context.Context, ref Ref, label string) error {
+	return s.submit(ctx, parkedFacts(ref, label, false))
+}
+
+// ReparkedOnNewDecision implements FactSink: Parked with
+// ParkFacts.DecisionSuperseded set, so a `needs-human` next to a stale
+// `approved-direction` re-derives 045 and clears the ack.
+func (s *factSink) ReparkedOnNewDecision(ctx context.Context, ref Ref, label string) error {
+	return s.submit(ctx, parkedFacts(ref, label, true))
+}
+
+func parkedFacts(ref Ref, label string, superseded bool) Facts {
 	label = strings.TrimSpace(label)
 	f := Facts{Ref: ref, Labels: []string{label}}
 	f.Park = ParkFacts{
-		Holds:         stagelabels.Holds(f.Labels),
-		NeedsHuman:    strings.EqualFold(label, NeedsHumanLabel),
-		DecisionLabel: label,
+		Holds:              stagelabels.Holds(f.Labels),
+		NeedsHuman:         strings.EqualFold(label, NeedsHumanLabel),
+		DecisionLabel:      label,
+		DecisionSuperseded: superseded,
 	}
 	if ref.Kind == stagelabels.PRItem {
 		f.PR = &PRFacts{}
 	} else {
 		f.Issue = &IssueFacts{Bucket: BucketFiltered, FilteredReason: label}
 	}
-	return s.submit(ctx, f)
+	return f
 }
 
 // Unparked implements FactSink: /hive approve or /hive decision recorded by

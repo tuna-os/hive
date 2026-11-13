@@ -10,6 +10,7 @@ import (
 
 	"github.com/hivecommons/hive/pkg/config"
 	ghpkg "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // verdictSettleTimeout bounds the detached GitHub work settleIssueFromVerdict
@@ -24,6 +25,9 @@ const (
 	verdictDispositionAlreadyDoneUnverified = "already-done-unverified"
 	verdictDispositionAlreadyDoneLabeled    = "already-done-labeled"
 	verdictDispositionAlreadyDoneClosed     = "already-done-closed"
+	// The citation verified, but the issue has an open sub-issue, so nothing
+	// was recorded, labelled or closed (contribute_parent_children.go).
+	verdictDispositionAlreadyDoneOpenSubIssues = "already-done-open-sub-issues"
 )
 
 var (
@@ -128,6 +132,13 @@ func (h *ContributeWSHub) settleIssueFromVerdictWithEvidence(repo string, number
 			h.logger.Info("[contribute-ws] verdict settle: open PR is the reporter's own, not an external claim",
 				"repo", repo, "number", number, "ref", ref.String(), "pr_author", claim.PRAuthor, "reporter", reporter)
 			continue
+		}
+		// A parent with an open sub-issue is not done on anyone's word: no
+		// claim, no likely-done, no already-done, no close.
+		if claim.MergedPR {
+			if held, disposition := h.verdictHeldForOpenChildren(ctx, repo, number, ref.String(), alreadyDone); held {
+				return disposition
+			}
 		}
 		claim.Repo, claim.Issue = repo, number
 		claim.Source = ghpkg.ClaimSourceVerdict
@@ -261,6 +272,16 @@ func (h *ContributeWSHub) markAlreadyDoneIssue(ctx context.Context, repo string,
 	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.GHClient == nil {
 		return ghpkg.ErrNoGitHubClient
 	}
+	if closeIssue {
+		client := h.server.deps.GHClient
+		item, err := client.WritebackItemForNumber(ctx, repo, number)
+		if err != nil {
+			return err
+		}
+		if d := client.WritebackAllowed(repo, item, writeback.KindIssueClose, "close issue already resolved by a merged PR"); !d.Allowed {
+			return fmt.Errorf("%w: %s", writeback.ErrSuppressed, d.Detail)
+		}
+	}
 	label := config.HubConfig{}.ContributeAlreadyDoneLabelOrDefault()
 	if h.server.deps.Config != nil {
 		label = h.server.deps.Config.Hub.ContributeAlreadyDoneLabelOrDefault()
@@ -287,10 +308,14 @@ func (h *ContributeWSHub) markAlreadyDoneIssue(ctx context.Context, repo string,
 	if err := h.server.deps.GHClient.AddLabels(ctx, repo, number, []string{label}); err != nil {
 		return err
 	}
+	// A verified already-done supersedes an earlier hive/verified-open, so
+	// the issue never wears both verdicts.
+	// Best-effort: the stage sweep settles a pair left behind.
+	_ = h.server.deps.GHClient.RemoveLabelsFresh(ctx, repo, number, ghpkg.VerifiedOpenLabel) // writeback:solicited the contributor's verified already-done verdict
 	if !closeIssue {
 		return nil
 	}
-	return h.server.deps.GHClient.CloseIssue(ctx, repo, number, ghpkg.IssueCloseOptions{
+	return h.server.deps.GHClient.CloseIssue(ctx, repo, number, ghpkg.IssueCloseOptions{ // writeback:gated
 		StateReason: ghpkg.IssueStateReasonCompleted,
 	})
 }

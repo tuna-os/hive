@@ -13,8 +13,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/hivecommons/hive/crux/internal/privatedir"
 
 	"github.com/hivecommons/hive/crux/api"
 )
@@ -95,7 +96,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+PathEffects+"/{id}/end", s.capability(CapabilityEffects, s.handleEndEffect))
 	mux.HandleFunc("POST "+PathAgentMint, s.capability(CapabilityAgentMint, s.handleAgentMint))
 	mux.HandleFunc("GET "+PathBobCredential, s.capability(CapabilityBob, s.handleBobCredential))
-	return s.authenticate(mux)
+	return s.instrument(s.authenticate(mux))
 }
 
 // authenticate is the fail-closed gate, the same rule as crux/serve: no
@@ -156,6 +157,9 @@ func (s *Server) configured(capability string) bool {
 
 func (s *Server) capability(name string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if rec := recorderOf(w); rec != nil {
+			rec.capability = name
+		}
 		if !s.configured(name) {
 			s.writeError(w, r, http.StatusNotFound, CodeNotConfigured, fmt.Sprintf("this hive has no %s capability", name))
 			return
@@ -458,6 +462,9 @@ func (s *Server) writeNoContent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	if rec := recorderOf(w); rec != nil {
+		rec.code = code
+	}
 	w.Header().Set("Content-Type", ContentTypeJSON)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(api.Error{Error: msg, Code: code})
@@ -572,27 +579,9 @@ func Listen(cfg ListenConfig) (*Listeners, error) {
 	return ls, nil
 }
 
-// ownedPrivateDir refuses a socket directory this user does not own
-// outright: a real directory (not a symlink), owned by this uid, with no
-// group or other permission bits.
+// ownedPrivateDir refuses a socket directory this user does not own outright.
 func ownedPrivateDir(dir string) error {
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		return err
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return errors.New("is a symlink")
-	}
-	if !fi.IsDir() {
-		return errors.New("is not a directory")
-	}
-	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		return fmt.Errorf("mode %04o is readable by others; want %04o", perm, SocketDirMode)
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
-		return fmt.Errorf("owned by uid %d, not this user (uid %d)", st.Uid, os.Getuid())
-	}
-	return nil
+	return privatedir.Check(dir, SocketDirMode)
 }
 
 // Serve runs the endpoint on ls until ctx ends, then shuts down and closes

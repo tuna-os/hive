@@ -19,6 +19,10 @@ type repoHoldMock struct {
 	added       []string
 	created     []string
 	removed     []string
+	// addLabelsStatus, when non-zero, is the status POST …/issues/7/labels
+	// answers (with addLabelsBody) instead of accepting the labels.
+	addLabelsStatus int
+	addLabelsBody   string
 }
 
 func newRepoHoldMockServer(t *testing.T, m *repoHoldMock) *httptest.Server {
@@ -39,6 +43,11 @@ func newRepoHoldMockServer(t *testing.T, m *repoHoldMock) *httptest.Server {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/labels/"):
 			http.NotFound(w, r)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues/7/labels"):
+			if m.addLabelsStatus != 0 {
+				w.WriteHeader(m.addLabelsStatus)
+				_, _ = io.WriteString(w, m.addLabelsBody)
+				return
+			}
 			var labels []string
 			_ = json.NewDecoder(r.Body).Decode(&labels)
 			m.added = append(m.added, labels...)
@@ -143,6 +152,56 @@ func TestRepoItemHoldToggleAuthorizationAndLabels(t *testing.T) {
 	}
 }
 
+// TestRepoItemHoldGitHubFailureIsNotAGatewayStatus: a hold on an issue whose
+// GitHub label write fails answers 424 with GitHub's reason — never 502/503,
+// which the hosted Ingress replaces with its generic "hive unavailable" page
+// (hivecommons/hive#17037) — and the hive id's hold label fits GitHub's cap
+// even for a long hosted id.
+func TestRepoItemHoldGitHubFailureIsNotAGatewayStatus(t *testing.T) {
+	mock := &repoHoldMock{
+		permission:      map[string]string{"writer": "maintain"},
+		addLabelsStatus: http.StatusUnprocessableEntity,
+		addLabelsBody:   `{"message":"Validation Failed","errors":[{"resource":"Label","field":"name","code":"invalid"}]}`,
+	}
+	srv := newRepoHoldServer(t, mock)
+	srv.deps.Config.HiveID = "hosted-available-oke-11-placeholder-r05x"
+
+	body := `{"held":true,"type":"issue"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/repos/testorg/testrepo/items/7/hold", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hive-User", "writer")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFailedDependency {
+		t.Fatalf("code = %d, want 424 (never 502/503: the Ingress swallows those) body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not JSON: %v %s", err, w.Body.String())
+	}
+	if resp.OK || !strings.Contains(resp.Error, "add hold label") || !strings.Contains(resp.Error, "422") {
+		t.Fatalf("error = %q, want the step and GitHub's 422", resp.Error)
+	}
+	if len(mock.created) != 1 || len(mock.created[0]) > 50 || !strings.HasPrefix(mock.created[0], "hive-pause/hosted-available-oke-11-") {
+		t.Fatalf("created labels = %v, want one hive-pause label within GitHub's 50-char cap", mock.created)
+	}
+
+	// The same failure when the label itself cannot be created: still 424.
+	srv.deps.GHClient = nil
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/repos/testorg/testrepo/items/7/hold", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	markOwnerRequest(req)
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusFailedDependency {
+		t.Fatalf("no GitHub client: code = %d, want 424 body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestRepoItemHoldToggleUpdatesStatusSnapshotAndReturnsFloor(t *testing.T) {
 	mock := &repoHoldMock{permission: map[string]string{"writer": "maintain"}}
 	srv := newRepoHoldServer(t, mock)
@@ -229,5 +288,33 @@ func TestRepoHoldPermissionEndpointUsesCachedGitHubPermission(t *testing.T) {
 	srv.mux.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"allowed":true`) {
 		t.Fatalf("permission response: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestRepoHoldReleaseOnIssueNamesCoveringPRHold: a release on an issue that
+// removed nothing, while the covering PR the row draws carries the hold, is
+// a no-effect answer naming the PR — not a silent "no change"
+// (hivecommons/hive#17564).
+func TestRepoHoldReleaseOnIssueNamesCoveringPRHold(t *testing.T) {
+	issue := StageTrackerItem{Repo: "o/r", Kind: "issue", Number: 17558, LinkedPRs: []StageTrackerLinkedPR{
+		{Number: 17500, State: "closed", Modifiers: []string{modHold}},
+		{Number: 17559, DrawnUnder: 17000, Modifiers: []string{modHold}},
+		{Number: 17561, Modifiers: []string{modHold}},
+	}}
+	if got := repoHoldCoveringPR(issue); got != 17561 {
+		t.Fatalf("repoHoldCoveringPR = %d, want 17561 (open, drawn here, held)", got)
+	}
+	if got := repoHoldCoveringPR(StageTrackerItem{Number: 1, LinkedPRs: []StageTrackerLinkedPR{{Number: 2}}}); got != 0 {
+		t.Fatalf("repoHoldCoveringPR on an unheld PR = %d, want 0", got)
+	}
+	if got := repoHoldCoveringPR(StageTrackerItem{Number: 1, LinkedPRs: []StageTrackerLinkedPR{{Number: 3, Hold: &StageTrackerHold{}}}}); got != 3 {
+		t.Fatalf("repoHoldCoveringPR with a hold record = %d, want 3", got)
+	}
+	res := repoHoldElsewhereResult("o/r", 17558, 17561)
+	if res.Action != rowActionNoEffect || res.Target.Number != 17558 || res.Target.Kind != rowActionTargetIssue {
+		t.Fatalf("result = %+v, want no-effect on the issue", res)
+	}
+	if want := "Nothing to release on #17558 — the hold is on #17561."; res.Outcome != want {
+		t.Fatalf("outcome = %q, want %q", res.Outcome, want)
 	}
 }

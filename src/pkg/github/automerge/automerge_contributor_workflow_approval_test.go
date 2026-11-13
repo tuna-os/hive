@@ -1,7 +1,9 @@
 package automerge
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -291,7 +293,7 @@ func TestContributorLaneWorkflowFenceMarkerOncePerHead(t *testing.T) {
 	fx := validContributorFixture()
 	fx.files = workflowPathFiles()
 	fx.reviews = []map[string]any{ownerApprovedReview("clubanderson", "sha7")}
-	fx.prComments = []map[string]any{{"id": 5, "user": map[string]string{"login": testHiveAppBotLogin}, "body": workflowApprovalComment("sha7", "clubanderson")}}
+	fx.prComments = []map[string]any{{"id": 5, "user": map[string]string{"login": testHiveAppBotLogin}, "body": workflowApprovalComment("sha7", workflowApproval{Login: "clubanderson"}, workflowApprovalVerdictNone)}}
 	api := newContributorLaneAPI(t, &fx)
 	defer api.Close()
 	policy := defaultContributorLanePolicy()
@@ -309,6 +311,210 @@ func TestContributorLaneWorkflowFenceMarkerOncePerHead(t *testing.T) {
 	for _, body := range fx.allComments {
 		if strings.HasPrefix(body, workflowApprovalMarkerPrefix) {
 			t.Fatalf("marker re-posted for an already-marked head: %v", fx.allComments)
+		}
+	}
+}
+
+// An approval on an earlier head carries over the hive's own base refresh —
+// an App-authored merge of the base branch that leaves the PR's three-dot
+// diff exactly as approved — so the update-branch a strict up-to-date rule
+// forces does not re-arm the workflow-path fence (projectbluefin/utah#1111).
+// Any other head change keeps the existing head-bound rule: the fence is
+// re-armed until the new head is approved, whether or not the new commit
+// touches the workflow files.
+func TestContributorLaneWorkflowFenceApprovalCarriesOverHiveBaseRefresh(t *testing.T) {
+	const approvedHead, baseTip = "sha6", "base9"
+	workflowDiff := func(blob string) []map[string]any {
+		return []map[string]any{{"filename": ".github/workflows/ci.yml", "status": "modified", "sha": blob, "additions": 3, "deletions": 1, "changes": 4, "patch": "@@ -1 +1,3 @@\n-old\n+new\n+steps\n+run"}}
+	}
+	// The App's update-branch merge as GitHub returns it: attributed to the
+	// App, committed and signed by web-flow (CommitIsVerifiedAppMerge).
+	baseMerge := func(author, committer string, verified bool) map[string]any {
+		return map[string]any{"sha": "sha7", "parents": []map[string]string{{"sha": approvedHead}, {"sha": baseTip}}, "author": map[string]string{"login": author}, "committer": map[string]string{"login": committer},
+			"commit": map[string]any{"verification": map[string]any{"verified": verified}}}
+	}
+	hiveBaseMerge := baseMerge(testHiveAppBotLogin, "web-flow", true)
+	approvedReview := []map[string]any{ownerApprovedReview("clubanderson", approvedHead)}
+	// docFile is a non-workflow file the PR also edits. Main editing the same
+	// doc above the PR's hunk changes the doc's blob and shifts the hunk's
+	// line numbers; editing next to the hunk changes its context lines too
+	// (projectbluefin/utah-packages#924 and #900).
+	docFile := func(blob, patch string) map[string]any {
+		return map[string]any{"filename": "docs/skills/upstream-version-bumps.md", "status": "modified", "sha": blob, "additions": 1, "deletions": 1, "changes": 2, "patch": patch}
+	}
+	const docPatch = "@@ -145,4 +145,4 @@ Verify a fix\n ctx one\n-old line\n+new line\n ctx two"
+	withDoc := func(diff []map[string]any, doc map[string]any) []map[string]any {
+		return append(append([]map[string]any{}, diff...), doc)
+	}
+	for _, tc := range []struct {
+		name         string
+		reviews      []map[string]any
+		comments     []map[string]any
+		headCommit   map[string]any
+		approvedDiff []map[string]any
+		currentDiff  []map[string]any
+		wantReason   string
+		wantMarker   string
+	}{
+		{
+			name:         "a base merge that also edited another file the PR changes, away from its hunks, carries the approval",
+			reviews:      approvedReview,
+			headCommit:   hiveBaseMerge,
+			approvedDiff: withDoc(workflowDiff("blobA"), docFile("docOld", docPatch)),
+			currentDiff:  withDoc(workflowDiff("blobA"), docFile("docNew", "@@ -160,4 +160,4 @@ Verify a fix\n ctx one\n-old line\n+new line\n ctx two")),
+			wantMarker:   "<!-- hive:workflow-approval head=sha7 by=clubanderson from=sha6 -->",
+		},
+		{
+			name:         "a base merge that changed the context of the PR's hunk in another file re-arms the fence",
+			reviews:      approvedReview,
+			headCommit:   hiveBaseMerge,
+			approvedDiff: withDoc(workflowDiff("blobA"), docFile("docOld", docPatch)),
+			currentDiff:  withDoc(workflowDiff("blobA"), docFile("docNew", "@@ -160,4 +160,4 @@ Verify a fix\n ctx one\n-old line\n+new line\n main's new line")),
+			wantReason:   contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:         "a base merge that edited the workflow file away from the PR's hunks still re-arms the fence",
+			reviews:      approvedReview,
+			headCommit:   hiveBaseMerge,
+			approvedDiff: workflowDiff("blobA"),
+			currentDiff:  []map[string]any{{"filename": ".github/workflows/ci.yml", "status": "modified", "sha": "blobA2", "additions": 3, "deletions": 1, "changes": 4, "patch": "@@ -9 +9,3 @@\n-old\n+new\n+steps\n+run"}},
+			wantReason:   contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:        "review on the approved head carries over the hive's base merge",
+			reviews:     approvedReview,
+			headCommit:  hiveBaseMerge,
+			currentDiff: workflowDiff("blobA"),
+			wantMarker:  "<!-- hive:workflow-approval head=sha7 by=clubanderson from=sha6 -->",
+		},
+		{
+			name:        "the hive's audit marker for the approved head carries over the base merge",
+			comments:    []map[string]any{{"id": 5, "user": map[string]string{"login": testHiveAppBotLogin}, "body": workflowApprovalComment(approvedHead, workflowApproval{Login: "clubanderson"}, workflowApprovalVerdictNone)}},
+			headCommit:  hiveBaseMerge,
+			currentDiff: workflowDiff("blobA"),
+			wantMarker:  "<!-- hive:workflow-approval head=sha7 by=clubanderson from=sha6 -->",
+		},
+		{
+			name:        "dashboard approval marked for the approved head carries over the base merge",
+			comments:    []map[string]any{dashboardApproveComment(5, "clubanderson", approvedHead, "")},
+			headCommit:  hiveBaseMerge,
+			currentDiff: workflowDiff("blobA"),
+			wantMarker:  "<!-- hive:workflow-approval head=sha7 by=clubanderson from=sha6 -->",
+		},
+		{
+			name:        "a new commit changing the workflow file re-arms the fence",
+			reviews:     approvedReview,
+			currentDiff: workflowDiff("blobB"),
+			wantReason:  contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:        "a new commit leaving the workflow files alone still re-arms the fence",
+			reviews:     approvedReview,
+			currentDiff: append(workflowDiff("blobA"), map[string]any{"filename": "pkg/widget/widget.go", "status": "modified", "sha": "blobW", "additions": 1, "deletions": 0, "changes": 1}),
+			wantReason:  contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:        "a base merge that changed the workflow diff re-arms the fence",
+			reviews:     approvedReview,
+			headCommit:  hiveBaseMerge,
+			currentDiff: workflowDiff("blobB"),
+			wantReason:  contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:        "a base merge pushed by the contributor re-arms the fence",
+			reviews:     approvedReview,
+			headCommit:  baseMerge(contributorLaneTestAuthor, "web-flow", true),
+			currentDiff: workflowDiff("blobA"),
+			wantReason:  contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:        "an App-attributed base merge GitHub did not verify re-arms the fence",
+			reviews:     approvedReview,
+			headCommit:  baseMerge(testHiveAppBotLogin, contributorLaneTestAuthor, false),
+			currentDiff: workflowDiff("blobA"),
+			wantReason:  contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:        "an audit marker forged by someone other than the App carries nothing",
+			comments:    []map[string]any{{"id": 5, "user": map[string]string{"login": contributorLaneTestAuthor}, "body": workflowApprovalComment(approvedHead, workflowApproval{Login: "clubanderson"}, workflowApprovalVerdictNone)}},
+			headCommit:  hiveBaseMerge,
+			currentDiff: workflowDiff("blobA"),
+			wantReason:  contributorLaneReasonWorkflowPath,
+		},
+		{
+			name:        "an approval by a login no longer trusted carries nothing",
+			reviews:     []map[string]any{ownerApprovedReview("passerby", approvedHead)},
+			headCommit:  hiveBaseMerge,
+			currentDiff: workflowDiff("blobA"),
+			wantReason:  contributorLaneReasonWorkflowPath,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := validContributorFixture()
+			fx.files = workflowPathFiles()
+			fx.reviews = tc.reviews
+			fx.prComments = tc.comments
+			fx.headCommit = tc.headCommit
+			approvedDiff := tc.approvedDiff
+			if approvedDiff == nil {
+				approvedDiff = workflowDiff("blobA")
+			}
+			fx.compareFiles = map[string][]map[string]any{approvedHead: approvedDiff, "sha7": tc.currentDiff}
+			fx.compareMergeBase = map[string]string{approvedHead: "base1", "sha7": baseTip}
+			api := newContributorLaneAPI(t, &fx)
+			defer api.Close()
+			policy := defaultContributorLanePolicy()
+			policy.OwnerApprovalReleasesWorkflowFence = true
+			clock := &contributorLaneClock{at: mustParseTime(t, "2026-10-27T13:00:00Z")}
+			engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock)})
+			engine.SetMergerAuthorizer(func(login string) bool { return strings.EqualFold(login, "clubanderson") })
+			_, reason, err := engine.trySweepContributorLanePR(context.Background(), "widget", "acme", "widget", 7, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantMerges := 0
+			if tc.wantReason == "" {
+				wantMerges = 1
+			}
+			if reason != tc.wantReason || fx.merges != wantMerges {
+				t.Fatalf("reason=%q merges=%d, want %q/%d (comments=%v)", reason, fx.merges, tc.wantReason, wantMerges, fx.allComments)
+			}
+			var markers []string
+			for _, body := range fx.allComments {
+				if strings.HasPrefix(body, workflowApprovalMarkerPrefix) {
+					markers = append(markers, body)
+				}
+			}
+			if tc.wantMarker == "" {
+				if len(markers) != 0 {
+					t.Fatalf("unexpected workflow-approval marker: %v", markers)
+				}
+				return
+			}
+			if len(markers) != 1 || !strings.HasPrefix(markers[0], tc.wantMarker) {
+				t.Fatalf("workflow-approval markers = %v, want one with prefix %q", markers, tc.wantMarker)
+			}
+		})
+	}
+}
+
+// The audit marker round-trips: the carry reads the head and approver back
+// off the hive's own comment, carried or not.
+func TestParseWorkflowApprovalMarker(t *testing.T) {
+	for _, tc := range []struct {
+		body       string
+		head, by   string
+		wantParsed bool
+	}{
+		{body: workflowApprovalComment("ABC123", workflowApproval{Login: "ClubAnderson"}, workflowApprovalVerdictNone), head: "abc123", by: "clubanderson", wantParsed: true},
+		{body: workflowApprovalComment("def456", workflowApproval{Login: "clubanderson", CarriedFrom: "abc123"}, workflowApprovalVerdictNone), head: "def456", by: "clubanderson", wantParsed: true},
+		{body: "<!-- hive:workflow-approval head=abc123 -->"},
+		{body: "<!-- hive:workflow-approvals head=abc123 by=x -->"},
+		{body: "> " + workflowApprovalComment("abc123", workflowApproval{Login: "clubanderson"}, workflowApprovalVerdictNone)},
+	} {
+		head, by, ok := parseWorkflowApprovalMarker(tc.body)
+		if ok != tc.wantParsed || head != tc.head || by != tc.by {
+			t.Fatalf("parseWorkflowApprovalMarker(%q) = %q, %q, %v; want %q, %q, %v", tc.body, head, by, ok, tc.head, tc.by, tc.wantParsed)
 		}
 	}
 }
@@ -346,7 +552,7 @@ func TestContributorLaneWorkflowFenceMergeUnauthorizedFallback(t *testing.T) {
 				fx.prComments = []map[string]any{{
 					"id":   5,
 					"user": map[string]string{"login": testHiveAppBotLogin},
-					"body": unauthorizedComment("sha7", unauthorizedStepMergeWorkflowPath, unauthorizedPermissionWorkflowsWrite, "click"),
+					"body": unauthorizedComment("sha7", unauthorizedStepMergeWorkflowPath, unauthorizedPermissionWorkflowsWrite, "click", unauthorizedAttempts{Count: 1, Heads: []string{"sha7"}}),
 				}}
 			}
 			api := newContributorLaneAPI(t, &fx)
@@ -391,7 +597,7 @@ func TestContributorLaneWorkflowFenceMergeUnauthorizedFallback(t *testing.T) {
 			if !slices.Contains(fx.labels, unauthorizedLabel) {
 				t.Fatalf("labels = %v, want %q", fx.labels, unauthorizedLabel)
 			}
-			marker := unauthorizedMarker("sha7", unauthorizedStepMergeWorkflowPath)
+			marker := unauthorizedMarker(unauthorizedStepMergeWorkflowPath)
 			unauthorizedComments := 0
 			for _, body := range fx.allComments {
 				if strings.HasPrefix(body, marker) {
@@ -440,6 +646,10 @@ func TestWorkflowApprovalCommentActor(t *testing.T) {
 	after := mustParseTime(t, "2026-10-27T12:00:00Z")
 	before := mustParseTime(t, "2026-10-27T10:00:00Z")
 	comment := newIssueComment
+	edited := func(c *gh.IssueComment, at time.Time) *gh.IssueComment {
+		c.UpdatedAt = &gh.Timestamp{Time: at}
+		return c
+	}
 	dashboard := func(actor, head string) string {
 		b := "/approve\n\nPosted by @" + actor + " from the Hive dashboard; the merge gate decides from here."
 		if head != "" {
@@ -464,7 +674,12 @@ func TestWorkflowApprovalCommentActor(t *testing.T) {
 		{name: "quoted decision approve", comment: comment("clubanderson", "> /hive decision approve", after)},
 		{name: "plain hive approve", comment: comment("clubanderson", "/hive approve", after)},
 		{name: "decision with other text", comment: comment("clubanderson", "/hive decision approve the rename later", after)},
+		{name: "edited typed decision approve", comment: edited(comment("clubanderson", "/hive decision approve", after), after.Add(time.Minute))},
+		{name: "edited dashboard approve", comment: edited(comment(testHiveAppBotLogin, dashboard("clubanderson", "sha7"), after), after.Add(time.Minute))},
 		{name: "bot typed decision", comment: comment("someone[bot]", "/hive decision approve", after)},
+		{name: "typed decision approve edited after posting", comment: edited(comment("clubanderson", "/hive decision approve", after), after.Add(time.Minute))},
+		{name: "dashboard approve edited after posting", comment: edited(comment(testHiveAppBotLogin, dashboard("clubanderson", "sha7"), after), after.Add(time.Minute))},
+		{name: "unedited comment reports updated_at equal to created_at", comment: edited(comment("clubanderson", "/hive decision approve", after), after), wantLogin: "clubanderson", wantOK: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			login, ok := workflowApprovalCommentActor(tc.comment, "sha7", pushed, testHiveAppBotLogin)
@@ -513,5 +728,38 @@ func TestParsePRApprovalCommandCommentRoundTrip(t *testing.T) {
 	}
 	if _, _, _, ok := hgithub.ParsePRApprovalCommandComment("/approve\n\nlooks good"); ok {
 		t.Fatal("a bare /approve is not a dashboard approval")
+	}
+}
+
+// An observe-only pass on a repo whose auto-merge is off still releases the
+// workflow-path fence for the stage it records, but does not try to post the
+// audit comment its mutation boundary refuses by design: the refusal used to
+// be logged at WARN on every re-evaluation of the head (hivecommons/hive#17668).
+func TestWorkflowFenceObserveOnlySkipsAuditComment(t *testing.T) {
+	fx := validContributorFixture()
+	fx.files = workflowPathFiles()
+	fx.reviews = []map[string]any{ownerApprovedReview("clubanderson", "sha7")}
+	api := newContributorLaneAPI(t, &fx)
+	defer api.Close()
+	policy := defaultContributorLanePolicy()
+	policy.OwnerApprovalReleasesWorkflowFence = true
+	clock := &contributorLaneClock{at: mustParseTime(t, "2026-10-27T13:00:00Z")}
+	engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock)})
+	oc := engine.observeOnlyEngine()
+	oc.SetMergerAuthorizer(func(login string) bool { return strings.EqualFold(login, "clubanderson") })
+	var logs bytes.Buffer
+	oc.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	pr := &gh.PullRequest{Number: gh.Ptr(7), Head: &gh.PullRequestBranch{SHA: gh.Ptr("sha7")}, Base: &gh.PullRequestBranch{Ref: gh.Ptr("main")}}
+	approval, released := oc.workflowFenceReleased(hgithub.WithIntegrationReadOnly(context.Background()), "widget", "acme", "widget", pr, 7, "sha7", contributorLaneReasonWorkflowPath, policy, ContributorLaneVerdict{}, false)
+	if !released || approval.Login != "clubanderson" {
+		t.Fatalf("released=%v approval=%+v, want the fence released by clubanderson", released, approval)
+	}
+	if strings.Contains(logs.String(), "could not post audit comment") {
+		t.Fatalf("observe-only pass logged the refused audit comment at WARN: %s", logs.String())
+	}
+	for _, body := range fx.allComments {
+		if strings.HasPrefix(body, workflowApprovalMarkerPrefix) {
+			t.Fatalf("observe-only pass posted the audit comment: %v", fx.allComments)
+		}
 	}
 }

@@ -14,20 +14,28 @@ const ReasonSupersessionPending = "supersession-decision-pending"
 
 // Lane reasons are shared by the producers and the stage classifier.
 const (
-	ReviewGateOutcomeAwaiting              = "awaiting-review-approval"
-	ReviewGateOutcomeChangesRequested      = "changes-requested"
-	ReviewGateOutcomeNoBundle              = "no-review-bundle"
-	AutoMergeReasonBehindBudgetExhausted   = "behind-update-budget-exhausted"
-	AutoMergeReasonForkNotEditable         = "fork-not-editable"
-	AutoMergeReasonForkWorkflowUpdate      = "fork-workflow-update"
-	AutoMergeReasonHumanChangesRequested   = "human-changes-requested"
-	AutoMergeReasonHumanMergePath          = "human-merge-path"
-	AutoMergeReasonHumanMergePathEvidence  = "human-merge-path-evidence"
+	ReviewGateOutcomeAwaiting             = "awaiting-review-approval"
+	ReviewGateOutcomeChangesRequested     = "changes-requested"
+	ReviewGateOutcomeNoBundle             = "no-review-bundle"
+	AutoMergeReasonBehindBudgetExhausted  = "behind-update-budget-exhausted"
+	AutoMergeReasonForkNotEditable        = "fork-not-editable"
+	AutoMergeReasonForkWorkflowUpdate     = "fork-workflow-update"
+	AutoMergeReasonHumanChangesRequested  = stagelabels.LaneReasonHumanChangesRequested
+	AutoMergeReasonHumanMergePath         = "human-merge-path"
+	AutoMergeReasonHumanMergePathEvidence = "human-merge-path-evidence"
+	// AutoMergeReasonHumanMergeRequired: the PR's title says breaking
+	// change (⚠️, or an auto_merge.human_merge_title_prefixes prefix) or it
+	// wears an auto_merge.human_merge_labels label; no lane and no merge
+	// train ever merges it — the owner does (hivecommons/hive#15442).
+	AutoMergeReasonHumanMergeRequired      = "human-merge-required"
 	AutoMergeReasonIntentEvidence          = "intent-evidence"
 	AutoMergeReasonIntentUnauthorized      = "intent-unauthorized"
 	AutoMergeReasonMergeQueueRequired      = "merge-queue-required"
 	AutoMergeReasonMergeRefusedMethod      = "merge-refused:method-not-allowed"
 	AutoMergeReasonMergeRefusedReview      = "merge-refused:review-required"
+	AutoMergeReasonNativeQueuePrefix       = "native-merge-queue"
+	AutoMergeReasonNativeQueueMethod       = "native-merge-queue-method"
+	AutoMergeReasonNativeQueued            = "native-merge-queued"
 	AutoMergeReasonNoAppBotLogin           = "no-app-bot-login"
 	AutoMergeReasonReviewGatePrefix        = "review-gate:"
 	AutoMergeReasonWorkflowPermission      = "workflow-permission"
@@ -50,6 +58,7 @@ const (
 	ContributorLaneReasonNoReviewer        = "contributor-lane:no-reviewer"
 	ContributorLaneReasonNoVerdict         = "contributor-lane:no-verdict"
 	ContributorLaneReasonReporterTrustHold = "contributor-lane:reporter-trust-hold"
+	ContributorLaneReasonReviewOff         = "contributor-lane:review-off"
 	ContributorLaneReasonSentinelBlocked   = "contributor-lane:sentinel-blocked"
 	ContributorLaneReasonSoaking           = "contributor-lane:soaking"
 	ContributorLaneReasonTestsRemoved      = "contributor-lane:tests-removed"
@@ -61,9 +70,13 @@ const (
 	StageLaneSelf                          = "self-authored"
 	StageLaneTrusted                       = "trusted-author"
 	StageReasonBaseBranchRed               = "base-branch-red:"
-	StageReasonForkGuard                   = "fork-guard:"
-	StageReasonOptionalCheckFailing        = "optional-check-failing:"
-	StageReasonSharedCIIncident            = "shared-ci-incident:"
+	// StageReasonBaseRefreshMergeGuard: the lane did not evaluate the PR
+	// this pass because a merge to its destination was in flight
+	// (hivecommons/hive#16520); it says nothing about the stage.
+	StageReasonBaseRefreshMergeGuard = "base-refresh:merge-guard"
+	StageReasonForkGuard             = "fork-guard:"
+	StageReasonOptionalCheckFailing  = "optional-check-failing:"
+	StageReasonSharedCIIncident      = "shared-ci-incident:"
 	// StageReasonUnauthorizedPrefix: the lane's next step needs an API
 	// call the hive's GitHub App is not permitted to make (403 "Resource
 	// not accessible by integration"); the rest names the step
@@ -80,6 +93,11 @@ const (
 	TrustedAuthorReasonAppAuthored    = "trusted-author:app-authored"
 	TrustedBotLaneSkipReason          = "trusted-bot-lane"
 	WorkflowApprovalRequiredPrefix    = "workflow-approval-required:"
+	// RequiredCheckNeverReportedPrefix: auto_merge.required_checks names a
+	// check that has never reported on this repo, so the trusted-bot lane
+	// cannot gate on it and no other check vouches for the head. A person
+	// (or a per-repo required_checks override) resolves it.
+	RequiredCheckNeverReportedPrefix = "required-check-never-reported:"
 )
 
 // Closing-link reasons (hivecommons/hive#15025): a closing keyword the
@@ -129,6 +147,9 @@ const (
 	// requires_human and a trusted merger approved the head; the hive
 	// leaves the merge itself to a person.
 	HumanMergeReasonReviewerDeferred = "reviewer-deferred"
+	// HumanMergeReasonBreakingChange: the PR's title or label marks it a
+	// breaking change the owner merges by hand (AutoMergeReasonHumanMergeRequired).
+	HumanMergeReasonBreakingChange = "breaking-change"
 	// HumanMergeReasonPolicy: a lane rule no more specific code names.
 	HumanMergeReasonPolicy = "policy"
 )
@@ -221,9 +242,11 @@ func HumanMergeReason(reason string) string {
 		return HumanMergeReasonTestsRemoved
 	case base == AutoMergeReasonHumanMergePath, base == AutoMergeReasonHumanMergePathEvidence:
 		return HumanMergeReasonManualMergePolicy
+	case base == AutoMergeReasonHumanMergeRequired:
+		return HumanMergeReasonBreakingChange
 	case base == AutoMergeReasonMergeRefusedReview, strings.HasPrefix(base, AutoMergeReasonReviewGatePrefix):
 		return HumanMergeReasonBranchProtection
-	case base == AutoMergeReasonMergeRefusedMethod:
+	case base == AutoMergeReasonMergeRefusedMethod, base == AutoMergeReasonNativeQueueMethod:
 		return HumanMergeReasonMergeMethod
 	case base == "repo-auto-merge-disabled", base == StageLaneContributor+":disabled", base == "disabled":
 		return HumanMergeReasonAutoMergeOff

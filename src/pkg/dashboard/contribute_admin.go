@@ -68,11 +68,20 @@ func (s *Server) paneTailViewer(r *http.Request) bool {
 
 func (s *Server) handleContributorsList(w http.ResponseWriter, r *http.Request) {
 	profiles := listContributorProfiles()
+	if profiles == nil {
+		profiles = []ContributorProfile{}
+	}
 	var liveStates map[string]ContributorLiveState
+	var heartbeats map[string]time.Time
+	window := config.DefaultPresenceWindow
 	if s.contributeHub != nil {
 		liveStates = s.contributeHub.LiveStates()
+		heartbeats = s.contributeHub.LastHeartbeats()
+		window = s.contributeHub.presenceWindow()
 	}
+	now := time.Now()
 	for i := range profiles {
+		profiles[i].Online = countOnlineContributors(profiles[i:i+1], heartbeats, window, now) == 1
 		policy := s.contributorTokenPolicy()
 		if err := policy.migrate(&profiles[i], time.Now().UTC()); err != nil {
 			jsonError(w, "Token migration failed; retry", http.StatusConflict)
@@ -89,7 +98,10 @@ func (s *Server) handleContributorsList(w http.ResponseWriter, r *http.Request) 
 			profiles[i].Sessions = ls.Sessions
 		}
 	}
-	jsonResponse(w, map[string]any{"contributors": profiles})
+	jsonResponse(w, map[string]any{
+		"contributors":    profiles,
+		"contributorPool": s.contributorPoolStatus(profiles, window),
+	})
 }
 
 func (s *Server) handleContributorGet(w http.ResponseWriter, r *http.Request) {

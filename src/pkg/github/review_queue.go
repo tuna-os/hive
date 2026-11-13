@@ -341,7 +341,9 @@ func ReviewQueueKey(fullRepo string, number int) string {
 	return strings.ToLower(fmt.Sprintf("%s#%d", fullRepo, number))
 }
 
-func reviewQueueFullRepo(repo, org string) string {
+// ReviewQueueFullRepo qualifies a bare repo name with org for queue identities.
+// It trims whitespace and leaves empty or already-qualified repo names unchanged.
+func ReviewQueueFullRepo(repo, org string) string {
 	repo = strings.TrimSpace(repo)
 	org = strings.TrimSpace(org)
 	if repo == "" || strings.Contains(repo, "/") || org == "" {
@@ -379,7 +381,7 @@ func BuildReviewQueue(prs []PullRequest, opts ReviewQueueOptions) []ReviewQueueE
 	seen := make(map[string]bool, len(prs))
 	entries := make([]ReviewQueueEntry, 0, len(prs))
 	for _, pr := range prs {
-		full := reviewQueueFullRepo(pr.Repo, opts.Org)
+		full := ReviewQueueFullRepo(pr.Repo, opts.Org)
 		if full == "" || pr.Number <= 0 {
 			continue
 		}
@@ -572,12 +574,45 @@ func reviewQueueDispatchReason(e *ReviewQueueEntry, pr PullRequest, full string,
 	if exhausted != "" {
 		return "review dispatch exhausted: " + strings.TrimPrefix(exhausted, review.HoldReasonDispatchExhausted+": ") + "; waiting on a human"
 	}
+	wait, waiting := opts.Dispatch.WaitFor(full, pr.Number, pr.HeadSHA)
+	if !waiting && full != pr.Repo {
+		wait, waiting = opts.Dispatch.WaitFor(pr.Repo, pr.Number, pr.HeadSHA)
+	}
 	if since.IsZero() {
+		if waiting {
+			return reviewQueueWaitReason(wait, now)
+		}
 		return ""
 	}
 	reason := fmt.Sprintf("review dispatched %s ago, no verdict yet", reviewQueueDispatchAge(now.Sub(since)))
 	if count > 0 {
 		reason += fmt.Sprintf(" (re-dispatched %dx after expiry)", count)
+	}
+	if waiting {
+		reason += "; " + reviewQueueWaitReason(wait, now)
+	}
+	return reason
+}
+
+// reviewQueueWaitReason explains a head the planner keeps passing over: the
+// perspectives it still owes have had no reviewer for this many consecutive
+// cycles (hivecommons/hive#15229). Past review.ReviewWaitStarvationCycles the
+// planner walks the head ahead of the queue, and the line says so.
+func reviewQueueWaitReason(w review.ReviewWaitRecord, now time.Time) string {
+	cause := "every eligible reviewer busy"
+	if w.Reason == review.ReviewWaitNoParallelSlot {
+		cause = "max_parallel_reviews spent"
+	}
+	reason := fmt.Sprintf("review waiting for a free reviewer: %d consecutive cycle", w.Cycles)
+	if w.Cycles != 1 {
+		reason += "s"
+	}
+	if !w.FirstAt.IsZero() {
+		reason += fmt.Sprintf(" over %s", reviewQueueDispatchAge(now.Sub(w.FirstAt)))
+	}
+	reason += " (" + cause + ")"
+	if w.Cycles >= review.ReviewWaitStarvationCycles {
+		reason += "; promoted ahead of the queue, takes the next free reviewer"
 	}
 	return reason
 }
@@ -609,7 +644,7 @@ func ReviewQueueFromActionable(actionable *ActionableResult, opts ReviewQueueOpt
 		held[k] = v
 	}
 	for _, pr := range actionable.PRs.Held {
-		held[ReviewQueueKey(reviewQueueFullRepo(pr.Repo, opts.Org), pr.Number)] = true
+		held[ReviewQueueKey(ReviewQueueFullRepo(pr.Repo, opts.Org), pr.Number)] = true
 	}
 	opts.Held = held
 	if opts.RedMain == nil {
@@ -635,7 +670,7 @@ func StampReviewQueue(actionable *ActionableResult, opts ReviewQueueOptions) []R
 	}
 	stamp := func(prs []PullRequest) {
 		for i := range prs {
-			e, ok := byKey[ReviewQueueKey(reviewQueueFullRepo(prs[i].Repo, opts.Org), prs[i].Number)]
+			e, ok := byKey[ReviewQueueKey(ReviewQueueFullRepo(prs[i].Repo, opts.Org), prs[i].Number)]
 			if !ok {
 				continue
 			}

@@ -83,15 +83,23 @@ func (c *Engine) PRApproveReply(ctx context.Context, displayRepo string, number 
 		}
 		diffReason := ""
 		if contributor {
-			diffReason = contributorLaneDiffReason(files)
+			// The lane's own merge fence, scoped the same way
+			// (automerge_workflow_fence_scope.go).
+			diffReason = c.contributorLaneMergeFence(c.currentContributorLanePolicy(), owner, repo, number, head, files)
+		}
+		// The same pin-only exception the sweep lanes apply (#16266), so the
+		// reply never contradicts what the lane will do on its next pass.
+		matches := intent.HumanMergePathMatches(files, patterns)
+		if exempt, _ := c.humanMergePinOnlyExempt(ctx, owner, repo, pr, files, matches); exempt {
+			matches = nil
 		}
 		// The owner-approval release lifts only the workflow-path fence; a head
 		// that also removes tests stops at tests-removed, so it gets the manual
 		// caption below rather than a promise the lane will merge it.
-		if len(intent.HumanMergePathMatches(files, patterns)) == 0 && diffReason == contributorLaneReasonWorkflowPath && contributorLaneTestsRemovedReason(files) == "" && c.currentContributorLanePolicy().OwnerApprovalReleasesWorkflowFence {
-			return "`/hive approve` acknowledged, but this PR edits CI workflow / action files, which the contributor lane merges only on a hive owner's explicit approval: a trusted merger submits a GitHub **Approve** review for the current head (`" + stagelabels.ShortSHA(head) + "`) or approves it from the Hive dashboard, and the lane merges once CI and the other gates are clear. Approval on an earlier head does not carry over.", nil
+		if len(matches) == 0 && diffReason == contributorLaneReasonWorkflowPath && contributorLaneTestsRemovedReason(files) == "" && c.currentContributorLanePolicy().OwnerApprovalReleasesWorkflowFence {
+			return "`/hive approve` acknowledged, but it does not release this PR's fence: the PR edits CI workflow / action files, which the contributor lane merges only on a hive owner's explicit approval of the current head (`" + stagelabels.ShortSHA(head) + "`). That is a trusted merger's GitHub **Approve** review, or a `/hive decision approve` reply (typed here or from the Hive dashboard), and either one also answers a `requires_human` review verdict on that head; the owner of their own PR, whom GitHub refuses as a reviewer, replies `/hive decision approve`. The lane merges once CI and the other gates are clear. Approval on an earlier head carries over only the hive's own merge of the base branch, never another push.", nil
 		}
-		if len(intent.HumanMergePathMatches(files, patterns)) > 0 || diffReason != "" {
+		if len(matches) > 0 || diffReason != "" {
 			return "`/hive approve` acknowledged, but this PR changes files that its lane requires a person to merge manually. The command cannot override that rule; a maintainer must review and merge it.", nil
 		}
 	}

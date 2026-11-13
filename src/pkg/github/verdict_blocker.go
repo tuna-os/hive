@@ -22,6 +22,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // VerdictBlocker is one blocker reference parsed from a blocked verdict.
@@ -109,6 +111,13 @@ func (c *Client) RecordVerdictBlocker(ctx context.Context, repo string, number i
 	if err := validateRepoRef(bOwner, bRepo); err != nil || number <= 0 || blocker.Number <= 0 {
 		return "", fmt.Errorf("RecordVerdictBlocker: invalid blocker %q for %s/%s#%d", blocker.String(), owner, repoName, number)
 	}
+	item, err := c.WritebackItemForNumber(ctx, owner+"/"+repoName, number)
+	if err != nil {
+		return "", err
+	}
+	if d := c.WritebackAllowed(owner+"/"+repoName, item, writeback.KindGateComment, "blocked on "+blocker.String()); !d.Allowed {
+		return "", fmt.Errorf("%w: %s", writeback.ErrSuppressed, d.Detail)
+	}
 	issue, _, err := c.client.Issues.Get(ctx, bOwner, bRepo, blocker.Number)
 	if err != nil {
 		return "", fmt.Errorf("reading blocker %s/%s#%d: %w", bOwner, bRepo, blocker.Number, err)
@@ -117,16 +126,12 @@ func (c *Client) RecordVerdictBlocker(ctx context.Context, repo string, number i
 		return VerdictBlockerClosed, nil
 	}
 	if issue.IsPullRequest() {
-		marker := BlockedOnMarker(bOwner+"/"+bRepo, blocker.Number)
-		posted, err := c.IssueCommentsContain(ctx, owner+"/"+repoName, number, marker)
+		posted, err := c.postBlockedOnPRMarker(ctx, owner+"/"+repoName, number, bOwner+"/"+bRepo, blocker.Number, verdictBlockerMarkerComment(bOwner+"/"+bRepo, blocker.Number))
 		if err != nil {
 			return "", err
 		}
-		if posted {
+		if !posted {
 			return VerdictBlockerAlreadyMarked, nil
-		}
-		if err := c.CreateIssueComment(ctx, owner+"/"+repoName, number, verdictBlockerMarkerComment(bOwner+"/"+bRepo, blocker.Number)); err != nil {
-			return "", err
 		}
 		return VerdictBlockerMarked, nil
 	}
@@ -150,4 +155,26 @@ func (c *Client) RecordVerdictBlocker(ctx context.Context, repo string, number i
 func verdictBlockerMarkerComment(prRepo string, pr int) string {
 	return BlockedOnMarker(prRepo, pr) + "\n" +
 		fmt.Sprintf("Hive: a contributor's agent reported this issue blocked on %s#%d, an open pull request. The `%s` label is lifted when it merges or closes.", prRepo, pr, BlockedLabel)
+}
+
+// postBlockedOnPRMarker posts comment, which must carry BlockedOnMarker(prRepo,
+// pr), on repo#number unless a comment there already carries that marker.
+// It is the one writer of the blocked-on marker comment, shared by a relay's
+// blocked verdict (RecordVerdictBlocker) and a PR's Depends-on placement
+// (SweepBlockedPRDependencies), so the marker the blocked sweep reads is the
+// same whichever wrote it. Callers consult the write-back gate first.
+// Reports whether a comment was posted.
+func (c *Client) postBlockedOnPRMarker(ctx context.Context, repo string, number int, prRepo string, pr int, comment string) (bool, error) {
+	marker := BlockedOnMarker(prRepo, pr)
+	if !strings.Contains(comment, marker) {
+		return false, fmt.Errorf("blocked-on comment for %s#%d does not carry its marker", repo, number)
+	}
+	posted, err := c.IssueCommentsContain(ctx, repo, number, marker)
+	if err != nil || posted {
+		return false, err
+	}
+	if err := c.CreateIssueComment(ctx, repo, number, comment); err != nil { // writeback:gated
+		return false, err
+	}
+	return true, nil
 }

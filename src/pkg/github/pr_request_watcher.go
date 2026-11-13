@@ -300,7 +300,7 @@ func (c *Client) StartPRRequestWatcher(ctx context.Context, authz PRRequestAutho
 				if ctx.Err() != nil {
 					return
 				}
-				c.processPRRequestsInDir(ctx, nowFn, dir)
+				c.processPRRequestsInDir(WithRESTCaller(ctx, "hive:pr_request_watcher"), nowFn, dir)
 				// Same goroutine as the open path, so the two never rewrite
 				// one branch concurrently (#9364). Throttled internally and
 				// a no-op unless github.app_signed_commits is on.
@@ -340,6 +340,22 @@ func (c *Client) ProcessPRRequestsOnce(ctx context.Context) {
 		return
 	}
 	c.processPRRequests(ctx, time.Now)
+}
+
+// ProcessPRRequestDirOnce runs one watcher pass over dir with authz as the
+// request authorizer and nowFn as the clock — a StartPRRequestWatcher tick
+// without the ticker. Test entry point for packages that drive the watcher
+// end to end against their own clocks (pkg/dashboard's claimed-target
+// regression, hivecommons/hive#17302). A nil nowFn is time.Now.
+func (c *Client) ProcessPRRequestDirOnce(ctx context.Context, dir string, authz PRRequestAuthorizer, nowFn func() time.Time) {
+	if c == nil {
+		return
+	}
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	c.prAuthz = authz
+	c.processPRRequestsInDir(ctx, nowFn, dir)
 }
 
 func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func() time.Time) {
@@ -447,6 +463,25 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 	// footer). Fail the request loudly rather than opening a content-less PR.
 	if reason := c.validatePRRequestBody(req); reason != "" {
 		c.rejectPRRequest(path, req, "body", reason, nowFn)
+		return
+	}
+	// #17298: a closing reference to an issue another principal has claimed,
+	// or covered with an open PR, is refused before the request books a start
+	// on anything — epic-driven work never claims its target, so this is the
+	// first point it is checked. A failed lookup fails closed (retried).
+	refused, err := c.validatePRRequestTargets(ctx, req, nowFn())
+	if err != nil {
+		if reason, policy := prRequestPolicyReason(err); policy {
+			for _, r := range refused {
+				if !strings.EqualFold(r.Repo, req.Repo) && !c.AgentServesRepo(req.Agent, r.Repo) {
+					continue
+				}
+				c.noticePRRequestTargetRefusal(ctx, prRequestTargetActionOpenPR, r)
+			}
+			c.rejectPRRequest(path, req, "claim", reason, nowFn)
+			return
+		}
+		c.failPRRequest(path, req, err, nowFn)
 		return
 	}
 	// #10527: an authorized PR request naming an issue is the agent's start
@@ -709,8 +744,22 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 	// reconciler keeps them while the PR is open (the PR's own stage is
 	// narrated in the issue's stage reason, never written as its label).
 	covered, partial := c.prCoveredIssues(req.Repo, body, req.IssueN)
-	c.clearInProgressForPR(ctx, req.Repo, res.Number, covered)
-	c.addressInProgressForPR(ctx, req.Repo, res.Number, partial)
+	if res.DuplicateReason == DuplicateReasonOverlappingFiles {
+		// The guard pointed at a PR that shares files with this request, not
+		// issues: it does not cover them, so they are not staged under it
+		// (projectbluefin/server#638 sat at 040 under an unrelated digest
+		// bump until the reconciler noticed). The issues are told instead
+		// and the refusal is logged at WARN, because the agent's own
+		// hive-open-pr call returned before this ran and never sees it.
+		blocked := append(append([]int(nil), covered...), partial...)
+		c.logger.Warn("pr-request watcher: no PR opened — another hive agent's open PR edits an overlapping set of files; the branch stays on the remote",
+			slog.String("repo", req.Repo), slog.String("head", req.Head), slog.String("agent", req.Agent),
+			slog.Int("blocking_pr", res.Number), slog.Any("issues", blocked))
+		c.noteDuplicateGuardOnIssues(ctx, req, res.Number, blocked)
+	} else {
+		c.clearInProgressForPR(ctx, req.Repo, res.Number, covered)
+		c.addressInProgressForPR(ctx, req.Repo, res.Number, partial)
+	}
 	c.recordWriteAudit(AuditActionAgentPRCreated, meta,
 		WriteTarget{Repo: req.Repo, Number: res.Number},
 		"author", res.Author,
@@ -728,7 +777,14 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 	}
 	c.writePRResult(path, resp)
 	// Success (or reuse of an existing PR) — consume the request so it isn't
-	// reprocessed.
+	// reprocessed. A request that had failed before succeeding is the retry
+	// policy working; say so, so the ERROR that opened the story has a
+	// matching close in the same log.
+	if failed := c.prRetries.attempts(path); failed > 0 {
+		c.logger.Info("pr-request watcher: request succeeded on retry",
+			slog.String("repo", req.Repo), slog.String("head", req.Head),
+			slog.Int("failed_attempts", failed), slog.Int("number", res.Number))
+	}
 	_ = os.Remove(path)
 	c.prRetries.clear(path)
 	if res.IsDuplicate() {
@@ -758,14 +814,29 @@ func (c *Client) failPRRequest(path string, req PRRequest, err error, nowFn func
 	// points away from its cause. Log it at ERROR on its own line — this is
 	// work an agent already completed and cannot publish, and it is invisible
 	// in the fleet view because the agent's session ended healthy.
+	//
+	// Once per request, not once per retry (#16969): the retry exists so a
+	// late push still lands, and re-logging the same request at ERROR every
+	// tick turned ONE unpushed branch into a "5 in 10m" fleet report before
+	// the branch arrived. Retries stay at INFO (below the fleet feed) so the
+	// fleet report fires only when distinct requests fail the same way. The
+	// message states what the watcher checked and what it saw — the ref, the
+	// repository, and the push relay's own record — not an inferred cause.
 	reason, missingHead := missingHeadReason(err)
-	// Only the first failure of a request is reported at ERROR: the retries of
-	// one request are not new incidents. The watcher cannot tell an
-	// authentication failure from a branch that was never pushed.
-	if missingHead && c.prRetries.failures(path) == 0 {
-		c.logger.Error("pr-request watcher: head branch is not on the remote — the agent's push did not land (never pushed, or push authentication failed)",
+	if missingHead {
+		attempt := c.prRetries.attempts(path) + 1
+		attrs := []any{
 			slog.String("repo", req.Repo), slog.String("head", req.Head),
-			slog.String("agent", req.Agent), slog.String("diagnosis", reason))
+			slog.String("checked", missingHeadRemoteRef(req.Repo, req.Head)),
+			slog.String("push_outcome", pushRelayOutcome(pushBranchRequestDir(), req.Head)),
+			slog.Int("attempt", attempt),
+			slog.String("agent", req.Agent), slog.String("diagnosis", reason),
+		}
+		if attempt == 1 {
+			c.logger.Error("pr-request watcher: head branch is not on the remote", attrs...)
+		} else {
+			c.logger.Info("pr-request watcher: head branch still not on the remote, retrying", attrs...)
+		}
 	}
 	if c.prRetries.noteFailure(path, nowFn()) {
 		_ = os.Rename(path, path+".failed")

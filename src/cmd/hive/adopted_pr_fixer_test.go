@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/rebasemerge"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
@@ -146,4 +151,185 @@ func TestWriteMergeEligible_NonAdoptedContributorPRGetsNoHivePush(t *testing.T) 
 			}
 		}
 	}
+}
+
+func useMemoryRebaseAttempts(t *testing.T) *rebasemerge.Attempts {
+	t.Helper()
+	store := rebasemerge.NewAttempts("")
+	prev := rebaseAttempts
+	rebaseAttempts = func() *rebasemerge.Attempts { return store }
+	t.Cleanup(func() { rebaseAttempts = prev })
+	return store
+}
+
+func trustedAuthorRebaseConfig() *config.Config {
+	cfg := &config.Config{}
+	cfg.Dashboard.AuthorizedUsers = []string{"clubanderson:owner"}
+	cfg.AutoMerge.TrustedAuthors.Enabled = true
+	return cfg
+}
+
+// hivecommons/hive#15103: a trusted author's PR (the operator's own
+// identity, opened through a session agent) that goes dirty is the hive's
+// rebase work — the trusted-author lane never rebases, so the fixer router
+// must list it. Attempts are capped: the third dirty head stops the kicks.
+func TestWriteMergeEligible_TrustedAuthorConflictGetsRebaseKickWithLoopGuard(t *testing.T) {
+	store := useMemoryRebaseAttempts(t)
+	cfg := trustedAuthorRebaseConfig()
+	mk := func(head string) github.PullRequest {
+		return github.PullRequest{Number: 15087, Repo: "hive", Author: "clubanderson", HeadSHA: head,
+			HeadRef: "feat/decision-actions", HeadRepo: "hivecommons/hive", BaseRef: "v5",
+			Mergeable: github.MergeableNo, MergeableState: "dirty", CIStatus: "pending",
+			Labels: []string{"needs-rebase"}}
+	}
+	_, failing := runWriteMergeEligible(t, []github.PullRequest{mk("aaa1111")}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if len(failing) != 1 {
+		t.Fatalf("ci_failing = %+v, want the trusted author's dirty PR listed once", failing)
+	}
+	row := failing[0]
+	if !row.Conflict || !row.TrustedAuthor || row.ReachableAction != github.ReachableActionPush || row.Agent != "scanner" {
+		t.Errorf("row = %+v, want a trusted-author push conflict row owned by the fallback fixer", row)
+	}
+	if row.RebaseAttempt != 1 || row.RebaseAttemptsMax != rebasemerge.MaxRebaseAttempts || row.BaseRef != "v5" {
+		t.Errorf("row = %+v, want attempt 1/%d onto v5", row, rebasemerge.MaxRebaseAttempts)
+	}
+	// The fixer pushed and the head is still dirty: attempt 2 of 2.
+	_, failing = runWriteMergeEligible(t, []github.PullRequest{mk("bbb2222")}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if len(failing) != 1 || failing[0].RebaseAttempt != 2 {
+		t.Fatalf("second dirty head: ci_failing = %+v, want attempt 2", failing)
+	}
+	// A third dirty head is past the cap: no kick, a person's turn.
+	_, failing = runWriteMergeEligible(t, []github.PullRequest{mk("ccc3333")}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if len(failing) != 0 {
+		t.Fatalf("third dirty head: ci_failing = %+v, want nothing (attempts exhausted)", failing)
+	}
+	if a, ok := store.Get("hivecommons/hive", 15087); !ok || !a.Exhausted() {
+		t.Fatalf("attempts = %+v ok=%v, want an exhausted episode", a, ok)
+	}
+	// Once the PR is clean again the episode ends.
+	clean := mk("ddd4444")
+	clean.Mergeable, clean.MergeableState, clean.Labels = github.MergeableYes, "clean", nil
+	runWriteMergeEligible(t, []github.PullRequest{clean}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if _, ok := store.Get("hivecommons/hive", 15087); ok {
+		t.Fatal("episode should be cleared once the PR is no longer conflicting")
+	}
+}
+
+func TestWriteMergeEligible_UntrustedConflictIsNotHiveRebaseWork(t *testing.T) {
+	useMemoryRebaseAttempts(t)
+	cfg := trustedAuthorRebaseConfig()
+	pr := github.PullRequest{Number: 15090, Repo: "hive", Author: "stranger", HeadSHA: "eee5555",
+		HeadRef: "feat/x", HeadRepo: "hivecommons/hive", BaseRef: "v5",
+		Mergeable: github.MergeableNo, MergeableState: "dirty", CIStatus: "pending", Labels: []string{"needs-rebase"}}
+	_, failing := runWriteMergeEligible(t, []github.PullRequest{pr}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if len(failing) != 0 {
+		t.Fatalf("ci_failing = %+v, want nothing for an untrusted author's conflict", failing)
+	}
+	cfg.AutoMerge.TrustedAuthors.Enabled = false
+	pr.Author = "clubanderson"
+	_, failing = runWriteMergeEligible(t, []github.PullRequest{pr}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if len(failing) != 0 {
+		t.Fatalf("ci_failing = %+v, want nothing when the trusted-author tier is off", failing)
+	}
+}
+
+// projectbluefin/utah#1097: a dirty Renovate branch is never the fixer's
+// rebase work, even under a trusted author's identity — the bot resolves
+// its own conflicts, and a hive push would stop it rebasing the branch for
+// good. The same PR on an ordinary branch is (TestWriteMergeEligible_
+// TrustedAuthorConflictGetsRebaseKickWithLoopGuard).
+func TestWriteMergeEligible_TrustedDependencyBotConflictIsNotHiveRebaseWork(t *testing.T) {
+	useMemoryRebaseAttempts(t)
+	cfg := trustedAuthorRebaseConfig()
+	pr := github.PullRequest{Number: 15091, Repo: "hive", Author: "clubanderson", HeadSHA: "fff6666",
+		HeadRef: "renovate/go-deps", HeadRepo: "hivecommons/hive", BaseRef: "v5",
+		Mergeable: github.MergeableNo, MergeableState: "dirty", CIStatus: "pending", Labels: []string{"needs-rebase"}}
+	_, failing := runWriteMergeEligible(t, []github.PullRequest{pr}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if len(failing) != 0 {
+		t.Fatalf("ci_failing = %+v, want nothing for a dependency bot's conflict", failing)
+	}
+	pr.HeadRef = "feat/x"
+	_, failing = runWriteMergeEligible(t, []github.PullRequest{pr}, mergeEligibleInputs{org: "hivecommons", cfg: cfg})
+	if len(failing) != 1 || !failing[0].TrustedAuthor {
+		t.Fatalf("ci_failing = %+v, want the ordinary branch listed as trusted-author rebase work", failing)
+	}
+}
+
+// sweepRebaseLogged runs one writeMergeEligible sweep at now and returns the
+// ci-failing rows and the number of "routed to fixer for rebase" lines.
+func sweepRebaseLogged(t *testing.T, prs []github.PullRequest, now time.Time) ([]failingEntry, int) {
+	t.Helper()
+	dir := t.TempDir()
+	origMerge, origFail, origNow := mergeEligiblePath, ciFailingPath, rebaseAttemptNow
+	mergeEligiblePath = filepath.Join(dir, "merge-eligible.json")
+	ciFailingPath = filepath.Join(dir, "ci-failing.json")
+	rebaseAttemptNow = func() time.Time { return now }
+	defer func() { mergeEligiblePath, ciFailingPath, rebaseAttemptNow = origMerge, origFail, origNow }()
+	var logs bytes.Buffer
+	actionable := &github.ActionableResult{PRs: github.PRResult{Items: prs}}
+	writeMergeEligible(actionable, github.HoldResult{}, "hivecommons", nil, false, nil, false, nil, nil, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	var payload struct {
+		CIFailing []failingEntry `json:"ci_failing"`
+	}
+	readJSON(t, ciFailingPath, &payload)
+	return payload.CIFailing, strings.Count(logs.String(), "PR routed to fixer for rebase")
+}
+
+// hivecommons/hive#16023: an adopted conflicting PR whose fixer never
+// pushes must not sit on attempt 1 forever. The attempt is routed (and
+// logged) once; past the per-attempt deadline it counts as failed and
+// attempt 2 is routed with one line; past the cap the row leaves the fixer
+// list so the adoption lane can re-home it.
+func TestWriteMergeEligible_AdoptedRebaseAttemptTimesOutWithoutPush(t *testing.T) {
+	store := useMemoryRebaseAttempts(t)
+	const repo = "hivecommons/hive"
+	adoptInPlace(t, repo, 15998, "f00dfac")
+	pr := github.PullRequest{Number: 15998, Repo: "hive", Author: "clanker-bot", HeadSHA: "f00dfac",
+		HeadRef: "feat/x", HeadRepo: "hivecommons/hive", BaseRef: "v5",
+		Mergeable: github.MergeableNo, MergeableState: "dirty", CIStatus: "pending",
+		Labels: []string{"needs-rebase", "stage/074-adopted-by-hive", "author/clanker"}}
+	t0 := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
+	timeout := config.DefaultAdoptRebaseAttemptTimeout
+
+	failing, routed := sweepRebaseLogged(t, []github.PullRequest{pr}, t0)
+	if len(failing) != 1 || failing[0].RebaseAttempt != 1 || routed != 1 {
+		t.Fatalf("first sweep: rows=%+v routed=%d, want attempt 1 routed once", failing, routed)
+	}
+	// Later sweeps inside the deadline keep the row listed, not re-routed.
+	failing, routed = sweepRebaseLogged(t, []github.PullRequest{pr}, t0.Add(5*time.Minute))
+	if len(failing) != 1 || failing[0].RebaseAttempt != 1 || routed != 0 {
+		t.Fatalf("second sweep: rows=%+v routed=%d, want attempt 1 listed but not re-routed", failing, routed)
+	}
+	if a, _ := store.Get(repo, 15998); !a.DispatchedAt.Equal(t0) || a.Fixer != "scanner" {
+		t.Fatalf("dispatch = %+v, want the first sweep's dispatch to scanner kept", a)
+	}
+	if got := rebasemerge.AttemptTextAt(mustAttempt(t, store, repo, 15998), t0.Add(12*time.Minute)); got != "Rebasing · attempt 1/2 · waiting for scanner 12m" {
+		t.Fatalf("caption = %q", got)
+	}
+	// No push by the deadline: attempt 1 failed, attempt 2 routed once.
+	failing, routed = sweepRebaseLogged(t, []github.PullRequest{pr}, t0.Add(timeout))
+	if len(failing) != 1 || failing[0].RebaseAttempt != 2 || routed != 1 {
+		t.Fatalf("deadline sweep: rows=%+v routed=%d, want attempt 2 routed once", failing, routed)
+	}
+	failing, routed = sweepRebaseLogged(t, []github.PullRequest{pr}, t0.Add(timeout+time.Minute))
+	if len(failing) != 1 || failing[0].RebaseAttempt != 2 || routed != 0 {
+		t.Fatalf("attempt 2 re-sweep: rows=%+v routed=%d", failing, routed)
+	}
+	// Attempt 2 also times out: exhausted, off the fixer list.
+	failing, routed = sweepRebaseLogged(t, []github.PullRequest{pr}, t0.Add(2*timeout))
+	if len(failing) != 0 || routed != 0 {
+		t.Fatalf("exhausted sweep: rows=%+v routed=%d, want nothing", failing, routed)
+	}
+	if a := mustAttempt(t, store, repo, 15998); !a.Exhausted() || a.Stalled != 2 {
+		t.Fatalf("episode = %+v, want exhausted by two timed-out attempts", a)
+	}
+}
+
+func mustAttempt(t *testing.T, store *rebasemerge.Attempts, repo string, number int) rebasemerge.Attempt {
+	t.Helper()
+	a, ok := store.Get(repo, number)
+	if !ok {
+		t.Fatalf("no rebase episode for %s#%d", repo, number)
+	}
+	return a
 }

@@ -16,7 +16,12 @@ package github
 // comment. The enumeration files a blocked issue under the filtered bucket,
 // IssueStageFor derives no stage for it, IssueClaimBlockReason refuses every
 // automated claim on it, and ReconcileBlockedIssues lifts the label once the
-// tracked PR merges or closes.
+// tracked PR merges or closes. The issue form, `<!-- hive:blocked-on
+// issue=owner/repo#N -->`, names an issue the block waits on instead (a
+// contributor's blocked verdict on another repository's work); the sweep
+// lifts that label once the issue closes and never as marker-less. A blocker
+// issue closed as a duplicate of, or replaced by, an issue that is still
+// open moves the block to that issue instead (blocked_successor.go).
 //
 // A blocked issue with no tracked PR may instead carry a deadline,
 // `<!-- hive:recheck-after <RFC3339> -->` (hivecommons/hive#13310): the
@@ -30,6 +35,7 @@ package github
 import (
 	"context"
 	"fmt"
+	"github.com/hivecommons/hive/pkg/prstatus"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -37,10 +43,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/pkg/gfi"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // BlockedLabel is the workflow label that parks an issue on an unmerged PR
@@ -66,6 +74,7 @@ const blockedUnblockedMarker = "<!-- hive:unblocked -->"
 
 var (
 	blockedOnMarkerRE      = regexp.MustCompile(`<!--\s*hive:blocked-on\s+pr=([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\s*-->`)
+	blockedOnIssueMarkerRE = regexp.MustCompile(`<!--\s*hive:blocked-on\s+issue=([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\s*-->`)
 	adoptedSupersedeRE     = regexp.MustCompile(`(?i)<!--\s*hive:adopted\b[^>]*\bmode=supersede\b[^>]*\bsuperseded_by=(\d+)`)
 	adoptedSupersedeAttrRE = regexp.MustCompile(`(?i)<!--\s*hive:adopted\b[^>]*\bsuperseded_by=(\d+)[^>]*\bmode=supersede`)
 	supersededByRE         = regexp.MustCompile(`(?i)\bSuperseded by #?(\d+)\b`)
@@ -99,6 +108,20 @@ func ParseSupersededBy(text string) (int, bool) {
 // BlockedOnMarker renders the marker that names the PR an issue waits on.
 func BlockedOnMarker(repo string, pr int) string {
 	return blockedOnMarkerPrefix + strings.TrimSpace(repo) + "#" + strconv.Itoa(pr) + " -->"
+}
+
+// parseBlockedOnIssueMarker returns the first issue-form blocked-on marker,
+// `<!-- hive:blocked-on issue=owner/repo#N -->`, in text.
+func parseBlockedOnIssueMarker(text string) (repo string, issue int, ok bool) {
+	m := blockedOnIssueMarkerRE.FindStringSubmatch(text)
+	if m == nil {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(m[2])
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	return m[1], n, true
 }
 
 // ParseBlockedOnMarker returns the first blocked-on marker in text.
@@ -137,17 +160,46 @@ func BlockedOnTarget(body, reason string) (repo string, pr int, ok bool) {
 	return ParseBlockedOnReason(reason)
 }
 
+// ParseBlockedOnIssueReason returns the issue a blockedFilterReason names
+// ("blocked on issue owner/repo#N"); false for the PR form and every other
+// reason. It shares parseBlockedOnReason with the sweep so the two never
+// drift.
+func ParseBlockedOnIssueReason(reason string) (repo string, issue int, ok bool) {
+	repo, issue, isIssue, ok := parseBlockedOnReason(reason)
+	if !ok || !isIssue {
+		return "", 0, false
+	}
+	return repo, issue, true
+}
+
+// BlockedOnIssueTarget is BlockedOnTarget for the issue variant: the
+// `issue=` marker in body, else the "blocked on issue owner/repo#N" reason.
+func BlockedOnIssueTarget(body, reason string) (repo string, issue int, ok bool) {
+	if repo, issue, ok = parseBlockedOnIssueMarker(body); ok {
+		return repo, issue, true
+	}
+	return ParseBlockedOnIssueReason(reason)
+}
+
 // blockedFilterReasonPrefix opens the enumeration's filtered reason for a
 // blocked issue; IssueStageFor and the sweep recognise it by prefix.
 const blockedFilterReasonPrefix = "blocked"
 
+// blockedOnIssueReasonWord sets an issue blocker apart from a PR one in the
+// filtered reason: "blocked on issue owner/repo#N".
+const blockedOnIssueReasonWord = "issue "
+
 // blockedFilterReason is the work-detail reason for a blocked issue:
-// "blocked on owner/repo#N" when the body carries the marker, "blocked until
+// "blocked on owner/repo#N" when the body carries the marker, "blocked on
+// issue owner/repo#N" when it carries the issue form, "blocked until
 // <RFC3339>" when it carries a recheck-after deadline instead, else the bare
 // label. It is what IssueStageFor echoes as the stage reason.
 func blockedFilterReason(body string) string {
 	if repo, pr, ok := ParseBlockedOnMarker(body); ok {
 		return blockedFilterReasonPrefix + " on " + repo + "#" + strconv.Itoa(pr)
+	}
+	if repo, issue, ok := parseBlockedOnIssueMarker(body); ok {
+		return blockedFilterReasonPrefix + " on " + blockedOnIssueReasonWord + repo + "#" + strconv.Itoa(issue)
 	}
 	if at, ok := gfi.ParseRecheckAfter(body); ok {
 		return blockedFilterReasonPrefix + " until " + at.Format(time.RFC3339)
@@ -312,7 +364,10 @@ type BlockedIssueResult struct {
 	// SoakTriaged counts ops-tracking issues that got soak evidence.
 	SoakTriaged int
 	Retargeted  int
-	Errors      int
+	// AskedHuman counts marker-less hive-applied blocks turned into a
+	// needs-human ask (blockedMarkerlessAsk).
+	AskedHuman int
+	Errors     int
 }
 
 // blockedIssueTarget is one blocked issue the sweep looks at.
@@ -341,7 +396,9 @@ type blockedIssueTarget struct {
 // deadline has passed loses `blocked` with a one-line note (once per
 // deadline) so the next enumeration re-triages it; an ops-tracking row on the
 // hive's own project gets soak evidence instead (runRecheckSoak) and keeps
-// `blocked`, other ops-tracking rows are left alone. A review-backlog item
+// `blocked`, other ops-tracking rows are left alone. A row whose marker names
+// an issue (issue=) instead loses `blocked` once that issue closes and keeps
+// it while it is open (reconcileBlockedOnIssue). A review-backlog item
 // with no marker, no deadline, no ops-tracking and no open native blocker
 // whose `blocked` the hive itself applied is lifted as a defect
 // (liftBlockedMarkerless, hivecommons/hive#13364); every other marker-less
@@ -416,6 +473,7 @@ func (c *Client) SweepBlockedIssues(ctx context.Context, opts BlockedSweepOption
 			})
 		}
 	}
+	c.retainBlockedRepairHeld(repos, targets)
 	return c.reconcileBlockedTargets(ctx, targets, c.logger), nil
 }
 
@@ -434,16 +492,18 @@ func (c *Client) reconcileBlockedTargets(ctx context.Context, targets []blockedI
 			break
 		}
 		res.Items++
-		prRepo, prNumber, ok := parseBlockedOnReason(t.reason)
+		// onIssue: the marker names an issue (issue=), not a PR.
+		prRepo, prNumber, onIssue, ok := parseBlockedOnReason(t.reason)
 		// scanned: the comments were read without error and hold no marker,
-		// so a marker-less lift may trust that nothing names a PR.
+		// so a marker-less lift may trust that nothing names a blocker.
 		scanned := false
 		if lookups < blockedSweepCommentLookups {
 			lookups++
 			scan, err := c.blockedSweepComments(ctx, t.repo, t.number, t.recheckAfter)
 			scanned = err == nil
 			if scan.ok {
-				prRepo, prNumber, ok = scan.prRepo, scan.pr, scan.ok
+				prRepo, prNumber, onIssue, ok = scan.prRepo, scan.pr, scan.issue, scan.ok
+				noteBlockedOnSeen(t.repo, t.number, scan.prRepo, scan.pr)
 			}
 			if !ok && !t.recheckAfter.IsZero() && !now.Before(t.recheckAfter) {
 				if t.opsTracking && isRecheckSoakRepo(t.repo) {
@@ -467,8 +527,18 @@ func (c *Client) reconcileBlockedTargets(ctx context.Context, targets []blockedI
 				if liftBlockedMarkerless(ctx, c, t, &res, logger) {
 					continue
 				}
+				if askHumanBlockedMarkerless(ctx, c, t, &res, logger) {
+					stripBlockedHelpWanted(ctx, c, t, &res, logger)
+					continue
+				}
 			}
 			stripBlockedHelpWanted(ctx, c, t, &res, logger)
+			continue
+		}
+		// A block that names what it waits on is not one the repair converts.
+		forgetBlockedRepairHeld(c, t)
+		if onIssue {
+			reconcileBlockedOnIssue(ctx, c, t, prRepo, prNumber, scanned, &res, logger)
 			continue
 		}
 		settled, merged, err := c.pullRequestSettledDetails(ctx, prRepo, prNumber)
@@ -497,10 +567,8 @@ func (c *Client) reconcileBlockedTargets(ctx context.Context, targets []blockedI
 						logger.Warn("blocked sweep: unblock failed", "repo", t.repo, "issue", t.number, "error", err)
 						continue
 					}
-					note := blockedUnblockedMarker + fmt.Sprintf("\nUnblocked: %s#%d (superseding #%d) is no longer open. This issue is actionable again.", prRepo, supersededBy, prNumber)
-					if err := c.CreateIssueCommentBudgeted(ctx, t.repo, t.number, note); err != nil {
-						logger.Warn("blocked sweep: unblock note not posted", "repo", t.repo, "issue", t.number, "error", err)
-					}
+					note := blockedSupersededSettledNote(prRepo, supersededBy, prNumber, c.unblockAdmission(t.labels))
+					c.postUnblockedNote(ctx, t.repo, t.number, note, logger)
 					res.Unblocked++
 					logger.Info("blocked sweep: issue unblocked", "repo", t.repo, "issue", t.number, "pr", prRepo+"#"+strconv.Itoa(supersededBy), "superseded", prNumber)
 					continue
@@ -518,11 +586,16 @@ func (c *Client) reconcileBlockedTargets(ctx context.Context, targets []blockedI
 						logger.Warn("blocked sweep: comment lookup before re-target failed", "repo", t.repo, "issue", t.number, "error", scanErr)
 						continue
 					}
-					if scan.ok && (scan.prRepo != prRepo || scan.pr != prNumber) {
+					if scan.ok && (scan.issue || scan.prRepo != prRepo || scan.pr != prNumber) {
 						stripBlockedHelpWanted(ctx, c, t, &res, logger)
 						continue
 					}
 				}
+				// Stays a standalone comment even under the attention pilot:
+				// blockedSweepComments finds the current blocker from the
+				// newest comment carrying the marker, and a status-card
+				// section keeps the card's original position and would
+				// hide this marker from that ordering.
 				note := fmt.Sprintf("%s\nRe-targeted: blocker #%d was superseded by #%d.", BlockedOnMarker(prRepo, supersededBy), prNumber, supersededBy)
 				if err := c.CreateIssueCommentBudgeted(ctx, t.repo, t.number, note); err != nil {
 					logger.Warn("blocked sweep: re-target note not posted", "repo", t.repo, "issue", t.number, "error", err)
@@ -538,10 +611,8 @@ func (c *Client) reconcileBlockedTargets(ctx context.Context, targets []blockedI
 				logger.Warn("blocked sweep: unblock failed", "repo", t.repo, "issue", t.number, "error", err)
 				continue
 			}
-			note := blockedPRSettledNote(prRepo + "#" + strconv.Itoa(prNumber))
-			if err := c.CreateIssueCommentBudgeted(ctx, t.repo, t.number, note); err != nil {
-				logger.Warn("blocked sweep: unblock note not posted", "repo", t.repo, "issue", t.number, "error", err)
-			}
+			note := blockedPRSettledNote(prRepo+"#"+strconv.Itoa(prNumber), c.unblockAdmission(t.labels))
+			c.postUnblockedNote(ctx, t.repo, t.number, note, logger)
 			res.Unblocked++
 			logger.Info("blocked sweep: issue unblocked", "repo", t.repo, "issue", t.number, "pr", prRepo+"#"+strconv.Itoa(prNumber))
 			continue
@@ -557,12 +628,21 @@ func stripBlockedHelpWanted(ctx context.Context, client *Client, t blockedIssueT
 	if !issueHasLabel(t.labels, helpWantedLabel) {
 		return
 	}
-	if err := client.RemoveLabel(ctx, t.repo, t.number, helpWantedLabel); err != nil {
+	if err := stripHelpWanted(ctx, client, t.repo, t.number); err != nil {
 		res.Errors++
 		logger.Warn("blocked sweep: help wanted not stripped", "repo", t.repo, "issue", t.number, "error", err)
 		return
 	}
 	res.Stripped++
+}
+
+// stripHelpWanted takes `help wanted` off an issue the hive is not asking
+// outside help for: one parked `blocked` (by the sweep or a --blocked-on-pr
+// comment), or one its filer claimed as its own next step
+// (hivecommons/hive#17299). Callers gate the write; this is the one shared
+// removal so the writeback ratchet sees a single call site.
+func stripHelpWanted(ctx context.Context, client *Client, repo string, number int) error {
+	return client.RemoveLabel(ctx, repo, number, helpWantedLabel)
 }
 
 // liftBlockedMarkerless lifts `blocked` from a review-backlog item with no
@@ -606,9 +686,7 @@ func liftBlockedMarkerless(ctx context.Context, client *Client, t blockedIssueTa
 		logger.Warn("blocked sweep: unblock failed", "repo", t.repo, "issue", t.number, "error", err)
 		return false
 	}
-	if err := client.CreateIssueCommentBudgeted(ctx, t.repo, t.number, blockedMarkerlessNote); err != nil {
-		logger.Warn("blocked sweep: unblock note not posted", "repo", t.repo, "issue", t.number, "error", err)
-	}
+	client.postUnblockedNote(ctx, t.repo, t.number, blockedMarkerlessNote, logger)
 	res.Unblocked++
 	logger.Info("blocked sweep: hive-applied marker-less block lifted", "repo", t.repo, "issue", t.number, "actor", actor)
 	return true
@@ -620,10 +698,211 @@ func liftBlockedMarkerless(ctx context.Context, client *Client, t blockedIssueTa
 // refuses stays out of the agent queue.
 const blockedMarkerlessNote = blockedUnblockedMarker + "\nUnblocked: the `blocked` label was applied by the hive without a blocked-on marker, so nothing could lift it; re-triaging."
 
+// askHumanBlockedMarkerless turns a `blocked` the hive applied with nothing
+// naming what the issue waits on into a needs-human ask. A contributor
+// relay's blocked verdict is applied with a hub-minted task token (so the
+// label's actor is the App bot) and carries no marker when the verdict named
+// no issue or PR (#15023 records one when it does). Lifting such a block put
+// the issue back in the queue and the next relay re-blocked it, daily
+// (projectbluefin/utah#771: 19 label events in 11 days); leaving it made the
+// issue invisible, "labelled blocked — the label records no reason" in no
+// inbox (projectbluefin/testsuite#908, projectbluefin/utah#1002, blocked 30s
+// after a footer-only relay comment). needs-human keeps every agent off it
+// and puts it in the maintainer inbox with the question. Only a hive-applied
+// label with no open native "blocked by" link is converted; a person's
+// marker-less block is theirs. Reports whether the issue was converted.
+//
+// The write-back gate is asked as blocked_repair with the fact established
+// here, that the label is the hive's (Item.HiveAppliedBlock). The hive has
+// already written to such an issue, so the gate does not hold the repair back
+// for the issue predating the hive's write access or lacking the opt-in
+// label; while it was asked as gate_comment both did, every sweep, and the
+// issue stayed in the invisible state above for days. A pause, the repo mode
+// and the kind's minimum level still refuse it.
+func askHumanBlockedMarkerless(ctx context.Context, client *Client, t blockedIssueTarget, res *BlockedIssueResult, logger *slog.Logger) bool {
+	if t.reviewBacklog || t.openBlockedBy > 0 {
+		forgetBlockedRepairHeld(client, t)
+		return false
+	}
+	actor, found, err := client.blockedLabelActor(ctx, t.repo, t.number)
+	if err != nil {
+		res.Errors++
+		logger.Warn("blocked sweep: timeline lookup failed; marker-less block left alone", "repo", t.repo, "issue", t.number, "error", err)
+		return false
+	}
+	if !found || (!client.isOwnBotLogin(actor) && !client.IsHiveAuthorLogin(actor)) {
+		forgetBlockedRepairHeld(client, t)
+		return false
+	}
+	item, err := client.WritebackItemForNumber(ctx, t.repo, t.number)
+	if err != nil {
+		res.Errors++
+		logger.Warn("blocked sweep: item lookup failed; marker-less block left alone", "repo", t.repo, "issue", t.number, "error", err)
+		return false
+	}
+	item.HiveAppliedBlock = true
+	gateRepo := client.blockedRepairRepo(t.repo)
+	if d := client.WritebackAllowed(gateRepo, item, writeback.KindBlockedRepair, blockedMarkerlessAskNote); !d.Allowed {
+		// The burst hold lets a couple of asks per repo through per sweep,
+		// and a failed write's retry is a duplicate for same_item_ttl; both
+		// clear on a later sweep. Say so rather than fall through silently,
+		// but once per issue and reason: the sweep asks again every few
+		// minutes, and a hold that lasts (a pause, the repo mode, the level)
+		// would repeat the line each time. Repeats go to the debug log.
+		level := slog.LevelDebug
+		if client.WritebackGate().NoteHeld(gateRepo, t.number, writeback.KindBlockedRepair, d.Reason) {
+			level = slog.LevelInfo
+		}
+		logger.Log(ctx, level, "blocked sweep: needs-human ask held by writeback gate", "repo", t.repo, "issue", t.number, "reason", d.Reason, "detail", d.Detail)
+		return false
+	}
+	forgetBlockedRepairHeld(client, t)
+	if !issueHasLabel(t.labels, issueNeedsHumanLabel) {
+		if err := client.AddLabels(ctx, t.repo, t.number, []string{issueNeedsHumanLabel}); err != nil { // writeback:gated
+			res.Errors++
+			logger.Warn("blocked sweep: needs-human not added; marker-less block left alone", "repo", t.repo, "issue", t.number, "error", err)
+			return false
+		}
+	}
+	if err := client.unblockIssue(ctx, t.repo, t.number); err != nil {
+		res.Errors++
+		logger.Warn("blocked sweep: unblock failed", "repo", t.repo, "issue", t.number, "error", err)
+		return false
+	}
+	client.postUnblockedNote(ctx, t.repo, t.number, blockedMarkerlessAskNote, logger)
+	res.AskedHuman++
+	logger.Info("blocked sweep: marker-less hive-applied block turned into a needs-human ask", "repo", t.repo, "issue", t.number, "actor", actor)
+	return true
+}
+
+// blockedMarkerlessAskNote is the note posted when a marker-less block
+// becomes a needs-human ask. It says what was missing and the two ways out.
+const blockedMarkerlessAskNote = blockedUnblockedMarker + "\n" +
+	"Needs a maintainer: a contributor's agent reported this issue blocked but named no issue or pull request it waits on, so the `blocked` label could never be lifted and the issue showed in no inbox. " +
+	"Hive replaced `blocked` with `needs-human`. Either name the dependency (a GitHub \"blocked by\" link, or re-add `blocked` with a `<!-- hive:blocked-on pr=owner/repo#N -->` comment; Hive lifts it when that closes) or remove `needs-human` to put the issue back in the queue."
+
+// blockedOnSeen remembers the blocker the sweep read from an issue's newest
+// blocked-on comment marker. The enumeration reads only the issue body, so a
+// marker the hive or a maintainer left in a comment (projectbluefin/finpilot#624,
+// #390) was invisible to the row's reason and the band.
+var blockedOnSeen = struct {
+	sync.Mutex
+	m map[string]string
+}{m: map[string]string{}}
+
+func blockedOnSeenKey(repo string, number int) string {
+	return strings.ToLower(strings.TrimSpace(repo)) + "#" + strconv.Itoa(number)
+}
+
+func noteBlockedOnSeen(repo string, number int, prRepo string, pr int) {
+	blockedOnSeen.Lock()
+	defer blockedOnSeen.Unlock()
+	blockedOnSeen.m[blockedOnSeenKey(repo, number)] = prRepo + "#" + strconv.Itoa(pr)
+}
+
+func forgetBlockedOnSeen(repo string, number int) {
+	blockedOnSeen.Lock()
+	defer blockedOnSeen.Unlock()
+	delete(blockedOnSeen.m, blockedOnSeenKey(repo, number))
+}
+
+// blockedFilterReasonFor is blockedFilterReason with the blocker the sweep
+// last read from the issue's comments preferred over the body's marker, the
+// same precedence the sweep lifts by.
+func blockedFilterReasonFor(repo string, number int, body string) string {
+	blockedOnSeen.Lock()
+	seen := blockedOnSeen.m[blockedOnSeenKey(repo, number)]
+	blockedOnSeen.Unlock()
+	if seen != "" {
+		return blockedFilterReasonPrefix + " on " + seen
+	}
+	return blockedFilterReason(body)
+}
+
 // blockedPRSettledNote is the note posted when the PR a blocked issue
 // waited on (pr, "owner/repo#N") has merged or closed.
-func blockedPRSettledNote(pr string) string {
+func blockedPRSettledNote(pr, admission string) string {
+	if admission != "" {
+		return blockedUnblockedMarker + "\nUnblocked: " + pr + " is no longer open. Unblocked — waiting for a maintainer to admit it: " + admission
+	}
 	return blockedUnblockedMarker + "\nUnblocked: " + pr + " is no longer open; re-triaging."
+}
+
+// blockedSupersededSettledNote is the note posted when the PR that superseded
+// an issue's blocker is no longer open either.
+func blockedSupersededSettledNote(prRepo string, supersededBy, prNumber int, admission string) string {
+	lead := blockedUnblockedMarker + fmt.Sprintf("\nUnblocked: %s#%d (superseding #%d) is no longer open.", prRepo, supersededBy, prNumber)
+	if admission != "" {
+		return lead + " Unblocked — waiting for a maintainer to admit it: " + admission
+	}
+	return lead + " This issue is actionable again."
+}
+
+// unblockAdmission is "" when project.issue_filter admits an issue with
+// these labels once `blocked` is gone; otherwise the sentence an unblock note
+// ends with instead of "actionable": nothing works an un-admitted issue
+// until a maintainer admits it (projectbluefin/website#987 had no
+// triage/accepted and was told it was actionable).
+func (c *Client) unblockAdmission(labels []string) string {
+	after := make([]string, 0, len(labels))
+	for _, l := range labels {
+		if !strings.EqualFold(strings.TrimSpace(l), BlockedLabel) {
+			after = append(after, l)
+		}
+	}
+	filter := c.getIssueFilter()
+	if filter.Admits(after) {
+		return ""
+	}
+	var required []string
+	if notice, ok := filter.(IssueFilterNoticeConfig); ok {
+		required = notice.RequireLabelsForNotice()
+	}
+	const lead = "`project.issue_filter` admits "
+	switch len(required) {
+	case 0:
+		return lead + "only issues carrying one of its required labels, and a maintainer adding one admits this one."
+	case 1:
+		return lead + "only issues labelled " + quoteLabels(required) + ", and a maintainer adding it admits this one."
+	default:
+		return lead + "only issues carrying one of " + quoteLabels(required) + ", and a maintainer adding one admits this one."
+	}
+}
+
+// unblockNoteRefRE reads the PR an unblock note is about: "Unblocked:
+// owner/repo#N …" or "Unblocked: source PR owner/repo#N …".
+var unblockNoteRefRE = regexp.MustCompile(`Unblocked: (?:source PR )?([\w.-]+/[\w.-]+)#(\d+)\b`)
+
+// unblockAlreadyNoted reports whether an unblock note about the same PR as
+// note is already on the issue, newer than the newest blocked-on marker
+// comment: the block on that PR was lifted already, by the other sweep or an
+// earlier pass. projectbluefin/website#987 got the review-backlog sweep's
+// "merged … actionable now" and, 8s later, the blocked sweep's "no longer
+// open; re-triaging" for the same #986. A note naming no PR (deadline,
+// marker-less) is never matched here.
+func unblockAlreadyNoted(comments []*gh.IssueComment, note string) bool {
+	m := unblockNoteRefRE.FindStringSubmatch(note)
+	if m == nil {
+		return false
+	}
+	short := m[1]
+	if i := strings.LastIndex(short, "/"); i >= 0 {
+		short = short[i+1:]
+	}
+	same := regexp.MustCompile(`(?i)Unblocked: (?:source PR )?(?:[\w.-]+/)?` + regexp.QuoteMeta(short) + `#` + m[2] + `\b`)
+	for i := len(comments) - 1; i >= 0; i-- {
+		body := comments[i].GetBody()
+		if strings.Contains(body, blockedUnblockedMarker) {
+			if same.MatchString(body) {
+				return true
+			}
+			continue
+		}
+		if _, _, ok := ParseBlockedOnMarker(body); ok {
+			return false
+		}
+	}
+	return false
 }
 
 // blockedLabelActor returns the login that most recently applied `blocked`
@@ -643,21 +922,78 @@ func (c *Client) blockedLabelActor(ctx context.Context, repo string, number int)
 	return "", false, nil
 }
 
-// parseBlockedOnReason reads "blocked on owner/repo#N" back into its parts.
-func parseBlockedOnReason(reason string) (repo string, pr int, ok bool) {
+// BlockedLabelAppliedByHive reports whether the most recent application of
+// `blocked` to the issue was by this hive. A human-applied label, a missing
+// labeled event, or a client with no hive identity reports false.
+func (c *Client) BlockedLabelAppliedByHive(ctx context.Context, repo string, number int) (bool, error) {
+	actor, found, err := c.blockedLabelActor(ctx, repo, number)
+	if err != nil || !found {
+		return false, err
+	}
+	return c.isOwnBotLogin(actor) || c.IsHiveAuthorLogin(actor), nil
+}
+
+// parseBlockedOnReason reads "blocked on owner/repo#N" (issue false) or
+// "blocked on issue owner/repo#N" (issue true) back into its parts.
+func parseBlockedOnReason(reason string) (repo string, number int, issue bool, ok bool) {
 	rest, found := strings.CutPrefix(strings.TrimSpace(reason), blockedFilterReasonPrefix+" on ")
 	if !found {
-		return "", 0, false
+		return "", 0, false, false
 	}
+	rest, issue = strings.CutPrefix(strings.TrimSpace(rest), blockedOnIssueReasonWord)
 	repo, num, found := strings.Cut(strings.TrimSpace(rest), "#")
 	if !found || repo == "" {
-		return "", 0, false
+		return "", 0, false, false
 	}
 	n, err := strconv.Atoi(num)
 	if err != nil || n <= 0 {
-		return "", 0, false
+		return "", 0, false, false
 	}
-	return repo, n, true
+	return repo, n, issue, true
+}
+
+// reconcileBlockedOnIssue settles a block whose marker names an issue
+// (`<!-- hive:blocked-on issue=owner/repo#N -->`): once that issue is closed
+// the label comes off with one unblocked note; while it is open the block
+// stays and only `help wanted` is stripped. A contributor's blocked verdict
+// on another repository's work is not a marker-less defect: lifting it sent
+// projectbluefin/utah#10 and #855 back to triage, where contributor after
+// contributor re-verified "still blocked" and re-applied it. A lookup error
+// is counted and leaves the block; a missing issue reads as open, so a
+// mistyped reference never lifts it. A transferred issue is not closed
+// either: GitHub redirects the old URL and the client follows it, so the
+// block follows the issue's state in its new repository.
+//
+// A closed blocker is first followed to its successor
+// (blockedSuccessorRetargetIssue): closed as a duplicate of an open issue,
+// or replaced by one a trusted "Superseded by #N" names, it leaves the block
+// on with one re-target comment naming the open issue. scanned says t's
+// comments were read this pass (see there).
+func reconcileBlockedOnIssue(ctx context.Context, c *Client, t blockedIssueTarget, repo string, number int, scanned bool, res *BlockedIssueResult, logger *slog.Logger) {
+	ref := repo + "#" + strconv.Itoa(number)
+	owner, name := c.splitRepo(repo)
+	_, closed, err := c.IssueClosedAt(ctx, owner, name, number)
+	if err != nil {
+		res.Errors++
+		logger.Warn("blocked sweep: tracked issue lookup failed", "repo", t.repo, "issue", t.number, "blocker", ref, "error", err)
+		return
+	}
+	if !closed {
+		stripBlockedHelpWanted(ctx, c, t, res, logger)
+		return
+	}
+	if blockedSuccessorRetargetIssue(ctx, c, t, repo, number, scanned, res, logger) {
+		return
+	}
+	if err := c.unblockIssue(ctx, t.repo, t.number); err != nil {
+		res.Errors++
+		logger.Warn("blocked sweep: unblock failed", "repo", t.repo, "issue", t.number, "error", err)
+		return
+	}
+	blockedSuccessorLookupSettled(blockedSuccessorLookupKey(t.repo, t.number, ref))
+	c.postUnblockedNote(ctx, t.repo, t.number, blockedUnblockedMarker+"\nUnblocked: "+ref+" is closed. This issue is actionable again.", logger)
+	res.Unblocked++
+	logger.Info("blocked sweep: issue unblocked", "repo", t.repo, "issue", t.number, "blocker", ref)
 }
 
 // liftBlockedDeadline lifts `blocked` from an issue with no tracked PR whose
@@ -685,11 +1021,56 @@ func liftBlockedDeadline(ctx context.Context, client *Client, t blockedIssueTarg
 		logger.Warn("blocked sweep: unblock failed", "repo", t.repo, "issue", t.number, "error", err)
 		return
 	}
-	if err := client.CreateIssueCommentBudgeted(ctx, t.repo, t.number, blockedDeadlineNote(deadline)); err != nil {
-		logger.Warn("blocked sweep: unblock note not posted", "repo", t.repo, "issue", t.number, "error", err)
-	}
+	client.postUnblockedNote(ctx, t.repo, t.number, blockedDeadlineNote(deadline), logger)
 	res.Unblocked++
 	logger.Info("blocked sweep: issue unblocked", "repo", t.repo, "issue", t.number, "recheck_after", deadline)
+}
+
+// postUnblockedNote leaves note on the issue once per cause: a comment
+// already carrying this exact note — the sweep saw the issue again before
+// the label removal was visible, or a second sweep path lifted the same
+// block (hivecommons/hive#15536 ×2 within a minute) — means nothing is
+// posted. An issue the hive is closing for the same merge (a close-on-merge
+// or issue-stage closing note is present) gets no unblocked note either:
+// it is done, not actionable again. In quiet notification mode the note is
+// a section of the issue's status comment, so only the first note on an
+// issue ever creates a comment.
+func (c *Client) postUnblockedNote(ctx context.Context, repo string, number int, note string, logger *slog.Logger) {
+	owner, name := c.splitRepo(repo)
+	comments, err := c.listIssueComments(ctx, owner, name, number)
+	if err != nil {
+		logger.Warn("blocked sweep: comment lookup before unblock note failed; posting anyway", "repo", repo, "issue", number, "error", err)
+	}
+	for _, cm := range comments {
+		body := cm.GetBody()
+		switch {
+		case strings.Contains(body, note):
+			c.noteCommentSuppressed()
+			return
+		case strings.Contains(body, CloseOnMergeMarker), strings.Contains(body, mergedPRClosedStageMarker):
+			logger.Info("blocked sweep: issue is being closed by its merged PR; unblock note not posted", "repo", repo, "issue", number)
+			c.noteCommentSuppressed()
+			return
+		}
+	}
+	if unblockAlreadyNoted(comments, note) {
+		logger.Info("blocked sweep: the block on this PR was already lifted with a note; not posting a second", "repo", repo, "issue", number)
+		c.noteCommentSuppressed()
+		return
+	}
+	// The attention pilot folds dependency progress into the issue's
+	// status card whatever github.notifications.mode says.
+	if c.notificationsQuiet() || c.attentionPilot() {
+		if created, err := c.UpsertPRStatusSection(ctx, repo, number, prstatus.KeyUnblocked, note); err != nil {
+			logger.Warn("blocked sweep: unblock note not recorded on status comment", "repo", repo, "issue", number, "error", err)
+		} else if !created {
+			c.noteCommentSuppressed()
+		}
+		return
+	}
+	if err := c.CreateIssueCommentBudgeted(ctx, repo, number, note); err != nil {
+		logger.Warn("blocked sweep: unblock note not posted", "repo", repo, "issue", number, "error", err)
+	}
 }
 
 // blockedDeadlineNote is the note posted when a recheck-after deadline
@@ -699,18 +1080,21 @@ func blockedDeadlineNote(deadline string) string {
 }
 
 // blockedSweepScan is what one comment read tells the sweep about an issue.
+// issue is set when the newest blocked-on marker is the issue form, so
+// prRepo and pr then name an issue.
 type blockedSweepScan struct {
 	prRepo        string
 	pr            int
+	issue         bool
 	ok            bool
 	deadlineNoted bool
 	evidenceNoted bool
 }
 
 // blockedSweepComments reads the issue's comments once: the newest
-// blocked-on marker (the scanner's blocked note carries one) and, when
-// recheckAfter is set, whether the unblocked note for that deadline or a
-// soak-evidence comment is already there.
+// blocked-on marker of either form (the scanner's blocked note carries one)
+// and, when recheckAfter is set, whether the unblocked note for that
+// deadline or a soak-evidence comment is already there.
 func (c *Client) blockedSweepComments(ctx context.Context, repo string, number int, recheckAfter time.Time) (blockedSweepScan, error) {
 	var scan blockedSweepScan
 	owner, name := c.splitRepo(repo)
@@ -726,6 +1110,10 @@ func (c *Client) blockedSweepComments(ctx context.Context, repo string, number i
 		body := comments[i].GetBody()
 		if !scan.ok {
 			scan.prRepo, scan.pr, scan.ok = ParseBlockedOnMarker(body)
+			if !scan.ok {
+				scan.prRepo, scan.pr, scan.ok = parseBlockedOnIssueMarker(body)
+				scan.issue = scan.ok
+			}
 		}
 		if passed != "" && strings.Contains(body, blockedUnblockedMarker) && strings.Contains(body, passed) {
 			scan.deadlineNoted = true

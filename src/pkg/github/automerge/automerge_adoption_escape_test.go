@@ -11,7 +11,6 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
-
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
@@ -307,13 +306,72 @@ func TestAdoptionEscapeHelpers(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := inPlaceRehomeReason(tc.obs, tc.rec, policy, tc.at); got != tc.wantRehome {
+			if got := inPlaceRehomeReason(tc.obs, tc.rec, policy, tc.at, false); got != tc.wantRehome {
 				t.Fatalf("inPlaceRehomeReason=%q, want %q", got, tc.wantRehome)
 			}
 			if got := adoptionStalledReason(tc.obs, tc.rec, policy, tc.at); got != tc.wantStall {
 				t.Fatalf("adoptionStalledReason=%q, want %q", got, tc.wantStall)
 			}
 		})
+	}
+}
+
+// hivecommons/hive#16023: an in-place adoption whose fixer rebase episode
+// is exhausted re-homes to a superseding PR at once instead of waiting out
+// the 074 dwell; a live episode, a non-conflicting head or a moved head
+// does not.
+func TestInPlaceRehomeOnExhaustedRebaseEpisode(t *testing.T) {
+	policy := adoptPolicy()
+	now := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
+	inPlace := stagelabels.Record{AdoptedHead: "aaa", AdoptMode: stagelabels.AdoptModeInPlace, AdoptedAt: now, AdoptedHeadAt: now}
+	conflict := stageObservation{Owner: "acme", Repo: "widget", Number: 7, HeadSHA: "aaa", Reason: "conflicting", LaneReason: "conflicting", Labels: []string{"needs-rebase"}}
+	red := stageObservation{Owner: "acme", Repo: "widget", Number: 7, HeadSHA: "aaa", Reason: "check-failing:unit", LaneReason: "check-failing:unit"}
+	moved := conflict
+	moved.HeadSHA = "bbb"
+	at := now.Add(30 * time.Minute)
+	tests := []struct {
+		name      string
+		obs       stageObservation
+		exhausted bool
+		want      string
+	}{
+		{"exhausted conflict re-homes before the dwell", conflict, true, AdoptReasonRebaseRehome},
+		{"live episode waits for the dwell", conflict, false, ""},
+		{"exhausted but not conflicting stays", red, true, ""},
+		{"exhausted on a moved head stays", moved, true, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inPlaceRehomeReason(tc.obs, inPlace, policy, at, tc.exhausted); got != tc.want {
+				t.Fatalf("inPlaceRehomeReason=%q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := inPlaceRehomeReason(conflict, inPlace, policy, now.Add(adoptedDwell), false); got != AdoptReasonRebaseRehome {
+		t.Fatalf("dwell path still re-homes: %q", got)
+	}
+
+	episodes := map[int]RebaseEpisode{7: {Attempt: 3, MaxAttempts: 2, Exhausted: true}, 8: {Attempt: 1, MaxAttempts: 2}}
+	e := &Engine{rebaseEpisode: func(repo string, number int) (RebaseEpisode, bool) {
+		if repo != "acme/widget" {
+			return RebaseEpisode{}, false
+		}
+		ep, ok := episodes[number]
+		return ep, ok
+	}}
+	live := conflict
+	live.Number = 8
+	none := conflict
+	none.Number = 9
+	supersede := stagelabels.Record{AdoptedHead: "aaa", AdoptMode: stagelabels.AdoptModeSupersede, AdoptedBy: 90, AdoptedAt: now}
+	if !e.inPlaceRebaseExhausted(conflict, inPlace) {
+		t.Fatal("exhausted episode on the in-place adoption not reported")
+	}
+	if e.inPlaceRebaseExhausted(live, inPlace) || e.inPlaceRebaseExhausted(none, inPlace) || e.inPlaceRebaseExhausted(conflict, supersede) {
+		t.Fatal("live, missing or supersede-mode episode reported exhausted")
+	}
+	if (&Engine{}).inPlaceRebaseExhausted(conflict, inPlace) {
+		t.Fatal("no episode reader reports exhausted")
 	}
 }
 
@@ -744,6 +802,55 @@ func TestAdoptionStalledNotePerReasonOnSameHead(t *testing.T) {
 	}
 }
 
+// hivecommons/hive#16619: the hive's own clanker (project.ai_author) opened
+// the PR from its fork; the hive's fixer pushed a commit signed as the App.
+// The squash attributes that commit to the hive's own author, so there is
+// nothing to re-home: the PR keeps its number, approval and CI, and the
+// adoption stays in place. No superseder, no stall note.
+func TestAdoptedInPlaceHiveAuthoredSquashUnsafeCommitStaysInPlace(t *testing.T) {
+	p := adoptPolicy()
+	p.AdoptInPlace = true
+	p.DCORequired = func(string) (bool, bool) { return true, true }
+	p.HiveAuthor = func(login string) bool { return strings.EqualFold(login, "thatguywob") }
+	h, done := newAdoptHarness(t, ContributorNudgeOutcome{Mode: "comment"}, p)
+	defer done()
+	h.api.commitDetails = map[int][]stageCommitFixture{7: {
+		{message: "fix: preserve verdicts\n\nSigned-off-by: thatguywob <thatguywob@users.noreply.github.com>", authorLogin: "thatguywob", authorName: "thatguywob", authorEmail: "thatguywob@users.noreply.github.com"},
+		{message: "fix: escape tooltip lines\n\nSigned-off-by: hive[bot] <12345+hive[bot]@users.noreply.github.com>", authorLogin: testHiveAppBotLogin, authorName: "scanner", authorEmail: "12345+hive[bot]@users.noreply.github.com"},
+	}}
+	own := func(head string, labels ...string) *gh.PullRequest {
+		pr := adoptPR(7, head, labels...)
+		pr.User = &gh.User{Login: gh.Ptr("thatguywob")}
+		pr.Head.Repo = &gh.Repository{FullName: gh.Ptr("thatguywob/widget")}
+		return pr
+	}
+	h.adopt.allowMaintainerEdits(7, true)
+	h.observe(own("5980996"), contributorLaneReasonNoVerdict)
+	key := stageKey("acme", "widget", 7)
+	h.e.stageStoreOrShared().MarkAdoptedInPlace(key, "5980996", AdoptReasonGrace, h.clock.at)
+	h.adopt.setCommitAuthor("5980996", testHiveAppBotLogin)
+	h.api.reset()
+
+	for _, advance := range []time.Duration{time.Minute, adoptedDwell + time.Hour} {
+		h.clock.advance(advance)
+		h.observe(own("5980996", adoptedLabels...), contributorLaneReasonNoVerdict)
+		// Past the dwell the idle head may escalate to a person (085);
+		// that is a note on the same PR, never a copy of it.
+		if len(h.adopt.pulls) != 0 || len(adoptionComments(h.api)) != 0 || h.adopt.refs["refs/heads/hive/adopt-7"] != "" {
+			t.Fatalf("hive-authored PR superseded for sign-off: pulls=%v refs=%v comments=%v", h.adopt.pulls, h.adopt.refs, h.api.comments)
+		}
+		rec, _ := h.e.stageStoreOrShared().Get(key)
+		if !rec.AdoptedInPlace() || rec.AdoptedBy != 0 || rec.AdoptReason == AdoptReasonSignoffRehome || rec.DCOSquashUnsafeHive != 0 {
+			t.Fatalf("record after %v: %+v", advance, rec)
+		}
+		for _, c := range stalledComments(h.api) {
+			if strings.Contains(c, stagelabels.LaneReasonHiveSignoffAttribution) {
+				t.Fatalf("hive-authored PR parked on sign-off attribution: %s", c)
+			}
+		}
+	}
+}
+
 // A record from before the noted reasons were kept: escalated and noted on
 // the head, no reasons. It reads as noted for every reason on that head, so
 // an upgrade does not repost on every parked PR.
@@ -879,8 +986,72 @@ func TestAdoptionStaleWaitsForFixerQueue(t *testing.T) {
 			if got := adoptionStale(obs, tc.rec, policy, tc.at); got != tc.want {
 				t.Fatalf("adoptionStale=%v, want %v", got, tc.want)
 			}
-			if got := inPlaceRehomeReason(obs, tc.rec, policy, tc.at); got != "" && !tc.want {
+			if got := inPlaceRehomeReason(obs, tc.rec, policy, tc.at, false); got != "" && !tc.want {
 				t.Fatalf("inPlaceRehomeReason=%q while waiting on the fixer queue", got)
+			}
+		})
+	}
+}
+
+// The same head on an external contributor's fork keeps the existing
+// behaviour: the App-signed commit is squash-unsafe under mallory's name,
+// so the adoption re-homes onto hive/adopt-7 at once
+// (TestAdoptedInPlaceSquashUnsafeHiveCommitSupersedes covers the full
+// path; this pins the decision with the hive-author hook present).
+func TestAdoptedInPlaceExternalForkSquashUnsafeStillSupersedes(t *testing.T) {
+	policy := adoptPolicy()
+	policy.AdoptInPlace = true
+	policy.HiveAuthor = func(login string) bool { return strings.EqualFold(login, "thatguywob") }
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	inPlace := stagelabels.Record{AdoptedHead: "aaa", AdoptMode: stagelabels.AdoptModeInPlace, AdoptedAt: now, AdoptedHeadAt: now}
+	external := stageObservation{HeadSHA: "aaa", Author: "mallory", HeadRepo: "mallory/widget", Reason: stagelabels.LaneReasonHiveSignoffAttribution, Detail: stageDetail{DCOSquashUnsafeHive: 1}}
+	if got := inPlaceRehomeReason(external, inPlace, policy, now.Add(time.Minute), false); got != AdoptReasonSignoffRehome {
+		t.Fatalf("external fork: inPlaceRehomeReason=%q, want %q", got, AdoptReasonSignoffRehome)
+	}
+	if got := adoptionStalledReason(external, inPlace, policy, now.Add(time.Minute)); got != "adoption-stalled:hive-signoff-attribution" {
+		t.Fatalf("external fork stall reason=%q", got)
+	}
+	own := external
+	own.Author, own.HeadRepo = "thatguywob", "thatguywob/widget"
+	if got := inPlaceRehomeReason(own, inPlace, policy, now.Add(time.Minute), false); got != "" {
+		t.Fatalf("hive-authored: inPlaceRehomeReason=%q, want none", got)
+	}
+	if got := adoptionStalledReason(own, inPlace, policy, now.Add(time.Minute)); got != "" {
+		t.Fatalf("hive-authored stall reason=%q, want none", got)
+	}
+}
+
+// An operator's approval on the adopted head is never thrown away for a
+// copy: neither the sign-off, the rebase nor the stalled-finding re-home
+// fires while the approval stands on that head. A new head starts over.
+func TestAdoptedInPlaceApprovedHeadIsNotSuperseded(t *testing.T) {
+	policy := adoptPolicy()
+	policy.AdoptInPlace = true
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	inPlace := stagelabels.Record{AdoptedHead: "aaa", AdoptMode: stagelabels.AdoptModeInPlace, AdoptedAt: now, AdoptedHeadAt: now}
+	late := now.Add(adoptedDwell + time.Hour)
+	approved := stageDetail{HumanApprover: "clubanderson", HumanApprovalHead: "aaa"}
+	cases := []struct {
+		name string
+		obs  stageObservation
+	}{
+		{"squash-unsafe sign-off", stageObservation{HeadSHA: "aaa", Author: "mallory", Reason: stagelabels.LaneReasonHiveSignoffAttribution, Detail: stageDetail{DCOSquashUnsafeHive: 1}}},
+		{"needs-rebase past dwell", stageObservation{HeadSHA: "aaa", Author: "mallory", Labels: []string{"needs-rebase"}, Reason: "conflicting"}},
+		{"finding past dwell", stageObservation{HeadSHA: "aaa", Author: "mallory", LaneReason: contributorLaneReasonChangesRequested, Detail: stageDetail{VerdictKnown: true, Verdict: ContributorLaneVerdict{Configured: true, Verdict: "changes_requested"}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inPlaceRehomeReason(tc.obs, inPlace, policy, late, true); got == "" {
+				t.Fatalf("precondition: unapproved head must re-home")
+			}
+			obs := tc.obs
+			obs.Detail.HumanApprover, obs.Detail.HumanApprovalHead = approved.HumanApprover, approved.HumanApprovalHead
+			if got := inPlaceRehomeReason(obs, inPlace, policy, late, true); got != "" {
+				t.Fatalf("approved head re-homed: %q", got)
+			}
+			obs.Detail.HumanApprovalHead = "older"
+			if got := inPlaceRehomeReason(obs, inPlace, policy, late, true); got == "" {
+				t.Fatalf("an approval on an older head must not pin the new one")
 			}
 		})
 	}

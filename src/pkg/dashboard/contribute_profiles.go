@@ -189,6 +189,12 @@ type ContributorProfile struct {
 	LastActive         string                `json:"last_active,omitempty"`
 	LastCompletedTask  *WSTaskAssign         `json:"last_completed_task,omitempty"`
 	RateLimits         ContributorRateLimits `json:"rate_limits"`
+	// Abandoned counts PRs of this contributor the hive adopted (in place or
+	// by supersession, operator takeovers included), one per PR; AbandonedPRs
+	// holds the records. Written by recordContributorAbandon and append-only
+	// across saves (hivecommons/hive#15782).
+	Abandoned    int                        `json:"abandoned"`
+	AbandonedPRs []ContributorAbandonRecord `json:"abandoned_prs,omitempty"`
 	// LabelInterests is the contributor's OPT-IN list of GitHub issue labels they
 	// want to help with (issue #2637) — e.g. a contributor with an NVIDIA machine
 	// subscribes to "nvidia" so nvidia-labelled work surfaces first for them. It is
@@ -230,9 +236,13 @@ type ContributorProfile struct {
 	Collaborators    []CollaboratorRecord         `json:"collaborators,omitempty"`
 	OperatorMessages []ContributorOperatorMessage `json:"operator_messages,omitempty"`
 	Active           bool                         `json:"active,omitempty"`
-	CurrentTask      *WSTaskAssign                `json:"current_task,omitempty"`
-	ActiveTasks      []WSTaskAssign               `json:"active_tasks,omitempty"`
-	Sessions         int                          `json:"sessions,omitempty"`
+	// Online is the tracker's presence verdict (heartbeat within
+	// governor.labels.stage.presence_window); filled on the list response
+	// only, never persisted.
+	Online      bool           `json:"online,omitempty"`
+	CurrentTask *WSTaskAssign  `json:"current_task,omitempty"`
+	ActiveTasks []WSTaskAssign `json:"active_tasks,omitempty"`
+	Sessions    int            `json:"sessions,omitempty"`
 	// Version is the profile's optimistic-concurrency token (hivecommons/hive H2,
 	// CWE-613/639). It is bumped on every persisted change. A caller that loaded the
 	// profile at version N may only persist its edit if the on-disk version is still
@@ -354,7 +364,11 @@ func saveContributorProfileTokenCAS(p *ContributorProfile, adminOverride, tokenU
 			p.TokenLastUsedAt = cur.TokenLastUsedAt
 		}
 		p.Version = cur.Version
+		// Abandon records are append-only: a writer holding an older copy
+		// must not drop one recorded since it loaded.
+		p.AbandonedPRs = mergeContributorAbandons(cur.AbandonedPRs, p.AbandonedPRs)
 	}
+	p.Abandoned = len(p.AbandonedPRs)
 	p.Version++
 
 	ensureDir(getContributorsDir())

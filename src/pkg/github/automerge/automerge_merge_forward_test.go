@@ -33,6 +33,14 @@ func mergeForwardPR(fork bool, labels ...string) *gh.PullRequest {
 	return pr
 }
 
+// renovateMergeForwardPR is a same-repo `author/human` PR on a Renovate
+// branch (Renovate run under a person's token): the head ref alone marks it.
+func renovateMergeForwardPR() *gh.PullRequest {
+	pr := mergeForwardPR(false, "author/human")
+	pr.Head.Ref = gh.Ptr("renovate/go-deps")
+	return pr
+}
+
 type mergeForwardAPI struct {
 	mu            sync.Mutex
 	mergeStatus   int
@@ -49,6 +57,14 @@ func newMergeForwardServer(t *testing.T, a *mergeForwardAPI) *httptest.Server {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/main":
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": "main", "commit": map[string]string{"sha": "base1"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7":
+			pr := mergeForwardPR(false, "author/human")
+			pr.State = gh.Ptr("open")
+			pr.MergeableState = gh.Ptr("dirty")
+			pr.Base.SHA = gh.Ptr("base1")
+			_ = json.NewEncoder(w).Encode(pr)
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widget/merges":
 			a.merges++
 			_ = json.NewDecoder(r.Body).Decode(&a.mergeBody)
@@ -111,6 +127,7 @@ func TestMergeForwardOrConflict(t *testing.T) {
 		{name: "unknown author keeps the hold", optIn: true, pr: mergeForwardPR(false), wantReason: "conflicting"},
 		{name: "nil pr", optIn: true, wantReason: "conflicting"},
 		{name: "clean merge pushes a merge commit", optIn: true, pr: mergeForwardPR(false, "author/human"), mergeStatus: http.StatusCreated, wantReason: "check-pending", wantUpdated: true, wantMerges: 1},
+		{name: "dependency bot branch is left to the bot", optIn: true, pr: renovateMergeForwardPR(), mergeStatus: http.StatusCreated, wantReason: "conflicting"},
 		{name: "nothing to merge waits for github", optIn: true, pr: mergeForwardPR(false, "author/human"), mergeStatus: http.StatusNoContent, wantReason: "check-pending", wantMerges: 1},
 		{name: "conflict posts the files note", optIn: true, pr: mergeForwardPR(false, "author/human"), mergeStatus: http.StatusConflict, wantReason: "conflicting", wantMerges: 1, wantComment: true, wantFiles: true},
 		{name: "conflict note without files when compare fails", optIn: true, pr: mergeForwardPR(false, "author/human"), mergeStatus: http.StatusConflict, compareStatus: http.StatusInternalServerError, wantReason: "conflicting", wantMerges: 1, wantComment: true},
@@ -174,6 +191,7 @@ func TestMergeForwardOrConflictOncePerHead(t *testing.T) {
 		if _, reason, err := c.mergeForwardOrConflict(context.Background(), "acme/widget", "acme", "widget", pr, 7); reason != "conflicting" || err != nil {
 			t.Fatalf("tick %d: reason, err = %q, %v", i, reason, err)
 		}
+
 	}
 	api.mu.Lock()
 	defer api.mu.Unlock()
@@ -213,6 +231,30 @@ func TestMergeForwardWorkflowRefusalHoldsPerHead(t *testing.T) {
 	moved.Head.SHA = gh.Ptr("sha-human-2")
 	if _, reason, err := c.mergeForwardOrConflict(context.Background(), "acme/widget", "acme", "widget", moved, 7); reason != "check-pending" || err != nil {
 		t.Fatalf("new head reason, err = %q, %v; want check-pending", reason, err)
+	}
+}
+
+func TestMergeForwardRepairSharesPreparationWithoutDisablingRepair(t *testing.T) {
+	api := &mergeForwardAPI{mergeStatus: http.StatusCreated}
+	srv := newMergeForwardServer(t, api)
+	defer srv.Close()
+	c := newAutoMergeSweepClient(srv.URL)
+	c.requireCurrentBase = func(string) bool { return true }
+	c.mergeForwardTrustedHuman = func(string) bool { return true }
+	for tick := range 2 {
+		ev, reason, err := c.mergeForwardOrConflict(context.Background(), "acme/widget", "acme", "widget", mergeForwardPR(false, "author/human"), 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tick == 0 && !ev.BranchUpdated {
+			t.Fatalf("explicit repair was disabled: %+v %q", ev, reason)
+		}
+		if tick == 1 && (ev.BranchUpdated || reason != basePreparationReady) {
+			t.Fatalf("repair refresh repeated: %+v %q", ev, reason)
+		}
+	}
+	if api.merges != 1 {
+		t.Fatalf("repair mutations=%d, want 1", api.merges)
 	}
 }
 

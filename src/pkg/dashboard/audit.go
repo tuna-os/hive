@@ -57,7 +57,9 @@ var auditSensitiveActions = map[string]bool{
 	"claude_auth_complete":                    true,
 	"claude_auth_logout":                      true,
 	"claude_auth_start":                       true,
+	"claude_credential_rebridged":             true,
 	"claude_token_missing":                    true,
+	"config_admin_mcp_writes":                 true,
 	"config_agent_cadences":                   true,
 	"config_agent_channels":                   true,
 	"config_agent_connections":                true,
@@ -72,8 +74,10 @@ var auditSensitiveActions = map[string]bool{
 	"config_auto_merge":                       true,
 	"config_compliance":                       true,
 	"config_convergence":                      true,
+	"config_decisions_delegate":               true,
 	"config_escalation":                       true,
 	"config_github":                           true,
+	"config_governor":                         true,
 	"config_governor_advisory":                true,
 	"config_governor_attribution":             true,
 	"config_governor_backup_key":              true,
@@ -280,7 +284,7 @@ func (a *AuditLog) logRecordAt(timestamp, user, action, detail, agent, repo stri
 	if len(a.ring) >= auditRingCap {
 		a.ring = a.ring[1:]
 	}
-	if prThroughputActions[entry.Action] && !a.notePRThroughput(entry) && prThroughputTerminalAction(entry.Action) {
+	if prThroughputActions[entry.Action] && !a.notePRThroughput(entry) && prThroughputDedupedAction(entry.Action) {
 		a.mu.Unlock()
 		return
 	}

@@ -13,6 +13,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 	type plain Config
 	node := cloneYAMLNode(value)
 	var recycle SessionRecycleConfig
+	var cliMemory CLIMemoryConfig
 	if agents := mappingValueNode(&node, "agents"); agents != nil && agents.Kind == yaml.MappingNode {
 		for i := 0; i < len(agents.Content)-1; {
 			switch agents.Content[i].Value {
@@ -29,6 +30,11 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 					return fmt.Errorf("agents.session_recycle: %w", err)
 				}
 				agents.Content = append(agents.Content[:i], agents.Content[i+2:]...)
+			case "cli_memory":
+				if err := agents.Content[i+1].Decode(&cliMemory); err != nil {
+					return fmt.Errorf("agents.cli_memory: %w", err)
+				}
+				agents.Content = append(agents.Content[:i], agents.Content[i+2:]...)
 			default:
 				i += 2
 			}
@@ -43,11 +49,18 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 	c.AgentsGitHubAPIHourlyCap = cap
 	c.AgentsGitHubAPIHourlyCapSet = capSet
 	c.AgentsSessionRecycle = recycle
+	c.AgentsCLIMemory = cliMemory
+	if governor := mappingValueNode(&node, "governor"); governor != nil {
+		if stall := mappingValueNode(governor, "merge_train_stall_warn_s"); stall != nil && stall.Tag != "!!null" {
+			c.Governor.mergeTrainStallWarnSet = true
+		}
+	}
 	return nil
 }
 
 func marshalConfigYAMLWithAgentCap(c Config, out any) (any, error) {
-	if !c.AgentsGitHubAPIHourlyCapSet && c.AgentsSessionRecycle.IsZero() {
+	explicitStallZero := c.Governor.mergeTrainStallWarnSet && c.Governor.MergeTrainStallWarnS == 0
+	if !c.AgentsGitHubAPIHourlyCapSet && c.AgentsSessionRecycle.IsZero() && c.AgentsCLIMemory.IsZero() && !explicitStallZero {
 		return out, nil
 	}
 	var node yaml.Node
@@ -57,6 +70,15 @@ func marshalConfigYAMLWithAgentCap(c Config, out any) (any, error) {
 	root := mappingNode(&node)
 	if root == nil {
 		return out, nil
+	}
+	if explicitStallZero {
+		// omitempty drops the zero; an explicit "disabled" must survive a
+		// save (hivecommons/hive#16680).
+		if governor := mappingValueNode(root, "governor"); governor != nil {
+			governor.Content = append(governor.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "merge_train_stall_warn_s"},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: "0"})
+		}
 	}
 	agents := mappingValueNode(root, "agents")
 	if agents == nil {
@@ -77,6 +99,15 @@ func marshalConfigYAMLWithAgentCap(c Config, out any) (any, error) {
 		agents.Content = append(agents.Content,
 			&yaml.Node{Kind: yaml.ScalarNode, Value: "session_recycle"},
 			&recycleNode)
+	}
+	if !c.AgentsCLIMemory.IsZero() && agents.Kind == yaml.MappingNode {
+		var memNode yaml.Node
+		if err := memNode.Encode(c.AgentsCLIMemory); err != nil {
+			return nil, err
+		}
+		agents.Content = append(agents.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: "cli_memory"},
+			&memNode)
 	}
 	return &node, nil
 }
@@ -116,15 +147,26 @@ func mappingNode(node *yaml.Node) *yaml.Node {
 	return node
 }
 
+// AgentGitHubAPIHourlyCap is the per-agent proxy cap on charged GitHub API
+// responses per sliding hour; 0 means no cap. An agent's own
+// agents.<name>.github_api_hourly_cap wins, then its base agent's (a replica
+// or review head is built as a copy of the base, so it normally carries the
+// base's value already; the lookup also covers a base override set after the
+// copy was made), then agents.github_api_hourly_cap, then the default of 300.
 func (c *Config) AgentGitHubAPIHourlyCap(agentName string) int {
 	if c == nil {
 		return DefaultAgentsGitHubAPIHourlyCap
 	}
-	if c.AgentsGitHubAPIHourlyCap == 0 && !c.AgentsGitHubAPIHourlyCapSet {
-		return DefaultAgentsGitHubAPIHourlyCap
-	}
 	if a, ok := c.Agents[agentName]; ok && a.GitHubAPIHourlyCap != nil {
 		return *a.GitHubAPIHourlyCap
+	}
+	if base := c.BaseAgentName(agentName); base != agentName {
+		if a, ok := c.Agents[base]; ok && a.GitHubAPIHourlyCap != nil {
+			return *a.GitHubAPIHourlyCap
+		}
+	}
+	if c.AgentsGitHubAPIHourlyCap == 0 && !c.AgentsGitHubAPIHourlyCapSet {
+		return DefaultAgentsGitHubAPIHourlyCap
 	}
 	return c.AgentsGitHubAPIHourlyCap
 }

@@ -52,6 +52,8 @@ import (
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/hivecommons/hive/crux/internal/frontmatter"
 )
 
 const (
@@ -63,10 +65,6 @@ const (
 
 	// SkillFileExt is the extension for standalone skill files.
 	SkillFileExt = ".md"
-
-	// frontMatterDelim is the line (trimmed) that opens and closes the optional
-	// YAML front-matter block.
-	frontMatterDelim = "---"
 
 	// skillHeadingPrefix marks an inline skill section. A heading of the form
 	// "## Skill: <name>" begins a named skill snippet.
@@ -163,25 +161,23 @@ func ParseNearest(repoRoot, relPath string, lg *slog.Logger) (*AgentsConfig, err
 
 	// Normalize and confine relPath to the repo. A path escaping the root falls
 	// back to the root file.
-	clean := filepath.Clean(relPath)
-	dir := filepath.Dir(filepath.Join(repoRoot, clean))
-
 	rootAbs, err := filepath.Abs(repoRoot)
 	if err != nil {
 		rootAbs = repoRoot
 	}
+	dir := filepath.Dir(filepath.Join(repoRoot, filepath.Clean(relPath)))
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil || (dirAbs != rootAbs && !strings.HasPrefix(dirAbs, rootAbs+string(filepath.Separator))) {
+		return Parse(repoRoot, lg)
+	}
+	dir = dirAbs
 
 	for {
 		candidate := filepath.Join(dir, AgentsFileName)
 		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
 			return parseAt(dir, candidate, lg)
 		}
-
-		dirAbs, absErr := filepath.Abs(dir)
-		if absErr != nil {
-			break
-		}
-		if dirAbs == rootAbs || !strings.HasPrefix(dirAbs, rootAbs) {
+		if dir == rootAbs {
 			break
 		}
 		parent := filepath.Dir(dir)
@@ -214,7 +210,7 @@ func parseAt(baseDir, agentsPath string, lg *slog.Logger) (*AgentsConfig, error)
 	content := string(raw)
 
 	// 1. Strip and parse optional front-matter.
-	fm, rest := splitFrontMatter(content)
+	fm, rest := frontmatter.Split(content)
 	if fm != "" {
 		var meta frontMatter
 		if yErr := yaml.Unmarshal([]byte(fm), &meta); yErr != nil {
@@ -241,30 +237,6 @@ func parseAt(baseDir, agentsPath string, lg *slog.Logger) (*AgentsConfig, error)
 	}
 
 	return cfg, nil
-}
-
-// splitFrontMatter returns the YAML front-matter (without delimiters) and the
-// remaining document. If no front-matter block is present, front-matter is ""
-// and the whole content is returned as rest.
-func splitFrontMatter(content string) (fm, rest string) {
-	// Front-matter must be at the very top (after an optional BOM/leading
-	// whitespace-free start). Tolerate a leading newline only.
-	trimmed := strings.TrimLeft(content, "\r\n")
-	lines := strings.Split(trimmed, "\n")
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) != frontMatterDelim {
-		return "", content
-	}
-
-	for i := 1; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == frontMatterDelim {
-			fm = strings.Join(lines[1:i], "\n")
-			rest = strings.Join(lines[i+1:], "\n")
-			return fm, rest
-		}
-	}
-
-	// Opening delimiter with no close: not valid front-matter, treat as body.
-	return "", content
 }
 
 // extractSkillSections splits a Markdown body into (body-without-skills, skills).

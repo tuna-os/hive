@@ -260,7 +260,8 @@
     .hive-group-head:hover td { color: var(--text) !important; }
     .hive-group-caret { display: inline-block; width: 12px; font-size: 0.7rem; }
     .table-wrap { overflow: visible; margin: 0 auto; position: relative; }
-    .hive-menu-cell:hover .hive-menu-dropdown { display: block !important; }
+    .hive-menu-cell:hover .hive-menu-dropdown,
+    .hive-menu-cell:focus-within .hive-menu-dropdown { display: block !important; }
     .hive-menu-item { display: block; padding: var(--sp-3) var(--sp-5); color: var(--text); text-decoration: none; font-size: var(--fs-sm); cursor: pointer; }
     .hive-menu-dropdown a:hover, .hive-menu-dropdown div[onclick]:hover { background: color-mix(in srgb,var(--hub-dashboard-accent) 8%,transparent); border-radius: var(--r-sm); }
     .table-wrap::-webkit-scrollbar { height: 10px; display: block; }
@@ -275,8 +276,11 @@
     .ws-badge--github_projects { background:#1a3a5c; color:#58a6ff; }
     .ws-badge--linear { background:#2d1b69; color:#a78bfa; }
     .ws-badge--jira { background:#0052cc; color:#fff; }
-    .hive-table th { text-align: center; padding: 10px 12px; border-bottom: 2px solid var(--line); color: var(--muted); font-weight: 600; font-size: var(--fs-sm); white-space: nowrap; text-transform: uppercase; letter-spacing: 0.5px; }
-    .hive-table td { padding: var(--sp-5); border-bottom: 1px solid #ffffff0a; vertical-align: middle; text-align: center; }
+    .hive-table th { text-align: center; padding: 10px var(--sp-4); border-bottom: 2px solid var(--line); color: var(--muted); font-weight: 600; font-size: var(--fs-sm); white-space: nowrap; text-transform: uppercase; letter-spacing: 0.5px; }
+    /* Horizontal cell padding is one step tighter than vertical: with 14
+       columns, 4px a side is ~110px of table width, the difference between
+       the fleet table fitting a 1600px viewport and scrolling sideways. */
+    .hive-table td { padding: var(--sp-5) var(--sp-4); border-bottom: 1px solid #ffffff0a; vertical-align: middle; text-align: center; }
     .hive-table td:first-child { text-align: left; }
     /* Zebra striping: a subtle alternating shade on every OTHER hive row so the
        eye can track one hive's cells straight across the wide table. Keyed off a
@@ -473,6 +477,8 @@
     .fleet-quadrant-head { display: flex; align-items: center; gap: var(--sp-3); }
     .fleet-quadrant-evidence-btn { border: 1px solid var(--hub-dashboard-accent); background: color-mix(in srgb, var(--hub-dashboard-accent) 12%, transparent); color: var(--hub-dashboard-accent); border-radius: var(--r-pill); padding: var(--sp-0) var(--sp-3); font: inherit; font-size: var(--fs-2xs); font-weight: 600; cursor: pointer; white-space: nowrap; }
     .fleet-quadrant-evidence-btn:hover, .fleet-quadrant-evidence-btn:focus-visible { background: color-mix(in srgb, var(--hub-dashboard-accent) 25%, transparent); outline: none; }
+    .fleet-activity-link { border: 1px solid var(--line); border-radius: var(--r-pill); padding: var(--sp-0) var(--sp-3); font-size: var(--fs-2xs); font-weight: 600; color: var(--text); text-decoration: none; white-space: nowrap; }
+    .fleet-activity-link:hover, .fleet-activity-link:focus-visible { border-color: var(--hub-dashboard-accent); color: var(--hub-dashboard-accent); outline: none; }
     .fleet-quadrant-hint { font-size: var(--fs-2xs); color: var(--muted); margin-top: var(--sp-2); }
     .evidence-section { margin-bottom: var(--sp-8); }
     .evidence-title { font-size: var(--fs-base); color: var(--text); margin: 0 0 var(--sp-2); }
@@ -608,6 +614,40 @@
     .repo-link { color: var(--blue); font-size: 0.8rem; }
     .hive-name-link { color: #58a6ff; font-weight: 700; text-decoration: none; }
     .hive-name-link:hover { color: #79c0ff; text-decoration: underline; }
+    /* "Open hive ↗" affordance on the hive-name link. A new owner reads the
+       bold name as a label, not a door: the glyph says it leaves the hub. Kept
+       faint at rest and lifted on hover so dense rows stay quiet. */
+    .hive-name-link .open-glyph { display: inline-block; opacity: 0.55; font-size: var(--fs-xs); margin-left: 4px; transform: translateY(-2px); transition: opacity var(--duration-fast), transform var(--duration-fast); }
+    .hive-name-link:hover .open-glyph { opacity: 1; transform: translate(1px, -3px); }
+
+    /* ── Spoke pointer ──
+       The hub LISTS hives; a hive's own dashboard, Guide, settings and GitHub
+       App install live inside the hive (the spoke). New owners miss that and
+       hunt the hub for a Guide that is not here, so this callout names their
+       hive, links it with the SAME href the row uses, and says where the ⋯ row
+       menu is. Rendered by renderSpokePointer(); dismissal is per user + hive
+       in localStorage and re-arms when a NEW attention kind appears. */
+    #spoke-pointer { margin-bottom: var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-4); }
+    #spoke-pointer[hidden] { display: none; }
+    .spoke-callout { position: relative; border: 1px solid color-mix(in srgb, var(--hub-dashboard-accent) 45%, transparent); border-left: 4px solid var(--hub-dashboard-accent); border-radius: var(--r-lg); background: color-mix(in srgb, var(--hub-dashboard-accent) 9%, var(--surface)); padding: var(--sp-5) calc(var(--sp-9) + var(--sp-5)) var(--sp-5) var(--sp-6); display: grid; gap: var(--sp-3); }
+    .spoke-callout-title { font-size: var(--fs-md); font-weight: 700; display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; }
+    .spoke-callout-title .hive-name-link { font-size: var(--fs-lg); }
+    .spoke-open-btn { display: inline-flex; align-items: center; gap: var(--sp-3); background: var(--brand); color: var(--surface-0); font-weight: 700; font-size: var(--fs-sm); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); text-decoration: none !important; }
+    .spoke-callout-line { font-size: var(--fs-base); color: var(--muted); line-height: 1.5; }
+    .spoke-callout-line b { color: var(--text); font-weight: 600; }
+    .spoke-callout-fix { font-size: var(--fs-base); color: var(--text); display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+    .spoke-callout-fix .spoke-warnmark { color: var(--status-warn); }
+    .spoke-callout-crumb { display: inline-flex; align-items: center; gap: var(--sp-3); }
+    .spoke-callout-crumb span { background: color-mix(in srgb, var(--text) 6%, transparent); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); font-size: var(--fs-xs); font-weight: 600; }
+    .spoke-callout-dismiss { position: absolute; top: var(--sp-4); right: var(--sp-4); background: none; border: 1px solid transparent; color: var(--muted); font-size: var(--fs-lg); line-height: 1; width: var(--sp-8); height: var(--sp-8); border-radius: var(--r-sm); cursor: pointer; font-family: inherit; }
+    .spoke-callout-dismiss:hover { border-color: var(--border); color: var(--text); background: color-mix(in srgb, var(--text) 5%, transparent); }
+    .spoke-kbd-dots { display: inline-grid; place-items: center; min-width: var(--sp-7); height: var(--sp-6); padding: var(--sp-0) var(--sp-2); border: 1px solid var(--border); border-radius: var(--r-sm); background: color-mix(in srgb, var(--text) 5%, transparent); font-size: var(--fs-base); line-height: 1; color: var(--text); vertical-align: -3px; }
+    /* Spotlight on the row link the callout points at: the same blue the
+       "Attention needed" jump uses (.hive-row-targeted), pulsing briefly so
+       the eye lands on the link and then rests. */
+    .spoke-spot { border-radius: var(--r-sm); animation: spokeSpotPulse 1.3s ease-out 3; }
+    @keyframes spokeSpotPulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--hub-dashboard-accent) 65%, transparent); } 70% { box-shadow: 0 0 0 var(--sp-5) transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+    @media (prefers-reduced-motion: reduce) { .spoke-spot { animation: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--hub-dashboard-accent) 65%, transparent); } }
     .hive-sub-link { color: #6b7280; font-weight: 400; text-decoration: none; }
     /* Inline action inside the restart-storms pill: inherits the pill's font/colour so it never inflates the pill. */
     .reset-agent-restarts { all: unset; cursor: pointer; margin-left: var(--sp-2); padding-left: var(--sp-2); border-left: 1px solid; border-color: inherit; font: inherit; color: inherit; text-decoration: underline; text-underline-offset: 2px; }
@@ -675,10 +715,22 @@
     .nps-admin-response-text { font-size: var(--fs-sm); color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; margin-top: var(--sp-2); }
       .upgrade-ctl[aria-disabled="true"] { cursor: not-allowed !important; opacity: 0.5; pointer-events: auto; }
       .version-missing { font-size: var(--fs-2xs); white-space: nowrap; color: var(--muted); }
+      /* Version column: bounded width, wrapping content. The cell is a two-line
+         block (identity / status+actions); each line is a wrapping flex row so
+         a long status folds inside the column instead of widening it, and
+         SHAs/long words may break anywhere. Individual pills keep their own
+         nowrap so a chip never splits mid-label. */
+      .hive-table td.version-cell { min-width: 14rem; max-width: 22rem; white-space: normal; overflow-wrap: anywhere; }
+      .version-stack { display: inline-flex; flex-direction: column; align-items: center; gap: var(--sp-1); max-width: 100%; }
+      .version-line { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: var(--sp-1) var(--sp-2); white-space: normal; max-width: 100%; }
+      .version-line .upgrade-progress-history, .version-line .upgrade-progress-interrupt { margin-left: 0; }
+      /* Repos column: the "as: <identity>" line and host pill wrap inside a
+         bounded width rather than stretching the column. */
+      .hive-table td.repos-cell { max-width: 12rem; white-space: normal; overflow-wrap: anywhere; }
       /* Scheduled-upgrade progress pill, history badge and interrupt action
          on the hive card's Version cell (#14950). */
       .upgrade-progress-pill { display: inline-block; padding: var(--sp-1) var(--sp-3); border-radius: var(--r-pill); font-size: var(--fs-2xs); background: var(--surface); color: var(--muted); border: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
-      .upgrade-progress-pill.is-draining { color: var(--amber); }
+      .upgrade-progress-pill.is-draining, .upgrade-progress-pill.is-delayed { color: var(--amber); }
       .upgrade-progress-pill.is-missed, .upgrade-progress-pill.has-missed { color: var(--red); }
       .upgrade-progress-pill.is-done { color: var(--green); }
       .upgrade-progress-history { margin-left: var(--sp-2); cursor: help; }
@@ -779,6 +831,10 @@
       <div id="past-requests-body" style="display:none;overflow-x:auto"><div id="admin-request-history"></div></div>
     </div>
 
+    <!-- Spoke pointer: "Your hive X is ready → Open your hive". Sits ABOVE
+         usage/attention/the list so it is the first thing a new owner reads,
+         and tells them the hub is not their hive. See renderSpokePointer(). -->
+    <div id="spoke-pointer" hidden aria-live="polite"></div>
     <!-- Usage renders ABOVE the attention strip on purpose: the strip's drift
          pills filter the hive list, so the strip and the list it narrows must
          sit directly adjacent with no unrelated card between them. -->
@@ -1393,7 +1449,7 @@
           quadrantSVG(q, null, 78, false) +
           '<div>' +
             '<div class="fleet-quadrant-head" style="font-size:0.72rem;color:var(--muted);margin-bottom:var(--sp-2)">' +
-              '<span>Fleet quadrant · ' + esc(scope) + ' <span class="fleet-quadrant-n">· ' + esc(agg) + '</span></span>' + fleetQuadrantEvidenceButtonHTML() + '</div>' +
+              '<span>Fleet quadrant · ' + esc(scope) + ' <span class="fleet-quadrant-n">· ' + esc(agg) + '</span></span>' + fleetQuadrantEvidenceButtonHTML() + fleetActivityLinkHTML() + '</div>' +
             '<div class="quadrant-axes">' + axes + '</div>' +
             quadrantSummaryHTML(q, true) +
             fleetQuadrantHintHTML() +
@@ -1422,6 +1478,16 @@
       if (!_isAdmin) return '';
       return '<button type="button" class="fleet-quadrant-evidence-btn" aria-haspopup="dialog" aria-controls="evidence-modal"' +
         ' title="Open the fleet evidence details" onclick="event.stopPropagation();openEvidenceModal()">\uD83D\uDD2C Evidence</button>';
+    }
+
+    /* fleetActivityLinkHTML links the read-only Fleet activity board
+       (/activity, #16063) next to Evidence. Unlike Evidence it is not
+       admin-only: GET /api/hub/activity scopes every hive to the viewer, so
+       every signed-in user gets the link. It stops propagation so an admin's
+       click does not also open the evidence modal from the card. */
+    function fleetActivityLinkHTML() {
+      return '<a class="fleet-activity-link" href="/activity" title="Open the Fleet activity board for the hives you can see"' +
+        ' onclick="event.stopPropagation()">\uD83D\uDCE1 Fleet activity</a>';
     }
 
     function fleetQuadrantHintHTML() {
@@ -1684,14 +1750,14 @@
           var att = 0, blk = 0, wh = 0;
           wrows.forEach(function(r) { att += Number(r.attempted) || 0; blk += Number(r.blocked) || 0; wh = Math.max(wh, Number(r.hives) || 0); });
           if (wrows.length) {
-            ours = 'Across ' + wh + ' reporting hive' + (wh === 1 ? '' : 's') + ': ' + att + ' agent write attempts, ' + blk + ' blocked (' + (att ? evidencePct(blk / att) : EVIDENCE_NULL) + ') over ' + wrows.length + ' tier' + (wrows.length === 1 ? '' : 's') + '. Not graded: there is no \u201Cgood\u201D block rate \u2014 it depends on what agents attempt. Zero blocks with many attempts means agents stayed inside their lane; many blocks means the guardrail did its job.';
+            ours = (blk > 0 ? 'Enforcement demonstrated' : 'Enforcement not observed') + ' \u2014 ' + blk + ' prohibited write(s) blocked. Across ' + wh + ' reporting hive' + (wh === 1 ? '' : 's') + ': ' + att + ' observed agent write attempts (' + (att ? evidencePct(blk / att) : EVIDENCE_NULL) + ' blocked) over ' + wrows.length + ' tier' + (wrows.length === 1 ? '' : 's') + '. Not graded: refusal frequency describes attempted-agent compliance, not enforcement quality. Zero means not observed, not failure; counts do not rule out bypasses or false positives.';
             grade = 'none';
           } else {
             ours = EVIDENCE_UPGRADE_NOTE + ' Technically: the heartbeat block write_counters is absent (the proxy write counters feed it).';
           }
           return {
             measured: 'Every write (push, comment, label, merge\u2026) an agent tried to make through the proxy, per intent tier, and how many the proxy refused.',
-            why: 'These are the guardrails working. A blocked write is a change an agent tried to make outside what its tier allows \u2014 it never reached GitHub.',
+            why: 'A recorded block demonstrates enforcement on that attempt: the refused write never reached GitHub. More prohibited attempts are not a goal. Sentinel detections alone are informational, not proof of a blocked write.',
             how: 'Running counters since each spoke\u2019s proxy started (not a time window). Block rate = blocked \u00F7 attempted. A blocked write says nothing about whether the PR could merge. ' + EVIDENCE_CI_NOTE,
             ours: ours, grade: grade
           };
@@ -2256,8 +2322,7 @@
       if (Array.isArray(v.write_counters)) {
         var att = 0, blk = 0;
         v.write_counters.forEach(function(t) { att += Number(t.attempted) || 0; blk += Number(t.blocked) || 0; });
-        out.writes = att === 0 ? 'No agent write attempts have been recorded by the guardrail proxy yet.' :
-          'Agents attempted ' + att + ' writes to GitHub through the guardrail proxy and ' + blk + ' (' + evidencePct(blk / att) + ') ' + evidencePlural(blk, 'was', 'were') + ' blocked; a blocked write never reached GitHub.';
+        out.writes = (blk > 0 ? 'Enforcement demonstrated' : 'Enforcement not observed') + ' \u2014 ' + blk + ' prohibited write(s) blocked; ' + att + ' observed agent write attempts through the guardrail proxy (' + (att ? evidencePct(blk / att) : EVIDENCE_NULL) + ' blocked). Counts do not rule out bypasses or false positives.';
       } else out.writes = '';
 
       var fam = v.family_false_approve_rate || {}, fparts = [];
@@ -3782,7 +3847,15 @@
 
     /* failingChecks returns only the checks in a failing/warning state. */
     function failingChecks(h) {
-      return healthChecks(h).filter(function(ck) { return !!FAILING_CHECK_STATUSES[ck.status]; });
+      var bad = healthChecks(h).filter(function(ck) { return !!FAILING_CHECK_STATUSES[ck.status]; });
+      /* Mirrors withoutForgeChecks in alerts.go: when the forge is unreachable
+         the github_auth failure is a symptom of broken egress, so it is owned
+         by the forge-unreachable pill; every OTHER failing check (disk, …) is
+         still a real hive fault and must keep rendering. */
+      if (h && h.forgeUnreachableLabel) {
+        bad = bad.filter(function(ck) { return ck.name !== 'github_auth'; });
+      }
+      return bad;
     }
 
     /* failingCheckSummary renders the compact in-row failure summary: the name
@@ -3816,6 +3889,24 @@
         esc(label) + '</span>';
     }
 
+    /* forgeUnreachableSummary renders the hub-computed "forge unreachable (host)"
+       label (h.forgeUnreachableLabel). Amber: the pod is healthy, the cluster's
+       egress to the forge is not. */
+    function forgeUnreachableSummary(h) {
+      if (!h || !h.forgeUnreachableLabel) return '';
+      return amberNudgePill('The spoke cannot reach its GitHub host from the pod; the hive itself is healthy', h.forgeUnreachableLabel);
+    }
+
+    /* amberNudgePill is the shared "worth noticing, not a row failure" pill used
+       by the stale-advisory and forge-unreachable summaries. */
+    function amberNudgePill(title, label) {
+      var col = '#d29922';
+      return '<span title="' + escAttr(title) + '" style="display:inline-block;margin-left:var(--sp-3);padding:var(--sp-0) var(--sp-3);' +
+        'border-radius:var(--r-pill);font-size:var(--fs-2xs);font-weight:600;line-height:1.5;cursor:help;white-space:nowrap;' +
+        'color:' + col + ';background:rgba(210,153,34,0.12);border:1px solid rgba(210,153,34,0.35)">' +
+        esc(label) + '</span>';
+    }
+
     /* advisoryStaleSummary renders a small "stale advisory" pill next to the
        failing-check pill when the hub has flagged this hive's advisory digest as
        stale. The flag (h.advisoryStale) and its reason are computed server-side
@@ -3826,12 +3917,7 @@
        digest is an operator nudge, not a hard row failure. */
     function advisoryStaleSummary(h) {
       if (!h || !h.advisoryStale) return '';
-      var col = '#d29922';
-      var title = h.advisoryStaleReason || 'Advisory digest has gone stale';
-      return '<span title="' + esc(title) + '" style="display:inline-block;margin-left:var(--sp-3);padding:var(--sp-0) var(--sp-3);' +
-        'border-radius:var(--r-pill);font-size:var(--fs-2xs);font-weight:600;line-height:1.5;cursor:help;white-space:nowrap;' +
-        'color:' + col + ';background:rgba(210,153,34,0.12);border:1px solid rgba(210,153,34,0.35)">' +
-        'stale advisory</span>';
+      return amberNudgePill(h.advisoryStaleReason || 'Advisory digest has gone stale', 'stale advisory');
     }
 
     /* advisoryFindingsSummary renders the finding count from this hive's last
@@ -4453,8 +4539,15 @@
     function ssoDisplayLink(openUrl, displayUrl, text, cls) {
       var shown = displayUrl || openUrl;
       var navAttr = displayUrl ? ' ' + SSO_NAV_ATTR + '="' + esc(openUrl) + '"' : '';
+      /* The bold hive-name variant carries the "Open hive ↗" glyph
+         (.open-glyph) and a tooltip naming the destination: a new owner
+         otherwise reads the name as a label and never learns it is the door
+         to their hive's own dashboard, Guide and settings. */
+      var isName = cls === 'hive-name-link';
+      var glyph = isName ? '<span class="open-glyph" aria-hidden="true">↗</span>' : '';
+      var title = isName ? 'Open this hive’s dashboard (Guide, settings, GitHub App install live there)' : 'Open dashboard';
       return '<a href="' + esc(shown) + '" target="_blank"' + navAttr +
-        ' class="' + cls + '" title="Open dashboard">' + esc(text) + '</a>';
+        ' class="' + cls + '" title="' + title + '">' + esc(text) + glyph + '</a>';
     }
 
     /* One delegated listener rather than per-row handlers: the table is
@@ -8509,6 +8602,189 @@
       }
       return line;
     }
+    /* ── Spoke pointer ──
+       Why: the hub is a LIST of hives, but a new owner lands here and looks
+       for the Guide / settings / GitHub App install that live inside their
+       hive (the spoke). Today's incident: an owner read "Open your hive
+       dashboard → Guide (top navbar)" on this page and replied "I do not see
+       any guide or setting option" — because this is the hub. The callout
+       names the owner's hive, links it with the SAME href the row's hive-name
+       cell uses, and points at the row's ⋯ menu where permissions, pause,
+       funding and delete live.
+
+       Dismissal is per viewer + hive in localStorage, storing the sorted list
+       of attention kinds (drift signals + live fleet alerts) visible at
+       dismissal. A later render re-shows the callout only when a kind appears
+       that was NOT in that list — a new problem the owner has not seen —
+       never merely because a filter toggled or a kind cleared. Admin viewers
+       never see it: their My Hives is the fleet, not "my hive". */
+    var LS_SPOKE_POINTER_PREFIX = 'hive-spoke-pointer';
+    /* Up to this many hives get a full callout each; beyond it one compact
+       callout lists every hive link, so a ten-hive owner does not get ten
+       banners. */
+    var SPOKE_POINTER_MAX_FULL = 2;
+    var HIVE_MENU_HINT = 'Manage: permissions, pause, funding, delete…';
+    /* The ⋮ glyph is focusable and the dropdown opens on :focus-within, so a
+       keyboard user already sees the menu on Tab. Enter/Space/ArrowDown move
+       focus into the first item (the dropdown items are anchors / onclick
+       divs, so they need tabindex to take focus); Escape returns to the glyph. */
+    function hiveMenuKey(ev) {
+      var cell = ev.currentTarget.closest('.hive-menu-cell');
+      if (!cell) return;
+      if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'ArrowDown') {
+        ev.preventDefault();
+        var items = cell.querySelectorAll('.hive-menu-dropdown a, .hive-menu-dropdown [onclick]');
+        items.forEach(function(it) { if (!it.hasAttribute('tabindex')) it.setAttribute('tabindex', '0'); });
+        if (items.length) items[0].focus();
+      } else if (ev.key === 'Escape') {
+        ev.currentTarget.blur();
+      }
+    }
+    var _spokePointerHives = [];
+    var _spokeSpotDone = {};
+
+    function spokePointerKey(hiveId) {
+      return LS_SPOKE_POINTER_PREFIX + ':' + (_currentUser || 'anon') + ':' + String(hiveId || '');
+    }
+
+    /* spokeAttentionKinds returns the sorted, de-duplicated attention kinds on
+       one hive: its drift signal kinds plus the types of any unacknowledged
+       fleet alert addressed to it. Kinds (not labels) so the stored
+       fingerprint is stable across copy changes. */
+    function spokeAttentionKinds(h) {
+      var seen = {}, out = [];
+      var signals = (h && h.drift && h.drift.signals) || [];
+      for (var i = 0; i < signals.length; i++) {
+        var k = signals[i] && signals[i].kind;
+        if (k && !seen[k]) { seen[k] = true; out.push(k); }
+      }
+      var alerts = (_fleetAlerts && _fleetAlerts.alerts) || [];
+      for (var j = 0; j < alerts.length; j++) {
+        var a = alerts[j];
+        if (!a || a.acknowledged || String(a.hiveId || '') !== String((h && h.id) || '')) continue;
+        if (a.type && !seen[a.type]) { seen[a.type] = true; out.push(a.type); }
+      }
+      out.sort();
+      return out;
+    }
+
+    function spokeAttentionLabel(kind) {
+      return DRIFT_KIND_LABELS[kind] || ALERT_TYPE_LABELS[kind] || kind || '';
+    }
+
+    /* spokePointerDismissed: true when the viewer dismissed this hive's
+       callout and no attention kind has appeared since. */
+    function spokePointerDismissed(h) {
+      var raw = null;
+      try { raw = localStorage.getItem(spokePointerKey(h.id)); } catch (e) { raw = null; }
+      if (raw === null) return false;
+      var stored = {};
+      String(raw).split(',').forEach(function(k) { if (k) stored[k] = true; });
+      var now = spokeAttentionKinds(h);
+      for (var i = 0; i < now.length; i++) { if (!stored[now[i]]) return false; }
+      return true;
+    }
+
+    function dismissSpokePointer(hiveIdsCsv) {
+      var ids = String(hiveIdsCsv || '').split(',');
+      for (var i = 0; i < ids.length; i++) {
+        if (!ids[i]) continue;
+        var h = null;
+        for (var j = 0; j < _spokePointerHives.length; j++) {
+          if (String(_spokePointerHives[j].id) === ids[i]) { h = _spokePointerHives[j]; break; }
+        }
+        try { localStorage.setItem(spokePointerKey(ids[i]), h ? spokeAttentionKinds(h).join(',') : ''); } catch (e) { /* storage unavailable: dismissal lasts this page view */ }
+      }
+      renderSpokePointer(_spokePointerHives);
+    }
+
+    /* spokeOpenLink mirrors the hive-name cell's href decision exactly: hosted
+       rows go through the hub's /open SSO handoff with the vanity host as the
+       display url (ssoDisplayLink); other rows link their resolved base. Empty
+       when the row itself would render a non-link name. */
+    function spokeOpenLink(h, text, cls) {
+      var rb = resolvedBase(h);
+      var isHostedRow = h.hiveType === 'hosted' || (h.id && (h.id.startsWith('hosted-') || h.id.startsWith('saas-')));
+      var dh = isHostedRow && h.id ? ('/api/saas/hives/' + encodeURIComponent(h.id) + '/open') : rb;
+      if (!dh) return '';
+      return ssoDisplayLink(dh, isHostedRow && rb ? rb : '', text, cls);
+    }
+
+    function spokePointerFixLine(h) {
+      var kinds = spokeAttentionKinds(h);
+      if (!kinds.length) return '';
+      var labels = kinds.map(spokeAttentionLabel).filter(Boolean);
+      return '<div class="spoke-callout-fix"><span class="spoke-warnmark" aria-hidden="true">&#9888;</span>' +
+        '<b>' + esc(labels.join(', ')) + '</b> needs fixing inside your hive: ' +
+        '<span class="spoke-callout-crumb"><span>Open it</span> &rarr; <span>&#129517; Guide</span> &rarr; <span>Install the Forge App</span></span></div>';
+    }
+
+    var SPOKE_POINTER_LIST_LINE = '<div class="spoke-callout-line">The hub only <b>lists</b> hives. Your hive’s own dashboard, <b>&#129517; Guide</b>, settings and the <b>GitHub App install</b> live inside the hive.</div>';
+    var SPOKE_POINTER_MENU_LINE = '<div class="spoke-callout-line">Use <span class="spoke-kbd-dots" aria-label="the row menu">&#8942;</span> on your hive’s row to manage <b>permissions</b>, <b>pause</b>, <b>funding</b> or <b>delete</b>.</div>';
+
+    function spokeDismissButton(idsCsv) {
+      return '<button type="button" class="spoke-callout-dismiss" aria-label="Dismiss" title="Dismiss (comes back if a new attention item appears)" onclick="dismissSpokePointer(' + jsArg(idsCsv) + ')">&times;</button>';
+    }
+
+    function spokeCalloutFull(h) {
+      var name = hiveLabel(h).line1 || h.name || h.id;
+      return '<div class="spoke-callout" role="status" data-hive-id="' + escAttr(h.id) + '">' +
+        '<div class="spoke-callout-title"><span>Your hive</span>' + spokeOpenLink(h, name, 'hive-name-link') +
+        '<span>is ready</span><span class="text-muted">&rarr;</span>' + spokeOpenLink(h, 'Open your hive ↗', 'spoke-open-btn') + '</div>' +
+        SPOKE_POINTER_LIST_LINE + spokePointerFixLine(h) + SPOKE_POINTER_MENU_LINE +
+        spokeDismissButton(String(h.id)) + '</div>';
+    }
+
+    function spokeCalloutCompact(hives) {
+      var links = hives.map(function(h) { return spokeOpenLink(h, hiveLabel(h).line1 || h.name || h.id, 'hive-name-link'); }).join('<span class="text-muted"> · </span>');
+      var needFix = hives.filter(function(h) { return spokeAttentionKinds(h).length > 0; });
+      var fix = needFix.length
+        ? '<div class="spoke-callout-fix"><span class="spoke-warnmark" aria-hidden="true">&#9888;</span><b>' +
+          esc(needFix.map(function(h) { return hiveLabel(h).line1 || h.name || h.id; }).join(', ')) + '</b> ' +
+          (needFix.length === 1 ? 'needs' : 'need') + ' fixing inside the hive: ' +
+          '<span class="spoke-callout-crumb"><span>Open it</span> &rarr; <span>&#129517; Guide</span> &rarr; <span>Install the Forge App</span></span></div>'
+        : '';
+      var ids = hives.map(function(h) { return String(h.id); }).join(',');
+      return '<div class="spoke-callout" role="status">' +
+        '<div class="spoke-callout-title"><span>Your hives are ready</span><span class="text-muted">&rarr;</span>' + links + '</div>' +
+        SPOKE_POINTER_LIST_LINE + fix + SPOKE_POINTER_MENU_LINE + spokeDismissButton(ids) + '</div>';
+    }
+
+    /* renderSpokePointer draws the callout(s) for the viewer's own hives:
+       assigned (non-placeholder) hives with a usable link, owners first and
+       hives with attention before quiet ones, minus the ones dismissed. */
+    function renderSpokePointer(assignedHives) {
+      var el = document.getElementById('spoke-pointer');
+      if (!el) return;
+      _spokePointerHives = (assignedHives || []).filter(function(h) { return h && h.id && !isPlaceholderHive(h) && spokeOpenLink(h, 'x', 'hive-name-link'); });
+      if (_isAdmin || !_spokePointerHives.length) { el.hidden = true; el.innerHTML = ''; return; }
+      var show = _spokePointerHives.filter(function(h) { return !spokePointerDismissed(h); });
+      if (!show.length) { el.hidden = true; el.innerHTML = ''; return; }
+      show.sort(function(a, b) {
+        var ao = a.role === 'owner' ? 0 : 1, bo = b.role === 'owner' ? 0 : 1;
+        if (ao !== bo) return ao - bo;
+        var aa = spokeAttentionKinds(a).length ? 0 : 1, ba = spokeAttentionKinds(b).length ? 0 : 1;
+        if (aa !== ba) return aa - ba;
+        return String(a.name || a.id).localeCompare(String(b.name || b.id));
+      });
+      el.innerHTML = show.length <= SPOKE_POINTER_MAX_FULL
+        ? show.map(spokeCalloutFull).join('')
+        : spokeCalloutCompact(show);
+      el.hidden = false;
+      /* Spotlight the row link the callout points at, once per hive per page
+         load. Deferred: renderHives draws the table AFTER this callout. */
+      setTimeout(function() {
+        show.forEach(function(h) {
+          if (_spokeSpotDone[h.id]) return;
+          var row = document.getElementById(hiveRowDomId(h.id));
+          var link = row ? row.querySelector('.hive-name-link') : null;
+          if (!link) return;
+          _spokeSpotDone[h.id] = true;
+          link.classList.add('spoke-spot');
+        });
+      }, 0);
+    }
+
     function renderHives(allHives, force) {
       allHives = allHives || [];
       /* Defer the whole render while a branch/channel menu is open. Skipping
@@ -8588,6 +8864,9 @@
          how the operator gets back out of a drill-down. */
       renderSummaryTiles();
       renderAlertsPanel();
+      /* After the alerts panel: the callout's "needs fixing" line reads the
+         same _fleetAlerts the panel just drew, so the two never disagree. */
+      renderSpokePointer(assignedAll);
       if (!allHives.length) {
         var driftEl0 = document.getElementById('hive-drift-summary');
         if (driftEl0) driftEl0.style.display = 'none';
@@ -8977,13 +9256,19 @@
             var behindLabel = behindKnown ? ('behind by ' + behindCount) : 'behind';
             var nextCheck = h.nextUpdateAt ? ('next check ' + nextCheckIn(h.nextUpdateAt)) : (h.nextUpdateStatus === 'candidate-continuous' ? 'next hub poll' : 'next check soon');
             var whyNotNow = h.upgradeWhyNotNow || (queuedDaily ? 'daily schedule' : 'waiting for idle/health gates');
-            var queuedLabel = behindLabel + ' · ' + nextCheck + ' · why not now: ' + whyNotNow;
+            /* The badge carries only the short state ("behind by 17 · next
+               check in 24h"); the reason it has not upgraded yet is a full
+               sentence and lives in the hover title, so the column stays
+               narrow. */
+            var queuedLabel = behindLabel + ' · ' + nextCheck;
+            var whyNotNowNote = ' Why not now: ' + whyNotNow + '.';
             /* The tooltip names the TARGET — SHA plus the tracked
                branch/channel label — so "queued for what?" never needs a
                second click to answer. */
-            var queuedTitle = queuedDaily
+            var queuedTitle = (queuedDaily
               ? 'Auto-upgrade will apply ' + branchLatest + ' (' + versionLabel(versionSel) + ') at the next 1pm ET window' + buildingHint + pendingImageNote + floatingLagNote + verificationNote
-              : 'Auto-upgrade will apply ' + branchLatest + ' (' + versionLabel(versionSel) + ') as soon as the hub observes a published image and the hive is idle/healthy' + buildingHint + pendingImageNote + floatingLagNote + verificationNote;
+              : 'Auto-upgrade will apply ' + branchLatest + ' (' + versionLabel(versionSel) + ') as soon as the hub observes a published image and the hive is idle/healthy' + buildingHint + pendingImageNote + floatingLagNote + verificationNote) +
+              '.' + whyNotNowNote;
             /* REFUSED, not queued. autoUpgradeBlocked is the hub's own evaluated
                decision (upgradeCollectible false), sent by the fleet API rather
                than re-derived here — the badge must never claim an upgrade is
@@ -9071,22 +9356,11 @@
             autoUpgradeCheck = d.outerHTML;
           }
           var shaMsg = _commitMessages[sha] || _latestSHAMessages[branchName] || '';
-          /* FOUR stacked lines, ONE element per line. The column is as wide as
-             its widest LINE, so as long as no two controls share a line the
-             width collapses to the widest single element — which, now that the
-             select is icon-only, is the 56px select rather than the ~150px
-             "[queued · 1pm ET] [Auto: daily 1pm ET]" pair that used to set it.
-               1. the branch pill, which the owner can CHANGE (it is a switcher,
-                  so it owns a line and stays a full tap target);
-               2. the SHA and its current/behind glyph — two views of the same
-                  immutable fact, "what commit is this hive on". These are one
-                  element for width purposes: the glyph is 10px and rides
-                  alongside the hash rather than setting the line's width.
-               3. what happens NEXT: the upgrade affordance alone;
-               4. the icon-only auto-upgrade mode select alone.
-             Lines 3 and 4 are omitted entirely when empty — a read-only viewer
-             gets two lines, not four with two blanks. Every fragment below is
-             embedded verbatim, so ids, handlers and tooltips are preserved. */
+          /* The cell's width is bounded by .version-stack (min/max-width) and
+             its two lines WRAP inside that bound (.version-line), so no single
+             string can widen the column: a crowded status line folds onto a
+             second visual row instead. Every fragment below is embedded
+             verbatim, so ids, handlers and tooltips are preserved. */
           /* The drift dot rides on the SHA line, right of the current/behind
              glyph: "what commit is this hive on, and does it match the fleet" is
              one thought. It sets no extra line, so a drifting hive is no taller. */
@@ -9120,14 +9394,25 @@
              hides it from readers who could not click it anyway. */
           var upgradeProgressLine = renderUpgradeProgress(h, isHosted && h.role === 'owner' && !h.upgradeInterruptPending);
           if (h.upgradeInterruptPending) upgradeProgressLine += '<span class="upgrade-progress-pill upgrade-progress-history" title="The owner asked this upgrade to interrupt in-flight agent turns; the spoke picks it up on its next heartbeat.">interrupt requested</span>';
-          /* The progress pill shares the upgrade line so the cell keeps its
-             one-element-per-line shape (TestVersionCellPutsEachElementOnItsOwnLine). */
+          /* The progress pill and its interrupt action share the status line
+             with the queued badge and Upgrade now. */
           if (upgradeProgressLine) upgradeIcon = upgradeIcon ? upgradeIcon + ' ' + upgradeProgressLine : upgradeProgressLine;
-          versionCell = '<div style="' + STACKED_CELL_STYLE + '">' +
-            '<div style="' + STACKED_LINE_STYLE + '">' + branch + '</div>' +
-            '<div style="' + STACKED_LINE_STYLE + '">' + shaLine + '</div>' +
-            (upgradeIcon ? '<div style="' + STACKED_LINE_STYLE + '">' + upgradeIcon + '</div>' : '') +
-            (autoUpgradeCheck ? '<div style="' + STACKED_LINE_STYLE + '">' + autoUpgradeCheck + '</div>' : '') +
+          /* TWO wrapping lines inside a width-bounded block (see .version-stack):
+               1. identity — the channel/branch pill, the running SHA with its
+                  current/behind glyph, the behind chip and the drift count;
+               2. status + actions — one short state badge, Upgrade now, the
+                  progress pill, Upgrade now (interrupt turns), the history chip
+                  and the auto-upgrade select.
+             Each line is a wrapping flex row, so a crowded status line folds
+             onto a third visual row INSIDE the column instead of pushing the
+             column wider. Long explanations ("why not now", the missed-window
+             reason, the agents holding a drain) live in the badges' hover
+             titles, never inline. Line 2 is omitted for a viewer with neither
+             an action nor a select, so a read-only row stays one line tall. */
+          var statusLine = (upgradeIcon || '') + (autoUpgradeCheck ? ' ' + autoUpgradeCheck : '');
+          versionCell = '<div class="version-stack">' +
+            '<div class="version-line version-line-id">' + branch + ' ' + shaLine + '</div>' +
+            (statusLine ? '<div class="version-line version-line-status">' + statusLine + '</div>' : '') +
             '</div>';
         /* No version reported, but drift can still exist (e.g. heartbeat-stale on a
            spoke too old to report a SHA) — surface the dot beside the dash so
@@ -9266,15 +9551,15 @@
            is unique across both the assigned and unassigned sections. */
         return '<tr id="' + escAttr(hiveRowDomId(h.id)) + '"' + ((i % 2 === 1) ? ' class="hive-row-alt"' : '') + '>' +
           bulkCheckboxCell(h, section || 'all') +
-          '<td class="hive-menu-cell" style="position:relative;width:30px;text-align:center;overflow:visible">' + ('<span style="cursor:pointer;font-size:1.1rem;color:var(--muted);user-select:none">⋮</span>' + pendingBadge + '<div class="hive-menu-dropdown" style="display:none;position:absolute;left:0;bottom:auto;background:#1c2128;border:1px solid #30363d;border-radius:8px;min-width:160px;padding:var(--sp-2) var(--sp-0);z-index:1000;box-shadow:0 8px 24px rgba(0,0,0,0.5)">' + menuItems.join('') + '</div>') + '</td>' +
-          '<td style="text-align:left;line-height:1.4">' + (function() { var isHostedRow = h.hiveType === 'hosted' || (h.id && (h.id.startsWith('hosted-') || h.id.startsWith('saas-'))); var dh = isHostedRow && h.id ? ('/api/saas/hives/' + encodeURIComponent(h.id) + '/open') : (rb ? esc(rb) : ''); /* Label derived from the PROJECT (org + primary repo), not by splitting h.name — see hiveLabel. */ var label = hiveLabel(h); var orgName = label.line1; var repoName = label.line2; /* rp is the repo path shown in the GitHub-icon tooltip; use the same doubling-safe path the label shows (repoDisplayLine / hiveLabel), never org + '/' + primaryRepo which doubles the owner on a github.io/GHE hive whose primaryRepo is already 'owner/repo'. */ var rp = repoName || ''; /* The icon href must resolve to a real GitHub path. When primaryRepo already carries 'owner/repo', that pair IS the owner/repo the URL needs (not org, which may be a mis-parsed host); otherwise fall back to org + primaryRepo. */ var hasRepoPath = h.primaryRepo && h.primaryRepo.indexOf('/') !== -1; var rpOwner = hasRepoPath ? h.primaryRepo.split('/')[0] : h.org; var rpName = hasRepoPath ? h.primaryRepo.split('/').slice(1).join('/') : h.primaryRepo; var rpHref = ghRepoURL(hiveForgeHost(h), rpOwner, rpName); var ghIcon = (rp && rpHref) ? '<a href="' + rpHref + '" target="_blank" style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>' : (rp ? '<span style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></span>' : ''); /* vanityDisplay is the friendly host shown in the status bar on hover. rb is resolvedBase(h), which the hub has already overlaid with the claimed vanity_url; it is only a DISPLAY url here, never the click target — see ssoDisplayLink. Empty for a row with no vanity host, which falls back to today's /open href. Only meaningful on hosted rows: a non-hosted row's dh IS rb already. */ var vanityDisplay = isHostedRow && rb ? rb : ''; var link = function(text, bold) { if (dh) { return ssoDisplayLink(dh, vanityDisplay, text, bold ? 'hive-name-link' : 'hive-sub-link'); } var s = bold ? 'font-weight:700;color:inherit' : 'color:#6b7280;font-weight:400'; return '<span style="' + s + '">' + esc(text) + '</span>'; }; /* repoLink wraps the second line (the org/repo) in a link to the ACTUAL FORGE REPO (github.com / GHE host), NOT the spoke dashboard: the top line already opens the dashboard, so the repo path should take an operator to the code. rpHref is the same doubling-safe forge URL the GitHub icon uses (ghRepoURL(hiveForgeHost(h), rpOwner, rpName)); when it is empty (BYO/mis-parsed host) fall back to plain non-link text, never to the dashboard. */ var repoLink = function(text) { if (rpHref) { return '<a href="' + rpHref + '" target="_blank" rel="noopener" class="hive-sub-link" title="Open repository on ' + escAttr((hiveForgeHost(h) || 'github.com')) + '">' + esc(text) + '</a>'; } return '<span style="color:#6b7280;font-weight:400">' + esc(text) + '</span>'; }; var line1 = dot + ' ' + link(orgName, true) + heartbeatHeart(h) + nameEditAffordance(h); var fcPill = h.online ? failingCheckSummary(h) : ''; /* Advisory-staleness pill sits right beside the failing-check pill: both are "something is quietly wrong with this working hive" signals, and advisoryStaleSummary already self-suppresses (empty string) unless the hub flagged the digest stale, so unaffected rows are pixel-identical. */ var advPill = h.online ? advisoryStaleSummary(h) : ''; /* Advisory finding-count pill rides beside the staleness pill and carries the "(top N)" marker when the spoke capped its digest. */ var advCountPill = h.online ? advisoryFindingsSummary(h) : ''; /* Dead-link pill is deliberately NOT gated on h.online: the entire point is a hive that IS online and heartbeating while its public URL is broken, so gating it the way the other pills are gated would hide exactly the case it exists to surface. */ var dlPill = deadLinkSummary(h); var privatePill = privateURLSummary(h); /* Inference-auth pill: like the dead-link pill it is NOT gated on h.online, because the hive being online while every inference call 401s is exactly the case it surfaces. */ var iaPill = inferenceAuthSummary(h); var rsPill = restartStormSummary(h); /* Inline access faces sit on the name cell's second line, immediately after this row's own role badge: the badge already answers "what am I on this hive", so the co-members read as the natural continuation of the same thought, in the one cell that is left-aligned and has room to grow. It also keeps them out of the 16 dense metric columns, none of which is about people. Empty string when the viewer is the only member, so those rows are pixel-identical to today. */ var accessFaces = hiveAccessAvatars(h); /* Keyed off repoName, not orgName: line 1 now always carries SOME identity, so the presence of a second line is decided purely by whether there is a repo to put on it. Without a repo the row still shows the GitHub icon, role badge, faces and failing-check pill on the compact variant. */ var line2 = repoName ? '<div style="padding-left:18px;font-size:0.8rem">' + repoLink(repoName) + ' ' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + rsPill + '</div>' : '<div style="padding-left:18px">' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + rsPill + '</div>'; var line3 = pendingPill ? '<div style="margin-top:var(--sp-2);padding-left:18px">' + pendingPill + '</div>' : ''; return line1 + line2 + line3; })() + '</td>' +
+          '<td class="hive-menu-cell" style="position:relative;width:30px;text-align:center;overflow:visible">' + ('<span role="button" tabindex="0" aria-haspopup="menu" aria-label="Manage hive" title="' + HIVE_MENU_HINT + '" onkeydown="hiveMenuKey(event)" style="cursor:pointer;font-size:1.1rem;color:var(--muted);user-select:none">⋮</span>' + pendingBadge + '<div class="hive-menu-dropdown" style="display:none;position:absolute;left:0;bottom:auto;background:#1c2128;border:1px solid #30363d;border-radius:8px;min-width:160px;padding:var(--sp-2) var(--sp-0);z-index:1000;box-shadow:0 8px 24px rgba(0,0,0,0.5)">' + menuItems.join('') + '</div>') + '</td>' +
+          '<td style="text-align:left;line-height:1.4">' + (function() { var isHostedRow = h.hiveType === 'hosted' || (h.id && (h.id.startsWith('hosted-') || h.id.startsWith('saas-'))); var dh = isHostedRow && h.id ? ('/api/saas/hives/' + encodeURIComponent(h.id) + '/open') : (rb ? esc(rb) : ''); /* Label derived from the PROJECT (org + primary repo), not by splitting h.name — see hiveLabel. */ var label = hiveLabel(h); var orgName = label.line1; var repoName = label.line2; /* rp is the repo path shown in the GitHub-icon tooltip; use the same doubling-safe path the label shows (repoDisplayLine / hiveLabel), never org + '/' + primaryRepo which doubles the owner on a github.io/GHE hive whose primaryRepo is already 'owner/repo'. */ var rp = repoName || ''; /* The icon href must resolve to a real GitHub path. When primaryRepo already carries 'owner/repo', that pair IS the owner/repo the URL needs (not org, which may be a mis-parsed host); otherwise fall back to org + primaryRepo. */ var hasRepoPath = h.primaryRepo && h.primaryRepo.indexOf('/') !== -1; var rpOwner = hasRepoPath ? h.primaryRepo.split('/')[0] : h.org; var rpName = hasRepoPath ? h.primaryRepo.split('/').slice(1).join('/') : h.primaryRepo; var rpHref = ghRepoURL(hiveForgeHost(h), rpOwner, rpName); var ghIcon = (rp && rpHref) ? '<a href="' + rpHref + '" target="_blank" style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>' : (rp ? '<span style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></span>' : ''); /* vanityDisplay is the friendly host shown in the status bar on hover. rb is resolvedBase(h), which the hub has already overlaid with the claimed vanity_url; it is only a DISPLAY url here, never the click target — see ssoDisplayLink. Empty for a row with no vanity host, which falls back to today's /open href. Only meaningful on hosted rows: a non-hosted row's dh IS rb already. */ var vanityDisplay = isHostedRow && rb ? rb : ''; var link = function(text, bold) { if (dh) { return ssoDisplayLink(dh, vanityDisplay, text, bold ? 'hive-name-link' : 'hive-sub-link'); } var s = bold ? 'font-weight:700;color:inherit' : 'color:#6b7280;font-weight:400'; return '<span style="' + s + '">' + esc(text) + '</span>'; }; /* repoLink wraps the second line (the org/repo) in a link to the ACTUAL FORGE REPO (github.com / GHE host), NOT the spoke dashboard: the top line already opens the dashboard, so the repo path should take an operator to the code. rpHref is the same doubling-safe forge URL the GitHub icon uses (ghRepoURL(hiveForgeHost(h), rpOwner, rpName)); when it is empty (BYO/mis-parsed host) fall back to plain non-link text, never to the dashboard. */ var repoLink = function(text) { if (rpHref) { return '<a href="' + rpHref + '" target="_blank" rel="noopener" class="hive-sub-link" title="Open repository on ' + escAttr((hiveForgeHost(h) || 'github.com')) + '">' + esc(text) + '</a>'; } return '<span style="color:#6b7280;font-weight:400">' + esc(text) + '</span>'; }; var line1 = dot + ' ' + link(orgName, true) + heartbeatHeart(h) + nameEditAffordance(h); var fcPill = h.online ? failingCheckSummary(h) : ''; /* Forge egress broken, pod healthy: the labelled pill replaces the stale-advisory pill and the github_auth entry (failingChecks already drops it), but any other failing check still renders beside it. Not re-gated on h.online here because the hub already blanks forgeUnreachableLabel for offline hives (forgeUnreachableLabel in Go), so the rule cannot drift between the API and this row. */ var fuPill = forgeUnreachableSummary(h); /* Advisory-staleness pill sits right beside the failing-check pill: both are "something is quietly wrong with this working hive" signals, and advisoryStaleSummary already self-suppresses (empty string) unless the hub flagged the digest stale, so unaffected rows are pixel-identical. */ var advPill = h.online && !fuPill ? advisoryStaleSummary(h) : ''; /* Advisory finding-count pill rides beside the staleness pill and carries the "(top N)" marker when the spoke capped its digest. */ var advCountPill = h.online ? advisoryFindingsSummary(h) : ''; /* Dead-link pill is deliberately NOT gated on h.online: the entire point is a hive that IS online and heartbeating while its public URL is broken, so gating it the way the other pills are gated would hide exactly the case it exists to surface. */ var dlPill = deadLinkSummary(h); var privatePill = privateURLSummary(h); /* Inference-auth pill: like the dead-link pill it is NOT gated on h.online, because the hive being online while every inference call 401s is exactly the case it surfaces. */ var iaPill = inferenceAuthSummary(h); var rsPill = restartStormSummary(h); /* Inline access faces sit on the name cell's second line, immediately after this row's own role badge: the badge already answers "what am I on this hive", so the co-members read as the natural continuation of the same thought, in the one cell that is left-aligned and has room to grow. It also keeps them out of the 16 dense metric columns, none of which is about people. Empty string when the viewer is the only member, so those rows are pixel-identical to today. */ var accessFaces = hiveAccessAvatars(h); /* Keyed off repoName, not orgName: line 1 now always carries SOME identity, so the presence of a second line is decided purely by whether there is a repo to put on it. Without a repo the row still shows the GitHub icon, role badge, faces and failing-check pill on the compact variant. */ var line2 = repoName ? '<div style="padding-left:18px;font-size:0.8rem">' + repoLink(repoName) + ' ' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fuPill + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + rsPill + '</div>' : '<div style="padding-left:18px">' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fuPill + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + rsPill + '</div>'; var line3 = pendingPill ? '<div style="margin-top:var(--sp-2);padding-left:18px">' + pendingPill + '</div>' : ''; return line1 + line2 + line3; })() + '</td>' +
           '<td>' + locationCell + '</td>' +
           '<td style="white-space:nowrap">' + uptimeCell(h) + '</td>' +
           /* No white-space:nowrap on the cell itself: the stacked lines each
              carry their own nowrap, so the SHA still never breaks mid-hash,
              but the COLUMN is no longer forced to the width of every part laid
              end to end. That nowrap was the main reason this column was wide. */
-          '<td style="font-size:0.7rem">' + versionCell + '</td>' +
+          '<td class="version-cell" style="font-size:0.7rem">' + versionCell + '</td>' +
           /* Repo count over the GitHub-instance pill: the host qualifies WHICH
              GitHub these repos live on, so the two belong together. Stacked
              rather than inline to keep the numeric column narrow. */
@@ -9285,11 +9570,11 @@
              "<slug>[bot]", else empty); a hive with no usable GitHub App renders
              "—", never a stale personal ai_author it can't act as. Prefixed "as:"
              so the line reads as the authoring identity, not another repo. */
-          '<td title="' + esc((h.repos || []).join('\n')) + '" style="cursor:' + (repoCount > 0 ? 'help' : 'default') + '">' +
+          '<td class="repos-cell" title="' + esc((h.repos || []).join('\n')) + '" style="cursor:' + (repoCount > 0 ? 'help' : 'default') + '">' +
             '<div style="' + STACKED_CELL_STYLE + '">' +
               '<div style="' + STACKED_LINE_STYLE + '">' + repoCount + '</div>' +
               '<div style="' + STACKED_LINE_STYLE + '" title="GitHub instance these repos live on">' + githubHostPill(hiveForgeHost(h)) + '</div>' +
-              '<div style="' + STACKED_LINE_STYLE + ';color:var(--muted)" title="GitHub identity this hive opens PRs/commits as (— = no GitHub App installed yet)">as: ' + esc(h.aiAuthorEffective || '—') + '</div>' +
+              '<div class="repos-as" style="' + STACKED_LINE_STYLE + ';white-space:normal;overflow-wrap:anywhere;color:var(--muted)" title="GitHub identity this hive opens PRs/commits as (— = no GitHub App installed yet)">as: ' + esc(h.aiAuthorEffective || '—') + '</div>' +
             '</div>' +
           '</td>' +
           /* MATURITY: the ACMM level badge and the Journey status stacked into
@@ -9937,8 +10222,8 @@
        window is never silent. Only the states that mean "something is
        happening or went wrong" get a pill; a plain "scheduled" row looks as
        it does today (the auto-upgrade line already says when). */
-    var UPGRADE_PROGRESS_PILL_STATES = {draining: 1, pulling: 1, rolling: 1, verifying: 1, missed: 1};
-    var UPGRADE_PROGRESS_LABELS = {scheduled: 'Scheduled', draining: 'Draining', pulling: 'Pulling', rolling: 'Rolling', verifying: 'Verifying', done: 'Upgraded', missed: 'Missed window'};
+    var UPGRADE_PROGRESS_PILL_STATES = {delayed: 1, draining: 1, pulling: 1, rolling: 1, verifying: 1, missed: 1};
+    var UPGRADE_PROGRESS_LABELS = {scheduled: 'Scheduled', delayed: 'Delayed', draining: 'Draining', pulling: 'Pulling', rolling: 'Rolling', verifying: 'Verifying', done: 'Upgraded', missed: 'Missed window'};
     var UPGRADE_HISTORY_MAX_ROWS = 14;
 
     function upgradeProgressLabel(state) {
@@ -9961,9 +10246,15 @@
     function renderUpgradeHistory(h) {
       var rows = (h && h.upgradeHistory) || [];
       if (!rows.length) return '';
-      var missed = 0;
+      var succeededAt = rows.reduce(function(latest, a) {
+        return a.outcome === 'done' ? Math.max(latest, Date.parse(a.endedAt) || 0) : latest;
+      }, 0);
+      var missed = rows.filter(function(a) {
+        return a.outcome === 'missed' && a.trigger !== 'window' &&
+          (Date.parse(a.endedAt || a.startedAt) || 0) > succeededAt;
+      }).length;
+      if (!missed) return '';
       var lines = rows.slice(0, UPGRADE_HISTORY_MAX_ROWS).map(function(a) {
-        if (a.outcome === 'missed') missed++;
         var when = a.endedAt && a.endedAt !== '0001-01-01T00:00:00Z' ? a.endedAt : a.startedAt;
         var d = when ? new Date(when) : null;
         var ts = d && !isNaN(d.getTime()) ? d.toLocaleString([], {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'}) : '?';
@@ -9984,15 +10275,21 @@
       var history = renderUpgradeHistory(h);
       if (!st || !UPGRADE_PROGRESS_PILL_STATES[st.state]) return history;
       var label = upgradeProgressLabel(st.state);
+      /* The pill shows the state plus at most one short fact (time left on a
+         drain); the agents holding the drain and a missed window's reason are
+         sentences, so they go in the hover title rather than widening the
+         Version column. */
       var extra = '';
+      var tipExtra = '';
       if (st.state === 'draining') {
         var agents = upgradeAgentsInTurnText(st);
         var left = typeof st.drainRemainingS === 'number' && st.drainRemainingS > 0 ? formatUpgradeElapsed(st.drainRemainingS * 1000) + ' left' : 'deadline reached';
-        extra = (agents ? ' · ' + agents : '') + ' · ' + left;
-      } else if (st.state === 'missed' && st.reason) {
-        extra = ' · ' + st.reason;
+        extra = ' · ' + left;
+        if (agents) tipExtra = '\n' + agents;
+      } else if ((st.state === 'missed' || st.state === 'delayed') && st.reason) {
+        tipExtra = '\n' + st.reason;
       }
-      var tip = st.detail || label;
+      var tip = (st.detail || label) + tipExtra;
       var pill = '<span class="upgrade-progress-pill is-' + escAttr(st.state) + '" title="' + escAttr(tip) + '">' + esc(label + extra) + '</span>';
       var action = '';
       if (canAct && (st.state === 'draining' || st.state === 'missed')) {
@@ -14566,10 +14863,17 @@
           var actor = ev.actor
             ? '<span style="color:var(--muted);font-size:0.7rem;margin-left:var(--sp-3)">by ' + esc(ev.actorName || ev.actor) + '</span>'
             : '';
+          /* Onboarding problems (GitHub App not installed / permissions /
+             install pending) get a pointer to the hive's own Getting Started
+             guide — the hive dashboard's 🧭 Guide chip — so a new operator
+             reading this timeline is not left asking for the install URL. */
+          var guideTip = (ev.kind === 'github_app_changed' && !/cleared|completed/i.test(ev.detail || ''))
+            ? '<div class="fs-xs text-muted mt-1">New hive? Open your hive dashboard → 🧭 Guide (top navbar) → step ‘Install the Forge App (GitHub App)’ for the install URL and permissions checklist.</div>'
+            : '';
           return '<div style="display:flex;gap:10px;padding:9px 0;border-bottom:1px solid var(--border)">' +
             '<div style="flex-shrink:0;width:84px"><span style="display:inline-block;padding:2px 7px;border-radius:var(--r-pill);font-size:var(--fs-2xs);font-weight:600;white-space:nowrap;background:' + kind.color + '22;color:' + kind.color + ';border:1px solid ' + kind.color + '55">' + esc(kind.label) + '</span></div>' +
             '<div style="flex:1;min-width:0">' +
-              '<div style="font-size:var(--fs-base);color:var(--text);word-break:break-word">' + esc(ev.detail || '') + actor + '</div>' +
+              '<div style="font-size:var(--fs-base);color:var(--text);word-break:break-word">' + esc(ev.detail || '') + actor + guideTip + '</div>' +
               '<div class="fs-xs text-muted mt-1" title="' + esc(ev.ts || '') + '">' + esc(timelineAgo(ev.ts)) + '</div>' +
             '</div></div>';
         }).join('');

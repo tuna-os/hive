@@ -3,7 +3,7 @@ package stageengine
 import "github.com/hivecommons/hive/pkg/stagelabels"
 
 // diagramEdges is the expected-transition table, generated from the
-// `stateDiagram-v2` block in src/docs/labels-and-control-signals.md. One
+// `stateDiagram-v2` block in src/docs/labels-and-control-signals/stage-labels.md. One
 // entry per `sNNN --> sMMM` line, in diagram order; `[*]` edges are
 // implied by Expected (None is always expected). transition_table_test.go
 // parses the fenced block and fails when this table and the diagram drift,
@@ -15,6 +15,16 @@ var diagramEdges = map[Edge]bool{
 	{stagelabels.TriageNeeded, stagelabels.Actionable}:                  true, // maintainer triages: triage/accepted, hive/verified-open or approved-direction added, or needs-triage removed (not a regression)
 	{stagelabels.TriageNeeded, stagelabels.Claimed}:                     true, // scanner / relay claim (015 is not a gate)
 	{stagelabels.TriageNeeded, stagelabels.IssueNeedsDecision}:          true, // needs-human / park label (agent escalates)
+	{stagelabels.Actionable, stagelabels.OpenForDiscussion}:             true, // proposal / kind/design label added to an unclaimed issue (reclassification)
+	{stagelabels.OpenForDiscussion, stagelabels.Actionable}:             true, // proposal / kind/design label removed (not a regression)
+	{stagelabels.TriageNeeded, stagelabels.OpenForDiscussion}:           true, // proposal / kind/design label added to an untriaged issue (reclassification)
+	{stagelabels.OpenForDiscussion, stagelabels.TriageNeeded}:           true, // proposal / kind/design label removed on an untriaged issue (not a regression)
+	{stagelabels.OpenForDiscussion, stagelabels.Claimed}:                true, // a person, relay contributor or agent claims it (018 is not a gate)
+	{stagelabels.OpenForDiscussion, stagelabels.IssueNeedsDecision}:     true, // needs-human / park label
+	{stagelabels.IssueNeedsDecision, stagelabels.OpenForDiscussion}:     true, // /hive approve or /hive decision on a proposal
+	{stagelabels.Claimed, stagelabels.OpenForDiscussion}:                true, // claim released or lapsed with no PR on a proposal (not a regression)
+	{stagelabels.PRInProgress, stagelabels.OpenForDiscussion}:           true, // PR request failed / start mark lapsed with no PR on a proposal
+	{stagelabels.CoveredByPR, stagelabels.OpenForDiscussion}:            true, // covering PR merged with Refs (hive/partially-addressed; progress) or closed unmerged on a proposal
 	{stagelabels.Claimed, stagelabels.IssueNeedsDecision}:               true, // claim lapses on a parked issue
 	{stagelabels.IssueNeedsDecision, stagelabels.Actionable}:            true, // /hive approve or /hive decision
 	{stagelabels.IssueNeedsDecision, stagelabels.TriageNeeded}:          true, // park label removed by hand on an untriaged issue (approved-direction itself counts as triage)
@@ -35,6 +45,8 @@ var diagramEdges = map[Edge]bool{
 	{stagelabels.Reviewed, stagelabels.AwaitingMergeAdmission}:          true, // CI green, author side done
 	{stagelabels.AwaitingMergeAdmission, stagelabels.PreMergeSoak}:      true, // lane admits, soak window running
 	{stagelabels.AwaitingMergeAdmission, stagelabels.MergeQueue}:        true, // lane admits, no soak / soak already complete
+	{stagelabels.AwaitingMergeAdmission, stagelabels.Fixing}:            true, // current head red, changes requested or being rebased by the train (hivecommons/hive#15825; backward hop)
+	{stagelabels.AwaitingMergeAdmission, stagelabels.ReviewPending}:     true, // new push: CI and verdicts owed again on the current head (hivecommons/hive#15825; backward hop)
 	{stagelabels.PreMergeSoak, stagelabels.MergeQueue}:                  true, // soak complete
 	{stagelabels.MergeQueue, stagelabels.PreMergeSoak}:                  true, // pre-095 record reclassified while still soaking (not a regression)
 	{stagelabels.ReviewPending, stagelabels.Fixing}:                     true, // hive PR red / changes requested
@@ -47,6 +59,7 @@ var diagramEdges = map[Edge]bool{
 	{stagelabels.MergeQueue, stagelabels.Fixing}:                        true, // new head red (backward hop, commented)
 	{stagelabels.MergeQueue, stagelabels.ReturnedToContributor}:         true, // contributor head red (backward hop, commented)
 	{stagelabels.Fixing, stagelabels.ReviewPending}:                     true, // fixed head pushed
+	{stagelabels.Fixing, stagelabels.NeedsDecision}:                     true, // hive adoption copy still conflicting after two fixer rebase attempts (rebase-failed-twice)
 	{stagelabels.NeedsAuthor, stagelabels.ReviewPending}:                true, // author pushes a new head
 	{stagelabels.ReturnedToContributor, stagelabels.ReviewPending}:      true, // author pushes a new head
 	{stagelabels.ReturnedToContributor, stagelabels.AdoptedByHive}:      true, // clanker unavailable, adopted

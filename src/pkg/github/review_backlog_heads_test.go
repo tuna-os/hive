@@ -71,7 +71,7 @@ func headsBacklogClient(t *testing.T, srvURL string, sink *fakeBacklogSink) *Cli
 	c.SetReviewBacklogRouting(func() ReviewBacklogRouting {
 		return ReviewBacklogRouting{
 			Severity: config.ReviewSeverityConfig{BlockAt: "P2"},
-			Backlog:  config.ReviewBacklogConfig{Destination: config.ReviewBacklogLinear, Labels: []string{"followup"}},
+			Backlog:  config.ReviewBacklogConfig{Destination: config.ReviewBacklogLinear, Labels: []string{"followup"}, MinSeverity: "P3"},
 			Sink:     sink,
 		}
 	})
@@ -119,7 +119,7 @@ func TestReviewBacklogHeadsModeFilesDecidedReportsOnly(t *testing.T) {
 		t.Fatalf("review 77 edits = %d, want 1", len(edits))
 	}
 	if !strings.HasPrefix(edits[0], "Decided review body.") || !strings.Contains(edits[0], reviewFollowUpsMarker) ||
-		!strings.Contains(edits[0], "[ENG-1](https://tracker.test/ENG-1) — Review backlog (correctness): stale docstring (filed)") {
+		!strings.Contains(edits[0], "[ENG-1](https://tracker.test/ENG-1) — [reviewer] Review backlog (correctness): stale docstring (filed)") {
 		t.Fatalf("follow-ups edit = %q", edits[0])
 	}
 
@@ -239,7 +239,7 @@ func TestReconcileReviewBacklogBlocks(t *testing.T) {
 	sink := &fakeResolverSink{fakeBacklogSink: fakeBacklogSink{dest: config.ReviewBacklogLinear}}
 	c := reviewTestClient(t, srv.URL)
 	c.SetReviewBacklogRouting(func() ReviewBacklogRouting {
-		return ReviewBacklogRouting{Backlog: config.ReviewBacklogConfig{Destination: config.ReviewBacklogLinear}, Sink: sink}
+		return ReviewBacklogRouting{Backlog: config.ReviewBacklogConfig{Destination: config.ReviewBacklogLinear, MinSeverity: "P3"}, Sink: sink}
 	})
 	now := time.Now().UTC()
 	ledger := newReviewBacklogLedger()
@@ -287,7 +287,7 @@ func TestReconcileReviewBacklogBlocks(t *testing.T) {
 // A closed-unmerged source PR never closes the item: the note unblocks it
 // and asks for re-triage (maintainer decision on #13849).
 func TestReviewBacklogRetriageNote(t *testing.T) {
-	note := reviewBacklogRetriageNote("o/r", 6)
+	note := reviewBacklogRetriageNote("o/r", 6, "")
 	for _, want := range []string{blockedUnblockedMarker, reviewBacklogRetriageMarker, "source PR o/r#6 closed unmerged — re-triage against current base"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("note missing %q: %q", want, note)
@@ -336,7 +336,7 @@ func TestReconcileReviewBacklogBlocksSupersede(t *testing.T) {
 	sink := &fakeResolverSink{fakeBacklogSink: fakeBacklogSink{dest: config.ReviewBacklogLinear}}
 	c := reviewTestClient(t, srv.URL)
 	c.SetReviewBacklogRouting(func() ReviewBacklogRouting {
-		return ReviewBacklogRouting{Backlog: config.ReviewBacklogConfig{Destination: config.ReviewBacklogLinear}, Sink: sink}
+		return ReviewBacklogRouting{Backlog: config.ReviewBacklogConfig{Destination: config.ReviewBacklogLinear, MinSeverity: "P3"}, Sink: sink}
 	})
 	now := time.Now().UTC()
 	ledger := newReviewBacklogLedger()

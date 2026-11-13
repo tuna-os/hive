@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -42,6 +43,27 @@ func agentHiveSHA() string {
 		return sha
 	}
 	return buildCommit
+}
+
+// agentNoProxy returns the NO_PROXY value handed to agents: loopback plus the
+// host of OMP_AUTH_BROKER_URL, and only that host. An unset, unparsable or
+// host-less URL adds nothing, so every other private address stays behind the
+// proxy's destination guard. The host is appended only when it is an IP
+// literal or a plain DNS hostname: wildcards, leading or trailing dots and
+// any other odd characters fall back to loopback, since NO_PROXY would read
+// them as "bypass everything" or a domain-suffix match.
+var noProxyHostRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`)
+
+func agentNoProxy() string {
+	u, err := url.Parse(strings.TrimSpace(os.Getenv("OMP_AUTH_BROKER_URL")))
+	if err != nil {
+		return loopbackNoProxy
+	}
+	host := u.Hostname()
+	if net.ParseIP(host) == nil && !noProxyHostRe.MatchString(host) {
+		return loopbackNoProxy
+	}
+	return loopbackNoProxy + "," + host
 }
 
 func (m *Manager) buildBootstrapPrompt(agent *AgentProcess) string {
@@ -263,6 +285,13 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 		{"HIVE_BACKEND", backend, false},
 		{"HIVE_MODEL", model, false},
 	}
+	if backend == "cline" {
+		source := os.Getenv("HIVE_CLINE_CONFIG_DIR")
+		if source == "" {
+			source = filepath.Join(sharedAgentHome, ".cline")
+		}
+		vars = append(vars, agentEnvPair{"HIVE_CLINE_CONFIG_DIR", source, false})
+	}
 	if hiveID := os.Getenv("HIVE_ID"); hiveID != "" {
 		vars = append(vars, agentEnvPair{"HIVE_ID", hiveID, false})
 	}
@@ -294,9 +323,11 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 	// Loopback must never traverse the hive proxy for any backend: an agent
 	// polling a local dev server would otherwise get proxy-side dial errors
 	// (#14076), and a repo's own tests must see real connection errors
-	// instead of the proxy's 502. The credential broker's host joins it (see
-	// agentNoProxy).
-	noProxy := agentNoProxy(os.Getenv("OMP_AUTH_BROKER_URL"))
+	// instead of the proxy's 502.
+	// The credential broker (OMP_AUTH_BROKER_URL) usually sits on a private
+	// address the proxy's plain-forward guard refuses, so its host bypasses
+	// the proxy too (#15432).
+	noProxy := agentNoProxy()
 	vars = append(vars, agentEnvPair{"NO_PROXY", noProxy, false})
 	vars = append(vars, agentEnvPair{"no_proxy", noProxy, false})
 	vars = append(vars, agentEnvPair{"HIVE_PROXY_AGENT", agent.Name, false})
@@ -374,6 +405,7 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 		}
 		vars = append(vars, agentEnvPair{claudeAutoModeServerEnv, claudeAutoModeServerOff, false})
 	}
+	vars = append(vars, cliMemoryEnvPairs(agent, backend)...)
 	if m.copilotAuthToken != "" {
 		vars = append(vars, agentEnvPair{copilotTokenEnvVar, m.copilotAuthToken, true})
 	}
@@ -432,7 +464,15 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 	// keeps the variable doing the job it was added for (#c5648bc9: deliver a
 	// dashboard-obtained token to an agent that cannot see the file) and stops
 	// it overriding a credential that can still refresh itself.
-	if m.claudeAuthToken != "" && backend == "claude" && !claudeCredentialReachable(agent, backend) {
+	//
+	// An operator-supplied long-lived token (HIVE_CLAUDE_OAUTH_TOKEN, from
+	// `claude setup-token`) is the exception: it lasts about a year and never
+	// needs a refresh, so pinning it is the point. It is injected whether or
+	// not a credentials file is reachable and wins over the dashboard
+	// sign-in, which only ever updates claudeAuthToken.
+	if m.claudeOperatorToken != "" && backend == "claude" {
+		vars = append(vars, agentEnvPair{"CLAUDE_CODE_OAUTH_TOKEN", m.claudeOperatorToken, true})
+	} else if m.claudeAuthToken != "" && backend == "claude" && !claudeCredentialReachable(agent, backend) {
 		vars = append(vars, agentEnvPair{"CLAUDE_CODE_OAUTH_TOKEN", m.claudeAuthToken, true})
 	}
 	// bob reads its key from BOBSHELL_API_KEY in 1.x and BOB_API_KEY in 2.x.
@@ -618,25 +658,4 @@ func (m *Manager) experimentEnvPairs(agent *AgentProcess) []agentEnvPair {
 		pairs = append(pairs, agentEnvPair{k, m.project.ExperimentEnv[k], false})
 	}
 	return pairs
-}
-
-// agentNoProxy is the NO_PROXY list handed to every agent: loopback, plus the
-// host of the operator-configured credential broker when there is one.
-//
-// The broker (OMP_AUTH_BROKER_URL, inherited from the hive's environment) is
-// typically a private address on the host's container bridge. Through the
-// proxy it is refused as "not globally routable", so an agent CLI that needs
-// a fresh credential exits at startup and every kick restarts it. Exempting
-// exactly that host keeps the private-destination guard intact for every
-// other address. An unparsable or host-less URL adds nothing.
-func agentNoProxy(brokerURL string) string {
-	brokerURL = strings.TrimSpace(brokerURL)
-	if brokerURL == "" {
-		return loopbackNoProxy
-	}
-	u, err := url.Parse(brokerURL)
-	if err != nil || u.Hostname() == "" {
-		return loopbackNoProxy
-	}
-	return loopbackNoProxy + "," + u.Hostname()
 }

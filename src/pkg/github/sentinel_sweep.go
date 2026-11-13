@@ -2,8 +2,13 @@ package github
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +16,7 @@ import (
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/pkg/forgestate"
 	"github.com/hivecommons/hive/pkg/sentinel"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // Sentinel sweep: evaluates open PRs in the watched repos with pkg/sentinel
@@ -52,6 +58,12 @@ type SentinelSweepOptions struct {
 	LabelColor       string
 	LabelDescription string
 	Evaluator        sentinel.Config
+	// SensitivePathsForRepo, when set, returns the sensitive-path globs for
+	// one "owner/repo" (project.repo_policies[].sentinel_sensitive_paths over
+	// sentinel.sensitive_paths); its result replaces Evaluator.SensitivePaths
+	// for that repository's pull requests. nil means every repository uses
+	// Evaluator.SensitivePaths.
+	SensitivePathsForRepo func(repo string) []string
 	// TrustedAuthor classifies authors with the same predicate used by the
 	// auto-merge exception lanes: the Hive App, trusted bots and owner-tier
 	// authorized users. nil means no author is trusted.
@@ -66,6 +78,94 @@ type SentinelSweepOptions struct {
 	// process-wide cache from SetSentinelPRCache; with neither, or for a
 	// repo the cache has not reconciled yet, the sweep lists the repo.
 	PRCache SentinelPRCache
+	// PatchObserver, when non-nil, receives one observation per successful
+	// patch fetch, before evaluation. It must return quickly and not block:
+	// the sweep waits at most sentinelPatchObserverTimeout for it, recovers a
+	// panic and logs it, and never lets it change the sweep's result. nil is a
+	// strict no-op. PRs the sentinel skips (unchanged heads, exempt authors)
+	// are not observed.
+	PatchObserver func(SentinelPatchObservation)
+}
+
+// sentinelEvaluatorForRepo is the evaluator config for one "owner/repo":
+// Evaluator with SensitivePaths taken from SensitivePathsForRepo when that is
+// set. A non-nil empty result is kept as-is, so it matches nothing.
+func (opts SentinelSweepOptions) sentinelEvaluatorForRepo(repo string) sentinel.Config {
+	cfg := opts.Evaluator
+	if opts.SensitivePathsForRepo != nil {
+		cfg.SensitivePaths = opts.SensitivePathsForRepo(repo)
+	}
+	return cfg
+}
+
+// SentinelPatchObservation is what PatchObserver sees: the pushed head's
+// patch files exactly as the sentinel fetched them. HiveIdentified is true
+// only when the hive can name its own accounts and the author is one of them.
+type SentinelPatchObservation struct {
+	Repo           string
+	Number         int
+	HeadSHA        string
+	Author         string
+	HiveIdentified bool
+	Private        bool
+	Files          []sentinel.File
+	At             time.Time
+}
+
+// sentinelPatchObserverTimeout bounds how long the sweep waits for an observer.
+var sentinelPatchObserverTimeout = 2 * time.Second
+
+// sentinelRepoPrivate reports whether the PR's repository is private. The PR
+// payload's base.repo can be absent, which would read as public, so a missing
+// one is resolved from the repository record; if that fails, assume private.
+func (c *Client) sentinelRepoPrivate(ctx context.Context, owner, name string, pr *gh.PullRequest) bool {
+	if repo := pr.GetBase().GetRepo(); repo != nil && repo.Private != nil {
+		return repo.GetPrivate()
+	}
+	if owner == "" || name == "" || c.client == nil {
+		return true
+	}
+	r, _, err := c.client.Repositories.Get(ctx, owner, name)
+	if err != nil || r == nil || r.Private == nil {
+		c.logger.Warn("sentinel repo privacy lookup failed; treating as private", "repo", owner+"/"+name)
+		return true
+	}
+	return r.GetPrivate()
+}
+
+// observeSentinelPatch hands the fetched patch to the observer. The
+// observation names the repository as owner/name, never the configured slug:
+// the slug is a bare name once config loading strips the org, and the
+// observer's allowlist (dashboard.matrix.repos) holds owner/name entries.
+func (c *Client) observeSentinelPatch(ctx context.Context, owner, name string, pr *gh.PullRequest, files []sentinel.File, observe func(SentinelPatchObservation)) {
+	fullRepo := owner + "/" + name
+	obs := SentinelPatchObservation{
+		Repo:           fullRepo,
+		Number:         pr.GetNumber(),
+		HeadSHA:        pr.GetHead().GetSHA(),
+		Author:         pr.GetUser().GetLogin(),
+		HiveIdentified: c.knowsOwnAccounts() && c.isHiveAccount(pr.GetUser()),
+		Private:        c.sentinelRepoPrivate(ctx, owner, name, pr),
+		Files:          append([]sentinel.File(nil), files...),
+		At:             time.Now(),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				c.logger.Warn("sentinel patch observer panicked", "repo", fullRepo, "number", obs.Number, "panic", fmt.Sprint(r))
+			}
+		}()
+		observe(obs)
+	}()
+	timer := time.NewTimer(sentinelPatchObserverTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		c.logger.Warn("sentinel patch observer exceeded its time bound", "repo", fullRepo, "number", obs.Number)
+	}
 }
 
 // SentinelPRCache is the forgestate view the full sweep enumerates from.
@@ -148,6 +248,12 @@ type SentinelSweepEvent struct {
 	Findings      []sentinel.Finding
 	Blocked       bool
 	TrustedReason string
+	// Suppressed is set when the write-back gate refused the comment and
+	// label: the finding is real and is recorded for the dashboard and
+	// /api/sentinel, but nothing was written to GitHub.
+	Suppressed bool
+	// SuppressedReason is the gate's reason when Suppressed.
+	SuppressedReason string
 }
 
 // Rules lists the triggered rule names.
@@ -159,6 +265,9 @@ type SentinelSweepResult struct {
 	Flagged    []SentinelSweepEvent
 	Notified   []SentinelSweepEvent
 	Remediated []SentinelSweepEvent
+	// Suppressed lists findings the write-back gate kept off GitHub
+	// (dashboard/API only).
+	Suppressed []SentinelSweepEvent
 	Skipped    int
 	Errors     []string
 	ReposHit   map[string]int
@@ -166,6 +275,9 @@ type SentinelSweepResult struct {
 	// than listed; ListedRepos counts the fallback.
 	CachedRepos int
 	ListedRepos int
+	// Fetched counts PRs whose head was new to the heads map and so was
+	// read and had its files fetched this pass (SweepSentinelNewHeads).
+	Fetched int
 }
 
 func (r *SentinelSweepResult) actions() int {
@@ -174,13 +286,16 @@ func (r *SentinelSweepResult) actions() int {
 
 // sentinelHeadsSeen remembers the head SHA each PR was last evaluated at so
 // an unchanged PR costs nothing on the cadence pass (no PR read, no files
-// fetch). It is in-memory only: a restart or a second replica starts empty
-// and re-evaluates every open PR once, so it is a cost optimisation, not the
-// record of a maintainer's clearance — that lives on GitHub
-// (sentinelClearedByMaintainer).
+// fetch). It is a cost optimisation, not the record of a maintainer's
+// clearance — that lives on GitHub (sentinelClearedByMaintainer). With no
+// path it is in-memory only and a restart re-evaluates every open PR once;
+// SetSentinelHeadsPath persists it so a restart neither re-diffs every head
+// nor leaves the Matrix line source blind until it has (#16276).
 type sentinelHeadsSeen struct {
-	mu   sync.Mutex
-	seen map[string]string
+	mu     sync.Mutex
+	seen   map[string]string
+	path   string
+	logger *slog.Logger
 }
 
 // isSeen reports whether key was last evaluated at head without recording
@@ -202,7 +317,98 @@ func (s *sentinelHeadsSeen) unchanged(key, head string) bool {
 		return true
 	}
 	s.seen[key] = head
+	s.saveLocked()
 	return false
+}
+
+// retain drops the remembered heads of PRs in owner/repo that are no longer
+// in the cached open set, so the persisted map does not grow with every PR
+// the repo ever had.
+func (s *sentinelHeadsSeen) retain(owner, repo string, open map[int]forgestate.Item) {
+	prefix := strings.ToLower(owner+"/"+repo) + "#"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dropped := false
+	for key := range s.seen {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimPrefix(key, prefix))
+		if err != nil {
+			continue
+		}
+		if _, ok := open[n]; !ok {
+			delete(s.seen, key)
+			dropped = true
+		}
+	}
+	if dropped {
+		s.saveLocked()
+	}
+}
+
+// setPath installs the persistence path and loads whatever it holds. An
+// unreadable or malformed file is logged and treated as empty.
+func (s *sentinelHeadsSeen) setPath(path string, logger *slog.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.path = strings.TrimSpace(path)
+	s.logger = logger
+	if s.path == "" {
+		return
+	}
+	raw, err := os.ReadFile(s.path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) && logger != nil {
+			logger.Warn("sentinel heads: state file unreadable; starting empty", "path", s.path, "error", err)
+		}
+		return
+	}
+	var loaded map[string]string
+	if err := json.Unmarshal(raw, &loaded); err != nil {
+		if logger != nil {
+			logger.Warn("sentinel heads: state file malformed; starting empty", "path", s.path, "error", err)
+		}
+		return
+	}
+	if s.seen == nil {
+		s.seen = map[string]string{}
+	}
+	for k, v := range loaded {
+		if k != "" && v != "" {
+			s.seen[k] = v
+		}
+	}
+}
+
+// saveLocked writes the map to path atomically; no path is a no-op.
+func (s *sentinelHeadsSeen) saveLocked() {
+	if s.path == "" {
+		return
+	}
+	raw, err := json.Marshal(s.seen)
+	if err != nil {
+		return
+	}
+	tmp := s.path + ".tmp"
+	err = os.WriteFile(tmp, raw, 0o644)
+	if err == nil {
+		err = os.Rename(tmp, s.path)
+	}
+	if err != nil && s.logger != nil {
+		s.logger.Warn("sentinel heads: state file write failed", "path", s.path, "error", err)
+	}
+}
+
+// SetSentinelHeadsPath persists the sentinel's evaluated-head map at path
+// (loaded now, written on every change) so a restart or client rebuild
+// neither re-diffs every open PR nor blanks the Matrix line source until
+// the next full sweep (#16276). Empty disables persistence.
+func (c *Client) SetSentinelHeadsPath(path string) {
+	if c == nil {
+		return
+	}
+	c.sentinelHeads.setPath(path, c.logger)
 }
 
 func sentinelKey(owner, repo string, number int) string {
@@ -250,6 +456,8 @@ func (c *Client) SweepSentinel(ctx context.Context, opts SentinelSweepOptions) (
 			if snap, ok := cache.Snapshot(repo); ok && snap.Ready {
 				result.CachedRepos++
 				c.sweepSentinelCached(ctx, result, repo, owner, repoName, snap, label, maxActions, opts)
+				c.sentinelHeads.retain(owner, repoName, snap.PRs)
+				c.writebackSweepSummary(repo)
 				continue
 			}
 		}
@@ -269,6 +477,7 @@ func (c *Client) SweepSentinel(ctx context.Context, opts SentinelSweepOptions) (
 			result.Seen++
 			c.sentinelEvaluatePR(ctx, result, repo, owner, repoName, pr, label, opts)
 		}
+		c.writebackSweepSummary(repo)
 	}
 	return result, nil
 }
@@ -306,6 +515,68 @@ func (c *Client) sweepSentinelCached(ctx context.Context, result *SentinelSweepR
 		}
 		c.sentinelEvaluatePR(ctx, result, repo, owner, repoName, pr, label, opts)
 	}
+}
+
+// SweepSentinelNewHeads is the incremental pass between reconciles: it walks
+// the forgestate cache for the repos opts.RepoAllowed admits and evaluates
+// only the open PRs whose head the heads map has not seen, reading each such
+// PR and its files exactly once. Unchanged heads cost no GitHub call, and
+// repos the cache has not reconciled are left to the full sweep rather than
+// listed. It exists so the Matrix line source (PatchObserver) sees a push
+// within minutes of it landing instead of waiting for the next full
+// SweepSentinel, whose cadence is bounded below by the governor tick (#16276);
+// because the heads map is shared, the full sweep then skips those heads.
+func (c *Client) SweepSentinelNewHeads(ctx context.Context, opts SentinelSweepOptions) (*SentinelSweepResult, error) {
+	label, maxActions, result, err := c.sentinelSweepPrepared(opts)
+	if err != nil {
+		return nil, err
+	}
+	cache := opts.prCache()
+	if cache == nil {
+		return result, nil
+	}
+	for _, repo := range c.getRepos() {
+		if opts.RepoAllowed != nil && !opts.RepoAllowed(repo) {
+			continue
+		}
+		if result.actions() >= maxActions {
+			break
+		}
+		snap, ok := cache.Snapshot(repo)
+		if !ok || !snap.Ready {
+			continue
+		}
+		result.CachedRepos++
+		owner, repoName := c.splitRepo(repo)
+		numbers := make([]int, 0, len(snap.PRs))
+		for n := range snap.PRs {
+			numbers = append(numbers, n)
+		}
+		sort.Ints(numbers)
+		for _, n := range numbers {
+			if result.actions() >= maxActions {
+				break
+			}
+			item := snap.PRs[n]
+			result.Seen++
+			if item.HeadSHA == "" || c.sentinelHeads.isSeen(sentinelKey(owner, repoName, n), item.HeadSHA) {
+				result.Skipped++
+				continue
+			}
+			pr, open, err := c.sentinelReadPR(ctx, owner, repoName, n)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("%s#%d: %v", repo, n, err))
+				continue
+			}
+			if !open {
+				result.Skipped++
+				continue
+			}
+			result.Fetched++
+			c.sentinelEvaluatePR(ctx, result, repo, owner, repoName, pr, label, opts)
+		}
+	}
+	return result, nil
 }
 
 // SweepSentinelPR evaluates one PR: the `pull_request` opened/synchronize/
@@ -376,7 +647,9 @@ func (c *Client) sentinelEvaluatePR(ctx context.Context, result *SentinelSweepRe
 	}
 	event.Repo = repo
 	c.recordReviewEvidenceSentinel(repo, pr, event.Findings, event.Blocked, time.Now())
-	if event.Blocked {
+	if event.Suppressed {
+		result.Suppressed = append(result.Suppressed, event)
+	} else if event.Blocked {
 		result.Flagged = append(result.Flagged, event)
 	} else if prHasLabel(pr, label) {
 		result.Remediated = append(result.Remediated, event)
@@ -415,7 +688,10 @@ func (c *Client) trySentinelPR(ctx context.Context, displayRepo, owner, repo str
 	if err != nil {
 		return SentinelSweepEvent{}, false, err
 	}
-	findings := sentinel.Evaluate(sentinel.PR{Author: author, Title: pr.GetTitle(), Files: files}, opts.Evaluator)
+	if opts.PatchObserver != nil {
+		c.observeSentinelPatch(ctx, owner, repo, pr, files, opts.PatchObserver)
+	}
+	findings := sentinel.Evaluate(sentinel.PR{Author: author, Title: pr.GetTitle(), Files: files}, opts.sentinelEvaluatorForRepo(owner+"/"+repo))
 	if len(findings) == 0 {
 		return SentinelSweepEvent{}, false, nil
 	}
@@ -426,10 +702,52 @@ func (c *Client) trySentinelPR(ctx context.Context, displayRepo, owner, repo str
 		markerBody += sentinelAdoptedNote(origin, codeAuthor)
 	}
 	markerBody = sentinelWithDigest(markerBody, digest)
+	// The write-back gate: a finding on a PR nobody opted in, below the
+	// level the sentinel kind needs, is recorded (dashboard, /api/sentinel,
+	// review evidence) but never commented or labelled (torch-spyre,
+	// 2026-10-28). The marker-comment read is skipped too — no GitHub call.
+	if d := c.WritebackAllowed(displayRepo, c.sentinelWritebackItem(pr), writeback.KindSentinel, markerBody); !d.Allowed {
+		event.Suppressed = true
+		event.SuppressedReason = d.Reason
+		return event, true, nil
+	}
 	marker := SentinelMarker + " " + head
 	comment, posted, err := c.findOwnMarkerComment(ctx, owner, repo, number, marker)
 	if err != nil {
 		return SentinelSweepEvent{}, false, err
+	}
+	// The hive's sentinel comment for an EARLIER head, if this head has
+	// none yet. A new push rewrites it for the new head rather than
+	// stamping the PR a second time (hivecommons/hive#16433): the label is
+	// what blocks, the comment is the explanation, and one explanation per
+	// PR is enough. Only a comment the hive can verify as its own is
+	// reused — a hive that cannot name its accounts never rewrites a
+	// comment the PR author may have forged. findOwnMarkerComment keeps
+	// its exact-head read for the clearance logic below.
+	var prior *gh.IssueComment
+	if !posted && c.knowsOwnAccounts() {
+		if prior, _, err = c.findOwnMarkerComment(ctx, owner, repo, number, SentinelMarker); err != nil {
+			return SentinelSweepEvent{}, false, err
+		}
+	}
+	writeSentinelComment := func(body, what string) error {
+		target := comment
+		if !posted {
+			target = prior
+		}
+		if target != nil {
+			if _, _, err := c.client.Issues.EditComment(ctx, owner, repo, target.GetID(), &gh.IssueComment{Body: gh.Ptr(body)}); err != nil { // writeback:gated
+				return fmt.Errorf("updating sentinel %s: %w", what, err)
+			}
+			c.noteCommentEdited()
+			return nil
+		}
+		_, resp, err := c.client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(body)}) // writeback:gated
+		c.noteWritebackOutcome(displayRepo, resp, err)
+		if err != nil {
+			return fmt.Errorf("posting sentinel %s: %w", what, err)
+		}
+		return nil
 	}
 	if decision.Block && !hasAlertLabel && sentinelClearedByMaintainer(comment, posted) {
 		// The alert for this exact head is on the PR but the label is not:
@@ -456,12 +774,14 @@ func (c *Client) trySentinelPR(ctx context.Context, displayRepo, owner, repo str
 		// maintainer's review, and the maintainer removed the label with
 		// this head already in place. The second case is a clearance of
 		// this head, not of the one the marker names (#13602); re-alerting
-		// would make the maintainer remove the same label twice.
+		// would make the maintainer remove the same label twice. A
+		// dashboard Approve bound to this head is the same clearance made
+		// through the hive, which took the label off as itself.
 		cleared, clearedBy, err := c.sentinelClearedAfterLatestPush(ctx, owner, repo, number, head, label)
 		if err != nil {
 			return SentinelSweepEvent{}, false, err
 		}
-		note := sentinelClearedNote
+		note := fmt.Sprintf(sentinelClearedNote, clearedBy, label)
 		if !cleared {
 			// The removal came before this head, but a push that leaves
 			// every flagged change as reviewed (a merge of the base branch,
@@ -471,10 +791,17 @@ func (c *Client) trySentinelPR(ctx context.Context, displayRepo, owner, repo str
 			if err != nil {
 				return SentinelSweepEvent{}, false, err
 			}
-			note = sentinelCarriedNote
+			note = fmt.Sprintf(sentinelCarriedNote, clearedBy, label)
+		}
+		if !cleared {
+			releasedBy, err := c.sentinelReleasedByDashboardApproval(ctx, owner, repo, number, head)
+			if err != nil {
+				return SentinelSweepEvent{}, false, err
+			}
+			cleared, note = releasedBy != "", fmt.Sprintf(sentinelReleasedNote, releasedBy, label)
 		}
 		if cleared {
-			if err := c.recordSentinelClearance(ctx, owner, repo, number, fmt.Sprintf(note, clearedBy, label), markerBody); err != nil {
+			if err := c.recordSentinelClearance(ctx, owner, repo, number, note, markerBody); err != nil {
 				return SentinelSweepEvent{}, false, err
 			}
 			return SentinelSweepEvent{}, false, nil
@@ -486,17 +813,19 @@ func (c *Client) trySentinelPR(ctx context.Context, displayRepo, owner, repo str
 			if !posted {
 				return SentinelSweepEvent{}, false, nil
 			}
-			if _, err := c.client.Issues.RemoveLabelForIssue(ctx, owner, repo, number, label); err != nil {
+			resp, err := c.client.Issues.RemoveLabelForIssue(ctx, owner, repo, number, label) // writeback:gated
+			c.noteWritebackOutcome(displayRepo, resp, err)
+			if err != nil {
 				return SentinelSweepEvent{}, false, fmt.Errorf("removing %s label from trusted author PR: %w", label, err)
 			}
-			if _, _, err := c.client.Issues.EditComment(ctx, owner, repo, comment.GetID(), &gh.IssueComment{Body: gh.Ptr(body)}); err != nil {
-				return SentinelSweepEvent{}, false, fmt.Errorf("updating sentinel notice: %w", err)
+			if err := writeSentinelComment(body, "notice"); err != nil {
+				return SentinelSweepEvent{}, false, err
 			}
 			return event, true, nil
 		}
 		if !posted {
-			if _, _, err := c.client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(body)}); err != nil {
-				return SentinelSweepEvent{}, false, fmt.Errorf("posting sentinel notice: %w", err)
+			if err := writeSentinelComment(body, "notice"); err != nil {
+				return SentinelSweepEvent{}, false, err
 			}
 		}
 		return event, true, nil
@@ -504,20 +833,26 @@ func (c *Client) trySentinelPR(ctx context.Context, displayRepo, owner, repo str
 	if err := c.EnsureIssueLabel(ctx, owner+"/"+repo, label, opts.LabelColor, opts.LabelDescription); err != nil {
 		return SentinelSweepEvent{}, false, fmt.Errorf("ensuring %s label: %w", label, err)
 	}
-	if _, _, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, number, []string{label}); err != nil {
+	_, resp, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, number, []string{label}) // writeback:gated
+	c.noteWritebackOutcome(displayRepo, resp, err)
+	if err != nil {
 		return SentinelSweepEvent{}, false, fmt.Errorf("adding %s label: %w", label, err)
 	}
-	body := markerBody
-	if posted {
-		if _, _, err := c.client.Issues.EditComment(ctx, owner, repo, comment.GetID(), &gh.IssueComment{Body: gh.Ptr(body)}); err != nil {
-			return SentinelSweepEvent{}, false, fmt.Errorf("updating sentinel alert: %w", err)
-		}
-	} else {
-		if _, _, err := c.client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(body)}); err != nil {
-			return SentinelSweepEvent{}, false, fmt.Errorf("posting sentinel comment: %w", err)
-		}
+	if err := writeSentinelComment(markerBody, "alert"); err != nil {
+		return SentinelSweepEvent{}, false, err
 	}
 	return event, true, nil
+}
+
+// sentinelWritebackItem is the gate's view of a PR read from GitHub.
+func (c *Client) sentinelWritebackItem(pr *gh.PullRequest) writeback.Item {
+	author := pr.GetUser().GetLogin()
+	labels := make([]string, 0, len(pr.Labels))
+	for _, l := range pr.Labels {
+		labels = append(labels, l.GetName())
+	}
+	hive := c.IsHiveAuthorLogin(author)
+	return writeback.Item{Number: pr.GetNumber(), IsPR: true, Author: author, HiveAuthored: hive, Labels: labels, CreatedAt: pr.GetCreatedAt().Time}
 }
 
 // sentinelClearedByMaintainer reports whether the marker comment found for

@@ -73,7 +73,7 @@ func (r *sandboxFakeRunner) Run(ctx context.Context, dir string, env []string, n
 		return []byte("0\n"), nil
 	case joined == "rev-parse --verify basesha":
 		return []byte("basesha\n"), nil
-	case joined == "diff --name-only -z basesha...HEAD":
+	case joined == "diff --no-renames --name-only -z basesha...HEAD":
 		return []byte("file.txt\x00"), nil
 	case joined == "diff --no-ext-diff basesha...HEAD":
 		return []byte("diff --git a/file.txt b/file.txt\n"), nil
@@ -159,6 +159,25 @@ func TestSandboxExecutorWorkspacePrepSanitizesCredentials(t *testing.T) {
 	}
 	if res.Workspace == "" || res.Report == nil || res.TranscriptPath == "" {
 		t.Fatalf("result missing collected artifacts: %+v", res)
+	}
+	// The workspace and transcript follow the shared sandbox naming so the
+	// dashboard's job-runtime terminal pane can find them by agent name
+	// (hivecommons/hive#14798), and the transcript ends with the exit code.
+	if want := sandbox.WorkspaceDir(root, "scanner", time.Unix(1, 0).UnixNano()); res.Workspace != want {
+		t.Fatalf("workspace = %q, want %q", res.Workspace, want)
+	}
+	if latest, ok := sandbox.LatestTranscript(root, "scanner"); !ok || latest != res.TranscriptPath {
+		t.Fatalf("LatestTranscript = %q, %v; want %q", latest, ok, res.TranscriptPath)
+	}
+	transcript, err := os.ReadFile(res.TranscriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, ok := sandbox.TranscriptExitCode(string(transcript)); !ok || code != 0 {
+		t.Fatalf("transcript exit code = %d, %v; transcript:\n%s", code, ok, transcript)
+	}
+	if !strings.HasPrefix(string(transcript), "stdout:\ndone\n") {
+		t.Fatalf("transcript body changed shape:\n%s", transcript)
 	}
 	for _, env := range runner.envs {
 		for _, pair := range env {

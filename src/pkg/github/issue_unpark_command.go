@@ -14,6 +14,8 @@ import (
 	"github.com/hivecommons/hive/pkg/review"
 	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/stagelabels"
+	"github.com/hivecommons/hive/pkg/workflowmodel"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // issueParkingLabels are the labels that park an issue on a person and so
@@ -47,7 +49,8 @@ const maintainerCommandsDocURL = "https://github.com/hivecommons/hive/blob/v5/sr
 const unparkCommandPrefix = "/hive"
 
 // unparkNoticeMarker tags the "What to reply" comment the hive keeps on every
-// parked issue, so it is edited in place rather than duplicated per cycle.
+// parked issue. There is one per issue, kept as the newest comment
+// (ensureUnparkNoticeComment).
 const unparkNoticeMarker = "<!-- hive:unpark-notice:9879 -->"
 
 // unparkReplyMarkerPrefix tags the hive's answer to one specific comment. The
@@ -104,6 +107,9 @@ var fixedCommandTokens = []string{"/fixed", "/close"}
 type unparkCommand struct {
 	Kind     unparkCommandKind
 	Decision string
+	// Verb is the model reply as the model declares it, for
+	// unparkCommandModelReply only (hivecommons/hive#17620).
+	Verb string
 	// Text is the whole decision as the person wrote it: the rest of the
 	// command line plus every line after it, trimmed. Decision stays the
 	// first line so the reply's `Decision:` round-trip is unchanged; the PR
@@ -111,12 +117,22 @@ type unparkCommand struct {
 	Text string
 }
 
-// BareApproval reports whether a `/hive decision` carries nothing beyond an
-// approval word — the owner answered "yes" without an instruction to act on.
-func (c unparkCommand) BareApproval() bool {
-	switch strings.ToLower(strings.TrimSpace(c.Text)) {
-	case "approve", "approved", "approve.", "approved.", "lgtm", "yes":
+// Approval reports whether the decision explicitly approves the head: the
+// first word is `approve`, `approved` or `lgtm` (trailing punctuation
+// ignored) and the rest is retained as the approval rationale. A bare `yes`
+// approves too, but `yes, but …` is a conditional answer and stays an
+// instruction for the fix lane (hivecommons/hive#14816).
+func (c unparkCommand) Approval() bool {
+	text := strings.TrimSpace(c.DecisionText())
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimRight(words[0], ".:,;!")) {
+	case "approve", "approved", "lgtm":
 		return true
+	case "yes":
+		return len(words) == 1
 	}
 	return false
 }
@@ -148,6 +164,10 @@ type IssueUnparkSweepOptions struct {
 	// cannot use it (hivecommons/hive#13087). It must not merge or change
 	// labels. nil leaves PRs to the 085 decision path alone.
 	PRApproveReply func(context.Context, string, int, *gh.IssueComment) (string, error)
+	// PRReplyOptions keeps the "Your move" section of the hive status
+	// comment on PRs at 085 or 070 that wait on a person: the `/hive` replies
+	// that answer them (pr_reply_options.go). false writes no section.
+	PRReplyOptions bool
 	// MaxActions caps the issues written to in one pass. Zero means
 	// DefaultIssueUnparkSweepMaxActions.
 	MaxActions int
@@ -175,7 +195,7 @@ type IssueUnparkSweepOptions struct {
 	LabelApprovalAudit func(IssueLabelApprovalEvent)
 	// HumanChangeRequests receives `/hive decision <text>` left by a trusted
 	// maintainer on a hive-authored PR parked at stage/085-needs-decision
-	// (hivecommons/hive#13041); the review planner turns it into a fix kick.
+	// or stage/070-fixing; the review planner turns instructions into a fix kick.
 	// nil means the sweep answers the PR but cannot route the decision.
 	HumanChangeRequests review.HumanChangeRequestStore
 	// TrustedMerger is the automerge lane's merger trust test. A PR-side
@@ -188,6 +208,14 @@ type IssueUnparkSweepOptions struct {
 	// ClosedAudit, when set, is called once per parked issue a maintainer's
 	// `/fixed` closed (hivecommons/dibs#459).
 	ClosedAudit func(IssueUnparkEvent)
+	// Now overrides the clock in tests.
+	Now func() time.Time
+	// WorkflowFor resolves the workflow model bound to a repository
+	// (hivecommons/hive#17620, RFC phase 4). On a bound repository a parked
+	// issue also answers `/hive <verb>` for each reply the model declares
+	// for the issue's current state. nil, or nil for a repository, keeps
+	// the built-in commands only.
+	WorkflowFor func(owner, repo string) *workflowmodel.Profile
 }
 
 // PullRequestDecisionEvent records one `/hive decision` on a hive-authored
@@ -199,9 +227,16 @@ type PullRequestDecisionEvent struct {
 	Actor    string
 	Decision string
 	// Mode is "changes_requested" (the decision carries an instruction)
-	// or "approve" (a bare `/hive decision approve`).
+	// or "approve" (an approval word followed by optional rationale).
 	Mode       string
 	CommentURL string
+	// ToContributor is the owning contributor's login when the direction
+	// was carried to their hive rather than the hive's own author agent (a
+	// clanker-authored PR, hivecommons/hive#15159); "" for the hive's PRs.
+	ToContributor string
+	// ParkLabelsLifted counts the park labels (needs-human, the 085 stage
+	// label) the decision took off in the same write.
+	ParkLabelsLifted int
 }
 
 // IssueLabelApprovalEvent records one acceptance the sweep acted on, for the
@@ -289,7 +324,20 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 		maxActions = DefaultIssueUnparkSweepMaxActions
 	}
 	result := &IssueUnparkSweepResult{}
-	cutoff := time.Now().Add(-unparkCommandScanWindow)
+	if opts.HumanChangeRequests != nil {
+		c.ReconcileSelfDecisionChangeRequests(opts.HumanChangeRequests)
+	}
+	now := time.Now()
+	if opts.Now != nil {
+		now = opts.Now()
+	}
+	// Exact cutoff for every eligibility check; the comment lists built from
+	// it round their since down to the hour so repeat passes stay cacheable
+	// (cacheableSince).
+	cutoff := now.Add(-unparkCommandScanWindow)
+	// Comment and timeline reads of an item whose updated_at has not moved
+	// since the last pass are reused (issue_unpark_read_cache.go).
+	ctx = withUnparkReadScope(ctx, &c.unparkReads, now)
 
 	for _, repo := range c.getRepos() {
 		if result.actions() >= maxActions {
@@ -306,6 +354,10 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 		if releasePolicy.enabled && opts.ReleaseVersionSource != nil {
 			releasePolicy.versionSource = opts.ReleaseVersionSource(repo)
 		}
+		var profile *workflowmodel.Profile
+		if opts.WorkflowFor != nil {
+			profile = opts.WorkflowFor(owner, repoName)
+		}
 		var policy LabelApprovalPolicy
 		labelApproval := false
 		if labelDriven {
@@ -315,12 +367,36 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 		if err != nil {
 			return result, err
 		}
+		listed := make(map[int]bool, len(issues))
+		for _, issue := range issues {
+			if issue != nil {
+				listed[issue.GetNumber()] = true
+			}
+		}
+		c.unparkReads.prune(owner, repoName, listed)
+		unparkedBefore := len(result.Unparked)
+		// waitingPRs are the PRs this pass saw at 085 or 070; the rest of
+		// the repo's PRs lose their "Your move" section after a full pass.
+		waitingPRs, fullPass := map[int]bool{}, true
 		for _, issue := range issues {
 			if result.actions() >= maxActions {
+				fullPass = false
 				break
 			}
 			if issue == nil {
 				continue
+			}
+			// `/hive ack` / `/hive snooze` only touch the attention ledger
+			// (hivecommons/hive#16359); the item then continues through
+			// the un-park paths below unchanged.
+			// Items without an open episode cost no API call.
+			n, err := c.replyAttentionCommands(ctx, owner+"/"+repoName, owner, repoName, issue, cutoff)
+			result.Replies += n
+			if n > 0 || err != nil {
+				c.forgetUnparkRead(ctx, owner, repoName, issue.GetNumber())
+			}
+			if err != nil && c.logger != nil {
+				c.logger.Warn("unpark sweep skipped attention commands", "repo", repo, "item", issue.GetNumber(), "error", err)
 			}
 			labels := issueLabelNames(issue.Labels)
 			if issue.IsPullRequest() {
@@ -331,6 +407,9 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 				// against the issue path.
 				if opts.PRApproveReply != nil && issue.GetComments() > 0 && !issue.GetUpdatedAt().Time.Before(cutoff) {
 					acted, err := c.replyPRApproveCommand(ctx, repo, owner, repoName, issue, cutoff, opts.PRApproveReply)
+					if acted || err != nil {
+						c.forgetUnparkRead(ctx, owner, repoName, issue.GetNumber())
+					}
 					if err != nil {
 						// One PR's failure must not stop un-parking for the rest of the pass.
 						if c.logger != nil {
@@ -345,13 +424,24 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 					}
 				}
 				// Otherwise PRs take one command only — `/hive decision`
-				// while parked at 085 (hivecommons/hive#13041) — and never a
+				// while at 085 or 070 — and never a
 				// notice.
-				if !labelPresent(labels, PRNeedsDecisionStageLabel) {
+				if !labelPresent(labels, PRNeedsDecisionStageLabel) && !labelPresent(labels, stagelabels.Fixing.Label()) {
 					continue
 				}
 				result.Seen++
+				waitingPRs[issue.GetNumber()] = true
 				acted, err := c.tryUnparkPullRequest(ctx, repo, owner, repoName, issue, cutoff, opts, result)
+				if acted || err != nil {
+					c.forgetUnparkRead(ctx, owner, repoName, issue.GetNumber())
+				}
+				// After the command, so an approval it just read clears the
+				// section in the same pass. Never counted as an action.
+				if opts.PRReplyOptions {
+					if err := c.syncPRReplyOptions(ctx, repo, owner, repoName, issue, labels); err != nil && c.logger != nil {
+						c.logger.Warn("unpark sweep: PR reply options not updated", "repo", repo, "pr", issue.GetNumber(), "error", err)
+					}
+				}
 				if err != nil {
 					if c.logger != nil {
 						c.logger.Warn("unpark sweep skipped pull request", "repo", repo, "pr", issue.GetNumber(), "error", err)
@@ -369,7 +459,10 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 				continue
 			}
 			result.Seen++
-			acted, err := c.tryUnparkIssue(ctx, repo, owner, repoName, issue, cutoff, labelDriven, unparkLabelApproval{policy: policy, enabled: labelApproval, audit: opts.LabelApprovalAudit}, releasePolicy, result, opts.Audit, opts.ClosedAudit)
+			acted, err := c.tryUnparkIssue(ctx, repo, owner, repoName, issue, cutoff, labelDriven, unparkLabelApproval{policy: policy, enabled: labelApproval, audit: opts.LabelApprovalAudit}, releasePolicy, profile, result, opts.Audit, opts.ClosedAudit)
+			if acted || err != nil {
+				c.forgetUnparkRead(ctx, owner, repoName, issue.GetNumber())
+			}
 			if err != nil {
 				if c.noteArchivedWrite(strings.ToLower(owner+"/"+repoName), err) {
 					if c.logger != nil {
@@ -387,6 +480,28 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 			if !acted {
 				result.Skipped++
 			}
+		}
+		// Decision parks that deferred to one answered in this pass take
+		// the same answer instead of asking the owner again
+		// (hivecommons/hive#16699). Label-driven repos keep their labels.
+		if !labelDriven && len(result.Unparked) > unparkedBefore {
+			decided := map[int]IssueUnparkEvent{}
+			for _, event := range result.Unparked[unparkedBefore:] {
+				decided[event.Number] = event
+			}
+			c.inheritDeferredDecisions(ctx, repo, owner, repoName, issues, decided, maxActions, result, opts.Audit)
+		}
+		// Reminders, closure clean-up and the per-repo attention queue
+		// (attention pilot, hivecommons/hive#16361, #16362) run after this
+		// pass recorded its `/hive ack` and `/hive snooze` commands.
+		if c.stageArchived.has(strings.ToLower(owner + "/" + repoName)) {
+			continue
+		}
+		if fullPass && opts.PRReplyOptions {
+			c.clearLeftPRReplyOptions(ctx, repo, waitingPRs)
+		}
+		if _, err := c.SweepAttentionQueue(ctx, owner+"/"+repoName); err != nil && c.logger != nil {
+			c.logger.Warn("unpark sweep: attention queue pass incomplete", "repo", repo, "error", err)
 		}
 	}
 	return result, nil
@@ -470,9 +585,9 @@ func unparkTextsProposeOwnerStep(issue *gh.Issue, comments []*gh.IssueComment) b
 // gets no hint. With label approval (hivecommons/hive#11313) a trusted
 // acceptance label is acted on first, and `/hive approve` / `/hive decision`
 // remove only the park labels the hive added itself.
-func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo string, issue *gh.Issue, cutoff time.Time, labelDriven bool, la unparkLabelApproval, releasePolicy unparkReleasePolicy, result *IssueUnparkSweepResult, audit, closedAudit func(IssueUnparkEvent)) (bool, error) {
+func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo string, issue *gh.Issue, cutoff time.Time, labelDriven bool, la unparkLabelApproval, releasePolicy unparkReleasePolicy, profile *workflowmodel.Profile, result *IssueUnparkSweepResult, audit, closedAudit func(IssueUnparkEvent)) (bool, error) {
 	number := issue.GetNumber()
-	comments, err := c.listIssueComments(ctx, owner, repo, number)
+	comments, err := c.unparkComments(ctx, owner, repo, issue, time.Time{})
 	if err != nil {
 		return false, err
 	}
@@ -480,8 +595,12 @@ func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo st
 	if menu.releaseStep != nil || c.issueOwnerStepProposed(issue, comments) {
 		c.rememberIssueOwnerStep(displayRepo, number, menu.releaseStep)
 	}
-	if !labelDriven {
-		if err := c.ensureUnparkNoticeComment(ctx, owner, repo, number, issue.GetBody(), issue.GetUser(), comments, releasePolicy.enabled); err != nil {
+	// A held issue (hivecommons/hive#16591) has nothing open to decide: no
+	// "What to reply" notice and no prose hint, but every command it does
+	// get is still answered.
+	held := isHeldAfterDecision(issueLabelNames(issue.Labels))
+	if !labelDriven && !held {
+		if err := c.ensureUnparkNoticeComment(ctx, owner, repo, issue, comments, releasePolicy.enabled); err != nil {
 			return false, err
 		}
 	}
@@ -497,7 +616,8 @@ func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo st
 	}
 
 	answered := c.answeredUnparkCommentIDs(comments)
-	candidate, command, err := c.eligibleUnparkCommand(ctx, owner, repo, comments, answered, cutoff, labelDriven && la.enabled)
+	verbs := issueModelReplyVerbs(profile, issue)
+	candidate, command, err := c.eligibleUnparkCommand(ctx, owner, repo, comments, answered, cutoff, labelDriven && la.enabled, verbs)
 	if err != nil {
 		return false, err
 	}
@@ -528,6 +648,17 @@ func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo st
 	// Approve needs no recommendation on a `blocked` park, where it means
 	// "the blocker is cleared" (hivecommons/hive#12376), or on an owner
 	// step, where it accepts the step the hive proposed.
+	// An owner step an accepted `/hive approve` already answered, parked
+	// again, is not answered by a second approve: it would un-park the
+	// issue only for the agent to park it once more.
+	if command.Kind == unparkCommandApprove && !(releasePolicy.enabled && menu.releaseStep != nil) && (!labelDriven || la.enabled) &&
+		menu.ownerStep && menu.approveAnswered {
+		if err := c.postUnparkReply(ctx, owner, repo, number, candidate.GetID(), unparkApproveAnsweredReply); err != nil {
+			return false, err
+		}
+		result.Replies++
+		return true, nil
+	}
 	if command.Kind == unparkCommandApprove && !(releasePolicy.enabled && menu.releaseStep != nil) && (!labelDriven || la.enabled) &&
 		!menu.ownerStep && menu.releaseStep == nil && !unparkTextsProposeOwnerStep(issue, comments) && !labelPresent(issueLabelNames(issue.Labels), issueBlockedLabel) {
 		decision, ok := menu.approveDecision()
@@ -570,6 +701,9 @@ func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo st
 		return true, nil
 	case unparkCommandNone:
 		// Prose assent, no command. Say what to type; do not act on it.
+		if held {
+			return false, nil
+		}
 		if err := c.postUnparkReply(ctx, owner, repo, number, candidate.GetID(), unparkProseHintReply); err != nil {
 			return false, err
 		}
@@ -582,6 +716,22 @@ func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo st
 	}
 
 	labels := issueLabelNames(issue.Labels)
+	if command.Kind == unparkCommandModelReply {
+		eff, ok := profile.ReplyForNumber(stagelabels.Current(labels).Number(), command.Verb)
+		if !ok {
+			return false, nil
+		}
+		event, err := c.applyIssueModelReply(ctx, owner, repo, number, labels, actor, eff, command.DecisionText(), candidate.GetID(), "")
+		if err != nil {
+			return false, err
+		}
+		event.Repo, event.CommentURL = displayRepo, candidate.GetHTMLURL()
+		result.Unparked = append(result.Unparked, event)
+		if audit != nil {
+			audit(event)
+		}
+		return true, nil
+	}
 	needsHuman := unparkNeedsHumanOutcome{}
 	hasNeedsHuman := c.hasNeedsHumanLabel(labels)
 	if hasNeedsHuman {
@@ -626,7 +776,9 @@ func (c *Client) tryUnparkIssue(ctx context.Context, displayRepo, owner, repo st
 func (c *Client) tryLabelApproval(ctx context.Context, displayRepo, owner, repo string, issue *gh.Issue, comments []*gh.IssueComment, la unparkLabelApproval, result *IssueUnparkSweepResult) (bool, error) {
 	number := issue.GetNumber()
 	labels := issueLabelNames(issue.Labels)
-	f, err := c.evaluateLabelApproval(ctx, owner, repo, issue, la.policy)
+	f, err := c.evaluateLabelApprovalFrom(ctx, owner, repo, issue, la.policy, func() ([]issueLabelEvent, error) {
+		return c.unparkLabelEvents(ctx, owner, repo, issue)
+	})
 	if err != nil {
 		return false, err
 	}
@@ -695,8 +847,9 @@ func (c *Client) postLabelApprovalReply(ctx context.Context, owner, repo string,
 
 // unparkLabelDrivenCommand answers `/hive approve` / `/hive decision` on a
 // label-driven repo with label approval configured (R5): it removes only the
-// park labels the hive itself added, adds the approval label, and says which
-// labels it left alone and who added them.
+// park labels the hive itself added, adds the approval label unless an
+// external needs-human remains, and says which labels it left alone and who
+// added them.
 func (c *Client) unparkLabelDrivenCommand(ctx context.Context, displayRepo, owner, repo string, issue *gh.Issue, candidate *gh.IssueComment, command unparkCommand, result *IssueUnparkSweepResult, audit func(IssueUnparkEvent)) (bool, error) {
 	number := issue.GetNumber()
 	labels := issueLabelNames(issue.Labels)
@@ -707,6 +860,7 @@ func (c *Client) unparkLabelDrivenCommand(ctx context.Context, displayRepo, owne
 	var removed []string
 	var kept []string
 	var stageLabels []string
+	acknowledge := true
 	for _, label := range labels {
 		if !c.isParkingLabel(label) {
 			continue
@@ -723,6 +877,9 @@ func (c *Client) unparkLabelDrivenCommand(ctx context.Context, displayRepo, owne
 				removed = append(removed, label)
 				continue
 			}
+			// A retained lifecycle park still needs a person. Adding an ack
+			// would contradict it and the stage engine would clear the ack.
+			acknowledge = false
 			note := fmt.Sprintf("`%s`", label)
 			if ok {
 				note = labelAttribution{Label: label, Actor: safeGetLogin(ev.Actor)}.String()
@@ -747,8 +904,8 @@ func (c *Client) unparkLabelDrivenCommand(ctx context.Context, displayRepo, owne
 	// The engine re-derives the stage from the labels left behind, so a kept
 	// park label (a person's or a lifecycle bot's `needs-human`) re-parks the
 	// issue at the same stage (hivecommons/hive#12715).
-	stayingStage := unparkStageThatStays(displayRepo, number, labels, removed, stageLabels)
-	if !labelPresent(labels, HumanAckLabel) {
+	stayingStage := unparkStageThatStays(displayRepo, number, labels, removed, stageLabels, acknowledge)
+	if acknowledge && !labelPresent(labels, HumanAckLabel) {
 		if _, _, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, number, []string{HumanAckLabel}); err != nil {
 			return false, fmt.Errorf("adding %s to %s/%s#%d: %w", HumanAckLabel, owner, repo, number, err)
 		}
@@ -770,7 +927,7 @@ func (c *Client) unparkLabelDrivenCommand(ctx context.Context, displayRepo, owne
 	gone, lingering := c.unparkStageLabelsLifted(ctx, owner, repo, number, lifting)
 	removed = append(removed, gone...)
 	decision := unparkCommandDecisionText(command)
-	reply := renderUnparkLabelDrivenAcceptedReply(actor, decision, removed, kept, stayingStage, lingering)
+	reply := renderUnparkLabelDrivenAcceptedReply(actor, decision, removed, kept, stayingStage, lingering, acknowledge)
 	if note := c.unparkIssueFilterNote(labels, removed); note != "" {
 		reply += "\n\n" + note
 	}
@@ -786,13 +943,21 @@ func (c *Client) unparkLabelDrivenCommand(ctx context.Context, displayRepo, owne
 }
 
 // unparkStageThatStays returns the stage label among stageLabels that the
-// issue still derives once the un-park has removed removed and applied
-// approved-direction, or "" when the park lifts.
-func unparkStageThatStays(displayRepo string, number int, labels, removed, stageLabels []string) string {
+// issue still derives once the un-park has removed removed and, when
+// acknowledge is set, applied approved-direction, or "" when the park
+// lifts. The ack is only counted when it is really applied: a kept
+// `needs-human` withholds it, and the engine reads a plain `needs-human`
+// as a 045 park but a `needs-human` beside the ack as held human work
+// (hivecommons/hive#16579), so seeding the ack unconditionally would
+// misreport a kept park as lifted.
+func unparkStageThatStays(displayRepo string, number int, labels, removed, stageLabels []string, acknowledge bool) string {
 	if len(stageLabels) == 0 {
 		return ""
 	}
-	after := []string{HumanAckLabel}
+	var after []string
+	if acknowledge {
+		after = append(after, HumanAckLabel)
+	}
 	for _, label := range labels {
 		if !labelPresent(removed, label) && !labelPresent(stageLabels, label) {
 			after = append(after, label)
@@ -810,9 +975,14 @@ func unparkStageThatStays(displayRepo string, number int, labels, removed, stage
 	return ""
 }
 
-func renderUnparkLabelDrivenAcceptedReply(actor, decision string, removed, kept []string, stayingStage string, lingering []string) string {
+func renderUnparkLabelDrivenAcceptedReply(actor, decision string, removed, kept []string, stayingStage string, lingering []string, acknowledge bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\nApproved by @%s. Decision: %s\n\n`%s` is applied", unparkAcceptedMarker, actor, decision, HumanAckLabel)
+	fmt.Fprintf(&b, "%s\nApproved by @%s. Decision: %s\n\n", unparkAcceptedMarker, actor, decision)
+	if acknowledge {
+		fmt.Fprintf(&b, "`%s` is applied", HumanAckLabel)
+	} else {
+		fmt.Fprintf(&b, "`%s` is not applied while `needs-human` remains", HumanAckLabel)
+	}
 	if len(removed) > 0 {
 		fmt.Fprintf(&b, " and Hive's own %s removed", quoteLabels(removed))
 	}
@@ -998,6 +1168,7 @@ func (c *Client) clearIssueParkingLabels(ctx context.Context, owner, repo string
 		return removed, err
 	}
 	gone, _ := c.unparkStageLabelsLifted(ctx, owner, repo, number, stageLabels)
+	notifyItemRefresh(owner+"/"+repo, number, false)
 	return append(removed, gone...), nil
 }
 
@@ -1047,22 +1218,43 @@ func (c *Client) answeredUnparkCommentIDs(comments []*gh.IssueComment) map[int64
 		if cm == nil || !c.markerAuthorTrusted(cm.GetUser()) {
 			continue
 		}
-		body := cm.GetBody()
-		idx := strings.Index(body, unparkReplyMarkerPrefix)
-		if idx < 0 {
-			continue
-		}
-		rest := body[idx+len(unparkReplyMarkerPrefix):]
-		end := strings.Index(rest, " ")
-		if end < 0 {
-			continue
-		}
-		var id int64
-		if _, err := fmt.Sscanf(rest[:end], "%d", &id); err == nil && id > 0 {
+		if id := unparkReplyAnsweredID(cm.GetBody()); id > 0 {
 			answered[id] = true
 		}
 	}
 	return answered
+}
+
+// unparkReplyAnsweredID reads the comment ID a hive reply's marker names,
+// or 0 when body carries no well-formed reply marker.
+func unparkReplyAnsweredID(body string) int64 {
+	idx := strings.Index(body, unparkReplyMarkerPrefix)
+	if idx < 0 {
+		return 0
+	}
+	rest := body[idx+len(unparkReplyMarkerPrefix):]
+	end := strings.Index(rest, " ")
+	if end < 0 {
+		return 0
+	}
+	var id int64
+	if _, err := fmt.Sscanf(rest[:end], "%d", &id); err != nil || id <= 0 {
+		return 0
+	}
+	return id
+}
+
+// unparkReplyAnswersApprove reports whether the hive reply body answers a
+// `/hive approve` command: the comment its marker names, read from byID,
+// carries one. A reply whose command comment is not in byID (deleted, or
+// a dashboard release with no marker) does not count.
+func (c *Client) unparkReplyAnswersApprove(body string, byID map[int64]*gh.IssueComment) bool {
+	cm := byID[unparkReplyAnsweredID(body)]
+	if cm == nil || c.isHiveAccount(cm.GetUser()) {
+		return false
+	}
+	cmd, ok := parseUnparkCommand(cm.GetBody())
+	return ok && cmd.Kind == unparkCommandApprove
 }
 
 // unparkCandidateLimit bounds the permission lookups one issue can cost in a
@@ -1080,7 +1272,10 @@ const unparkCandidateLimit = 5
 // every command posted before it is superseded and never replayed, even
 // after the issue is parked again (hivecommons/hive#14344). Otherwise a
 // retracted older decision would be acted on once the newer one is answered.
-func (c *Client) eligibleUnparkCommand(ctx context.Context, owner, repo string, comments []*gh.IssueComment, answered map[int64]bool, cutoff time.Time, allowTriage bool) (*gh.IssueComment, unparkCommand, error) {
+//
+// verbs are the bound workflow model's replies for the item's current state
+// (hivecommons/hive#17620); nil admits the built-in commands only.
+func (c *Client) eligibleUnparkCommand(ctx context.Context, owner, repo string, comments []*gh.IssueComment, answered map[int64]bool, cutoff time.Time, allowTriage bool, verbs []string) (*gh.IssueComment, unparkCommand, error) {
 	checked := 0
 	for i := len(comments) - 1; i >= 0 && checked < unparkCandidateLimit; i-- {
 		cm := comments[i]
@@ -1088,7 +1283,7 @@ func (c *Client) eligibleUnparkCommand(ctx context.Context, owner, repo string, 
 			continue
 		}
 		if answered[cm.GetID()] {
-			if isUnparkWatermarkCommand(cm.GetBody()) {
+			if isUnparkWatermarkCommandFor(cm.GetBody(), verbs) {
 				break
 			}
 			continue
@@ -1101,7 +1296,7 @@ func (c *Client) eligibleUnparkCommand(ctx context.Context, owner, repo string, 
 		if updated := cm.GetUpdatedAt().Time; updated.After(created) {
 			continue
 		}
-		cmd, isCommand := parseUnparkCommand(cm.GetBody())
+		cmd, isCommand := parseUnparkCommandFor(cm.GetBody(), verbs)
 		if !isCommand && !isUnparkProseAssent(cm.GetBody()) {
 			continue
 		}
@@ -1157,12 +1352,18 @@ func renderUnparkAIAuthorRefusal(login string) string {
 // isUnparkWatermarkCommand reports whether an answered comment carried a
 // command that acted on the park state, so nothing older may be replayed.
 func isUnparkWatermarkCommand(body string) bool {
-	cmd, ok := parseUnparkCommand(body)
+	return isUnparkWatermarkCommandFor(body, nil)
+}
+
+// isUnparkWatermarkCommandFor is isUnparkWatermarkCommand with a bound
+// model's reply verbs: an answered model reply is a watermark too.
+func isUnparkWatermarkCommandFor(body string, verbs []string) bool {
+	cmd, ok := parseUnparkCommandFor(body, verbs)
 	if !ok {
 		return false
 	}
 	switch cmd.Kind {
-	case unparkCommandApprove, unparkCommandDecision, unparkCommandFixed:
+	case unparkCommandApprove, unparkCommandDecision, unparkCommandFixed, unparkCommandModelReply:
 		return true
 	}
 	return false
@@ -1381,7 +1582,7 @@ func renderUnparkHelpFor(menu unparkMenu) string {
 }
 
 func renderUnparkHelpForPolicy(menu unparkMenu, releaseOnApprove bool) string {
-	return "**Maintainer commands**\n" + menu.sourceLine() + menu.bulletsFor(releaseOnApprove) + "\n" + maintainerCommandReference()
+	return menu.unparkReplyBox("**Maintainer commands**", releaseOnApprove) + "\n" + maintainerCommandReference()
 }
 
 // unparkNoticeBody is the "What to reply" comment kept on every parked issue.
@@ -1395,7 +1596,7 @@ func renderUnparkNotice(menu unparkMenu) string {
 }
 
 func renderUnparkNoticeForPolicy(menu unparkMenu, releaseOnApprove bool) string {
-	return unparkNoticeMarker + "\n**What to reply**\n" + menu.sourceLine() + menu.bulletsFor(releaseOnApprove) +
+	return unparkNoticeMarker + "\n" + menu.unparkReplyBox("**What to reply**", releaseOnApprove) +
 		"\nIf what this issue waited on has been done (a merged fix, or an action taken outside this repository), a maintainer can reply `/fixed` to close it as completed; Hive clears its park labels.\n\n" +
 		fmt.Sprintf("_Only a maintainer with write access can un-park; everything else is ignored. Full command reference: %s._", maintainerCommandsDocURL)
 }
@@ -1417,8 +1618,8 @@ func maintainerCommandReference() string {
 }
 
 // unparkOptionLabels finds the lettered options an issue offers, e.g. a line
-// starting "Option B:" or "- **C.**". Only A-F, in the order they appear, and
-// each one once.
+// starting "Option B:", "- **C.**" or "- A:". Only A-F, in the order they
+// appear, and each one once.
 func unparkOptionLabels(issueBody string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -1464,12 +1665,13 @@ var unparkHTMLCommentPattern = regexp.MustCompile(`<!--.*?(-->|$)`)
 // into the hive-authored notice, and @mentions are defanged so quoting the
 // option notifies nobody.
 //
-// Invariant: the byte offsets below mirror unparkOptionLetter and
-// unparkBoldOptionLetter, which have already validated the line's shape by
-// the time the guard on the first line passes. "Option X" lines yield a rest
-// starting at the single-byte letter; bold lines are "**X" after trimming
-// list markers, so b[2:] is the letter and rest[1:] skips it. Change those
-// parsers and this slicing together.
+// Invariant: the byte offsets below mirror unparkOptionLetter,
+// unparkBoldOptionLetter and unparkPlainOptionAt, which have already
+// validated the line's shape by the time the guard on the first line passes.
+// "Option X" lines yield a rest starting at the single-byte letter; bold lines
+// are "**X" after trimming list markers, so b[2:] is the letter; plain list
+// items yield a rest starting at the letter; and rest[1:] skips it. Change
+// those parsers and this slicing together.
 func unparkOptionSummary(line string) string {
 	if unparkOptionLetter(line) == "" {
 		return ""
@@ -1477,13 +1679,24 @@ func unparkOptionSummary(line string) string {
 	t := strings.TrimLeft(strings.TrimSpace(line), "-*# \t")
 	t = strings.TrimPrefix(t, "**")
 	var rest string
-	if strings.HasPrefix(strings.ToLower(t), "option ") {
+	switch {
+	case strings.HasPrefix(strings.ToLower(t), "option "):
 		rest = strings.TrimSpace(t[len("option "):])
-	} else {
+	case unparkBoldOptionLetter(line) != "":
 		b := strings.TrimLeft(strings.TrimSpace(line), "-+ \t")
 		rest = b[2:]
+	default:
+		rest = unparkPlainOptionAt(line)
 	}
-	rest = rest[1:]
+	return unparkCleanOptionSummary(rest[1:])
+}
+
+// unparkCleanOptionSummary turns the text after an option's marker into its
+// one-line summary: separators and a closing bold marker trimmed, HTML
+// comments removed and @mentions defanged (the text is untrusted and is
+// quoted in hive-authored comments), whitespace collapsed, cut to
+// unparkOptionSummaryMax runes.
+func unparkCleanOptionSummary(rest string) string {
 	rest = strings.TrimLeftFunc(rest, func(r rune) bool { return strings.ContainsRune(" \t*.:)—–-", r) })
 	rest = strings.TrimSpace(rest)
 	rest = strings.TrimSpace(strings.TrimSuffix(rest, "**"))
@@ -1501,7 +1714,13 @@ func unparkOptionLetter(line string) string {
 	trimmed = strings.TrimPrefix(trimmed, "**")
 	lower := strings.ToLower(trimmed)
 	if !strings.HasPrefix(lower, "option ") {
-		return unparkBoldOptionLetter(line)
+		if letter := unparkBoldOptionLetter(line); letter != "" {
+			return letter
+		}
+		if rest := unparkPlainOptionAt(line); rest != "" {
+			return rest[:1]
+		}
+		return ""
 	}
 	rest := strings.TrimSpace(trimmed[len("option "):])
 	if rest == "" {
@@ -1517,28 +1736,93 @@ func unparkOptionLetter(line string) string {
 	return letter
 }
 
-// ensureUnparkNoticeComment posts the "What to reply" block once per parked
-// issue and edits it in place when the issue's options change, so a maintainer
-// reading the bottom of the issue always sees the current commands. Options
-// and owner-only steps the hive posted in comments count as well as the body.
-func (c *Client) ensureUnparkNoticeComment(ctx context.Context, owner, repo string, number int, issueBody string, issueAuthor *gh.User, comments []*gh.IssueComment, releaseOnApprove bool) error {
-	desired := renderUnparkNoticeForPolicy(c.unparkMenuFor(issueBody, issueAuthor, comments), releaseOnApprove)
-	for _, cm := range comments {
-		if cm == nil || !strings.Contains(cm.GetBody(), unparkNoticeMarker) {
-			continue
+// ensureUnparkNoticeComment keeps the "What to reply" block as the newest
+// comment on a parked issue, so a maintainer reading the bottom of the issue
+// always sees the current commands. Options and owner-only steps the hive
+// posted in comments count as well as the body.
+//
+// While nothing newer buries it, the notice is edited in place when the
+// options change. Once a later comment buries it (an agent's new owner step,
+// a question, a re-check note), a fresh notice is posted at the bottom and
+// the old one is deleted, so the thread keeps exactly one notice. A
+// maintainer's command and the hive's reply to it do not bury the notice:
+// the command is answered in the same pass, and an accepted one un-parks the
+// issue. Earlier notices left by an interrupted move are deleted too. Moving
+// and deleting consult the write-back gate (KindNeedsDecisionComment, as the
+// park re-check note does); a refusal keeps the in-place edit.
+func (c *Client) ensureUnparkNoticeComment(ctx context.Context, owner, repo string, issue *gh.Issue, comments []*gh.IssueComment, releaseOnApprove bool) error {
+	number := issue.GetNumber()
+	// A write here changes the comments the sweep cached for the item.
+	wrote := false
+	defer func() {
+		if wrote {
+			c.forgetUnparkRead(ctx, owner, repo, number)
 		}
-		if cm.GetBody() == desired {
-			return nil
+	}()
+	desired := renderUnparkNoticeForPolicy(c.unparkMenuFor(issue.GetBody(), issue.GetUser(), comments), releaseOnApprove)
+	var notices []*gh.IssueComment
+	last := -1
+	for i, cm := range comments {
+		if cm != nil && strings.Contains(cm.GetBody(), unparkNoticeMarker) {
+			notices = append(notices, cm)
+			last = i
 		}
-		if _, _, err := c.client.Issues.EditComment(ctx, owner, repo, cm.GetID(), &gh.IssueComment{Body: gh.Ptr(desired)}); err != nil {
-			return fmt.Errorf("editing unpark notice on %s/%s#%d: %w", owner, repo, number, err)
+	}
+	if last < 0 {
+		wrote = true
+		if _, _, err := c.client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(desired)}); err != nil {
+			return fmt.Errorf("creating unpark notice on %s/%s#%d: %w", owner, repo, number, err)
 		}
 		return nil
 	}
-	if _, _, err := c.client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(desired)}); err != nil {
-		return fmt.Errorf("creating unpark notice on %s/%s#%d: %w", owner, repo, number, err)
+	// The move and the clean-up of leftover notices consult the gate; a
+	// refusal deletes nothing and keeps the in-place edit.
+	stale, moved := notices[:len(notices)-1], false
+	if buried := unparkNoticeBuried(comments[last+1:]); buried || len(stale) > 0 {
+		item := c.WritebackItemForIssue(Issue{Number: number, Author: safeGetLogin(issue.GetUser()), Labels: issueLabelNames(issue.Labels), CreatedAt: issue.GetCreatedAt().Time})
+		if d := c.WritebackAllowed(owner+"/"+repo, item, writeback.KindNeedsDecisionComment, desired); !d.Allowed {
+			stale = nil
+		} else if buried {
+			wrote = true
+			if _, _, err := c.client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(desired)}); err != nil { // writeback:gated
+				return fmt.Errorf("moving unpark notice to the bottom of %s/%s#%d: %w", owner, repo, number, err)
+			}
+			stale, moved = notices, true
+		}
+	}
+	if keep := notices[len(notices)-1]; !moved && keep.GetBody() != desired {
+		wrote = true
+		if _, _, err := c.client.Issues.EditComment(ctx, owner, repo, keep.GetID(), &gh.IssueComment{Body: gh.Ptr(desired)}); err != nil {
+			return fmt.Errorf("editing unpark notice on %s/%s#%d: %w", owner, repo, number, err)
+		}
+	}
+	for _, cm := range stale {
+		wrote = true
+		if _, err := c.client.Issues.DeleteComment(ctx, owner, repo, cm.GetID()); err != nil { // writeback:gated
+			return fmt.Errorf("deleting buried unpark notice on %s/%s#%d: %w", owner, repo, number, err)
+		}
 	}
 	return nil
+}
+
+// unparkNoticeBuried reports whether any comment posted after the notice
+// pushes it off the bottom of the issue. A maintainer's command and the
+// hive's reply to one do not: the command is answered in the same pass.
+func unparkNoticeBuried(after []*gh.IssueComment) bool {
+	for _, cm := range after {
+		if cm == nil {
+			continue
+		}
+		body := cm.GetBody()
+		if strings.Contains(body, unparkNoticeMarker) || strings.Contains(body, unparkReplyMarkerPrefix) {
+			continue
+		}
+		if _, ok := parseUnparkCommand(body); ok {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // postUnparkReply answers one command comment exactly once; the marker carries
@@ -1625,4 +1909,15 @@ func renderUnparkFixedReply(actor, note string, removed []string) string {
 	}
 	b.WriteString("; any `hold` label is left exactly as it was.\n\nIf this was closed by mistake, the reporter or a maintainer can comment `/reopen`.")
 	return b.String()
+}
+
+// isHeldAfterDecision reports an issue held after a human decision:
+// `needs-human` beside the approval label and without a stage/045 park label.
+// Nothing is open to decide on it, so the sweep stops offering `/hive approve`
+// / `/hive decision` (hivecommons/hive#16591) while still answering any
+// command a maintainer posts.
+func isHeldAfterDecision(labels []string) bool {
+	return hasIssueNeedsHumanLabel(labels) && labelPresent(labels, HumanAckLabel) &&
+		!labelPresent(labels, NeedsDecisionStageLabel) && !labelPresent(labels, legacyIssueNeedsDecisionStageLabel) &&
+		!labelPresent(labels, issueNeedsDecisionLabel) && !labelPresent(labels, issueNeedsDirectionLabel)
 }

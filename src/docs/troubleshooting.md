@@ -1,8 +1,46 @@
 # Hive troubleshooting
 
-This guide covers the current containerized Go service (branch `v4`; code under the `src/` directory). Hive runs as an in-process supervisor: the governor loop, health checks, login detection, and notifications all run inside the `hive` process — there is no separate systemd supervisor, `bin/supervisor.sh` loop, `hive-healthcheck.service` timer, or `/etc/hive/agent.env` file. Those, along with `AGENT_LOOP_PROMPT`, `AGENT_READY_MARKER`, `AGENT_AUTO_APPROVE_PHRASE`, and `install.sh`/`uninstall.sh`, belong to the legacy v1 host install and do not apply here.
+This guide covers the containerized Go service (code under `src/`, including
+the current v5 line). Start with the dashboard and service logs, then choose
+the symptom and access level below.
 
-Start most investigations from the dashboard and the service logs, then drop to the sections below for a specific failure mode.
+Hive supervises agents **inside the `hive` process**: the governor loop,
+health checks, login detection and notifications are not a separate systemd
+supervisor. **Podman Quadlet systemd units are supported** for the container
+lifecycle; that is a different layer.
+
+The separate `bin/supervisor.sh` loop, `hive-healthcheck.service` timer,
+`/etc/hive/agent.env`, `AGENT_LOOP_PROMPT`, `AGENT_READY_MARKER`,
+`AGENT_AUTO_APPROVE_PHRASE`, and `install.sh`/`uninstall.sh` belong to the
+legacy v1 host install and do not apply here.
+
+## Choose a symptom and access level
+
+| Symptom / task | First check | Access for repair |
+|---|---|---|
+| Hive unavailable / startup failing | [Running service logs](#find-the-running-service-logs) | Deployment host or Kubernetes admin; hosted owners request operator help |
+| Config rejected or crash-looping after an edit | [Config load/save](#config-fails-to-load-or-save), then `hive validate` against the real overlays | Deployment/container shell; do not validate only a copied seed file |
+| GitHub work disabled | [Credentials](#github-credentials-are-missing-or-invalid) | Dashboard owner; App installation changes need the GitHub installation owner |
+| Workflow-file push rejected | [Workflows permission](#workflow-file-pushes-are-rejected-by-github-app-tokens) | GitHub organization/App owner, not a coding agent |
+| Hosted hive gone permanently | [Hosted hive recovery](#hosted-hive-disappeared-or-its-url-times-out) | Hosted owner requests a new hive |
+| Agent idle, paused or not scheduled | [Agent card](#start-on-the-agent-card-not-in-tmux) | Dashboard operator first; container shell only if needed |
+| CLI restarted at an empty prompt | [Resume-kick diagnosis](#cli-restarted-at-an-empty-prompt) | Dashboard operator |
+| Repeated CLI deaths but no pod restart | [Memory-kill diagnosis](#cli-dies-without-a-pod-restart) | Host/cluster admin for memory limits; operator for concurrency |
+| Need logs without host access | [No-shell route](#no-shell-on-the-host) | Admin MCP is **v6-only**, not assumed available on v5 |
+| Notifications absent | [Notification checks](#notifications-ntfy--slack--discord-never-arrive) | Dashboard operator; outbound-network test needs container shell |
+| Agent committed but no remote branch/PR | [Publication diagnosis](#an-agent-session-completes-but-no-branch-or-pr-appears) | Container shell, with the agent's UID/HOME |
+| Login repeats or Copilot licensing fails | [Login loop](#an-agent-says-please-run-login-but-logging-in-changes-nothing), [license check](#every-copilot-agent-says-you-are-not-licensed-to-use-copilot) | Backend account owner; container admin for file-access repair |
+| Browser terminal frozen | [Terminal recovery](#the-terminal-looks-frozen--no-new-output-and-reopening-it-doesnt-help) | Browser/dashboard first; container shell only for deeper diagnosis |
+| Agent behavior/model unexpected | [Reasoning logs](#an-agent-runs-but-not-the-way-i-expect--why-did-it-do-that), [model selection](#switching-an-agents-model) | Dashboard operator |
+| Dashboard access or API startup delays | [Auth/access](#dashboard-auth-and-access-problems), [startup response](#the-api-says-service-starting-up-please-retry), [health endpoints](#health-endpoints) | Dashboard owner or deployment admin, according to the failing layer |
+| Request/effect operation stuck | [Ledger diagnosis](#the-dashboard-shows-issue-request-stuck-or-effect-ledger-op-stuck) | Dashboard evidence first; deployment admin for deeper repair |
+| Upgrade failed or Podman service will not start | [Upgrade status](#the-version-badge-says--auto-update-failed-or--auto-update-retrying), [Quadlet failure modes](#podman-quadlet-deployments-failure-modes-docker-does-not-have) | Host admin or cluster admin for the deployed runtime |
+| Intentionally erase and rebuild state | [Clean reset](#clean-reset) | Deployment admin; **destructive, back up first** |
+
+Commands labelled Docker/Podman require the deployment host's runtime access;
+`kubectl` commands require cluster credentials and the correct namespace.
+`tmux`/agent credential-file checks require a shell **inside the Hive
+container**, not an unrelated host session. Do not print credential contents.
 
 ## Find the running service logs
 
@@ -14,7 +52,9 @@ docker compose -f src/docker-compose.yaml logs hive --tail=200
 docker compose -f src/docker-compose.yaml logs gateway --tail=100
 ```
 
-Kubernetes deployments use namespace `hive`, Deployment `hive`, Service `hive`, and probes on `/api/health` and `/api/livez` in `src/deploy/k8s/deployment.yaml`:
+**Access: Kubernetes admin.** The standalone manifests use namespace `hive`,
+Deployment `hive`, Service `hive`, and probes on `/api/health` and `/api/livez`
+in `src/deploy/k8s/deployment.yaml`; hosted namespaces can differ:
 
 ```bash
 kubectl -n hive get deploy,pod,svc,pvc
@@ -54,8 +94,8 @@ In Kubernetes, edit the ConfigMap/Secret source and restart the pod; dashboard e
 
 ### Validate without booting: `hive validate`
 
-Since v4.15.0 (#6027) you do not have to apply a config and watch for a
-crash-loop to learn whether it is valid. `hive validate` (alias
+**Access: deployment/container shell.** Validate before applying a config,
+without starting the service. `hive validate` (alias
 `hive --config-check`) loads the config byte-for-byte the way a real boot does
 — `config.LoadWithDashboardOverlay`, so the dashboard overlay
 (`/data/hive.yaml.dashboard`) **and** the per-agent overlay files under
@@ -97,7 +137,7 @@ podman exec hive hive validate                  # Podman
 
 ## GitHub credentials are missing or invalid
 
-When no token or App credentials are usable, Hive starts the dashboard but disables write-capable GitHub work. The code logs these exact messages from `src/cmd/hive/main.go` depending on the state:
+When no token or App credentials are usable, Hive starts the dashboard but disables write-capable GitHub work. The code logs these exact messages from `src/cmd/hive/main_github_app.go` depending on the state:
 
 - `no GitHub token configured (set github.token or github.app_id in config) — starting in dashboard-only mode`
 - `GitHub App configured without credentials — hive starting in dashboard-only mode. Install the app and provide installation_id + key to enable agents.`
@@ -177,16 +217,77 @@ Two more card behaviors remove the old one-reason-per-click treasure hunt:
 
 - **Zero cadence is named.** An enabled, governor-kickable agent with no cadence in *any* mode that has never been kicked shows a `⏱ never scheduled — set cadences` chip; clicking it opens the agent's Cadences tab. This is the per-agent form of the fleet-level "never kicked" banner — both are driven by the same predicate, so they cannot name different agents.
 - **A cadence in the wrong mode is named too** ([#7474](https://github.com/hivecommons/hive/issues/7474)). An agent that *some* mode schedules but the current one does not — no entry for the current mode, and none in `idle`, which every other mode inherits — is not kicked until the mode changes, and would otherwise read as healthy: enabled, session up, a cadence configured, not on-demand. The card renders it in the same hollow-green "off" state as a governor-paused agent, the `scheduling` segment reads `no cadence in busy (only in surge)`, and the fleet banner `agent(s) reviewer (cadence only in surge) not scheduled in the current busy mode …` names the same agents. The shape to look for is a cadence **only in `surge`**: the agent runs while the backlog holds the fleet in surge, and its own success — driving the backlog below the threshold — removes its schedule. Add an entry for the mode the fleet is in, or an `idle` entry to cover every mode. An explicit `pause`/`off` entry is not this: that is an operator choice, and the card reports it as `off in <mode> mode`.
-- **A crash-restarted agent sitting at an empty prompt is named too.** When an agent's CLI dies mid-turn, hive relaunches it, but the *resume kick* - the early kick that would let it pick the work back up - goes through the governor gate ([#2573](https://github.com/hivecommons/hive/issues/2573)): at most one resume kick per cadence interval, none while the mode pauses or does not schedule the agent, none for on-demand or time-of-day agents, none while the budget is exhausted. Only the first case (`interval_throttle`: a second crash inside the same interval) leaves an agent that is expected to work idle until its next scheduled slot, so only that case raises the fleet banner `agent scanner is idle at a fresh prompt: its CLI crashed and was restarted, but the resume-kick gate refused an early kick (one resume kick per cadence interval) - kick it from the agent card now, or wait for its next scheduled slot`. The other refusals get no per-agent banner ([#9612](https://github.com/hivecommons/hive/issues/9612)): a paused, unscheduled, on-demand or non-interval agent is idle by configuration and only logs `restarted agent NOT resume-kicked (cadence/budget gate); idle by configuration` (info, with `reason=`), and a budget refusal logs `...; budget exhausted, kicks suspended` and is covered by the fleet-wide `token budget exhausted` banner. The throttle log line is still `restarted agent NOT resume-kicked (cadence/budget gate); it idles until its next scheduled slot`, now with `reason=interval_throttle`. The banner is reconciled every eval cycle and clears as soon as any of these holds: a kick (scheduled or manual) reached the agent; the agent is operator-paused, disabled, or gone from the roster; its session was busy or working again; the gate would now refuse it for a non-throttle reason (for example the mode changed to one that pauses it); or the banner is older than two cadence intervals (6h when the interval is unknown). When the crash coincides with a rise in the container's cgroup `oom_kill` counter (`/sys/fs/cgroup/memory.events` or the v1 `memory/memory.oom_control`), the banner says `OOM-killed (container hit its memory limit)` instead, and the log carries `agent crash coincides with cgroup OOM kills` with the before/after counts: the kernel killed the largest process in the pod — almost always an agent CLI — without restarting the container, so Kubernetes shows no `OOMKilled` and no pod restart. The remedy is the pod memory limit (the hub provisions new spokes at 16Gi for exactly this reason) or fewer concurrent sub-agents, not another kick.
+- **Crash-restarted at an empty prompt:** follow the [resume-kick checks](#cli-restarted-at-an-empty-prompt).
+  If the banner says `OOM-killed (container hit its memory limit)`, use the
+  [memory-kill checks](#cli-dies-without-a-pod-restart) instead; another kick
+  does not repair memory exhaustion.
 - **A paused agent's primary action is always its pause toggle.** With a live session the button is `▶ resume`, and its tooltip names anything resuming will *not* clear. If the session is also down, the one button reads `▶ start & resume` and clears both flags in a single click — client-side chaining of the two existing endpoints (`POST /api/resume/{agent}` first, so the fresh session is never born paused, then `POST /api/restart/{agent}`). No new API surface; scripts can chain the same two calls. A paused agent never offers a bare Start.
 
 If the card says the agent should be running (session up, scheduling shows a cadence, next kick has an ETA) and it still misbehaves, *then* drop into the session as described below.
 
+### CLI restarted at an empty prompt
+
+**First check — dashboard access:** read the agent card and fleet banner.
+Hive relaunched the CLI after a mid-turn crash, but an early **resume kick**
+(the prompt to continue work) can be refused by the governor.
+
+| What you see | Meaning | Next action |
+|---|---|---|
+| Banner says the resume-kick gate refused an early kick | `interval_throttle`: a second crash within the same cadence interval | Kick from the agent card now, or wait for the next scheduled slot |
+| No per-agent banner; card shows pause, no schedule, on-demand or time-of-day scheduling | Idle by configuration | Change only the intended scheduling/pause setting; restarting the CLI does not change it |
+| Fleet-wide `token budget exhausted` banner | Budget refused the kick | Resolve the budget condition; do not treat it as a missing session |
+
+**Limits:** at most one resume kick per cadence interval; none while the mode
+pauses or does not schedule the agent, for on-demand/time-of-day agents, or
+while the budget is exhausted.
+
+<details>
+<summary>Exact logs and banner reconciliation (diagnostic reference)</summary>
+
+- Throttle: `restarted agent NOT resume-kicked (cadence/budget gate); it idles until its next scheduled slot`,
+  with `reason=interval_throttle`.
+- Configuration refusal (info, with `reason=`):
+  `restarted agent NOT resume-kicked (cadence/budget gate); idle by configuration`.
+- Budget refusal: `...; budget exhausted, kicks suspended`.
+- Only throttling raises the per-agent fleet banner:
+  `agent scanner is idle at a fresh prompt: its CLI crashed and was restarted, but the resume-kick gate refused an early kick (one resume kick per cadence interval) - kick it from the agent card now, or wait for its next scheduled slot`.
+- Every evaluation reconciles that banner. It clears when a scheduled/manual
+  kick reaches the agent; the agent is operator-paused, disabled or removed;
+  its session is busy/working; a non-throttle gate would now refuse it (such
+  as a mode change to pause); or it is older than two cadence intervals
+  (6h when the interval is unknown).
+
+Background: [resume gate #2573](https://github.com/hivecommons/hive/issues/2573)
+and [refusal reporting #9612](https://github.com/hivecommons/hive/issues/9612).
+
+</details>
+
+### CLI dies without a pod restart
+
+**First check — dashboard/log access:** look for
+`OOM-killed (container hit its memory limit)` on the agent banner and
+`agent crash coincides with cgroup OOM kills` in the logs (before/after
+counts). A **cgroup** is the kernel's resource-accounting group; **OOM**
+means out of memory.
+
+**Repair — deployment admin plus operator:** inspect/raise the pod's memory
+limit or reduce concurrent sub-agents. New hub-provisioned spokes use 16Gi
+for this reason; do not assume an existing spoke has that limit. Another
+kick does not solve memory pressure.
+
+**Why Kubernetes can look healthy:** the kernel can kill an agent CLI inside
+the container without killing its main process, so there is no pod restart
+and no Kubernetes `OOMKilled` status. With container-shell access, the
+confirming counter is `oom_kill` in `/sys/fs/cgroup/memory.events`
+(or cgroup v1 `memory/memory.oom_control`).
+
 ### Inspecting the session
+
+**Access: shell inside the Hive container/pod.**
 
 Agents run in tmux sessions named `hive-<agent>` managed by Hive's agent manager. There is no v1 `AGENT_READY_MARKER` or `bin/supervisor.sh` loop: the manager drives each agent by delivering a *kick* (its next work prompt) directly into the session and, once running, auto-dismisses the CLI's own startup consent screens.
 
-The login detector (`scanForLoginRequired` in `src/cmd/hive/main.go`) scans recent tmux pane output for the regexes in `governor.sensing.login_patterns`. On a match it logs `login required detected`, pauses the agent, and sends a high-priority notification telling you to attach to `hive-<agent>` and run that backend's login command.
+The login detector (`scanForLoginRequired` in `src/cmd/hive/main.go`) scans recent tmux pane output for the regexes in `governor.sensing.login_patterns`. On a match it logs `login required detected`, pauses the agent, and sends a high-priority notification telling you to attach to `hive-<agent>` and run that backend's login command. For a `claude` agent running on the operator's long-lived token (`HIVE_CLAUDE_OAUTH_TOKEN` or its `_FILE` source) the notification is titled `Claude token rejected: <agent>` instead and omits the login command, since `/login` cannot fix a rejected token; follow [Replace a Claude operator token](backend-auth-recovery-runbook.md#replace-a-claude-operator-token) in the runbook.
 
 Useful checks from inside the Hive container/pod:
 
@@ -202,6 +303,8 @@ To recover a paused agent:
 
 1. Complete the CLI login for that backend outside the pause. Attach to the session (`tmux attach -t hive-<agent>`) and run the login command shown in the notification: `claude login`, `copilot auth login`, `gemini auth login`, or the backend-specific command. The picker expects an interactive OAuth/browser flow, so complete it from a terminal you control rather than leaving the unattended session blocked on it.
 2. Resume the agent from the dashboard, or `POST /api/resume/{agent}`. If the pause outlived its session, the card offers a single `▶ start & resume` instead — see [Start on the agent card, not in tmux](#start-on-the-agent-card-not-in-tmux).
+
+For `claude` agents you rarely need step 2. A successful dashboard Claude sign-in (the agent card's **Sign in Claude for all agents** button, which is one fleet-wide sign-in, not a per-agent login) resumes every claude agent that the login detector paused. It resumes only those: a pause with any other trigger, such as an operator's (`dashboard-api`), the fleet breaker's or a hook's, stays as it is. Each resume is in the Audit Log as `resume` with `trigger=claude-sign-in`, and the sign-in's `claude_auth_complete` entry lists the agents it resumed. The sign-in also re-links any agent whose credential link a token refresh had broken; such an agent's card says **credential bridge broken (private stale file)** until then (see [the agent watchdog notes](agent-watchdog.md#some-claude-agents-stay-on-login-expired-after-a-sign-in)).
 
 If an agent returns to "needs login" immediately after resuming, the credentials themselves are the problem (expired token, revoked API key, or an account-level sign-out). Re-authenticate that backend's CLI as the agent user, then resume again so the fresh session is picked up.
 
@@ -471,6 +574,24 @@ a login prompt: it badged the agent 🔑, and — because a valid token was on d
 auto-restarted it straight back into the same 403, which looked like the agent
 crash-looping. Hive no longer treats a 403 as a login signal; a 401 still is.
 
+## An agent shows "model … rejected by the CLI"
+
+```
+● There's an issue with the selected model (claude-sonnet-5.5). It may not exist or you may not have access to it. Run /model to pick a different model.
+```
+
+That is Claude Code refusing the model id the agent was launched with. The agent's login is fine, which is why its AUTH badge still says logged in; the model id is the problem. Usually it is a typo, such as `claude-sonnet-5.5` where the id is `claude-sonnet-5-5`, or a model this account cannot use.
+
+What hive does about it:
+
+- The agent card shows **blocked: inference (model_rejected): model `<id>` rejected by the CLI: …**, and `/api/status` carries the same text in the agent's status evidence and `lastError`.
+- Kicks back off instead of re-sending work into the same refusal. The first wait is 2 minutes and it doubles after each refusal, using the same backoff as other provider errors (`HIVE_PROVIDER_ERROR_BACKOFF_BASE` and `HIVE_PROVIDER_ERROR_BACKOFF_MAX` in [env-vars.md](env-vars.md)). Automatic restarts are held for the same window, because a restart relaunches with the same `--model` and cannot fix it.
+- After **3 refusals of the same id in a row** (one per kicked turn), the agent is paused with trigger `model-rejected` and the reason `model <id> rejected by the CLI 3 times in a row; set a valid model for this agent (the change resumes it)`.
+
+To fix it, set a valid model for the agent (the model picker on its dashboard card or its settings dialog, `PUT /api/config/agent/{name}/models`, or `hivectl agent model-set`). Changing the model or the backend resumes an agent with the `model-rejected` pause and restarts it on the new model, so you do not need to resume it as well; the audit log records the resume with trigger `model-change`. A change does not lift any other pause: an agent you paused yourself stays paused. Picking a different model also clears the backoff at once. If you resume without changing the model, the agent gets three fresh tries and is paused again if the CLI still refuses it, and the same happens if the new model is refused too.
+
+Before this, nothing classified the refusal. Each relaunch cleared the agent's last error, the card showed a healthy, logged-in agent, and the agent kept cycling between kicks and restarts (502 restarts in 24 hours on one hive).
+
 ## Every Copilot agent says "You are not licensed to use Copilot"
 
 ```
@@ -642,7 +763,7 @@ Or from the dashboard (which calls `POST /api/model/{agent}/{model}`). Both pers
 
 Two gotchas:
 
-- **Slug spelling is backend-specific.** The Claude CLI expects hyphens (`claude-opus-4-8`); Copilot uses dots (`claude-opus-4.8`). A mis-normalized slug is rejected by that backend. The dashboard offers candidate ids from live `/v1/models` discovery, with a static fallback list in `src/pkg/dashboard/cli_models.go`.
+- **Slug spelling is backend-specific.** The Claude CLI expects hyphens (`claude-opus-4-8`); Copilot uses dots (`claude-opus-4.8`). A mis-normalized slug is rejected by that backend. The dashboard offers candidate ids from live `/v1/models` discovery, with a static fallback list in `src/pkg/dashboard/cli_models.go`. On the `claude` backend a dotted `claude-…` id is refused when you save it (`400`, with the dashed spelling suggested); see [Model ids are checked when you save them](agent-configuration.md#model-ids-are-checked-when-you-save-them).
 - **A change that is not operator-owned reverts on restart.** If the model appears to "come back" to the pack default, it was set through a path that did not mark it operator-owned. The `hivectl` and dashboard routes above set operator ownership precisely to prevent that reconciliation.
 
 ## Dashboard auth and access problems
@@ -701,7 +822,9 @@ when self-reporting is enabled, as a `[selfreport]` issue.
   mutation journal (`/data/convergence/mutation/journal.json` in the pod). Check whether the effect
   exists on GitHub; the owning call site reconciles it on its next pass, or
   the op resolves once the request behind it is removed. A watcher retrying
-  a doomed request keeps the op pinned, so fix the request first.
+  a doomed request keeps the op pinned, so fix the request first. An
+  `issue_create` op still refused after 1h is expired to NotApplied by the
+  boundary itself and the report clears.
 - **`unclassified_error_repeated`** — any WARN/ERROR line repeated five times
   in ten minutes. The report's message is the normalised line; grep the log
   for it (`kubectl -n hive logs deploy/hive | grep -F "<message>"`) to find
@@ -866,6 +989,10 @@ Rootless, and the archive was written by a root process — anything from Docker
 Auto-update is opt-in and off by default. If it rolled back, the published image is bad and **will be retried on the next timer firing** — the unit's own state stays green throughout. If it reports success but changes nothing, a digest pin is probably in force. Both are covered in [podman-auto-update.md](podman-auto-update.md).
 
 ## Clean reset
+
+**Access: deployment administrator.** This is data deletion, not a routine
+restart or login repair. Stop work and make a recoverable backup first;
+hosted dashboard owners must ask their hub operator.
 
 There is no `uninstall.sh`/`install.sh` on the containerized runtime. To start from a clean state, remove the process and its `/data` state, then bring it back:
 

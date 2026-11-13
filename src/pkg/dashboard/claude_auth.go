@@ -57,14 +57,13 @@ func (s *Server) registerClaudeAuthRoutes() {
 	s.mux.HandleFunc("POST /api/claude-auth/logout", s.handleClaudeAuthLogout)
 }
 
-// handleClaudeAuthStatus returns the current Claude auth state.
+// handleClaudeAuthStatus returns the current Claude auth state and which mode
+// is active: the operator's long-lived token or the dashboard sign-in. It
+// never returns token material, so the admin MCP claude_auth_status tool can
+// read it.
 func (s *Server) handleClaudeAuthStatus(w http.ResponseWriter, r *http.Request) {
-	token := claudeReadToken(claudeCredPath)
-	if token == "" {
-		jsonResponse(w, map[string]interface{}{"logged_in": false})
-		return
-	}
-	jsonResponse(w, map[string]interface{}{"logged_in": true})
+	mode := claude.AuthMode()
+	jsonResponse(w, map[string]interface{}{"logged_in": claudeSignedIn(), "mode": mode})
 }
 
 // handleClaudeAuthStart generates PKCE params and returns the authorize URL.
@@ -165,6 +164,10 @@ func (s *Server) handleClaudeAuthExchange(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Record the plan behind the token, as Claude Code does after its own
+	// sign-in. Never blocks the sign-in.
+	s.stampClaudePlan(r, tokens)
+
 	if err := claudeWriteCreds(tokens, claudeCredPath); err != nil {
 		jsonError(w, "Failed to save credentials: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -179,9 +182,13 @@ func (s *Server) handleClaudeAuthExchange(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// Tell the agent manager to pick up the new token.
+	// Tell the agent manager to pick up the new token. With a usable shared
+	// credential this also re-bridges every agent whose link to it a token
+	// refresh had replaced with a private file (agent.Manager.ReloadClaudeToken).
+	var resumed []string
 	if s.deps != nil && s.deps.AgentMgr != nil {
 		s.deps.AgentMgr.ReloadClaudeToken()
+		resumed = s.resumeLoginPausedClaudeAgents(r)
 	}
 
 	// Clear the PKCE state.
@@ -190,10 +197,14 @@ func (s *Server) handleClaudeAuthExchange(w http.ResponseWriter, r *http.Request
 	s.claudeOAuthFlow.state = ""
 	s.claudeOAuthFlow.mu.Unlock()
 
-	s.auditFromRequest(r, "claude_auth_complete", "", "")
-	s.deps.Logger.Info("Claude Code authenticated via OAuth")
+	detail := ""
+	if len(resumed) > 0 {
+		detail = auditDetail("resumed_login_paused", strings.Join(resumed, " "))
+	}
+	s.auditFromRequest(r, "claude_auth_complete", detail, "")
+	s.deps.Logger.Info("Claude Code authenticated via OAuth", "resumed_login_paused", resumed)
 
-	jsonResponse(w, map[string]interface{}{"status": "complete"})
+	jsonResponse(w, map[string]interface{}{"status": "complete", "resumed": resumed})
 }
 
 // handleClaudeAuthLogout removes the Claude credentials.
@@ -221,4 +232,21 @@ func (s *Server) handleClaudeAuthLogout(w http.ResponseWriter, r *http.Request) 
 	s.auditFromRequest(r, "claude_auth_logout", "", "")
 	s.deps.Logger.Info("Claude Code logged out")
 	jsonResponse(w, map[string]interface{}{"status": "logged_out"})
+}
+
+// claudeFetchProfile is a test seam for the profile read in stampClaudePlan.
+var claudeFetchProfile = claude.FetchProfile
+
+// stampClaudePlan reads subscriptionType and rateLimitTier for a freshly
+// exchanged token and sets them on it. Without them Claude Code labels a
+// subscription session "Claude API" / "API Usage Billing". A failed read logs
+// a warning and leaves the sign-in to proceed: the token is written with no
+// plan, unless the plan already on file was recorded for the same account.
+func (s *Server) stampClaudePlan(r *http.Request, tokens *claude.OAuthTokens) {
+	prof, err := claudeFetchProfile(r.Context(), tokens.AccessToken)
+	kept := claude.ApplyProfile(tokens, prof, err, claude.LoadTokens(claudeCredPath))
+	if err != nil && s.deps != nil && s.deps.Logger != nil {
+		s.deps.Logger.Warn("Claude sign-in: could not read the plan behind the new token; saving it without subscriptionType/rateLimitTier unless the same account's plan is on file",
+			"error", err, "kept_previous_plan", kept)
+	}
 }

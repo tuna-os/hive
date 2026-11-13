@@ -14,20 +14,50 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hivecommons/hive/crux"
 	"github.com/hivecommons/hive/crux/taskmcp"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/policies"
 	"github.com/hivecommons/hive/pkg/resolve"
 )
 
+// updateAgentProcessConfig refreshes a runtime config copy when one is expected
+// to exist. Reconciliation deliberately omits disabled and ACMM-gated agents;
+// editing their persisted config must not report a missing process as a fault.
+// Still update an inactive agent's existing copy (for example after ApplyPack),
+// and preserve errors for unexpectedly missing active agents.
+func (s *Server) updateAgentProcessConfig(name string, cfg config.AgentConfig) error {
+	if !cfg.Enabled || !crux.AgentAvailableAtACMMLevel(name, s.deps.AgentMgr.GetACMMLevel()) {
+		if _, err := s.deps.AgentMgr.GetStatus(name); err != nil {
+			return nil
+		}
+	}
+	return s.deps.AgentMgr.UpdateConfig(name, cfg)
+}
+
+// restartForAgentConfigChange restarts an agent to apply a config edit. When
+// the edit changed the agent's model or backend, the restart is the runtime's
+// RestartAfterModelChange, which first lifts a pause the CLI's model
+// rejection caused (only that pause); otherwise it is a plain Restart.
+func (s *Server) restartForAgentConfigChange(r *http.Request, name string, modelOrBackendChanged bool) error {
+	if modelOrBackendChanged {
+		return s.deps.AgentMgr.RestartAfterModelChange(s.deps.Ctx, name, requestUser(r))
+	}
+	return s.deps.AgentMgr.Restart(s.deps.Ctx, name)
+}
+
+// defaultLaunchCmdForBackend renders the launch command shown for an agent
+// with no launch_cmd of its own. An empty model omits --model entirely
+// (config.ModelFlag): a bare `--model` makes the CLI consume the next flag as
+// its value, which is how a claude agent lost --dangerously-skip-permissions.
 func (s *Server) defaultLaunchCmdForBackend(backend, model string) string {
 	switch {
 	case backend == "copilot":
-		return fmt.Sprintf("/usr/bin/copilot --allow-all --model %s", model)
+		return "/usr/bin/copilot --allow-all" + config.ModelFlag(model)
 	case backend == "claude" || config.IsInferenceBackend(backend) || s.deps.Config.Governor.ResolveGateway(backend) != nil:
-		return fmt.Sprintf("claude --model %s --dangerously-skip-permissions", model)
+		return "claude" + config.ModelFlag(model) + " --dangerously-skip-permissions"
 	default:
-		return fmt.Sprintf("%s --model %s", backend, model)
+		return backend + config.ModelFlag(model)
 	}
 }
 
@@ -158,6 +188,13 @@ func (s *Server) handleAgentConfigGet(w http.ResponseWriter, r *http.Request) {
 			"definitionSource":    agentCfg.DefinitionSource,
 			"mode":                agentCfg.Mode,
 			"includeRepos":        includeRepos,
+			// Contributor-first lane keys (#16518). The grace is seconds, 0 when
+			// unset (the governor then uses DefaultContributorFirstGrace);
+			// contributorFirstDelegatable says whether the toggle can be turned
+			// on at all, so the panel can disable it and name the fix.
+			"contributorFirst":            agentCfg.ContributorFirst,
+			"contributorFirstGrace":       int64(agentCfg.ContributorFirstGrace.Seconds()),
+			"contributorFirstDelegatable": config.ContributorFirstDelegatable(name, s.deps.Config.Hub),
 			// The agent's repository scope (#6204), plus the hive's own repo
 			// list so the dialog can offer real choices instead of a free-text
 			// field the operator has to spell from memory.
@@ -170,9 +207,18 @@ func (s *Server) handleAgentConfigGet(w http.ResponseWriter, r *http.Request) {
 			"jevMode":          agentCfg.JevMode,
 			"jevReady":         s.deps.Config.JevReady(),
 			"explainMode":      agentCfg.ExplainMode,
+			"sandboxSubstrate": agentSandboxSubstrateOrEmpty(agentCfg),
 			"sandboxEnabled":   agentCfg.Sandbox != nil && agentCfg.Sandbox.Enabled != nil && *agentCfg.Sandbox.Enabled,
 			"sandboxEffective": agentCfg.SandboxEnabled(s.deps.Config.AgentSandbox),
 			"replicas":         agentCfg.Replicas,
+			// The proxy's GitHub API hourly cap (agents.<key>.github_api_hourly_cap):
+			// this agent's own override (null = inherit), the cap the proxy
+			// applies now, the fleet default it inherits, and, for a replica
+			// or review head, the base agent it takes its cap from.
+			"githubApiHourlyCap":          agentCfg.GitHubAPIHourlyCap,
+			"githubApiHourlyCapEffective": s.deps.Config.AgentGitHubAPIHourlyCap(name),
+			"githubApiHourlyCapFleet":     s.deps.Config.FleetAgentGitHubAPIHourlyCap(),
+			"githubApiHourlyCapBase":      agentCfg.ReplicaOf,
 		},
 		"cadences":     cadences,
 		"models":       models,
@@ -392,11 +438,28 @@ func (s *Server) handleAgentConfigGeneral(w http.ResponseWriter, r *http.Request
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// agents.<name>.github_api_hourly_cap (api_github_api_cap.go): a number,
+	// 0 for no cap, or null to inherit the fleet default. Only a base agent
+	// carries one; its replicas and review heads are copies rebuilt from it.
+	ghCap, ghCapPresent, ghCapErr := agentGitHubCapFromBody(body)
+	if ghCapErr != nil {
+		jsonError(w, ghCapErr.Error(), http.StatusBadRequest)
+		return
+	}
+	if base := s.deps.Config.Agents[name].ReplicaOf; ghCapPresent && base != "" {
+		jsonError(w, agentGitHubCapReplicaError(name, base).Error(), http.StatusBadRequest)
+		return
+	}
 
 	agentCfg := s.deps.Config.Agents[name]
 	// Captured before the field writes below, because leaving on-demand is a
 	// TRANSITION rather than a state: acting on it needs the previous value.
 	prevOnDemand := agentCfg.OnDemand
+	ghCapAudit := ""
+	if ghCapPresent {
+		ghCapAudit = agentGitHubOverrideLabel(agentCfg.GitHubAPIHourlyCap) + " -> " + agentGitHubOverrideLabel(ghCap)
+		agentCfg.GitHubAPIHourlyCap = ghCap
+	}
 	if v, ok := body["enabled"]; ok {
 		if b, ok := v.(bool); ok {
 			agentCfg.Enabled = b
@@ -417,6 +480,29 @@ func (s *Server) handleAgentConfigGeneral(w http.ResponseWriter, r *http.Request
 			// An explicit operator choice; ApplyPack must not reconcile it
 			// back to the pack's value on the next restart.
 			agentCfg.OnDemandOwner = config.FieldOwnerOperator
+		}
+	}
+	// Contributor-first lane keys (#16518). Judged on this copy by the same
+	// rule the load applies, before anything below can persist a side effect,
+	// so a refusal answers 400 with the load's own message and saves nothing.
+	// 0 seconds clears the grace back to the default. A save that carries
+	// neither key is not judged on them.
+	_, cfSet := body["contributorFirst"]
+	_, cfGraceSet := body["contributorFirstGrace"]
+	if v, ok := body["contributorFirst"]; ok {
+		if b, ok := v.(bool); ok {
+			agentCfg.ContributorFirst = b
+		}
+	}
+	if v, ok := body["contributorFirstGrace"]; ok {
+		if f, ok := v.(float64); ok {
+			agentCfg.ContributorFirstGrace = time.Duration(int64(f)) * time.Second
+		}
+	}
+	if cfSet || cfGraceSet {
+		if err := config.ValidateContributorFirstAgent(name, agentCfg, s.deps.Config.Hub); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 	}
 	if v, ok := body["continuous"]; ok {
@@ -519,6 +605,21 @@ func (s *Server) handleAgentConfigGeneral(w http.ResponseWriter, r *http.Request
 			agentCfg.Backend = backend
 			agentCfg.BackendOwner = config.FieldOwnerOperator
 			backendChanged = true
+		}
+	}
+	// Same set-time shape check as PUT .../models, against the backend the
+	// agent will launch with (a live override wins unless this request
+	// changed the backend).
+	if modelChanged && agentCfg.Model != "" {
+		launchBackend := agentCfg.Backend
+		if !backendChanged {
+			if proc, err := s.deps.AgentMgr.GetStatus(name); err == nil && proc != nil && proc.BackendOverride != "" {
+				launchBackend = proc.BackendOverride
+			}
+		}
+		if err := malformedModelIDError(launchBackend, agentCfg.Model); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 	}
 	if v, ok := body["emoji"]; ok {
@@ -663,6 +764,27 @@ func (s *Server) handleAgentConfigGeneral(w http.ResponseWriter, r *http.Request
 			}
 			bb := b
 			agentCfg.Sandbox.Enabled = &bb
+		}
+	}
+	if v, ok := body["sandboxSubstrate"]; ok {
+		raw, err := json.Marshal(v)
+		var in config.SandboxSubstrateConfig
+		if err == nil {
+			err = json.Unmarshal(raw, &in)
+		}
+		var sub *config.SandboxSubstrateConfig
+		if err == nil {
+			sub, err = sanitizeSubstrateConfig(in)
+		}
+		if err != nil {
+			jsonError(w, "invalid sandboxSubstrate: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if sub != nil && agentCfg.Sandbox == nil {
+			agentCfg.Sandbox = &config.AgentSandboxOverride{}
+		}
+		if agentCfg.Sandbox != nil {
+			agentCfg.Sandbox.Substrate = sub
 		}
 	}
 	if v, ok := body["cavemanMode"]; ok {
@@ -843,7 +965,7 @@ func (s *Server) handleAgentConfigGeneral(w http.ResponseWriter, r *http.Request
 	// Sync the updated config into the agent process so that status builders
 	// (which read from AgentProcess.Config, not the global config map) reflect
 	// changes like display_name immediately.
-	if err := s.deps.AgentMgr.UpdateConfig(name, agentCfg); err != nil {
+	if err := s.updateAgentProcessConfig(name, agentCfg); err != nil {
 		s.logger.Warn("failed to sync agent config to process", "agent", name, "error", err)
 	}
 
@@ -861,23 +983,28 @@ func (s *Server) handleAgentConfigGeneral(w http.ResponseWriter, r *http.Request
 	// masked by a pre-existing override from a card dropdown. SetModelOverride
 	// with the saved value (or "" to clear back to the launch-command default)
 	// keeps the dialog and the card in sync; a single restart applies both.
-	if modelChanged {
-		if err := s.deps.AgentMgr.SetModelOverride(name, agentCfg.Model); err != nil {
-			s.logger.Warn("failed to apply model from config dialog", "agent", name, "error", err)
-		}
-	}
+	// Backend first, so SetModelOverride spells the model for the new backend.
 	if backendChanged {
 		if err := s.deps.AgentMgr.SetBackendOverride(name, agentCfg.Backend); err != nil {
 			s.logger.Warn("failed to apply backend from config dialog", "agent", name, "error", err)
 		}
 	}
+	if modelChanged {
+		if err := s.deps.AgentMgr.SetModelOverride(name, agentCfg.Model); err != nil {
+			s.logger.Warn("failed to apply model from config dialog", "agent", name, "error", err)
+		}
+	}
 	if modelChanged || backendChanged || jevModeChanged {
-		if err := s.deps.AgentMgr.Restart(s.deps.Ctx, name); err != nil {
+		if err := s.restartForAgentConfigChange(r, name, modelChanged || backendChanged); err != nil {
 			s.logger.Warn("restart after config-dialog model/backend/jev_mode change failed", "agent", name, "error", err)
 		}
 	}
 
-	s.auditFromRequest(r, "config_agent_general", auditDetail("section", "general"), name)
+	generalAudit := auditDetail("section", "general")
+	if ghCapPresent {
+		generalAudit = auditDetail("section", "general", "github_api_hourly_cap", ghCapAudit)
+	}
+	s.auditFromRequest(r, "config_agent_general", generalAudit, name)
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated", "agent": name})
 }
@@ -985,9 +1112,11 @@ func (s *Server) handleAgentConfigModels(w http.ResponseWriter, r *http.Request)
 	// request against those effective values so a change is detected — and
 	// applied — even when the config field already matched (#7374).
 	prevModel, prevBackend := agentCfg.Model, agentCfg.Backend
+	liveModelOverride := ""
 	if proc, err := s.deps.AgentMgr.GetStatus(name); err == nil && proc != nil {
 		if proc.ModelOverride != "" {
 			prevModel = proc.ModelOverride
+			liveModelOverride = proc.ModelOverride
 		}
 		if proc.BackendOverride != "" {
 			prevBackend = proc.BackendOverride
@@ -1014,14 +1143,50 @@ func (s *Server) handleAgentConfigModels(w http.ResponseWriter, r *http.Request)
 		}
 		agentCfg.Backend = backend
 		agentCfg.BackendOwner = config.FieldOwnerOperator
+		s.reconcileLaunchCmdForBackend(name, &agentCfg)
 		effectiveBackend = agentCfg.Backend
 		backendChanged = backend != prevBackend
 	}
+	modelWarning := ""
 	if body.Model != "" {
-		agentCfg.Model = sanitizeString(body.Model)
+		model := sanitizeString(body.Model)
+		// Refuse an id the effective backend's CLI is certain to reject
+		// (a dotted claude-… id on claude), and only warn about a
+		// well-formed id hive's list does not know — it may be newer than
+		// the list. Without this the save succeeded and the agent then
+		// restart-looped on "There's an issue with the selected model".
+		if err := malformedModelIDError(effectiveBackend, model); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		modelWarning = s.unknownModelIDWarning(effectiveBackend, model)
+		agentCfg.Model = model
 		agentCfg.ModelOwner = config.FieldOwnerOperator
 		effectiveModel = agentCfg.Model
 		modelChanged = agentCfg.Model != prevModel
+	}
+	// A backend change with no model in the request keeps the saved model,
+	// so re-spell it for the new backend: the Copilot spelling
+	// claude-sonnet-5.5 is refused by the Claude CLI, and a model the new
+	// backend cannot run at all is cleared rather than kept.
+	if backendChanged && body.Model == "" && agentCfg.Model != "" {
+		respelled, ok := crux.ModelForBackend(agentCfg.Model, effectiveBackend)
+		if !ok {
+			modelWarning = fmt.Sprintf("model %q cannot run on the %s backend, so it was cleared and the agent launches on the backend's default model; pick a %s model to choose one.",
+				agentCfg.Model, effectiveBackend, effectiveBackend)
+		}
+		agentCfg.Model = respelled
+		effectiveModel = agentCfg.Model
+	}
+	// Once this request names a backend or a model, the saved config is what
+	// the agent must launch with. A live model override that still differs
+	// (left by a card dropdown, a pin, or a boot replay of hive-state) would
+	// otherwise keep winning at launch and be persisted again, so the
+	// operator's write never took effect: a PUT carrying only the backend the
+	// agent already ran on left a stale override in place with no restart.
+	if (body.Backend != "" || body.Model != "") && liveModelOverride != "" && liveModelOverride != agentCfg.Model {
+		modelChanged = true
+		effectiveModel = agentCfg.Model
 	}
 	if body.ReasoningEffort != nil {
 		effort := sanitizeString(*body.ReasoningEffort)
@@ -1041,17 +1206,27 @@ func (s *Server) handleAgentConfigModels(w http.ResponseWriter, r *http.Request)
 
 	// Sync updated backend/model into the agent process so status builders
 	// reflect the change without requiring a restart.
-	if err := s.deps.AgentMgr.UpdateConfig(name, agentCfg); err != nil {
+	if err := s.updateAgentProcessConfig(name, agentCfg); err != nil {
 		s.logger.Warn("failed to sync agent config to process", "agent", name, "error", err)
 	}
 
+	// The reconcile above guarantees no backend/launch_cmd contradiction
+	// reaches the save guard; a failure here is an I/O problem, and the
+	// in-memory change already applied, so surface it rather than abort.
 	if err := s.saveConfig(); err != nil {
 		s.logger.Error("failed to persist config after model update", "agent", name, "error", err)
-	}
-	if agentsDir := s.deps.Config.Data.AgentsDir; agentsDir != "" {
+		s.AddSystemAlert("agent-field-save-failed", "error",
+			"Could not save the model/method choice for "+name+" — it will revert on the next restart: "+err.Error())
+	} else if agentsDir := s.deps.Config.Data.AgentsDir; agentsDir != "" {
 		if err := config.SaveAgentFile(agentsDir, name, agentCfg); err != nil {
 			s.logger.Error("failed to persist agent overlay after model update", "agent", name, "error", err)
+			s.AddSystemAlert("agent-field-save-failed", "error",
+				"Could not save the model/method choice for "+name+" to its agent overlay — it will revert on the next config load: "+err.Error())
+		} else {
+			s.ClearSystemAlert("agent-field-save-failed")
 		}
+	} else {
+		s.ClearSystemAlert("agent-field-save-failed")
 	}
 	s.auditFromRequest(r, "config_agent_models", auditDetail("backend", agentCfg.Backend, "model", agentCfg.Model, "reasoning_effort", agentCfg.ReasoningEffort), name)
 
@@ -1064,20 +1239,25 @@ func (s *Server) handleAgentConfigModels(w http.ResponseWriter, r *http.Request)
 	// override to the saved value keeps config, status and the next launch
 	// in agreement; the effort lives in agent.Config and is already synced.
 	// Model, backend and effort are all launch-time flags, so the change is
-	// applied by restarting — once, for however many of them moved.
-	if modelChanged {
-		if err := s.deps.AgentMgr.SetModelOverride(name, agentCfg.Model); err != nil {
-			s.logger.Warn("failed to apply model from config endpoint", "agent", name, "error", err)
-		}
-	}
+	// applied by restarting — once, for however many of them moved. The
+	// backend goes first: SetModelOverride spells the model for the agent's
+	// effective backend, so it must already be the new one.
 	if backendChanged {
 		if err := s.deps.AgentMgr.SetBackendOverride(name, agentCfg.Backend); err != nil {
 			s.logger.Warn("failed to apply backend from config endpoint", "agent", name, "error", err)
 		}
 	}
+	if modelChanged {
+		if err := s.deps.AgentMgr.SetModelOverride(name, agentCfg.Model); err != nil {
+			s.logger.Warn("failed to apply model from config endpoint", "agent", name, "error", err)
+		}
+	}
 	resp := map[string]any{"ok": true, "status": "updated", "agent": name, "applied": true, "restarted": false}
+	if modelWarning != "" {
+		resp["warning"] = modelWarning
+	}
 	if modelChanged || backendChanged || effortChanged {
-		if err := s.deps.AgentMgr.Restart(s.deps.Ctx, name); err != nil {
+		if err := s.restartForAgentConfigChange(r, name, modelChanged || backendChanged); err != nil {
 			// Persisted and applied to the launch configuration, but the
 			// running session (if any) is still on the old flags. Say so in
 			// the response rather than returning a bare "updated" — the
@@ -1922,4 +2102,11 @@ func (s *Server) getAgentHooks(name string) map[string][]any {
 		return h
 	}
 	return map[string][]any{"preKick": {}, "postIdle": {}}
+}
+
+func agentSandboxSubstrateOrEmpty(a config.AgentConfig) config.SandboxSubstrateConfig {
+	if a.Sandbox == nil {
+		return config.SandboxSubstrateConfig{}
+	}
+	return substrateOrEmpty(a.Sandbox.Substrate)
 }

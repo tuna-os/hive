@@ -286,9 +286,9 @@ type agentRecord struct {
 	// alert fire once, not every tick.
 	CrashLooping bool
 	// LastClass is the previous liveness verdict, for transition logging.
-	LastClass PaneClass
-	// restartInFlight is true while a restart goroutine is running; the
-	// reconciler never stacks a second restart on a wedged one.
+	LastClass   PaneClass
+	loginStreak int // consecutive polls showing login chrome; see classifyLocked
+	// restartInFlight: a restart goroutine is running; never stack another on a wedged one.
 	restartInFlight bool
 	// restartStartedAt dates the in-flight restart so a wedge past the hard
 	// timeout is alerted on (the control-plane guard for failure mode 4).
@@ -351,31 +351,6 @@ func (r *Reconciler) TakeRestarted() []string {
 	out := r.restarted
 	r.restarted = nil
 	return out
-}
-
-// Option customizes a Reconciler.
-type Option func(*Reconciler)
-
-// WithClock injects a fake clock for tests.
-func WithClock(now func() time.Time) Option {
-	return func(r *Reconciler) { r.now = now }
-}
-
-// WithAuthProbes registers per-provider credential probes.
-func WithAuthProbes(probes map[string]AuthProbe) Option {
-	return func(r *Reconciler) { r.authProbes = probes }
-}
-
-// WithBackendProvider injects the backend→provider mapping.
-func WithBackendProvider(f func(string) string) Option {
-	return func(r *Reconciler) { r.backendProvider = f }
-}
-
-// WithConditionReporter injects the host sink for the watchdog's
-// agent_crash_loop self-report (hive wires pkg/fleetreport). Without one the
-// crash loop still pauses and alerts; it just is not reported upstream.
-func WithConditionReporter(rep crux.ConditionReporter) Option {
-	return func(r *Reconciler) { r.conditions = rep }
 }
 
 func (r *Reconciler) observeCondition(class, key, message, diagnostics string) {
@@ -548,10 +523,13 @@ func (r *Reconciler) recordLocked(name string) *agentRecord {
 }
 
 // Tick runs one reconciliation sweep. It is synchronous and bounded: every
-// probe carries a deadline and every restart runs detached under the hard
-// RestartTimeout, so the governor tick that hosts it can never wedge on a
-// stuck agent (the RFC's control-plane guard). Calls inside ProbeInterval of
-// the previous sweep are no-ops.
+// probe carries a deadline (Source implementations must bound Observe —
+// crux/agent's WatchdogFleet caps its tmux probes at ObserveProbeTimeout) and
+// every restart runs detached under the hard RestartTimeout, so the governor
+// tick that hosts it can never wedge on a stuck agent (the RFC's control-plane
+// guard). ctx is checked between agents, so a cancelled ctx (shutdown) ends
+// the sweep early. Calls inside ProbeInterval of the previous sweep are
+// no-ops.
 func (r *Reconciler) Tick(ctx context.Context) {
 	now := r.now()
 	r.mu.Lock()
@@ -568,6 +546,9 @@ func (r *Reconciler) Tick(ctx context.Context) {
 
 	authCache := make(map[string]authVerdict)
 	for _, name := range r.fleet.AgentNames() {
+		if ctx.Err() != nil {
+			return
+		}
 		r.reconcileAgent(ctx, name, now, authCache)
 	}
 }
@@ -583,11 +564,11 @@ func (r *Reconciler) reconcileAgent(ctx context.Context, name string, now time.T
 		r.logger.Warn("watchdog: agent unobservable", "agent", name, "error", err)
 		return
 	}
-	cls := Classify(obs, now, r.snapshotSettings())
 	paused := r.fleet.IsPaused(name)
 
 	r.mu.Lock()
 	rec := r.recordLocked(name)
+	cls := r.classifyLocked(rec, obs, now)
 	if cls.Class != rec.LastClass {
 		r.logger.Info("watchdog: liveness transition",
 			"agent", name, "from", string(rec.LastClass), "to", string(cls.Class), "reason", cls.Reason)
@@ -811,6 +792,12 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 	// standing operator alert must be cleared.
 	healable := cls.Class == ClassAuthRequired && obs.CredentialProven
 
+	// The classifier withheld ClassAuthRequired for login chrome (boot grace).
+	// For claude the per-agent probe only answers known-absent from that same
+	// pane signal (AgentAuthState), so CredentialMissing would re-page the
+	// very sighting the classifier just declined to act on.
+	loginChromeSuppressed := obs.ShowsLoginPrompt && cls.Class != ClassAuthRequired
+
 	if healable {
 		// A login screen over a credential that demonstrably still works is
 		// the token-restart heal's case, not an operator's — the same division
@@ -833,7 +820,7 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 		status = ConditionFalse
 		reason = "PaneShowsLogin"
 		message = cls.Reason
-	} else if obs.AuthKnown && !obs.AuthAvailable {
+	} else if obs.AuthKnown && !obs.AuthAvailable && !loginChromeSuppressed {
 		// The manager's owner-aware per-agent credential probe (#4619/#4641)
 		// says the credential file is definitively absent for an agent whose
 		// backend requires interactive auth.
@@ -905,128 +892,6 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 	// re-raises it on the next False transition.
 	if r.alerter != nil && prev.Status == ConditionFalse && status != ConditionFalse {
 		r.alerter.ClearSystemAlert(authAlertID(name))
-	}
-}
-
-// productionThreshold is the no-production window for one agent: the
-// configured NoProductionFor, widened to the agent's cadence period plus
-// one kick's worth of slack when the governor kicks it less often than the
-// window (#13817). A 24h lane cannot be expected to show evidence every 6h;
-// it CAN be expected to show evidence within one cadence of its last kick,
-// and the slack covers a kick that lands late or runs long. The note names
-// the cadence so the condition explains why the threshold moved.
-func (r *Reconciler) productionThreshold(name string, settings Settings) (time.Duration, string) {
-	threshold := settings.NoProductionFor
-	kp, ok := r.fleet.(KickPeriodReporter)
-	if !ok {
-		return threshold, ""
-	}
-	period, ok := kp.KickPeriod(name)
-	if !ok || period <= 0 {
-		return threshold, ""
-	}
-	widened := period + period/cadenceSlackDivisor
-	if widened <= threshold {
-		return threshold, ""
-	}
-	return widened, fmt.Sprintf("cadence %v widens the %v window to %v", period, settings.NoProductionFor, widened)
-}
-
-// reconcileReadiness updates the Producing condition from production
-// evidence. A readiness failure alone NEVER pauses or restarts (design
-// decision on RFC open question 3): it publishes Producing=False and a
-// warning alert, degrading the agent's standing rather than its life.
-func (r *Reconciler) reconcileReadiness(name string, obs Observation, now time.Time) {
-	settings := r.snapshotSettings()
-	last, ok := r.fleet.LastProduction(name)
-	status := ConditionUnknown
-	reason := "NoEvidence"
-	message := "no production evidence source is readable for this agent"
-	if obs.ProviderErrorClass != "" {
-		status = ConditionFalse
-		reason = "ProviderInferenceError"
-		message = fmt.Sprintf("blocked: inference (%s)", obs.ProviderErrorClass)
-		if line := strings.TrimSpace(obs.ProviderErrorLine); line != "" {
-			message += ": " + line
-		}
-	} else if ok {
-		age := now.Sub(last)
-		threshold, thresholdNote := r.productionThreshold(name, settings)
-		switch {
-		case age < threshold:
-			status = ConditionTrue
-			reason = "RecentProduction"
-			message = fmt.Sprintf("last production evidence %v ago", age.Round(time.Minute))
-			if thresholdNote != "" && age >= settings.NoProductionFor {
-				reason = "WithinCadence"
-				message += " — " + thresholdNote
-			}
-		default:
-			// Silence is only a fault when there is work to be silent about.
-			// An agent with an empty queue producing nothing is behaving
-			// correctly, and reporting it would light this condition on every
-			// healthy quiet hive — the failure mode the hub's inactivity rule
-			// exists to prevent (agent_inactivity.go: a facet which lights up
-			// constantly gets ignored). Same threshold as the hub's
-			// inactiveAgentMinQueued: one waiting item is enough to make "and
-			// nothing is happening" wrong.
-			//
-			// Nor is silence a fault when the governor is deliberately not
-			// kicking the agent: the hive-wide backlog is not this agent's
-			// work while its cadence is paused or its lane is idle (#11910).
-			suppressed := ""
-			if ks, ok := r.fleet.(KickSuppressionReporter); ok {
-				suppressed = ks.KickSuppressedReason(name)
-			}
-			queued, queueKnown := 0, false
-			if suppressed == "" {
-				queued, queueKnown = r.fleet.QueuedWork(name)
-			}
-			switch {
-			case suppressed != "":
-				status = ConditionTrue
-				reason = "IdleNotScheduled"
-				message = fmt.Sprintf("no production for %v, but the governor is not kicking this agent: %s", age.Round(time.Minute), suppressed)
-			case !queueKnown:
-				status = ConditionUnknown
-				reason = "QueueUnknown"
-				message = fmt.Sprintf("no production for %v, but the work queue could not be read — not called a fault without knowing there was work to do", age.Round(time.Minute))
-			case queued < minQueuedForNotProducing:
-				status = ConditionTrue
-				reason = "IdleNoWorkQueued"
-				message = fmt.Sprintf("no production for %v, and nothing is queued — an agent with no work to do is correct, not unhealthy", age.Round(time.Minute))
-			default:
-				status = ConditionFalse
-				reason = "NoRecentProduction"
-				message = fmt.Sprintf("no production evidence for %v (threshold %v) while %d item(s) are queued", age.Round(time.Minute), threshold, queued)
-				if thresholdNote != "" {
-					message += "; " + thresholdNote
-				}
-				if lister, ok := r.fleet.(QueuedWorkLister); ok {
-					refs, hiveWide := lister.QueuedWorkRefs(name)
-					message += queuedRefsSuffix(queued, refs, hiveWide)
-				}
-			}
-		}
-	}
-
-	r.mu.Lock()
-	rec := r.recordLocked(name)
-	prev, _ := FindCondition(rec.Conditions, ConditionProducing)
-	rec.Conditions = setCondition(rec.Conditions, Condition{
-		Type: ConditionProducing, Status: status, Reason: reason, Message: message,
-	}, now)
-	r.mu.Unlock()
-
-	if status == ConditionFalse && prev.Status != ConditionFalse {
-		r.logger.Warn("watchdog: agent not producing", "agent", name, "detail", message)
-		if r.alerter != nil {
-			r.alerter.AddSystemAlert(producingAlertID(name), severityWarning,
-				fmt.Sprintf("Agent %q is alive but not producing: %s", name, message))
-		}
-	}
-	if status == ConditionTrue && prev.Status == ConditionFalse && r.alerter != nil {
-		r.alerter.ClearSystemAlert(producingAlertID(name))
 	}
 }
 

@@ -459,6 +459,57 @@ func TestStorePersistsAndPrunes(t *testing.T) {
 	}
 }
 
+// hivecommons/hive#15443: the per-author trust-promotion record is claimed
+// once, released by a failed post, cleared by a demotion, survives a
+// reload and Prune only drops it after trustPromotionRetention.
+func TestStoreTrustPromotionAnnouncement(t *testing.T) {
+	now := time.Date(2026, 10, 29, 17, 20, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "s.json")
+	st := NewStore(path, func() time.Time { return now })
+	if !st.ClaimTrustPromotionAnnouncement("Norway-02") {
+		t.Fatal("first claim should win")
+	}
+	if st.ClaimTrustPromotionAnnouncement("norway-02") {
+		t.Fatal("second claim (case-insensitive) should lose")
+	}
+	if !st.TrustPromotionAnnounced("NORWAY-02") {
+		t.Fatal("announced should be true after a claim")
+	}
+	st.ReleaseTrustPromotionAnnouncement("Norway-02")
+	if st.TrustPromotionAnnounced("Norway-02") || !st.ClaimTrustPromotionAnnouncement("Norway-02") {
+		t.Fatal("release should let the next claim win")
+	}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(30 * 24 * time.Hour)
+	st2 := NewStore(path, func() time.Time { return later })
+	if err := st2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if n := st2.Prune(14 * 24 * time.Hour); n != 0 || !st2.TrustPromotionAnnounced("Norway-02") {
+		t.Fatalf("prune dropped the trust record: n=%d keys=%v", n, st2.Keys())
+	}
+	if st2.ClaimTrustPromotionAnnouncement("Norway-02") {
+		t.Fatal("claim after reload should lose")
+	}
+	veryLate := now.Add(trustPromotionRetention + 24*time.Hour)
+	st3 := NewStore(path, func() time.Time { return veryLate })
+	if err := st3.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if n := st3.Prune(14 * 24 * time.Hour); n != 1 || st3.TrustPromotionAnnounced("Norway-02") {
+		t.Fatalf("prune kept a trust record past retention: n=%d keys=%v", n, st3.Keys())
+	}
+	st2.ClearTrustPromotion("Norway-02")
+	if st2.TrustPromotionAnnounced("Norway-02") || !st2.ClaimTrustPromotionAnnouncement("Norway-02") {
+		t.Fatal("clear should let a re-promotion announce again")
+	}
+	if st.ClaimTrustPromotionAnnouncement("") || (*Store)(nil).ClaimTrustPromotionAnnouncement("x") {
+		t.Fatal("empty login or nil store must never claim")
+	}
+}
+
 func TestLookupsAndAuthorStrings(t *testing.T) {
 	if s, ok := StageBySlug(" Merge-Queue "); !ok || s != MergeQueue {
 		t.Fatalf("StageBySlug = %v %v", s, ok)
@@ -548,6 +599,66 @@ func TestStoreMarksForgetsAndSharedLoad(t *testing.T) {
 	first := Shared()
 	if first == nil || Shared() != first {
 		t.Fatal("Shared() must return one store")
+	}
+}
+
+func TestStoreMarkNudgedReason(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	s := NewStore("", func() time.Time { return now })
+	s.MarkNudgedReason("missing", "check-failing:unit", 1, now) // unknown key: no-op
+	if _, ok := s.Get("missing"); ok {
+		t.Fatal("MarkNudgedReason created a record")
+	}
+	key := Key("acme/widget", 7)
+	s.Observe(key, ReturnedToContributor, "check-failing:unit")
+	s.MarkNudgedReason(key, "required-check-failing:unit (lint)", 1, now)
+	r, _ := s.Get(key)
+	if r.NudgeReason != "check-failing" || r.NudgeReasonCount != 1 || !r.NudgeReasonAt.Equal(now) {
+		t.Fatalf("after first: %+v", r)
+	}
+	// A head-only rewrite (n == 0) for the same class keeps the count and time.
+	s.MarkNudgedReason(key, "check-failing:e2e", 0, now.Add(time.Hour))
+	if r, _ = s.Get(key); r.NudgeReasonCount != 1 || !r.NudgeReasonAt.Equal(now) {
+		t.Fatalf("rewrite: %+v", r)
+	}
+	s.MarkNudgedReason(key, "check-failing:e2e", 2, now.Add(2*time.Hour))
+	if r, _ = s.Get(key); r.NudgeReasonCount != 2 || !r.NudgeReasonAt.Equal(now.Add(2*time.Hour)) {
+		t.Fatalf("second nudge: %+v", r)
+	}
+	// A different class restarts the count.
+	s.MarkNudgedReason(key, "changes-requested", 1, now.Add(3*time.Hour))
+	if r, _ = s.Get(key); r.NudgeReason != "changes-requested" || r.NudgeReasonCount != 1 || !r.NudgeReasonAt.Equal(now.Add(3*time.Hour)) {
+		t.Fatalf("new class: %+v", r)
+	}
+}
+
+func TestRecordNudgeStart(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	if got := (Record{}).NudgeStart(); !got.IsZero() {
+		t.Fatalf("never nudged: %v", got)
+	}
+	if got := (Record{NudgeCount: 1, LastNudgeAt: now}).NudgeStart(); !got.Equal(now) {
+		t.Fatalf("legacy record falls back to LastNudgeAt: %v", got)
+	}
+	if got := (Record{NudgeCount: 2, FirstNudgeAt: now, LastNudgeAt: now.Add(time.Hour)}).NudgeStart(); !got.Equal(now) {
+		t.Fatalf("FirstNudgeAt wins: %v", got)
+	}
+}
+
+func TestNudgeReasonSlug(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                               "unknown",
+		"   ":                            "unknown",
+		"check-failing:unit (lint)":      "check-failing",
+		"required-check-failing:unit":    "check-failing",
+		"optional-check-failing:links":   "check-failing",
+		"Changes Requested by @Reviewer": "changes-requested-by--reviewer",
+		"--merge_conflict.v2--":          "merge_conflict.v2",
+		"(only parenthetical)":           "unknown",
+	} {
+		if got := NudgeReasonSlug(in); got != want {
+			t.Errorf("NudgeReasonSlug(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -947,18 +1058,18 @@ func TestStoreNoteDCOSplitAndAdoptReason(t *testing.T) {
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	s := NewStore("", func() time.Time { return now })
 	key := Key("acme/widget", 7)
-	s.NoteDCO(key, "a", 3, 2, 1, 0)
+	s.NoteDCO(key, "a", 3, 2, 1, 0, true)
 	s.NoteAdoptReason(key, "dco-rehome")
 	if _, ok := s.Get(key); ok {
 		t.Fatal("NoteDCO/NoteAdoptReason created a record")
 	}
 	s.Observe(key, ReturnedToContributor, "check-failing:dco")
-	s.NoteDCO(key, "a", 3, 2, 1, 0)
+	s.NoteDCO(key, "a", 3, 2, 1, 0, true)
 	r, _ := s.Get(key)
 	if t0, u, ok := r.DCOFor("a"); !ok || t0 != 3 || u != 2 || r.DCOUnsignedHive != 1 || r.DCOUnsignedOther != 1 || !r.DCOSplitKnown("a") || r.DCOSplitKnown("b") {
 		t.Fatalf("cached split: %+v", r)
 	}
-	s.NoteDCO(key, "a", 3, 2, 2, 0)
+	s.NoteDCO(key, "a", 3, 2, 2, 0, true)
 	if r, _ = s.Get(key); r.DCOUnsignedHive != 2 || r.DCOUnsignedOther != 0 || !r.DCOSplitKnown("a") {
 		t.Fatalf("hive share not updated: %+v", r)
 	}
@@ -973,6 +1084,51 @@ func TestStoreNoteDCOSplitAndAdoptReason(t *testing.T) {
 	s.NoteAdoptReason(key, "dco-rehome")
 	if r, _ = s.Get(key); r.AdoptReason != "dco-rehome" || r.AdoptMode != AdoptModeSupersede || r.AdoptedBy != 0 {
 		t.Fatalf("adopt reason: %+v", r)
+	}
+}
+
+// hivecommons/hive#16701: NoteDCO marks the split as computed with hive
+// identities, including on a legacy record whose counts are unchanged.
+func TestStoreNoteDCOMarksHiveIdentitySplit(t *testing.T) {
+	s := NewStore("", nil)
+	key := Key("acme/widget", 8)
+	s.items[key] = Record{DCOHead: "a", DCOTotal: 2, DCOUnsigned: 1, DCOUnsignedOther: 1, DCOSquashUnsafeKnown: true}
+	s.NoteDCO(key, "a", 2, 1, 0, 0, true)
+	if r, _ := s.Get(key); !r.DCOSplitHiveIdentity || r.DCOUnsignedOther != 1 {
+		t.Fatalf("legacy record not marked: %+v", r)
+	}
+}
+
+// hivecommons/hive#16707: an App-only split (no hive identity configured)
+// must not be marked, so configuring one later triggers the re-read.
+func TestStoreNoteDCOAppOnlySplitNotMarked(t *testing.T) {
+	s := NewStore("", nil)
+	key := Key("acme/widget", 9)
+	s.items[key] = Record{DCOHead: "a", DCOTotal: 2, DCOUnsigned: 1, DCOUnsignedOther: 1, DCOSquashUnsafeKnown: true}
+	s.NoteDCO(key, "a", 2, 1, 1, 0, false)
+	if r, _ := s.Get(key); r.DCOSplitHiveIdentity || r.DCOUnsignedHive != 1 {
+		t.Fatalf("app-only split marked or not stored: %+v", r)
+	}
+	s.NoteDCO(key, "a", 2, 1, 1, 0, true)
+	if r, _ := s.Get(key); !r.DCOSplitHiveIdentity {
+		t.Fatalf("hive-identity split not marked: %+v", r)
+	}
+}
+
+// hivecommons/hive#16710: a new head cached App-only must clear a stale
+// hive-identity marker; a same-head App-only refresh must keep it.
+func TestStoreNoteDCONewHeadClearsHiveIdentityMarker(t *testing.T) {
+	s := NewStore("", nil)
+	key := Key("acme/widget", 10)
+	s.items[key] = Record{DCOHead: "a", DCOTotal: 2, DCOUnsigned: 1, DCOUnsignedOther: 1, DCOSquashUnsafeKnown: true}
+	s.NoteDCO(key, "a", 2, 1, 0, 0, true)
+	s.NoteDCO(key, "a", 2, 1, 0, 0, false)
+	if r, _ := s.Get(key); !r.DCOSplitHiveIdentity {
+		t.Fatalf("same-head App-only refresh cleared the marker: %+v", r)
+	}
+	s.NoteDCO(key, "b", 2, 1, 1, 0, false)
+	if r, _ := s.Get(key); r.DCOSplitHiveIdentity || r.DCOHead != "b" {
+		t.Fatalf("stale marker survived a new App-only head: %+v", r)
 	}
 }
 
@@ -1640,5 +1796,189 @@ func TestStoreMarkSupersededAndPollDue(t *testing.T) {
 	s.MarkSuperseded(key, 0, false, now)
 	if r, _ = s.Get(key); r.Superseded() {
 		t.Fatal("MarkSuperseded accepted PR 0")
+	}
+}
+
+func TestTransitionDampenerRefusesFrequentFlapsBetweenTwoStages(t *testing.T) {
+	now := time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)
+	clock := now
+	s := NewStore("", func() time.Time { return clock })
+	key := Key("acme/widget", 123)
+	head := "687f4cb"
+
+	// Initial entry: NeedsDecision.
+	tr0 := s.ObserveHead(key, head, NeedsDecision, "initial")
+	if !tr0.Changed || tr0.Suppressed {
+		t.Fatalf("initial entry = %+v", tr0)
+	}
+
+	// Move 1: NeedsDecision -> Fixing.
+	clock = clock.Add(time.Minute)
+	tr1 := s.ObserveHead(key, head, Fixing, "ci-pending")
+	if !tr1.Changed || tr1.Suppressed || tr1.Next != Fixing {
+		t.Fatalf("move 1 = %+v", tr1)
+	}
+
+	// Move 2: Fixing -> NeedsDecision.
+	clock = clock.Add(time.Minute)
+	tr2 := s.ObserveHead(key, head, NeedsDecision, "verdict")
+	if !tr2.Changed || tr2.Suppressed || tr2.Next != NeedsDecision {
+		t.Fatalf("move 2 = %+v", tr2)
+	}
+
+	// Move 3: NeedsDecision -> Fixing.
+	clock = clock.Add(time.Minute)
+	tr3 := s.ObserveHead(key, head, Fixing, "ci-pending")
+	if !tr3.Changed || tr3.Suppressed || tr3.Next != Fixing {
+		t.Fatalf("move 3 = %+v", tr3)
+	}
+
+	// Move 4: Fixing -> NeedsDecision (4th move between {Fixing, NeedsDecision} in 4m). Must be suppressed!
+	clock = clock.Add(time.Minute)
+	tr4 := s.ObserveHead(key, head, NeedsDecision, "verdict")
+	if tr4.Changed || !tr4.Suppressed || tr4.Next != Fixing {
+		t.Fatalf("move 4 must be suppressed: %+v", tr4)
+	}
+	rec, _ := s.Get(key)
+	if rec.Stage != Fixing {
+		t.Fatalf("stage should remain Fixing after suppression, got %v", rec.Stage)
+	}
+
+	// A new head resets the dampener.
+	clock = clock.Add(time.Minute)
+	tr5 := s.ObserveHead(key, "newhead456", NeedsDecision, "new-push")
+	if !tr5.Changed || tr5.Suppressed || tr5.Next != NeedsDecision {
+		t.Fatalf("new head move must be allowed: %+v", tr5)
+	}
+	rec, _ = s.Get(key)
+	if rec.Stage != NeedsDecision {
+		t.Fatalf("stage should move to NeedsDecision on new head, got %v", rec.Stage)
+	}
+}
+
+// A same-head fall back into a repair stage (070/071/072) is never
+// dampened: refusing "CI went red, back to fixing" would leave the record
+// at a stage the merge train treats as ready.
+func TestTransitionDampenerNeverSuppressesMovesIntoRepairStages(t *testing.T) {
+	for _, repair := range []Stage{Fixing, NeedsAuthor, ReturnedToContributor} {
+		t.Run(repair.String(), func(t *testing.T) {
+			clock := time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)
+			s := NewStore("", func() time.Time { return clock })
+			key := Key("acme/widget", 123)
+			head := "687f4cb"
+			s.ObserveHead(key, head, AwaitingMergeAdmission, "initial")
+			for i := 0; i < 6; i++ {
+				clock = clock.Add(time.Minute)
+				tr := s.ObserveHead(key, head, repair, "check-failing:unit")
+				// Once the climb back is refused the record already sits
+				// at repair, so later falls are no-ops rather than moves.
+				if tr.Suppressed || tr.Next != repair || (i < 2 && !tr.Changed) {
+					t.Fatalf("round %d: move into %s must be allowed: %+v", i, repair, tr)
+				}
+				clock = clock.Add(time.Minute)
+				tr = s.ObserveHead(key, head, AwaitingMergeAdmission, "checks-green")
+				// Round 0 books 080->070->080 (2 moves), round 1's fall into
+				// 070 is the 3rd: the 4th move of the pair is refused.
+				if i >= 1 {
+					if !tr.Suppressed || tr.Changed {
+						t.Fatalf("round %d: move back to 080 should be dampened: %+v", i, tr)
+					}
+					continue
+				}
+				if tr.Suppressed || !tr.Changed {
+					t.Fatalf("round %d: move back to 080 = %+v", i, tr)
+				}
+			}
+			if rec, _ := s.Get(key); rec.Stage != repair {
+				t.Fatalf("stage = %s, want %s", rec.Stage, repair)
+			}
+		})
+	}
+}
+
+func TestTransitionDampenerResetOnHumanEvent(t *testing.T) {
+	now := time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)
+	clock := now
+	s := NewStore("", func() time.Time { return clock })
+	key := Key("acme/widget", 123)
+	head := "687f4cb"
+
+	s.ObserveHead(key, head, NeedsDecision, "initial")
+	s.NoteActivity(key, Activity{Head: head, Comments: 1, Reviews: 0})
+
+	// 3 transitions.
+	clock = clock.Add(time.Minute)
+	s.ObserveHead(key, head, Fixing, "ci-pending")
+	clock = clock.Add(time.Minute)
+	s.ObserveHead(key, head, NeedsDecision, "verdict")
+	clock = clock.Add(time.Minute)
+	s.ObserveHead(key, head, Fixing, "ci-pending")
+
+	// 4th is suppressed.
+	clock = clock.Add(time.Minute)
+	tr := s.ObserveHead(key, head, NeedsDecision, "verdict")
+	if !tr.Suppressed {
+		t.Fatalf("expected suppressed move: %+v", tr)
+	}
+
+	// Human event: new comment arrives.
+	s.NoteActivity(key, Activity{Head: head, Comments: 2, Reviews: 0})
+
+	// Move is now allowed because human event reset the dampener.
+	tr = s.ObserveHead(key, head, NeedsDecision, "human-responded")
+	if tr.Suppressed || !tr.Changed || tr.Next != NeedsDecision {
+		t.Fatalf("move after human event must be allowed: %+v", tr)
+	}
+}
+
+func TestTransitionDampenerExpiresAfterWindow(t *testing.T) {
+	now := time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)
+	clock := now
+	s := NewStore("", func() time.Time { return clock })
+	key := Key("acme/widget", 123)
+	head := "687f4cb"
+
+	s.ObserveHead(key, head, NeedsDecision, "initial")
+	clock = clock.Add(time.Minute)
+	s.ObserveHead(key, head, Fixing, "ci-pending")
+	clock = clock.Add(time.Minute)
+	s.ObserveHead(key, head, NeedsDecision, "verdict")
+	clock = clock.Add(time.Minute)
+	s.ObserveHead(key, head, Fixing, "ci-pending")
+
+	// 4th move within 4m is suppressed.
+	tr := s.ObserveHead(key, head, NeedsDecision, "verdict")
+	if !tr.Suppressed {
+		t.Fatalf("expected suppressed move: %+v", tr)
+	}
+
+	// Advance time past the 30-minute window from the earlier moves.
+	clock = clock.Add(31 * time.Minute)
+	tr = s.ObserveHead(key, head, NeedsDecision, "verdict")
+	if tr.Suppressed || !tr.Changed || tr.Next != NeedsDecision {
+		t.Fatalf("move after window expiry must be allowed: %+v", tr)
+	}
+}
+
+func TestStoreMarkNudgedCIFailure(t *testing.T) {
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	s := NewStore("", func() time.Time { return now })
+	s.MarkNudgedCIFailure("missing", []string{"unit"}, "a", "spawn", 1, true, now) // unknown key: no-op
+	if _, ok := s.Get("missing"); ok {
+		t.Fatal("MarkNudgedCIFailure created a record")
+	}
+	key := Key("acme/widget", 7)
+	s.Observe(key, ReturnedToContributor, "check-failing:unit")
+	s.MarkNudgedCIFailure(key, []string{"unit", "lint"}, "a", "spawn", 1, true, now)
+	r, _ := s.Get(key)
+	if !reflect.DeepEqual(r.NudgeCIChecks, []string{"lint", "unit"}) || r.NudgeCIHead != "a" || r.NudgeCIAttempts != 1 || r.NudgeMode != "spawn" || !r.NudgeCIAt.Equal(now) {
+		t.Fatalf("after first: %+v", r)
+	}
+	// A fold (not counted) moves the set, head and attempt but keeps the
+	// cooldown clock and, with no mode given, the recorded mode.
+	s.MarkNudgedCIFailure(key, []string{"lint", "unit", "vet"}, "b", "", 2, false, now.Add(time.Hour))
+	r, _ = s.Get(key)
+	if !reflect.DeepEqual(r.NudgeCIChecks, []string{"lint", "unit", "vet"}) || r.NudgeCIHead != "b" || r.NudgeCIAttempts != 2 || r.NudgeMode != "spawn" || !r.NudgeCIAt.Equal(now) {
+		t.Fatalf("after fold: %+v", r)
 	}
 }

@@ -33,6 +33,10 @@ func freshenKickMessages(ctx context.Context, guard github.IrreversibleGuard, ac
 			continue
 		}
 		kept := make([]string, 0, len(msg.IssueRefs))
+		// Deferred and closed refusals are the guard working as designed; a
+		// kick withheld only by those is summarised below WARN too (#17518).
+		allExpected := true
+		var stale, closed, deferredReads, readErrors int
 		for _, raw := range msg.IssueRefs {
 			ref, ok := worksource.ParseKey(raw)
 			if !ok || !ref.IsGitHubIssue() {
@@ -42,12 +46,36 @@ func freshenKickMessages(ctx context.Context, guard github.IrreversibleGuard, ac
 			key := ref.Key()
 			_, isPR := prRefs[key]
 			if err := guard(ctx, ref.Repo, ref.Number, isPR); err != nil {
+				deferred := errors.Is(err, github.ErrAPIBudgetCritical) || errors.Is(err, github.ErrRateLimitCaution)
+				if !deferred && !errors.Is(err, github.ErrItemNotOpen) {
+					allExpected = false
+				}
 				if logger != nil {
 					reason := "re-read"
-					if errors.Is(err, github.ErrSnapshotStaleForDecision) {
+					level := slog.LevelWarn
+					switch {
+					case deferred:
+						// Budget and rate-limit refusals are retried next cycle.
+						reason = "github read deferred"
+						level = slog.LevelInfo
+						deferredReads++
+					case errors.Is(err, github.ErrSnapshotStaleForDecision):
 						reason = "stale snapshot"
+						stale++
+					case errors.Is(err, github.ErrItemNotOpen):
+						// The re-read found the item closed or merged: the guard
+						// doing its job, not a fault. The snapshot keeps serving the
+						// stale copy until the cache catches up, so this repeats
+						// every cycle; at WARN the slog feed filed it as an
+						// unclassified repeated error (#17518). The withheld-kick
+						// summary below still counts it as closed.
+						reason = "closed"
+						level = slog.LevelInfo
+						closed++
+					default:
+						readErrors++
 					}
-					logger.Warn("kick ref withheld: snapshot not fresh enough to act on",
+					logger.Log(ctx, level, "kick ref withheld: snapshot not fresh enough to act on",
 						slog.String("agent", msg.Agent), slog.String("ref", raw),
 						slog.String("reason", reason), slog.Any("error", err))
 				}
@@ -57,7 +85,14 @@ func freshenKickMessages(ctx context.Context, guard github.IrreversibleGuard, ac
 		}
 		if len(kept) == 0 {
 			if logger != nil {
-				logger.Warn("kick withheld: every ref failed the freshness check", slog.String("agent", msg.Agent))
+				level := slog.LevelWarn
+				if allExpected {
+					level = slog.LevelInfo
+				}
+				logger.Log(ctx, level, "kick withheld: every ref failed the freshness check",
+					slog.String("agent", msg.Agent), slog.Int("stale", stale),
+					slog.Int("closed", closed), slog.Int("deferred", deferredReads),
+					slog.Int("read_error", readErrors))
 			}
 			continue
 		}

@@ -17,7 +17,9 @@ import (
 	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/github/automerge"
 	"github.com/hivecommons/hive/pkg/intent"
+	"github.com/hivecommons/hive/pkg/rebasemerge"
 	"github.com/hivecommons/hive/pkg/review"
+	"github.com/hivecommons/hive/pkg/stageengine/prstage"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
@@ -111,7 +113,19 @@ func contributorLanePolicyFunc(cfg *config.Config) func() automerge.ContributorL
 			AutoPromotionScope:                 p.EffectiveAutoPromotionScope(),
 			ApproveHeldRunsForRegistryTrusted:  p.EffectiveApproveHeldRunsForRegistryTrusted(),
 			OwnerApprovalReleasesWorkflowFence: p.EffectiveOwnerApprovalReleasesWorkflowFence(),
+			WorkflowFenceScope:                 p.EffectiveWorkflowFenceScope(),
+			WorkflowFenceScopeForRepo:          repoWorkflowFenceScopeFunc(cfg),
 		}
+	}
+}
+
+// repoWorkflowFenceScopeFunc resolves the contributor lane's workflow fence
+// scope for one "owner/repo": its project.repo_policies[].workflow_fence_scope
+// override, else the hive-wide auto_merge.contributor_lane.workflow_fence_scope.
+func repoWorkflowFenceScopeFunc(cfg *config.Config) func(repo string) string {
+	return func(repo string) string {
+		scope, _ := cfg.RepoWorkflowFenceScope(repo)
+		return scope
 	}
 }
 
@@ -128,26 +142,50 @@ func stageLabelPolicyFunc(cfg *config.Config) func() automerge.StageLabelPolicy 
 			Dwell:                     stage.DwellOverrides(),
 			StalledRequireQuiet:       stage.Stalled.IsRequireQuiet(),
 			ContributorNudge:          stage.ContributorNudge.IsEnabled(),
-			RenudgeInterval:           stage.ContributorNudge.EffectiveRenudgeInterval(),
+			RenudgeInterval:           nudgeRepeatAfter(cfg),
+			CIFailureCooldown:         stage.ContributorNudge.EffectiveCIFailureCooldown(),
 			Adoption:                  stage.Adoption.IsEnabled(),
 			GraceOnline:               stage.EffectiveContributorGraceOnline(),
 			GraceOffline:              stage.EffectiveContributorGraceOffline(),
 			AdoptAfterOffline:         stage.Adoption.EffectiveAfterOffline(),
 			AdoptAfterUnregistered:    stage.Adoption.EffectiveAfterUnregistered(),
+			AdoptOfflineGrace:         stage.Adoption.EffectiveOfflineGrace(),
 			AdoptInPlace:              stage.Adoption.InPlaceEnabled(),
 			AdoptionStrictAttribution: stage.Adoption.StrictAttributionEnabled(),
 			AdoptionAutoMerge:         stage.Adoption.AutoMergeEnabled(),
 			AdoptionMaintainerPolicy:  stage.Adoption.EffectiveMaintainerPolicy(),
 			AdoptSupersedeCloseFirst:  stage.Adoption.Supersede.CloseFirstEnabled(),
+			AdoptCloseSuperseded:      stage.Adoption.EffectiveCloseSuperseded(),
 			HiveID:                    cfg.HiveID,
 			AuthorKindLabels:          cfg.Governor.Labels.Author.Names(),
 			RelayKnown:                contributorRelayKnown,
+			OwnerAuthor:               dashboardOwnerLogin(cfg),
+			HiveAuthor:                hiveIdentity(cfg).Matches,
 			SharedCIIncident:          stageSharedCIIncident,
 			BaseBranchRed:             stageBaseBranchRed,
 			ForkGuard:                 stageForkGuard,
 			DCORequired:               stage.DCO.RequiredFor,
 			SquashOnly:                cfg.AutoMerge.SquashOnlyFor,
+			QuietNotifications:        cfg.GitHub.Notifications.Quiet(),
 		}
+	}
+}
+
+// dashboardOwnerLogin answers StageLabelPolicy.OwnerAuthor from
+// dashboard.authorized_users: an owner's PR is a person's, never adopted
+// (hivecommons/hive#15202).
+func dashboardOwnerLogin(cfg *config.Config) func(login string) bool {
+	return func(login string) bool {
+		login = strings.TrimSpace(strings.TrimPrefix(login, "@"))
+		if login == "" || cfg == nil {
+			return false
+		}
+		for _, entry := range cfg.Dashboard.AuthorizedUsers {
+			if name, _ := dashboard.AuthorizedUserEntry(entry); strings.EqualFold(name, login) {
+				return true
+			}
+		}
+		return false
 	}
 }
 
@@ -188,24 +226,42 @@ func contributorLaneReviewerConfigured(cfg *config.Config) bool {
 	return false
 }
 
+// contributorLaneReviewDispatched reports whether the review planner asks
+// reviewers for new heads at all. It mirrors planReviewDispatchWith's
+// answeredOnly rule: with review.require_approval or review.fan_out off the
+// planner hands out only maintainer-answered fix work, never a review.
+func contributorLaneReviewDispatched(cfg *config.Config) bool {
+	return cfg != nil && cfg.Review.RequireApproval && cfg.Review.FanOut
+}
+
 // contributorLaneVerdictFunc answers the contributor-lane reviewer gate from
 // the same durable review-verdicts.json the merge-eligibility gate reads
 // (review.Artifact.HasAggregateApproval). An unreadable artifact with a
-// reviewer configured fails closed: Configured=true, Approved=false.
+// reviewer configured fails closed: Configured=true, Approved=false. A head
+// with no aggregate on a hive that never dispatches the review swarm is
+// marked ReviewOff: no verdict is on its way, and the lane says so
+// (contributor-lane:review-off) instead of waiting at no-verdict forever.
 func contributorLaneVerdictFunc(cfg *config.Config, logger *slog.Logger) automerge.ContributorLaneVerdictFunc {
 	return func(repo string, number int, headSHA string) automerge.ContributorLaneVerdict {
 		if !contributorLaneReviewerConfigured(cfg) {
 			return automerge.ContributorLaneVerdict{}
 		}
+		reviewOff := !contributorLaneReviewDispatched(cfg)
 		artifact, err := review.LoadArtifact("")
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Nothing was ever reviewed: no verdict for this head either.
+				return automerge.ContributorLaneVerdict{Configured: true, ReviewOff: reviewOff}
+			}
 			if logger != nil {
 				logger.Warn("contributor-lane verdict gate: review-verdicts.json unavailable; failing closed", "error", err)
 			}
 			return automerge.ContributorLaneVerdict{Configured: true}
 		}
 		approved := artifact.HasAggregateApproval(repo, number, headSHA)
-		return contributorLaneVerdictFromArtifact(artifact, repo, number, headSHA, approved)
+		v := contributorLaneVerdictFromArtifact(artifact, repo, number, headSHA, approved)
+		v.ReviewOff = reviewOff && !approved && strings.TrimSpace(v.Verdict) == ""
+		return v
 	}
 }
 
@@ -246,6 +302,11 @@ func reviewHoldReleaseRecorder(logger *slog.Logger) automerge.ReviewHoldReleaseF
 	}
 }
 
+// contributorNudgeFindingLimit caps the findings a contributor nudge lists
+// on a changes_requested; the rest are counted in one line. The reviewer
+// summaries it lists instead, when the verdict has no finding, share the cap.
+const contributorNudgeFindingLimit = 5
+
 func contributorLaneVerdictFromArtifact(artifact review.Artifact, repo string, number int, headSHA string, approved bool) automerge.ContributorLaneVerdict {
 	var match review.Aggregate
 	var ok bool
@@ -265,7 +326,11 @@ func contributorLaneVerdictFromArtifact(artifact review.Artifact, repo string, n
 			Verdict:            string(match.Verdict),
 			DecisionRequested:  match.DecisionRequested,
 			DecisionQuestion:   match.DecisionQuestion,
+			DecisionFinding:    match.DecisionFinding,
+			RedundantOf:        match.RedundantOf,
 			HumanSummaries:     append([]string(nil), match.HumanSummaries...),
+			FindingAsks:        match.FindingAsks(contributorNudgeFindingLimit),
+			SummaryAsks:        match.BlockSummaryAsks(contributorNudgeFindingLimit),
 			HiveAuthoredKnown:  match.HiveAuthoredKnown,
 			HiveAuthored:       match.HiveAuthored,
 			FixCycleCapReached: review.FixCycleCapReached(match),
@@ -324,7 +389,18 @@ const (
 // ordinary hive PR and flows through normal review and auto-merge (operator
 // decision, 2026-10-16). A nil ownsRepo fails closed to "cross-repo", so a
 // wiring mistake can only hold too much, never too little.
-func shouldHoldAgentPR(agentName, repo string, level int, ownsRepo func(agent, repo string) bool) bool {
+//
+// The red-team lane (hivecommons/hive#17420) adds a second level-independent
+// reason: its PRs change the ioscan red-team corpus and the published block
+// rate, and the lane's whole output is adversarial text. Its policy promises
+// "hold at every ACMM level, including L6"; alwaysHold is the server-side
+// enforcement of that promise, keyed on the authenticated agent's role/base
+// name from config, so a prompt that forgets the label cannot open an
+// auto-merge path. A nil alwaysHold simply adds no reason.
+func shouldHoldAgentPR(agentName, repo string, level int, ownsRepo func(agent, repo string) bool, alwaysHold func(agent string) bool) bool {
+	if alwaysHold != nil && alwaysHold(agentName) {
+		return true
+	}
 	if isOutreachAgent(agentName) {
 		if ownsRepo == nil || !ownsRepo(agentName, repo) {
 			return true
@@ -467,13 +543,14 @@ func setMergeEligibleLaneGate(g github.MergeRequestPolicyGate) {
 // refuses must not be listed merge-eligible: hive-merge on it is a wasted
 // attempt every kick, and the contributor lane merges it itself when ready.
 // It reuses the relay's gate (automerge.Engine.RelayMergeRefusal) rather than
-// restating the rule. Hive-authored PRs bypass the lane, and an unreadable
-// gate leaves the PR listed — the relay still re-checks it at merge time.
+// restating the rule. The gate itself owns author exemptions: hive attribution
+// describes provenance, not contributor trust. An unreadable gate leaves the
+// PR listed — the relay still re-checks it at merge time.
 func relayLaneRefusal(pr github.PullRequest, fullRepo string, logger *slog.Logger) string {
 	mergeEligibleLaneGateMu.RLock()
 	gate := mergeEligibleLaneGate
 	mergeEligibleLaneGateMu.RUnlock()
-	if gate == nil || hiveAuthoredPR(pr) {
+	if gate == nil {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -487,6 +564,21 @@ func relayLaneRefusal(pr github.PullRequest, fullRepo string, logger *slog.Logge
 		logger.Info("excluding PR from merge-eligible: contributor lane refuses the merge relay", "repo", fullRepo, "number", pr.Number, "refusal", refusal)
 	}
 	return refusal
+}
+
+// relayRefusalNeedsMaintainer reports trust admission failures using the
+// stage engine's existing classification. Soak, head age and pending review
+// are temporary gates, not requests for a maintainer merge.
+func relayRefusalNeedsMaintainer(refusal string) bool {
+	if !strings.HasPrefix(refusal, automerge.RelayMergeRefusalPrefix) {
+		return false
+	}
+	_, reason, ok := strings.Cut(refusal, ": ")
+	if !ok {
+		return false
+	}
+	reason, _, _ = strings.Cut(reason, " (")
+	return prstage.HumanMergeReason(reason) == prstage.HumanMergeReasonUntrustedAuthor
 }
 
 // mergeableJSON renders a tri-state mergeability verdict for the
@@ -646,6 +738,15 @@ func classifyMergeEligibility(pr github.PullRequest, held bool, fullRepo string,
 	if held {
 		return mergeBucketSkip, blockedOrOutstanding("label:hold"), ""
 	}
+	// The conflict classification sits BEFORE the needs-decision park for
+	// the same reason the red one sits before the hold (hivecommons/hive
+	// #14822 sat 14h at stage/085 behind v5 with nothing rebasing it): a
+	// parked CONFLICTING PR is still its fixer's to rebase, so the person
+	// deciding on it decides on a branch that can merge. The park still
+	// keeps it out of merge-eligible — the conflict bucket never merges.
+	if conflictMergeState(pr) {
+		return mergeBucketConflict, github.MergeVerdict{State: github.MergeVerdictBlocked, Reason: notMergeableReason(pr, "")}, ""
+	}
 	// A PR parked on a person's decision (stage/085-needs-decision, or the
 	// issue-side stage/045 spelling a hook may have left on it) is a
 	// human's to release, so it is never merge-eligible — the relay must
@@ -653,10 +754,6 @@ func classifyMergeEligibility(pr github.PullRequest, held bool, fullRepo string,
 	// classification: a parked RED PR is still its author's to repair.
 	if parked := needsDecisionParkLabel(pr.Labels); parked != "" {
 		return mergeBucketSkip, blockedOrOutstanding("label:" + parked + " — parked on a human decision"), ""
-	}
-
-	if conflictMergeState(pr) {
-		return mergeBucketConflict, github.MergeVerdict{State: github.MergeVerdictBlocked, Reason: notMergeableReason(pr, "")}, ""
 	}
 	if sentinelMergeBlock {
 		return mergeBucketSkip, blockedOrOutstanding(blockLabelSentinel), ""
@@ -770,6 +867,29 @@ func classifyMergeEligibility(pr github.PullRequest, held bool, fullRepo string,
 	return mergeBucketEligible, github.MergeVerdict{State: github.MergeVerdictEligible, Reason: reason}, ""
 }
 
+// handMergeVerdict marks an outstanding verdict in a repo whose auto-merge
+// switch is off as a hand merge too, its reason naming both what the sweep
+// still wants and that a person merges it. Outstanding means GitHub would
+// take the merge and only Hive's own gates (a contributor-lane refusal, a red
+// check nobody declared required, a soak) hold it, and no Hive sweep ever
+// merges in that repo. Without this only a PR that passed every gate carried
+// HandMerge, so those PRs fell out of the your-turn inbox with no reason
+// (projectbluefin/documentation#1668, projectbluefin/actions#697). A blocked
+// verdict (GitHub itself refuses: a conflict, a failing required check) is
+// still the author's CI work, and an unknown one is left alone.
+func handMergeVerdict(v github.MergeVerdict, repoAutoMergeOff bool) github.MergeVerdict {
+	if !repoAutoMergeOff || v.HandMerge || v.State != github.MergeVerdictOutstanding {
+		return v
+	}
+	v.HandMerge = true
+	if r := strings.TrimSpace(v.Reason); r != "" {
+		v.Reason = r + "; " + repoAutoMergeOffReason
+	} else {
+		v.Reason = repoAutoMergeOffReason
+	}
+	return v
+}
+
 // repoAutoMergeOffReason is the verdict reason for a PR that passes every
 // gate in a repo whose auto-merge switch is off.
 const repoAutoMergeOffReason = "auto-merge is off for this repo (its auto-merge setting, or the hive is below ACMM L6) — a person merges it"
@@ -825,6 +945,13 @@ func automergeBlockLabelReason(labels []string, trusted bool) string {
 			return "label:" + lower
 		case lower == "hold" || strings.Contains(lower, "hold"):
 			return "label:hold"
+		}
+	}
+	// Last, as in the lanes' labelBlockReason: a PR held on its Depends-on
+	// targets (or a person's `blocked`) is never merge-eligible.
+	for _, label := range labels {
+		if strings.EqualFold(strings.TrimSpace(label), github.BlockedLabel) {
+			return "label:" + github.BlockedLabel
 		}
 	}
 	return ""
@@ -904,6 +1031,53 @@ func hiveAuthoredPR(pr github.PullRequest) bool {
 	}
 	author := strings.ToLower(strings.TrimSpace(pr.Author))
 	return strings.HasPrefix(author, "app/")
+}
+
+// rebaseAttempts is the conflict loop-guard ledger; tests swap it.
+var rebaseAttempts = rebasemerge.SharedAttempts
+
+// rebaseAttemptNow is the clock for the rebase episode; tests swap it.
+var rebaseAttemptNow = time.Now
+
+// rebaseAttemptTimeout is how long one fixer rebase attempt may wait for a
+// push before it counts as failed
+// (governor.labels.stage.adoption.rebase_attempt_timeout, default 15m).
+func rebaseAttemptTimeout(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return config.DefaultAdoptRebaseAttemptTimeout
+	}
+	return cfg.Governor.Labels.Stage.Adoption.EffectiveRebaseAttemptTimeout()
+}
+
+// mergeTrainRebaseRequester is the RequestedBy the merge train writes on a
+// rebase episode it opens for a member it could not update-branch
+// (hivecommons/hive#15117 → #15104).
+const mergeTrainRebaseRequester = "merge-train"
+
+// trustedAuthorRebasePR: a PR by a trusted author (auto_merge.trusted_authors
+// would merge it unattended) whose head the hive can push to. Its rebase is
+// the hive's: the trusted-author lane never rebases, and the author is a
+// person who opened it through the hive and expects the hive to carry it.
+// A dependency bot's branch never is: the bot resolves its own conflicts,
+// and a fixer push would stop it rebasing the branch for good
+// (github.DependencyBotBranch).
+func trustedAuthorRebasePR(cfg *config.Config, fullRepo string, pr github.PullRequest) bool {
+	if cfg == nil || github.ReachableAction(pr) != github.ReachableActionPush || github.DependencyBotBranch(pr.HeadRef, pr.Author) {
+		return false
+	}
+	policy := trustedAuthorPolicyFunc(cfg)()
+	if !policy.Enabled {
+		return false
+	}
+	if len(policy.Repos) > 0 && !policy.Repos[strings.ToLower(strings.TrimSpace(fullRepo))] {
+		return false
+	}
+	for _, l := range pr.Labels {
+		if policy.ExcludeLabels[strings.ToLower(strings.TrimSpace(l))] {
+			return false
+		}
+	}
+	return trustedAuthorFunc(cfg)(pr.Author, policy.RequireRole).Allowed
 }
 
 func conflictMergeState(pr github.PullRequest) bool {
@@ -1112,6 +1286,16 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 		// leave the label alone — a maintainer clears the alert before the
 		// merge. Only adopted rows reach the buckets with it set.
 		SentinelAlert bool `json:"sentinel_alert,omitempty"`
+		// RebaseAttempt / RebaseAttemptsMax are the conflict loop guard
+		// (hivecommons/hive#15103): attempt n of max for this conflict
+		// episode, where each fixer head still dirty is the next attempt.
+		// BaseRef names the branch to rebase onto. TrustedAuthor marks a
+		// trusted author's PR (not hive-authored, not adopted) the hive
+		// rebases on the author's behalf.
+		RebaseAttempt     int    `json:"rebase_attempt,omitempty"`
+		RebaseAttemptsMax int    `json:"rebase_attempts_max,omitempty"`
+		BaseRef           string `json:"base_ref,omitempty"`
+		TrustedAuthor     bool   `json:"trusted_author,omitempty"`
 		// DeferredIncident is the open [shared-ci] incident issue this red
 		// PR was already deferred to (github.PullRequest.SharedCIIncident,
 		// hivecommons/hive#10528); only red PRs carry one. It applies to a
@@ -1145,7 +1329,15 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 
 	prAgents := auditPRAgents(org, time.Now().Add(-auditPRAttributionWindow), "")
 
+	type maintainerMergePR struct {
+		Number  int    `json:"number"`
+		Repo    string `json:"repo"`
+		Title   string `json:"title"`
+		HeadSHA string `json:"head_sha,omitempty"`
+		Reason  string `json:"reason"`
+	}
 	var eligible []eligiblePR
+	var needsMaintainer []maintainerMergePR
 	var failing []failingPR
 	// escalated holds the escalated (needs-human) hive PRs that did NOT land
 	// in the failing bucket — conflicted, green or pending ones
@@ -1195,6 +1387,7 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 		requiredChecks:        requiredChecks,
 	}
 	seen := make(map[string]bool, len(candidates))
+	openPRs := make(map[string]bool, len(candidates))
 	for _, cand := range candidates {
 		pr := cand.pr
 		key := fmt.Sprintf("%s/%d", pr.Repo, pr.Number)
@@ -1206,6 +1399,7 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 		// the hold snapshot; both mean the same thing here.
 		held := cand.held || holdSet[key]
 		fullRepo := fullRepoName(pr.Repo, org)
+		openPRs[stagelabels.Key(fullRepo, pr.Number)] = true
 		prGates := gates
 		if cfg != nil {
 			if set, ok := cfg.AutoMerge.RequiredCheckSetForRepo(fullRepo); ok {
@@ -1218,14 +1412,30 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 		prGates.mergeQueueRequired = hiveMergeQueueBases.Required(fullRepo, pr.BaseRef, time.Now())
 
 		adopted := adoptedInPlace(fullRepo, pr.Number)
+		// An operator's "Rebase, then merge as maintainer" makes the rebase
+		// the hive's whoever authored the PR: route it like an in-place
+		// adoption so the fixer gets a push instruction (a fork that
+		// allows maintainer edits is push-reachable; the dashboard refuses
+		// to arm one that is not).
+		rebaseMergeArmed := rebasemerge.Shared().Armed(fullRepo, pr.Number)
+		if rebaseMergeArmed && !adopted {
+			adopted = true
+			logger.Info("rebase-then-merge armed; routing PR to fixer", "repo", fullRepo, "number", pr.Number, "mergeable_state", pr.MergeableState)
+		}
 		prGates.adopted = adopted
 		bucket, verdict, intentReason := classifyMergeEligibility(pr, held, fullRepo, prGates)
 		if bucket == mergeBucketEligible {
 			if refusal := relayLaneRefusal(pr, fullRepo, logger); refusal != "" {
 				bucket = mergeBucketSkip
 				verdict = github.MergeVerdict{State: github.MergeVerdictOutstanding, Reason: refusal}
+				if relayRefusalNeedsMaintainer(refusal) {
+					needsMaintainer = append(needsMaintainer, maintainerMergePR{
+						Number: pr.Number, Repo: fullRepo, Title: pr.Title, HeadSHA: pr.HeadSHA, Reason: refusal,
+					})
+				}
 			}
 		}
+		verdict = handMergeVerdict(verdict, prGates.repoAutoMergeOff)
 		verdicts[github.MergeVerdictKey(pr)] = verdict
 		if intentReason != "" {
 			iv := intentVerdicts[fmt.Sprintf("%s/%d", fullRepo, pr.Number)]
@@ -1261,6 +1471,10 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 		if adopted {
 			row.ReachableAction = github.ReachableActionPush
 		}
+		if bucket != mergeBucketConflict {
+			// Not conflicting any more: the rebase episode is over.
+			rebaseAttempts().Clear(fullRepo, pr.Number)
+		}
 		if bucket != mergeBucketFailing && row.Escalated && !holdDriftPRs[key] {
 			row.Mergeable = mergeableJSON(pr.Mergeable)
 			row.CIStatus = pr.CIStatus
@@ -1270,13 +1484,57 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 		case mergeBucketSkip:
 			continue
 		case mergeBucketConflict:
-			if !hiveAuthoredPR(pr) && !adopted {
+			// Whose rebase is it? The hive's own PR, an adopted one, or —
+			// hivecommons/hive#15103 — a trusted author's (the operator's
+			// own identity opening PRs through session agents): the
+			// trusted-author lane skips those on label:needs-rebase and
+			// nothing else ever rebased them. Any PR the hive can push to
+			// and would merge unattended is the hive's to keep mergeable.
+			trustedRebase := !hiveAuthoredPR(pr) && !adopted && trustedAuthorRebasePR(cfg, fullRepo, pr)
+			// An operator's approve / merge-now from the dashboard on a
+			// conflicting PR asks for the rebase outright (the episode
+			// carries RequestedBy); that admits any PR the hive can push.
+			requested := false
+			if prior, ok := rebaseAttempts().Get(fullRepo, pr.Number); ok && prior.RequestedBy != "" && github.ReachableAction(pr) == github.ReachableActionPush {
+				requested = !hiveAuthoredPR(pr) && !adopted && !trustedRebase
+			}
+			if !hiveAuthoredPR(pr) && !adopted && !trustedRebase && !requested {
+				continue
+			}
+			// Loop guard: attempt n of MaxRebaseAttempts per conflict
+			// episode; a fixer's pushed head that is still dirty is the
+			// next attempt, and past the cap the hive stops re-kicking.
+			// A fixer-owned attempt (adopted, trusted-author, requested)
+			// that saw no push within its deadline is the next attempt too
+			// (hivecommons/hive#16023): a busy fixer must not hold the
+			// episode at attempt 1 forever.
+			fixerRebase := adopted || trustedRebase || requested
+			rebaseNow := rebaseAttemptNow()
+			attempt := rebaseAttempts().Observe(fullRepo, pr.Number, pr.HeadSHA, rebaseNow)
+			var timedOut *rebasemerge.Attempt
+			if fixerRebase {
+				prev := attempt
+				if next, ok := rebaseAttempts().Expire(fullRepo, pr.Number, rebaseAttemptTimeout(cfg), rebaseNow); ok {
+					timedOut, attempt = &prev, next
+				}
+			}
+			row.RebaseAttempt = attempt.Count()
+			row.RebaseAttemptsMax = rebasemerge.MaxRebaseAttempts
+			row.BaseRef = pr.BaseRef
+			row.TrustedAuthor = trustedRebase
+			if attempt.Exhausted() {
+				args := []any{"repo", fullRepo, "number", pr.Number, "head", pr.HeadSHA, "attempts", attempt.Count() - 1, "max", rebasemerge.MaxRebaseAttempts, "timed_out", attempt.Stalled, "mergeable_state", pr.MergeableState}
+				if timedOut != nil {
+					args = append(args, "waited_for", timedOut.Fixer, "waited", timedOut.Waiting(rebaseNow).Round(time.Second).String())
+				}
+				logger.Warn("rebase attempts exhausted; leaving the conflict to a person", args...)
 				continue
 			}
 			agent := prFixAgent(pr, prAgents[fmt.Sprintf("%s#%d", fullRepo, pr.Number)])
-			if adopted {
-				// A contributor's branch name is not a lane; the
-				// fallback fixer owns adopted PRs.
+			if adopted || trustedRebase || requested {
+				// A contributor's (or the owner's) branch name is not a
+				// lane; the fallback fixer owns adopted, trusted-author
+				// and operator-requested rebases.
 				agent = ""
 			}
 			reroutedFrom := ""
@@ -1288,11 +1546,36 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 			row.DeferredIncident = pr.SharedCIIncident
 			if adopted {
 				markAdoptedFixerQueued(fullRepo, pr.Number, pr.HeadSHA, agent, cfg)
-				logger.Info("adopted PR routed to fixer", "repo", fullRepo, "number", pr.Number, "work", "rebase", "mergeable_state", pr.MergeableState, "fixer", agent, "sentinel_alert", row.SentinelAlert)
+			}
+			if trustedRebase || requested {
+				row.ReachableAction = github.ReachableActionPush
+			}
+			if fixerRebase {
+				// The row stays listed every sweep (the fixer's kick overlay
+				// reads it), but each attempt is routed and announced once;
+				// the dispatch time is the attempt's deadline clock.
+				if _, first := rebaseAttempts().Dispatch(fullRepo, pr.Number, agent, rebaseNow); first {
+					args := []any{"repo", fullRepo, "number", pr.Number, "work", "rebase", "adopted", adopted, "trusted_author", trustedRebase, "requested_by", attempt.RequestedBy, "attempt", attempt.Count(), "max", rebasemerge.MaxRebaseAttempts, "mergeable_state", pr.MergeableState, "fixer", agent, "sentinel_alert", row.SentinelAlert}
+					if timedOut != nil {
+						args = append(args, "previous_attempt_timed_out", true, "waited_for", timedOut.Fixer, "waited", timedOut.Waiting(rebaseNow).Round(time.Second).String())
+					}
+					logger.Info("PR routed to fixer for rebase", args...)
+				}
 			}
 			failing = append(failing, row)
 			continue
 		case mergeBucketFailing:
+			if adopted {
+				// Parked at 085 on this head: the hive already told a person
+				// it has nothing to push, so the fixer is not kicked to
+				// re-triage the same red on every sweep.
+				if reason, parked := adoptedFixCIParked(fullRepo, pr.Number, pr.HeadSHA); parked {
+					if adoptedFixCIRoutes.first(fullRepo, pr.Number, parkedEpisode(pr.HeadSHA, reason)) {
+						logger.Info("adopted PR parked at needs-decision; fix-ci not routed", "repo", fullRepo, "number", pr.Number, "head", pr.HeadSHA, "reason", reason, "failing_checks", pr.FailingChecks)
+					}
+					continue
+				}
+			}
 			agent := prFixAgent(pr, prAgents[fmt.Sprintf("%s#%d", fullRepo, pr.Number)])
 			reroutedFrom := ""
 			if adopted {
@@ -1305,8 +1588,13 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 			row.DeferredIncident = pr.SharedCIIncident
 			row.DeferredExternal = pr.ExternalCIDeferred
 			if adopted {
+				// The row stays listed (and queued for the 074 dwell) every
+				// sweep, but each red episode, its head plus failing checks,
+				// is routed and announced once.
 				markAdoptedFixerQueued(fullRepo, pr.Number, pr.HeadSHA, agent, cfg)
-				logger.Info("adopted PR routed to fixer", "repo", fullRepo, "number", pr.Number, "work", "fix-ci", "failing_checks", pr.FailingChecks, "fixer", agent, "sentinel_alert", row.SentinelAlert)
+				if adoptedFixCIRoutes.first(fullRepo, pr.Number, fixCIEpisode(pr.HeadSHA, pr.FailingChecks)) {
+					logger.Info("adopted PR routed to fixer", "repo", fullRepo, "number", pr.Number, "work", "fix-ci", "head", pr.HeadSHA, "failing_checks", pr.FailingChecks, "fixer", agent, "sentinel_alert", row.SentinelAlert)
+				}
 			}
 			failing = append(failing, row)
 			continue
@@ -1328,11 +1616,17 @@ func writeMergeEligible(actionable *github.ActionableResult, hold github.HoldRes
 		})
 	}
 
+	if len(openPRs) > 0 {
+		// An empty pass is more likely a failed read than every PR closing.
+		adoptedFixCIRoutes.retain(openPRs)
+	}
+
 	_ = os.MkdirAll("/var/run/hive-metrics", 0o755)
 
 	payload := map[string]any{
-		"generated_at":   time.Now().UTC().Format(time.RFC3339),
-		"merge_eligible": eligible,
+		"generated_at":           time.Now().UTC().Format(time.RFC3339),
+		"merge_eligible":         eligible,
+		"needs_maintainer_merge": needsMaintainer,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -1367,4 +1661,15 @@ func normalizedAutoMergeLabel(label string) string {
 		return label
 	}
 	return github.AutoMergeQueuedLabel
+}
+
+// nudgeRepeatAfter is the delay before the one contributor re-nudge:
+// governor.labels.stage.contributor_nudge.renudge_interval when set,
+// otherwise auto_merge.nudge_repeat_after (default 72h,
+// hivecommons/hive#17067).
+func nudgeRepeatAfter(cfg *config.Config) time.Duration {
+	if d := cfg.Governor.Labels.Stage.ContributorNudge.EffectiveRenudgeInterval(); d > 0 {
+		return d
+	}
+	return cfg.AutoMerge.EffectiveNudgeRepeatAfter()
 }

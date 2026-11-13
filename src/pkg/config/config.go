@@ -3,6 +3,9 @@ package config
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
+
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // saveMu serializes all Config.Save() calls process-wide. Multiple goroutines
@@ -14,6 +17,17 @@ import (
 // pause is silently lost. Pausing 7 agents in quick succession reliably left
 // only the last 1-2 on the PVC. Serializing every Save() closes the race.
 var saveMu sync.Mutex
+
+// saveSeq counts the config file writes this process has started. A reload
+// that cannot be applied yet records it when it is parked; a different value
+// when it is finally applied means some other saver rewrote hive.yaml from the
+// pre-reload config in between (hivecommons/hive#17467).
+var saveSeq atomic.Uint64
+
+// SaveSeq reports the number of config file writes started by this process:
+// every Config.Save, SetAgentPausedAndSave and ReconcilePausedAndSave that
+// reached the write stage, from any goroutine.
+func SaveSeq() uint64 { return saveSeq.Load() }
 
 var (
 	saveObserverMu sync.Mutex
@@ -60,14 +74,24 @@ type Config struct {
 	Data               DataConfig          `yaml:"data"`
 	Deployment         DeploymentConfig    `yaml:"deployment,omitempty" json:"deployment,omitempty"`
 	Knowledge          KnowledgeConfig     `yaml:"knowledge"`
-	Hub                HubConfig           `yaml:"hub"`
+	// Inbox routes voice-recorder items (Plaud, Wispr Flow) to spek RFCs or
+	// dibs from the dashboard Inbox.
+	Inbox InboxConfig `yaml:"inbox,omitempty" json:"inbox,omitempty"`
+	Hub   HubConfig   `yaml:"hub"`
 	// Issues tunes issue lifecycle automation. Zero value keeps the safe
 	// defaults: close issues after their fix PR merges, and backfill hourly.
-	Issues     IssuesConfig     `yaml:"issues,omitempty" json:"issues,omitempty"`
-	Fleet      FleetConfig      `yaml:"fleet,omitempty" json:"fleet,omitempty"`
+	Issues IssuesConfig `yaml:"issues,omitempty" json:"issues,omitempty"`
+	Fleet  FleetConfig  `yaml:"fleet,omitempty" json:"fleet,omitempty"`
+	// Dedupe tunes the dedupe lane's follow-through on its checklists.
+	Dedupe     DedupeLaneConfig `yaml:"dedupe,omitempty" json:"dedupe,omitempty"`
 	Contribute ContributeConfig `yaml:"contribute,omitempty" json:"contribute,omitempty"`
-	HiveID     string           `yaml:"hive_id"`
-	ACMMLevel  *int             `yaml:"acmm_level,omitempty" json:"acmm_level"`
+	// Workflow gates the workflow-model engine (hivecommons/hive#17620).
+	// Off by default: every repository derives stages with the built-in
+	// derivers exactly as before. On, repositories bound to a workflow
+	// model derive through it; unbound repositories are unchanged.
+	Workflow  WorkflowConfig `yaml:"workflow,omitempty" json:"workflow,omitempty"`
+	HiveID    string         `yaml:"hive_id"`
+	ACMMLevel *int           `yaml:"acmm_level,omitempty" json:"acmm_level"`
 	// ModelRoles is the named model-roles map (#9722): a small set of names,
 	// each naming a backend, a model and a reasoning effort, referenced as
 	// "@<role>" wherever hive asks for a model (today: agents' model and the
@@ -86,6 +110,11 @@ type Config struct {
 	// Debug holds process-level diagnostics knobs (pprof listener). See
 	// docs/operator-reference.md "Runtime diagnostics".
 	Debug DebugConfig `yaml:"debug,omitempty" json:"debug,omitempty"`
+	// Network holds outbound-connectivity knobs: the optional upstream HTTP
+	// forward proxy that selected hosts (e.g. an enterprise GitHub reachable
+	// only via a corporate proxy) are chained through. Env overrides and
+	// HTTPS_PROXY fallback: see crux/upstreamproxy.Resolve.
+	Network NetworkConfig `yaml:"network,omitempty" json:"network,omitempty"`
 	// Triggers is an additive list of CEL-based declarative agent triggers.
 	// Default empty → existing label/governor triggering is unchanged.
 	Triggers []TriggerRule `yaml:"triggers,omitempty" json:"triggers,omitempty"`
@@ -109,9 +138,19 @@ type Config struct {
 	// Sentinel flags PRs that look like security overrides, privilege
 	// escalation or codebase damage, from any author. Default on; see
 	// SentinelConfig.
-	Sentinel   SentinelConfig   `yaml:"sentinel,omitempty" json:"sentinel,omitempty"`
+	Sentinel SentinelConfig `yaml:"sentinel,omitempty" json:"sentinel,omitempty"`
+	// Security holds the hive-wide security knobs that are not one agent's
+	// or one sweep's; see SecurityConfig.
+	Security SecurityConfig `yaml:"security,omitempty" json:"security,omitempty"`
+	// Evidence controls the review evidence bundles the review relay writes
+	// (hivecommons/hive#11060). Default on, unsigned; see EvidenceConfig.
+	Evidence EvidenceConfig `yaml:"evidence,omitempty" json:"evidence,omitempty"`
+	// Benchmarks governs the anonymized per-PR records this hive contributes
+	// to hivecommons/benchmarks (hivecommons/hive#17694); see BenchmarksConfig.
+	Benchmarks BenchmarksConfig `yaml:"benchmarks,omitempty" json:"benchmarks,omitempty"`
+	// Compliance selects framework profiles; see ComplianceConfig.
+	Compliance ComplianceConfig `yaml:"compliance,omitempty" json:"compliance,omitempty"`
 	Escalation EscalationConfig `yaml:"escalation,omitempty" json:"escalation,omitempty"`
-	Evidence   EvidenceConfig   `yaml:"evidence,omitempty" json:"evidence,omitempty"`
 	// Jev configures the shared Jev (TypeSafe AI typed-decision model) client
 	// that agents with jev_mode: assist reach through the hive's local decision
 	// endpoint (hivecommons/hive#8939). Zero value: OpenRouter-hosted
@@ -120,17 +159,20 @@ type Config struct {
 	Jev JevConfig `yaml:"jev,omitempty" json:"jev,omitempty"`
 	// Runs tunes long-running runs and the opt-in Spektacular stage runner
 	// (hivecommons/hive#8303). Zero value: runner off, default retry budget.
-	Runs       RunsConfig       `yaml:"runs,omitempty" json:"runs,omitempty"`
-	Retro      RetroConfig      `yaml:"retro,omitempty" json:"retro,omitempty"`
-	Swarm      SwarmConfig      `yaml:"swarm,omitempty" json:"swarm,omitempty"`
-	Autonomy   AutonomyConfig   `yaml:"autonomy,omitempty" json:"autonomy,omitempty"`
-	Review     ReviewConfig     `yaml:"review,omitempty" json:"review,omitempty"`
-	Compliance ComplianceConfig `yaml:"compliance,omitempty" json:"compliance,omitempty"`
-	AutoMerge  AutoMergeConfig  `yaml:"auto_merge,omitempty" json:"auto_merge,omitempty"`
+	Runs      RunsConfig      `yaml:"runs,omitempty" json:"runs,omitempty"`
+	Retro     RetroConfig     `yaml:"retro,omitempty" json:"retro,omitempty"`
+	Swarm     SwarmConfig     `yaml:"swarm,omitempty" json:"swarm,omitempty"`
+	Autonomy  AutonomyConfig  `yaml:"autonomy,omitempty" json:"autonomy,omitempty"`
+	Review    ReviewConfig    `yaml:"review,omitempty" json:"review,omitempty"`
+	AutoMerge AutoMergeConfig `yaml:"auto_merge,omitempty" json:"auto_merge,omitempty"`
 	// Decisions tunes how decisions on needs-human items are recorded; its
 	// `delegate` block gates the activity monitor's "Let hive decide"
 	// action (default on).
 	Decisions DecisionsConfig `yaml:"decisions,omitempty" json:"decisions,omitempty"`
+	// Writeback is the unsolicited GitHub write-back containment gate
+	// (per-kind ACMM floor + review opt-in label, per-repo mode, backfill
+	// guard). Zero value = all three knobs on with the default matrix.
+	Writeback writeback.Config `yaml:"writeback,omitempty" json:"writeback,omitempty"`
 	// Chat tunes the dashboard Hive Chat panel; its `grounded_answers`
 	// block gates the model-backed answer path (default on).
 	Chat ChatConfig `yaml:"chat,omitempty" json:"chat,omitempty"`
@@ -152,6 +194,10 @@ type Config struct {
 	// broke a required check on the default branch (tuna-os pilot,
 	// tuna-os/tunaOS#4072). Nil means off.
 	RevertSheriff *RevertSheriffConfig `yaml:"revert_sheriff,omitempty" json:"revert_sheriff,omitempty"`
+	// SharedCIIssues files one `[shared-ci]` tracking issue when a check
+	// fails on several open PRs in a repository (or trips the red-main
+	// breaker) and no incident is open for it yet. Default on.
+	SharedCIIssues SharedCIIssuesConfig `yaml:"shared_ci_issues,omitempty" json:"shared_ci_issues,omitzero"`
 	// Search controls the portfolio search indexer (hivecommons/hive#14635).
 	// Default off.
 	Search  SearchConfig  `yaml:"search,omitempty" json:"search,omitempty"`
@@ -159,9 +205,13 @@ type Config struct {
 	// UpstreamWatch declares per-repo upstreams and filters for the fork
 	// upstream watch (hivecommons/hive#9966). Default off.
 	UpstreamWatch UpstreamWatchConfig `yaml:"upstream_watch,omitempty" json:"upstream_watch,omitempty"`
+	// CodeScanning turns open GitHub code scanning alerts into grouped hive
+	// issues (src/docs/code-scanning.md). Default off, opt-in per repo.
+	CodeScanning CodeScanningConfig `yaml:"code_scanning,omitempty" json:"code_scanning,omitempty"`
 	// Convergence toggles the convergence-driven admission surfaces
 	// (kubestellar/hive#3845 follow-ons). Default off → zero behaviour change.
-	Convergence ConvergenceConfig `yaml:"convergence,omitempty" json:"convergence,omitempty"`
+	Convergence              ConvergenceConfig              `yaml:"convergence,omitempty" json:"convergence,omitempty"`
+	IntegrationOrchestration IntegrationOrchestrationConfig `yaml:"integration_orchestration,omitempty" json:"integration_orchestration"`
 	// SLA holds the Delivery SLA span targets the dashboard Overview colours
 	// against (see sla.go). Unset fields use the defaults.
 	SLA SLAConfig `yaml:"sla,omitempty" json:"sla,omitempty"`
@@ -194,7 +244,13 @@ type Config struct {
 	// exposure is opt-in; with remote_enabled false the endpoint remains usable
 	// only through the existing dashboard/contribute auth path.
 	TaskMCP TaskMCPConfig `yaml:"task_mcp,omitempty" json:"task_mcp,omitempty"`
-
+	// AdminMCP holds the owner's switch for the HTTP admin MCP endpoint's
+	// write tools (Settings → Channels). Default empty → the
+	// HIVE_ADMIN_MCP_ENABLE_WRITES environment variable decides, as before.
+	AdminMCP AdminMCPConfig `yaml:"admin_mcp,omitempty" json:"admin_mcp,omitzero"`
+	// ConfigGuard is the `config:` block: how the config itself is loaded
+	// (hivecommons/hive#16438). See ConfigGuardConfig in gate_regression.go.
+	ConfigGuard ConfigGuardConfig `yaml:"config,omitempty" json:"config,omitempty"`
 	// RemovedAgents are agent names an operator deliberately deleted. It is a
 	// TOMBSTONE list, and it exists because deletion had no durable record
 	// anywhere: the delete handlers dropped the agent from the in-memory map
@@ -220,12 +276,48 @@ type Config struct {
 	RemovedAgents []string `yaml:"removed_agents,omitempty" json:"removed_agents,omitempty"`
 
 	SourcePath string `yaml:"-" json:"-"`
+	// LaunchCmdDegradations lists the base-config agents whose launch_cmd the
+	// loader dropped because it contradicted the agent's backend, so the
+	// dashboard can raise a banner for each. Runtime-only; see
+	// DegradeContradictingLaunchCmds.
+	LaunchCmdDegradations []LaunchCmdDegradation `yaml:"-" json:"-"`
+	// GateRegressions lists the safety gates a previous runtime overlay
+	// carried that this config lacks or weakens, as detected at boot
+	// (hivecommons/hive#16438). Runtime-only; served in /api/status as
+	// config.gate_regressions. See DetectPriorOverlayGateRegressions.
+	GateRegressions []GateRegression `yaml:"-" json:"-"`
 	// ReviewerAutoscaleActive is the reviewer autoscaler's current target
 	// replica count for the autoscaled lane (hivecommons/hive#14685).
 	// Runtime-only: it is never persisted, is carried across config reloads
 	// by the caller, and zero means "use the declared replicas". Written
 	// via SetReviewerAutoscaleActive.
 	ReviewerAutoscaleActive int `yaml:"-" json:"-"`
+	// ReviewerAutoscaleActiveAgent is the base agent ReviewerAutoscaleActive
+	// was set for. Runtime-only and carried with it. ExpandAgentReplicas
+	// honours the count only for this agent, so a lane that has just become
+	// the autoscaled one never inherits another lane's size.
+	ReviewerAutoscaleActiveAgent string `yaml:"-" json:"-"`
+}
+
+// WorkflowConfig is the `workflow:` block (hivecommons/hive#17620).
+type WorkflowConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// LabelGC lets the stage engine delete a bound model's labels from a
+	// repository once the repository is unbound or rebound to a model that
+	// no longer declares them (RFC phase 4 follow-up). Only labels the hive
+	// itself provisioned, outside the built-in stage family and worn by no
+	// open issue or PR, are ever deleted; each deletion is audited as
+	// workflow_label_removed. nil means true; false leaves every label in
+	// place and logs what would have gone.
+	LabelGC *bool `yaml:"label_gc,omitempty" json:"label_gc,omitempty"`
+	// Marketplace configures the spoke's view of the hub workflow catalogue
+	// (hivecommons/hive#17620 phase 7).
+	Marketplace MarketplaceConfig `yaml:"marketplace,omitempty" json:"marketplace,omitempty"`
+}
+
+// LabelGCEnabled is the effective workflow.label_gc (default true).
+func (c WorkflowConfig) LabelGCEnabled() bool {
+	return c.LabelGC == nil || *c.LabelGC
 }
 
 type DataConfig struct {
@@ -240,6 +332,10 @@ type DataConfig struct {
 	// panel configuration (#11694). Default /data/nous; HIVE_NOUS_DATA_DIR
 	// overrides it at runtime.
 	NousDir string `yaml:"nous_dir,omitempty"`
+	// WorkflowsDir is the durable root for stored workflow models
+	// (hivecommons/hive#17620); models live under <dir>/workflows. Empty
+	// means the hive data dir (/data); HIVE_WORKFLOWS_DATA_DIR overrides.
+	WorkflowsDir string `yaml:"workflows_dir,omitempty"`
 
 	// SessionRetentionDays is how many days of CLI session-state directories to
 	// keep. Session directories are created per CLI invocation and were never
@@ -302,7 +398,7 @@ func (c *Config) ExpandAgentReplicas() error {
 	}
 	effectiveReplicas := func(name string, agent AgentConfig) int {
 		if autoscaled != "" && name == autoscaled {
-			return c.reviewerAutoscaleReplicaCount(agent.Replicas)
+			return c.reviewerAutoscaleReplicaCount(name, agent.Replicas)
 		}
 		return normalizeReplicaCount(agent.Replicas)
 	}
@@ -395,6 +491,10 @@ func (c *Config) EnabledAgents() map[string]AgentConfig {
 			if agent.SessionRecycle == nil && !c.AgentsSessionRecycle.IsZero() {
 				fleet := c.AgentsSessionRecycle
 				agent.SessionRecycle = &fleet
+			}
+			if agent.CLIMemory == nil && !c.AgentsCLIMemory.IsZero() {
+				fleet := c.AgentsCLIMemory
+				agent.CLIMemory = &fleet
 			}
 			result[name] = agent
 		}

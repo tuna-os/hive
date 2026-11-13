@@ -34,7 +34,7 @@ const RELAY_PATH = path.join(__dirname, 'contributor-relay.js');
 // bash and no WebSocket are ever touched.
 // ---------------------------------------------------------------------------
 
-function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '--allow-all', backendPermShell = null, model = '', reasoningEffort = '', cliStates = ['ready'], procAlive = true, mode = 'interactive', execFileResult = null, statusFile = null, paneText = null, env = null, cliVersion = null, attachedClients = false, attachedIdleMs = 0, clientActivityRaw = null, listClientsThrows = false, prMeta = null, sessionMissing = false, newSessionFails = false, gitStatus = '', ghIssueEditFailures = 0 } = {}) {
+function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '--allow-all', backendPermShell = null, model = '', reasoningEffort = '', cliStates = ['ready'], procAlive = true, mode = 'interactive', execFileResult = null, statusFile = null, paneText = null, env = null, cliVersion = null, attachedClients = false, attachedIdleMs = 0, clientActivityRaw = null, listClientsThrows = false, prMeta = null, sessionMissing = false, newSessionFails = false, gitStatus = '', ghIssueEditFailures = 0, subIssuesSummary = null, mlxPreflightError = null } = {}) {
   const commands = [];
   // #7924: how many `gh issue edit` calls fail before one succeeds — models a
   // label the repository does not define (the first add fails, the relay
@@ -159,6 +159,14 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
       if (answer) return JSON.stringify(answer);
       return '';
     }
+    // The already-done label guard reads the issue for its sub-issue summary
+    // first. `subIssuesSummary` is GitHub's answer: unset prints `null`, which
+    // is what gh prints for an issue with no sub-issue block; an object is
+    // that block; an Error is thrown, modelling gh missing, offline or refused.
+    if (/gh api .*--jq \.sub_issues_summary/.test(cmd)) {
+      if (subIssuesSummary instanceof Error) throw subIssuesSummary;
+      return subIssuesSummary ? `${JSON.stringify(subIssuesSummary)}\n` : 'null\n';
+    }
     if (/gh issue edit/.test(cmd) && issueEditFailuresLeft > 0) {
       issueEditFailuresLeft--;
       const e = new Error('Command failed: gh issue edit');
@@ -192,7 +200,8 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    child.stdin = { end() {} };
+    child.stdin = new EventEmitter();
+    child.stdin.end = input => { child.input = input; };
     child.killed = false;
     let completed = false;
     const r = execFileResult || {};
@@ -253,6 +262,11 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
   };
 
   const stubs = {
+    './mlx-backend.js': {
+      checkRuntime(raw) {
+        if (raw.startsWith('mlx/') && mlxPreflightError) throw mlxPreflightError;
+      },
+    },
     child_process: {
       execSync: fakeExecSync,
       execFile: fakeExecFile,
@@ -401,6 +415,58 @@ function graceTicks(relay, tick) {
 
 const tests = [];
 function test(name, fn) { tests.push([name, fn]); }
+test('Cline routes both relay modes through the bounded canonical adapter without prompt argv', () => {
+  const relay = loadRelay({ backend: 'cline', model: 'openrouter/anthropic/test', reasoningEffort: 'high' });
+  try {
+    assert.strictEqual(relay.CONTRIBUTOR_MODE, relay.MODE_HEADLESS);
+    assert.strictEqual(relay.headlessSupportsBackend(), true);
+    assert.strictEqual(relay.effectiveProvider(), 'openrouter');
+    const built = relay.buildHeadlessArgv('private prompt with quotes and $shell');
+    assert.strictEqual(built.bin, 'crux');
+    assert.deepStrictEqual(built.args, ['cline-turn', '--model', 'openrouter/anthropic/test', '--thinking', 'high']);
+    assert.strictEqual(built.input, 'private prompt with quotes and $shell');
+    assert(!built.args.some(a => a.includes('private prompt')));
+    const task = { task_id: 'cline-selection', task_gen: 1, kind: 'issue', repo: 'x/y', number: 1, title: 'Cline' };
+    relay.setCurrentTask(task);
+    relay.runHeadlessTask(task);
+    const complete = relay.__sent.find(m => m.type === 'task_complete');
+    assert.ok(complete, 'Cline produced no completion receipt');
+    assert.strictEqual(complete.provider, 'openrouter');
+    assert.strictEqual(complete.model, 'openrouter/anthropic/test');
+    assert.strictEqual(complete.cli_backend, 'cline');
+  } finally { teardown(relay); }
+});
+
+test('Cline stdin EPIPE is a bounded task failure, not an uncaught relay error', () => {
+  const relay = loadRelay({ backend: 'cline', mode: 'headless', model: 'openrouter/test', execFileResult: { defer: true } });
+  try {
+    const task = { task_id: 'cline-epipe', task_gen: 1, kind: 'issue', repo: 'x/y', number: 1, title: 'Cline' };
+    relay.setCurrentTask(task);
+    relay.runHeadlessTask(task);
+    const child = relay.getHeadlessChild();
+    assert.ok(child.input && child.input.includes('Cline'), 'prompt was not delivered on stdin');
+    assert.doesNotThrow(() => child.stdin.emit('error', Object.assign(new Error('closed pipe'), { code: 'EPIPE' })));
+    relay.__completeDeferredExecFile(Object.assign(new Error('runner failed'), { code: 1 }));
+    assert.ok(relay.__sent.some(m => m.type === 'task_failed' && m.task_id === task.task_id));
+    assert.ok(!relay.__sent.some(m => m.type === 'task_complete' && m.task_id === task.task_id));
+  } finally { teardown(relay); }
+});
+
+test('Cline revoke requests graceful group cleanup and fences late completion', () => {
+  const relay = loadRelay({ backend: 'cline', mode: 'headless', model: 'openrouter/test', execFileResult: { defer: true } });
+  try {
+    const task = { task_id: 'cline-revoke', task_gen: 2, kind: 'issue', repo: 'x/y', number: 1, title: 'Cline' };
+    relay.setCurrentTask(task);
+    relay.runHeadlessTask(task);
+    const child = relay.getHeadlessChild();
+    let signal = '';
+    child.kill = value => { child.killed = true; signal = value; };
+    relay.handleMessage(JSON.stringify({ type: 'task_revoke', task_id: task.task_id, reason: 'operator stop' }));
+    assert.strictEqual(signal, 'SIGTERM');
+    relay.__completeDeferredExecFile(null, 'late success', '');
+    assert.ok(!relay.__sent.some(m => m.type === 'task_complete' && m.task_id === task.task_id));
+  } finally { teardown(relay); }
+});
 
 // ---------------------------------------------------------------------------
 // Bug 1 — the relaunch command must keep the model flag, and must never pass
@@ -778,6 +844,115 @@ test('#5652 the launcher-resolved line is the WHOLE command — no flags are app
   try {
     assert.strictEqual(relay.buildLaunchCommand(), LOCAL_SANDBOXED_CLAUDE_CMD,
       'AGENT_MODEL must not be appended onto the launcher-resolved line');
+  } finally { teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// hivecommons/hive#16222 — local mode dropped AGENT_MODEL and the effort from
+// the launch line, yet the relay still reported both to the hub. The local
+// launcher now appends config/backends.conf's backend_selection_flags_shell
+// output to AGENT_LAUNCH_CMD, and the relay reports a model/effort only when
+// that line carries the flag its own builder would have added.
+// ---------------------------------------------------------------------------
+
+const SELECTION_CASES = [
+  ['claude', 'claude-sonnet-5-5', 'medium'],
+  ['claude', 'claude-sonnet-5-5', 'turbo'],
+  ['claude', '', 'xhigh'],
+  ['litellm', 'anthropic/claude-sonnet-4', 'high'],
+  ['copilot', 'gpt-5.6-luna', ''],
+  ['codex', 'gpt-5.5', 'high'],
+  ['codex', '', 'low'],
+  ['agy', 'gemini-3.6-flash-high', 'medium'],
+  ['agy', 'gemini-3.6-flash-high', 'xhigh'],
+  ['agy', '', 'high'],
+  ['muse', 'muse-1', 'ultra'],
+  ['muse', '', 'bogus'],
+  ['pi', 'openai/gpt-5', 'high'],
+  ['omp', 'github-copilot/gpt-5.6-luna', 'high'],
+  ['goose', 'llama3.2:3b', 'high'],
+  ['bob', 'auto', ''],
+  ['openhands', 'anthropic/claude-sonnet-4-6', 'high'],
+];
+
+function localSelectionFlags(backend, model, effort) {
+  const conf = path.join(__dirname, '..', 'config', 'backends.conf');
+  const r = require('child_process').spawnSync('bash', ['-c', 'source "$1"; backend_selection_flags_shell "$2" "$3" "$4"', '_', conf, backend, model, effort], { encoding: 'utf8' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  return r.stdout.trim();
+}
+
+test('#16222 local-mode selection flags match the relay builder for every backend', () => {
+  for (const [backend, model, effort] of SELECTION_CASES) {
+    const relay = loadRelay({ backend, model, reasoningEffort: effort, backendPerm: '' });
+    try {
+      const built = relay.buildLaunchCommand();
+      const builderFlags = built === backend ? '' : built.slice(backend.length + 1);
+      assert.strictEqual(localSelectionFlags(backend, model, effort), builderFlags,
+        `${backend} model=${model} effort=${effort}: local launch flags diverge from the relay builder`);
+    } finally { teardown(relay); }
+  }
+});
+
+test('#16222 a launch line carrying the local selection flags reports what the builder would', () => {
+  for (const [backend, model, effort] of SELECTION_CASES) {
+    const expected = loadRelay({ backend, model, reasoningEffort: effort, backendPerm: '' });
+    let want;
+    try {
+      want = { model: expected.effectiveModel(), effort: expected.effectiveReasoningEffort() };
+    } finally { teardown(expected); }
+    const flags = localSelectionFlags(backend, model, effort);
+    const relay = loadRelay({
+      backend, model, reasoningEffort: effort, backendPerm: '',
+      env: { AGENT_LAUNCH_CMD: `HIVE_WORKSPACE_DIR=/w ${backend} --sandboxed${flags ? ` ${flags}` : ''}` },
+    });
+    try {
+      assert.deepStrictEqual({ model: relay.effectiveModel(), effort: relay.effectiveReasoningEffort() }, want,
+        `${backend} model=${model} effort=${effort}`);
+    } finally { teardown(relay); }
+  }
+});
+
+test('#16222 a launch line without --model/--effort does not report them to the hub', () => {
+  const relay = loadRelay({
+    backend: 'claude', model: 'claude-sonnet-5-5', reasoningEffort: 'medium',
+    env: { AGENT_LAUNCH_CMD: LOCAL_SANDBOXED_CLAUDE_CMD },
+  });
+  try {
+    assert.strictEqual(relay.effectiveModel(), '');
+    assert.strictEqual(relay.effectiveReasoningEffort(), '');
+    assert.deepStrictEqual(relay.progressModelFields(), {});
+    assert.deepStrictEqual(relay.effectiveSelectionFields(), { cli_backend: 'claude' });
+    relay.__setDetectedModel('claude-sonnet-5');
+    assert.strictEqual(relay.effectiveModel(), 'claude-sonnet-5',
+      'the transcript-detected model is what is really running');
+  } finally { teardown(relay); }
+});
+
+test('#16222 agy effort is not reported when the launch line drops its --model', () => {
+  const relay = loadRelay({
+    backend: 'agy', model: 'gemini-3.6-flash-high', reasoningEffort: 'high',
+    env: { AGENT_LAUNCH_CMD: 'agy --dangerously-skip-permissions --effort high' },
+  });
+  try {
+    assert.strictEqual(relay.effectiveModel(), '');
+    assert.strictEqual(relay.effectiveReasoningEffort(), '');
+  } finally { teardown(relay); }
+});
+
+test('#16222 headless mode ignores the launch line and keeps the requested selection', () => {
+  const relay = loadRelay({
+    backend: 'claude', mode: 'headless', model: 'claude-sonnet-5-5', reasoningEffort: 'medium',
+    backendPerm: '--dangerously-skip-permissions',
+    env: { AGENT_LAUNCH_CMD: LOCAL_SANDBOXED_CLAUDE_CMD },
+  });
+  try {
+    assert.strictEqual(relay.effectiveModel(), 'claude-sonnet-5-5');
+    assert.strictEqual(relay.effectiveReasoningEffort(), 'medium');
+    const argv = relay.buildHeadlessArgv('do the thing');
+    const args = argv.args.join(' ');
+    assert.match(args, /--model claude-sonnet-5-5/);
+    assert.match(args, /--effort medium/);
   } finally { teardown(relay); }
 });
 
@@ -1935,6 +2110,57 @@ test('omp container staging without a provider in AGENT_MODEL follows config.yml
   }
 });
 
+// A modelRoles selection naming a custom provider (a self-hosted llama.cpp
+// server with `auth: none`) only exists for omp if models.yml defines it, so
+// the container needs that file — but models.yml can also hold literal
+// apiKey/header secrets for any provider, so only the selected blocks travel.
+test('omp container staging ships models.yml narrowed to the selected custom providers', () => {
+  if (ompBackend.sqliteBackend() !== 'node:sqlite') { console.log('SKIP: node:sqlite unavailable on this Node; omp staging not exercised'); return; }
+  const tmpDir = fs.mkdtempSync(path.join(__dirname, '..', '.relay-test-tmp', 'omp-stage-'));
+  try {
+    const hostOmp = path.join(tmpDir, 'host-omp');
+    const agentDir = makeFakeOmpHome(hostOmp, { configYml: [
+      'modelRoles:',
+      '  default: local-flint/flint',
+      '  advisor: local-qwen/qwen3',
+      'advisor:',
+      '  enabled: true',
+      '',
+    ].join('\n') });
+    fs.writeFileSync(path.join(agentDir, 'models.yml'), [
+      'providers:',
+      '  local-flint:',
+      '    baseUrl: http://flint.internal/v1',
+      '    auth: none',
+      '    models:',
+      '      - id: flint',
+      '  gateway:',
+      '    baseUrl: https://gateway.example/v1',
+      '    apiKey: sk-gateway-literal-secret',
+      '  local-qwen:',
+      '    baseUrl: http://qwen.internal/v1',
+      '    auth: none',
+      '',
+    ].join('\n'));
+    const stage = path.join(tmpDir, 'stage', '.omp');
+    const report = ompBackend.stageOmp(hostOmp, stage, '');
+    const staged = fs.readFileSync(path.join(stage, 'agent', 'models.yml'), 'utf8');
+    assert.ok(staged.includes('local-flint:') && staged.includes('local-qwen:') && staged.includes('http://flint.internal/v1'),
+      `the selected custom providers must reach the container or omp falls back to another model:\n${staged}`);
+    assert.ok(!staged.includes('sk-gateway-literal-secret') && !staged.includes('gateway:'),
+      `an unselected provider's models.yml block (and its apiKey) must not be staged:\n${staged}`);
+    assert.strictEqual(fs.statSync(path.join(stage, 'agent', 'models.yml')).mode & 0o777, 0o600);
+    assert.deepStrictEqual(providersIn(path.join(stage, 'agent', 'agent.db')), [], 'no stored sign-in is selected, so none is staged');
+    // Keyless local providers need no stored sign-in: no "sign in" warning.
+    assert.ok(!report.warnings.some((w) => /credential|setup wizard/.test(w)), JSON.stringify(report.warnings));
+    // A models.yml the subset cannot split is refused, never shipped whole.
+    fs.writeFileSync(path.join(agentDir, 'models.yml'), 'providers: {gateway: {apiKey: sk-x}}\n');
+    assert.throws(() => ompBackend.stageOmp(hostOmp, path.join(tmpDir, 'stage-2', '.omp'), ''), /cannot narrow .*models\.yml/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('omp container staging narrows the store through the sqlite3 CLI when node:sqlite is unavailable', () => {
   if (ompBackend.sqliteBackend() !== 'node:sqlite') { console.log('SKIP: node:sqlite unavailable on this Node; omp staging not exercised'); return; }
   const cli = require('child_process').spawnSync('sqlite3', ['-version'], { encoding: 'utf8' });
@@ -2474,6 +2700,51 @@ test('Pi revoke kills the child and rejects a raced stale completion', () => {
     assert.strictEqual(child.killed, true, 'revoke did not kill Pi');
     relay.__completeDeferredExecFile(null, 'late success', '');
     assert.ok(!relay.__sent.some(m => m.type === 'task_complete' && m.task_id === task.task_id), 'revoked Pi emitted stale completion');
+  } finally { teardown(relay); }
+});
+
+test('MLX uses the real Pi task argv, model receipts and cancellation contract', () => {
+  const model = 'mlx/mlx-community/tool-coder-4bit';
+  const relay = loadRelay({ backend: 'pi', backendPerm: '', mode: 'headless', model, cliVersion: 'pi 1.4.0' });
+  try {
+    assert.deepStrictEqual(relay.buildHeadlessArgv('edit and test').args,
+      ['--model', model, '--extension', path.join(__dirname, 'mlx-pi-extension.js'), '--print', '--mode', 'json', 'edit and test']);
+    const task = { task_id: 'mlx-1', task_gen: 17, kind: 'issue', repo: 'x/y', number: 1, title: 'MLX' };
+    relay.setCurrentTask(task);
+    relay.runHeadlessTask(task);
+    const complete = relay.__sent.find(m => m.type === 'task_complete');
+    assert.ok(complete);
+    assert.strictEqual(complete.cli_backend, 'pi');
+    assert.strictEqual(complete.provider, 'mlx');
+    assert.strictEqual(complete.model, model);
+  } finally { teardown(relay); }
+  const waiting = loadRelay({ backend: 'pi', mode: 'headless', model, cliVersion: 'pi 1.4.0', execFileResult: { defer: true } });
+  try {
+    const task = { task_id: 'mlx-cancel', task_gen: 18, kind: 'issue', repo: 'x/y', number: 2, title: 'cancel' };
+    waiting.setCurrentTask(task);
+    waiting.runHeadlessTask(task);
+    const child = waiting.getHeadlessChild();
+    waiting.handleMessage(JSON.stringify({ type: 'task_revoke', task_id: task.task_id, reason: 'operator stop' }));
+    assert.strictEqual(child.killed, true);
+    waiting.__completeDeferredExecFile(null, 'late success', '');
+    assert.ok(!waiting.__sent.some(m => m.type === 'task_complete'));
+  } finally { teardown(waiting); }
+});
+
+test('MLX endpoint failure refuses execution rather than falling back to a hosted Pi model', () => {
+  const relay = loadRelay({
+    backend: 'pi', mode: 'headless', model: 'mlx/mlx-community/tool-coder-4bit',
+    mlxPreflightError: new Error('MLX local endpoint request failed'),
+  });
+  try {
+    assert.throws(() => relay.buildHeadlessArgv('edit'), /local endpoint/);
+    assert.throws(() => relay.buildLaunchCommand(), /local endpoint/);
+    const task = { task_id: 'mlx-fail', task_gen: 19, kind: 'issue', repo: 'x/y', number: 3, title: 'fail' };
+    relay.setCurrentTask(task);
+    relay.runHeadlessTask(task);
+    assert.ok(relay.__sent.some(m => m.type === 'task_failed'));
+    assert.ok(!relay.__sent.some(m => m.type === 'task_complete'));
+    assert.ok(!relay.__execFileCalls.some(call => call.bin === 'pi'), 'failed MLX preflight must not start a coding agent');
   } finally { teardown(relay); }
 });
 
@@ -10556,6 +10827,187 @@ test('#5655 a crash exit (uncaught exception) still takes the scoped token with 
   } finally { cleanupTmp(); }
 });
 
+// ---------------------------------------------------------------------------
+// A stop that lands just after a task's verdict must not lose the verdict.
+//
+// Observed live 2026-11-08: the relay logged "Task ... completed —
+// signal=verdict (HIVE_VERDICT: no_work_needed)", a `docker stop` arrived about
+// a second later, and the hub never got task_complete. It booked the run
+// "abandoned: connection lost with the task still held" and the issue was
+// worked again 13 minutes later.
+//
+// The finish is synchronous (label calls are execSync, stopping the agent
+// sleeps), so a signal that arrives during it is handled only after
+// task_complete was handed to the socket — and the handler then called
+// process.exit(0) with the write still queued. The child below reproduces that
+// order with a real signal: SIGTERM is raised, then the task is finished in
+// the same synchronous turn, and the fake socket completes its write a moment
+// later, the way a real one does.
+// ---------------------------------------------------------------------------
+
+const VERDICT_SHUTDOWN_CHILD_DRIVER = `
+  'use strict';
+  const Module = require('module');
+  const origLoad = Module._load;
+  class FakeWebSocket {
+    static get OPEN() { return 1; }
+    constructor() { this.readyState = 1; }
+    on() {} close() {} ping() {} terminate() {} removeAllListeners() {}
+    send(payload, cb) {
+      const frame = JSON.parse(payload);
+      console.log('QUEUED ' + frame.type);
+      setTimeout(() => {
+        console.log('WRITTEN ' + frame.type);
+        if (typeof cb === 'function') cb();
+      }, Number(process.env.FAKE_WS_WRITE_MS));
+    }
+  }
+  Module._load = function (request) {
+    if (request === 'ws') return FakeWebSocket;
+    return origLoad.apply(this, arguments);
+  };
+  const relay = require(process.env.RELAY_UNDER_TEST);
+  Module._load = origLoad;
+  relay.setWs(new FakeWebSocket());
+  relay.setCurrentTask({ task_id: 'ct-Danathar/arch-bootc-627-1', task_gen: 1, kind: 'issue', repo: 'Danathar/arch-bootc', number: 627 });
+  const t0 = Date.now();
+  process.on('exit', () => console.log('EXITED_AFTER_MS ' + (Date.now() - t0)));
+  // Keep the loop alive: the process must end through the signal handler.
+  setInterval(() => {}, 1000);
+  process.kill(process.pid, 'SIGTERM');
+  if (process.env.SHUTDOWN_CASE === 'verdict') {
+    relay.finishCurrentTask({
+      completionSignal: 'verdict',
+      summary: 'Agent returned to idle (reported no_work_needed)',
+      tmuxLines: ['HIVE_VERDICT: no_work_needed — the requested change is not needed'],
+      prURL: null,
+      noWork: { verdict: 'no_work_needed', reason: 'the requested change is not needed' },
+    });
+  } else {
+    // Mid-task, nothing finished: only an ordinary progress frame is queued.
+    relay.sendTo(relay.getHubs()[0], { type: 'task_progress', seq: 1, task_id: 'ct-Danathar/arch-bootc-627-1', task_gen: 1, status: 'working' });
+  }
+`;
+
+function runVerdictShutdownChild(shutdownCase, writeMs) {
+  const scratchRoot = path.join(__dirname, '..', '.relay-test-tmp');
+  fs.mkdirSync(scratchRoot, { recursive: true });
+  const tmpDir = fs.mkdtempSync(path.join(scratchRoot, 'relay-verdict-shutdown-'));
+  const res = spawnSync(process.execPath, ['-e', VERDICT_SHUTDOWN_CHILD_DRIVER], {
+    env: {
+      ...process.env,
+      HIVE_RELAY_TEST_MODE: '1',
+      CONTRIBUTOR_MODE: 'headless',
+      AGENT_BACKEND: 'claude',
+      HIVE_REGISTRATION_TOKEN: 'test-token',
+      HIVE_HUB: '',
+      HIVE_WORKSPACE_DIR: '',
+      RELAY_UNDER_TEST: RELAY_PATH,
+      SHUTDOWN_CASE: shutdownCase,
+      FAKE_WS_WRITE_MS: String(writeMs),
+      HIVE_CONTRIBUTOR_CONFIG_DIR: tmpDir,
+      HIVE_RELAY_PID_FILE: path.join(tmpDir, 'contributor-relay.pid'),
+      HIVE_RELAY_STATUS_FILE: path.join(tmpDir, 'relay-status.json'),
+      HIVE_HUBS_SEEN_FILE: path.join(tmpDir, 'hubs-seen.json'),
+      HIVE_RELAY_ACTIVITY_FILE: path.join(tmpDir, 'relay-activity.jsonl'),
+      HIVE_RELAY_AUDIT_DIR: path.join(tmpDir, 'relay-audit'),
+      HIVE_GH_TOKEN_CACHE: path.join(tmpDir, 'gh-token.cache'),
+      HIVE_TASK_FILE: path.join(tmpDir, 'contributor-task.json'),
+      HIVE_HEADLESS_STATUS_FILE: path.join(tmpDir, 'headless-status.json'),
+    },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  const lines = String(res.stdout || '').split('\n');
+  const exitedAfter = Number((lines.find(l => l.startsWith('EXITED_AFTER_MS ')) || '').split(' ')[1]);
+  return { res, lines, exitedAfter };
+}
+
+test('SIGTERM during a verdict finish waits for task_complete to be written before exiting', () => {
+  const { res, lines, exitedAfter } = runVerdictShutdownChild('verdict', 300);
+  const out = `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`;
+  assert.strictEqual(res.status, 0, `the handler must still exit 0 (${out})`);
+  const queued = lines.indexOf('QUEUED task_complete');
+  const written = lines.indexOf('WRITTEN task_complete');
+  const exited = lines.findIndex(l => l.startsWith('EXITED_AFTER_MS '));
+  assert.ok(queued >= 0, `the finish must hand task_complete to the socket (${out})`);
+  assert.ok(written > queued && exited > written,
+    `the relay exited before the task_complete write completed — the hub would book the finished task abandoned (${out})`);
+  assert.ok(exitedAfter < 5000, `the wait must end when the write does, not at the deadline (exited after ${exitedAfter}ms)`);
+  const waiting = lines.findIndex(l => /^SIGTERM: waiting up to \d+s for task_complete for ct-Danathar\/arch-bootc-627-1/.test(l));
+  assert.ok(waiting >= 0, `the wait must say what it is waiting for (${out})`);
+  assert.ok(!lines.slice(waiting).some(l => l === 'QUEUED ready'),
+    `no ready may go out once shutdown has started (${out})`);
+});
+
+test('SIGTERM with no finished task to report still exits at once', () => {
+  const { res, lines, exitedAfter } = runVerdictShutdownChild('progress', 3000);
+  const out = `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`;
+  assert.strictEqual(res.status, 0, `the handler must exit 0 (${out})`);
+  assert.ok(lines.includes('QUEUED task_progress'), `precondition: a progress frame was queued (${out})`);
+  assert.ok(!lines.includes('WRITTEN task_progress'),
+    `a progress frame must not hold the exit — only a finished task's frame does (${out})`);
+  assert.ok(exitedAfter < 1500, `an idle shutdown must stay immediate (exited after ${exitedAfter}ms)`);
+});
+
+// The same handler driven in-process, for the parts a child cannot time
+// cheaply: the deadline, work offered during the wait, and a second signal.
+function loadRelayWithStuckSocket(env = {}) {
+  const relay = loadRelay({ backend: 'claude', env });
+  const sent = [];
+  // A socket whose writes never complete: the send callback is never called.
+  relay.setWs({ readyState: 1, send: (payload) => { sent.push(JSON.parse(payload)); } });
+  const exits = [];
+  relay.__setExitProcess((code) => { exits.push(code); });
+  relay.setCurrentTask({ task_id: 'ct-foo/bar-834-1', task_gen: 1, kind: 'issue', repo: 'foo/bar', number: 834 });
+  relay.finishCurrentTask({ completionSignal: 'verdict', summary: 'done', tmuxLines: [], prURL: null, noWork: null });
+  return { relay, sent, exits };
+}
+
+test('SIGTERM shutdown gives up on an unwritten task_complete at the deadline, and takes no work meanwhile', async () => {
+  const log = console.log; const warn = console.warn;
+  console.log = () => {}; console.warn = () => {};
+  const { relay, sent, exits } = loadRelayWithStuckSocket({ HIVE_RELAY_SHUTDOWN_FLUSH_MS: '80' });
+  try {
+    assert.ok(sent.some(m => m.type === 'task_complete'), 'precondition: the finish handed task_complete to the socket');
+    assert.strictEqual(relay.unflushedHeldFrameCount(), 1, 'precondition: its write has not completed');
+    relay.handleShutdownSignal('SIGTERM');
+    assert.strictEqual(relay.isShuttingDown(), true);
+    assert.deepStrictEqual(exits, [], 'a finished task still on the wire holds the exit');
+    const before = sent.length;
+    relay.requestWork(relay.getHubs()[0], 'test_after_sigterm');
+    relay.handleMessage(JSON.stringify({ type: 'task_assign', task_id: 'ct-foo/bar-900-1', kind: 'issue', repo: 'foo/bar', number: 900, title: 'late offer', prompt: 'p' }), relay.getHubs()[0]);
+    const after = sent.slice(before);
+    assert.ok(!after.some(m => m.type === 'ready'), `no ready during shutdown: ${JSON.stringify(after)}`);
+    assert.ok(after.some(m => m.type === 'task_failed' && m.task_id === 'ct-foo/bar-900-1' && /shutting down/.test(m.reason)),
+      `an assignment during shutdown is handed back: ${JSON.stringify(after)}`);
+    assert.strictEqual(relay.getCurrentTask(), null, 'the late assignment must not become the current task');
+    await new Promise(r => setTimeout(r, 250));
+    assert.deepStrictEqual(exits, [0], 'the wait is bounded: the relay exits once the deadline passes');
+  } finally { console.log = log; console.warn = warn; teardown(relay); }
+});
+
+test('a second signal during the shutdown wait exits at once', () => {
+  const log = console.log; const warn = console.warn;
+  console.log = () => {}; console.warn = () => {};
+  const { relay, exits } = loadRelayWithStuckSocket({ HIVE_RELAY_SHUTDOWN_FLUSH_MS: '80' });
+  try {
+    relay.handleShutdownSignal('SIGTERM');
+    assert.deepStrictEqual(exits, [], 'precondition: the first signal waits');
+    relay.handleShutdownSignal('SIGINT');
+    assert.deepStrictEqual(exits, [0], 'the second signal must not wait');
+  } finally { console.log = log; console.warn = warn; teardown(relay); }
+});
+
+test('the shutdown deadline stays below the 10 s container stop timeout', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    assert.ok(relay.SHUTDOWN_FLUSH_DEADLINE_MS > 0 && relay.SHUTDOWN_FLUSH_DEADLINE_MS < 10000,
+      `docker and podman SIGKILL 10 s after the stop signal; got ${relay.SHUTDOWN_FLUSH_DEADLINE_MS}ms`);
+  } finally { teardown(relay); }
+});
+
 // kubestellar/hive#5650 — the relay lost track of a live claude after the first
 // task of a session, then booked the NEXT task complete off the previous one's
 // transcript.
@@ -13215,6 +13667,30 @@ test('#9078 short task prompts use the same bracketed-paste path', () => {
   } finally { teardown(relay); }
 });
 
+test('#16423 oversized task prompts are pasted via load-buffer on every backend', () => {
+  const relay = loadRelay({ backend: 'claude', paneText: CODEX_WORKING_PANE });
+  try {
+    relay.setCliReady(true);
+    const prompt = 'lane role prompt. ' + 'padding '.repeat(7000);
+    relay.tmuxSendKeys(prompt);
+    const loads = tmuxCalls(relay, 'load-buffer');
+    assert.strictEqual(loads.length, 1);
+    assert.strictEqual(loads[0].opts && loads[0].opts.input, prompt);
+    assert.strictEqual(tmuxCalls(relay, 'paste-buffer').length, 1);
+    assert.deepStrictEqual(relay.__tmuxSends().filter(c => / -l lane role prompt/.test(c)), [],
+      'an oversized prompt must not be sent as one send-keys argument');
+  } finally { teardown(relay); }
+});
+
+test('#16423 small task prompts on claude keep the send-keys path', () => {
+  const relay = loadRelay({ backend: 'claude', paneText: CODEX_WORKING_PANE });
+  try {
+    relay.setCliReady(true);
+    relay.tmuxSendKeys('short task prompt');
+    assert.strictEqual(tmuxCalls(relay, 'load-buffer').length, 0);
+  } finally { teardown(relay); }
+});
+
 // #9082: tmux capture-pane -p pads to the pane height. A codex turn that is
 // in flight renders "esc to interrupt" near the top of a tall pane, so a raw
 // slice(-15) window is blank padding and the busy marker is never seen.
@@ -14033,6 +14509,9 @@ const HEALTHY_6953 = JSON.stringify({ state: 'available', limits: [{ id: 'weekly
 
 function poolFor(relay, dir) { return { dir, poolKey: relay.QUOTA_POOL_KEY }; }
 
+const HOUR_MS = 60 * 60 * 1000;
+const WEEK_MS = 7 * 24 * HOUR_MS;
+
 test('#6953 pool identity is opaque: no account identifier survives into the key', () => {
   const key = poolStore.derivePoolKey({ backend: 'claude', account: 'user@example.com:acct-9931' });
   assert.match(key, /^[0-9a-f]{16}$/, 'the pool key is a short hex digest, safe to put in a filename or log');
@@ -14067,7 +14546,9 @@ test('#6953 continue-until-reset expires when the exact window reset epoch chang
   poolStore.writeOverride(pool, { directive: 'continue_until_reset', window_id: 'weekly', reset_epoch: 1000 });
   assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }).admit, true,
     'the override pins this window at this reset epoch, so it admits while the epoch holds');
-  const rolled = { state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 10, reset_epoch: 2000 }] };
+  // A real roll moves the reset a whole window later (a week here); a few
+  // seconds of drift is the same reset (see the drift tests below).
+  const rolled = { state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 10, reset_epoch: 1000 + WEEK_MS }] };
   assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, rolled).admit, false,
     'once the window resets to a new epoch the override no longer matches and the guard holds again');
   teardown(relay);
@@ -14099,11 +14580,142 @@ test('#6953 pause-until-reset outranks a fully recovered reading', () => {
   const d = relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' });
   assert.strictEqual(d.admit, false, 'an explicit pause must outrank an automatic resume');
   assert.strictEqual(d.reason, 'override_pause');
-  const rolled = { state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 90, reset_epoch: 2000 }] };
+  const rolled = { state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 90, reset_epoch: 1000 + WEEK_MS }] };
   assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, rolled).admit, true,
     'and the pause expires the moment that exact window resets');
   teardown(relay);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ── Reset-time drift between readings ───────────────────────────────────────
+// Observed: `just contribute-quota continue-until-reset` pinned weekly_all at
+// reset_epoch 1794207600373 (07:00:00.373Z); the next Claude reading five
+// minutes later said 1794207599634 (06:59:59.634Z). The exact-match rule
+// dropped the override and the relay stayed held for 14 minutes.
+const PINNED_RESET = 1794207600373;
+const DRIFTED_RESET = 1794207599634;
+
+function weeklyAll(pct, resetEpoch) {
+  return { state: 'available', limits: [{ id: 'weekly_all', kind: 'weekly', pct_remaining: pct, reset_epoch: resetEpoch }] };
+}
+
+test('quota drift: continue-until-reset still applies when the reset time drifts by under a second', () => {
+  const dir = poolDir6953();
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_CONTRIBUTOR_QUOTA_POOL_DIR: dir, HIVE_CONTRIBUTOR_QUOTA_READING_JSON: JSON.stringify(weeklyAll(11, PINNED_RESET)) } });
+  try {
+    poolStore.writeOverride(poolFor(relay, dir), { directive: 'continue_until_reset', window_id: 'weekly_all', reset_epoch: PINNED_RESET });
+    const d = relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, weeklyAll(11, DRIFTED_RESET));
+    assert.strictEqual(d.admit, true, 'a reading that restates the same reset 0.7 s earlier is the same reset, not a roll');
+    assert.strictEqual(d.reason, 'override_continue_until_reset');
+  } finally { teardown(relay); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('quota drift: continue-until-reset still expires on a real roll to the next week or session', () => {
+  const dir = poolDir6953();
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_CONTRIBUTOR_QUOTA_POOL_DIR: dir, HIVE_CONTRIBUTOR_QUOTA_READING_JSON: JSON.stringify(weeklyAll(11, PINNED_RESET)) } });
+  try {
+    const pool = poolFor(relay, dir);
+    poolStore.writeOverride(pool, { directive: 'continue_until_reset', window_id: 'weekly_all', reset_epoch: PINNED_RESET });
+    assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, weeklyAll(11, PINNED_RESET + WEEK_MS)).admit, false,
+      'the weekly window rolled to next week: the override is spent and the reserve holds again');
+
+    // Five-hour session window (Claude `session`, Codex `five_hour`).
+    const session = (resetEpoch) => ({ state: 'available', limits: [{ id: 'session', kind: 'session', pct_remaining: 5, reset_epoch: resetEpoch }] });
+    poolStore.writeOverride(pool, { directive: 'continue_until_reset', window_id: 'session', reset_epoch: PINNED_RESET });
+    assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, session(DRIFTED_RESET)).admit, true,
+      'precondition: the session override applies across the drift');
+    assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, session(PINNED_RESET + 5 * HOUR_MS)).admit, false,
+      'the next five-hour session is a new reset');
+    // The shortest window any adapter publishes is agy's one-hour `session`.
+    assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, session(PINNED_RESET + HOUR_MS)).admit, false,
+      'even a one-hour roll is far outside the tolerance');
+  } finally { teardown(relay); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('quota drift: the tolerance is five minutes, inclusive, and never matches a missing epoch', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    assert.strictEqual(relay.QUOTA_RESET_EPOCH_TOLERANCE_MS, 5 * 60 * 1000);
+    assert.strictEqual(relay.quotaResetEpochsMatch(PINNED_RESET, PINNED_RESET + relay.QUOTA_RESET_EPOCH_TOLERANCE_MS), true);
+    assert.strictEqual(relay.quotaResetEpochsMatch(PINNED_RESET, PINNED_RESET - relay.QUOTA_RESET_EPOCH_TOLERANCE_MS - 1), false);
+    assert.strictEqual(relay.quotaResetEpochsMatch(PINNED_RESET, null), false, 'a window with no reset epoch never matches');
+    assert.strictEqual(relay.quotaResetEpochsMatch(undefined, PINNED_RESET), false, 'an override with no pinned epoch never matches');
+  } finally { teardown(relay); }
+});
+
+test('quota drift: pause-until-reset keeps holding across the drift and expires on a real roll', () => {
+  const dir = poolDir6953();
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_CONTRIBUTOR_QUOTA_POOL_DIR: dir, HIVE_CONTRIBUTOR_QUOTA_READING_JSON: JSON.stringify(weeklyAll(90, PINNED_RESET)) } });
+  try {
+    poolStore.writeOverride(poolFor(relay, dir), { directive: 'pause_until_reset', window_id: 'weekly_all', reset_epoch: PINNED_RESET });
+    const held = relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, weeklyAll(90, DRIFTED_RESET));
+    assert.strictEqual(held.admit, false, 'the pause must not lapse because the reading restated the same reset 0.7 s earlier');
+    assert.strictEqual(held.reason, 'override_pause');
+    assert.strictEqual(relay.evaluateContributorQuota({ title: 'x', complexity: 'medium' }, weeklyAll(90, PINNED_RESET + WEEK_MS)).admit, true,
+      'and it still expires when the window rolls to next week');
+  } finally { teardown(relay); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── The release log line names what released the hold ───────────────────────
+function retryReleaseLines(relay) {
+  const lines = [];
+  const log = console.log; const warn = console.warn;
+  console.log = (...a) => lines.push(a.join(' '));
+  console.warn = () => {};
+  try { relay.retryContributorQuota(); } finally { console.log = log; console.warn = warn; }
+  return lines.filter(l => l.includes('Contributor quota guard released'));
+}
+
+test('quota release line: a continue-once override names itself, not a recovered reading', () => {
+  const dir = poolDir6953();
+  const readingFile = path.join(dir, 'reading.json');
+  fs.writeFileSync(readingFile, JSON.stringify(weeklyAll(11, PINNED_RESET)));
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_CONTRIBUTOR_QUOTA_POOL_DIR: dir, HIVE_CONTRIBUTOR_QUOTA_READING_FILE: readingFile } });
+  try {
+    relay.setCliReady(true);
+    relay.setWs({ readyState: 1, send: () => {} });
+    relay.setContributorQuotaPaused(true);
+    poolStore.writeOverride(poolFor(relay, dir), { directive: 'continue_once' });
+    const lines = retryReleaseLines(relay);
+    assert.strictEqual(lines.length, 1, `expected one release line, got ${JSON.stringify(lines)}`);
+    assert.match(lines[0], /continue-once override/);
+    assert.match(lines[0], /weekly_all is still at 11% against a 20% reserve/);
+    assert.doesNotMatch(lines[0], /fresh reading/, 'the reading did not recover; saying it did misleads the operator');
+  } finally { teardown(relay); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('quota release line: continue-until-reset names itself across reset-time drift', () => {
+  const dir = poolDir6953();
+  const readingFile = path.join(dir, 'reading.json');
+  fs.writeFileSync(readingFile, JSON.stringify(weeklyAll(11, DRIFTED_RESET)));
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_CONTRIBUTOR_QUOTA_POOL_DIR: dir, HIVE_CONTRIBUTOR_QUOTA_READING_FILE: readingFile } });
+  try {
+    relay.setCliReady(true);
+    relay.setWs({ readyState: 1, send: () => {} });
+    relay.setContributorQuotaPaused(true);
+    poolStore.writeOverride(poolFor(relay, dir), { directive: 'continue_until_reset', window_id: 'weekly_all', reset_epoch: PINNED_RESET });
+    const lines = retryReleaseLines(relay);
+    assert.strictEqual(lines.length, 1, `the drifted reading must still release on the override: ${JSON.stringify(lines)}`);
+    assert.match(lines[0], /continue-until-reset override/);
+  } finally { teardown(relay); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('quota release line: a recovered reading says the reading cleared the reserves', () => {
+  const dir = poolDir6953();
+  const readingFile = path.join(dir, 'reading.json');
+  fs.writeFileSync(readingFile, JSON.stringify(weeklyAll(11, PINNED_RESET)));
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_CONTRIBUTOR_QUOTA_POOL_DIR: dir, HIVE_CONTRIBUTOR_QUOTA_READING_FILE: readingFile } });
+  try {
+    relay.setCliReady(true);
+    relay.setWs({ readyState: 1, send: () => {} });
+    relay.setContributorQuotaPaused(true);
+    assert.deepStrictEqual(retryReleaseLines(relay), [], 'precondition: 11% against 20% with no override stays held');
+    fs.writeFileSync(readingFile, JSON.stringify(weeklyAll(60, PINNED_RESET)));
+    const lines = retryReleaseLines(relay);
+    assert.strictEqual(lines.length, 1);
+    assert.match(lines[0], /a fresh reading clears every effective reserve/);
+    assert.doesNotMatch(lines[0], /override/);
+  } finally { teardown(relay); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('#6953 an override never bypasses an unknown/blind reading (fail closed)', () => {
@@ -14993,6 +15605,58 @@ test('#12436 headless primary: a preempt fix is deferred and runs before the nex
     assert.ok(!sent.some(m => m.type === 'ready'), `no ready while a fix waits: ${JSON.stringify(sent.map(m => m.type))}`);
     assert.strictEqual(relay.getCurrentTask() && relay.getCurrentTask().task_id, 'fix-d', 'deferred fix becomes the current task');
     assert.deepStrictEqual(relay.fixPRState().deferred, []);
+  } finally { console.log = log; teardown(relay); }
+});
+
+// hivecommons/hive#17385 (2026-11-09): the hub delivered one boundary fix-pr
+// task twice. The relay started the first copy as its primary task and the
+// second in a parallel fix session, so the same fix ran in two places.
+test('#17385 a fix-pr task_id delivered twice runs once, as the primary task', () => {
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_MAX_PARALLEL_FIXES: '1', HIVE_CONTRIBUTOR_QUOTA_GUARD: 'off' }, execFileResult: { defer: true } });
+  const log = console.log;
+  const lines = [];
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    const hub = relay.getHubs()[0];
+    const sent = [];
+    hub.ws = { readyState: 1, send: p => sent.push(JSON.parse(p)) };
+    relay.setCurrentTask(null);
+    const boundary = FIX_PR_TASK('fix-danathar-1', { priority: 'queued', mode: 'boundary' });
+    relay.handleMessage(JSON.stringify(boundary), hub);
+    assert.strictEqual(relay.getCurrentTask() && relay.getCurrentTask().task_id, 'fix-danathar-1', 'the first copy becomes the primary task');
+    const spawnsBefore = relay.__execFileCalls.length;
+    relay.handleMessage(JSON.stringify(boundary), hub);
+    assert.deepStrictEqual(relay.fixPRState().parallel, [], 'the second copy must not start a parallel fix session');
+    assert.strictEqual(relay.__execFileCalls.length, spawnsBefore, 'no parallel child spawned for the duplicate');
+    assert.strictEqual(relay.getCurrentTask().task_id, 'fix-danathar-1');
+    assert.strictEqual(sent.filter(m => m.type === 'task_accepted' && m.task_id === 'fix-danathar-1').length, 1, `accepted once: ${JSON.stringify(sent)}`);
+    assert.ok(!sent.some(m => m.type === 'task_failed' && m.task_id === 'fix-danathar-1'), 'the duplicate is ignored, not failed back');
+    assert.ok(lines.some(l => /running as the primary task/.test(l)), `log names the path taken: ${lines.join('\n')}`);
+    assert.ok(lines.some(l => /Ignoring duplicate fix-pr fix-danathar-1 — already running it as the primary task/.test(l)), lines.join('\n'));
+  } finally { console.log = log; teardown(relay); }
+});
+
+test('#17385 a fix-pr task_id already in a parallel session is not also started as the primary task', () => {
+  const relay = loadRelay({ backend: 'claude', env: { HIVE_MAX_PARALLEL_FIXES: '1', HIVE_CONTRIBUTOR_QUOTA_GUARD: 'off' }, execFileResult: { defer: true } });
+  const log = console.log;
+  const lines = [];
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    const hub = relay.getHubs()[0];
+    const sent = [];
+    hub.ws = { readyState: 1, send: p => sent.push(JSON.parse(p)) };
+    relay.setCurrentTask({ task_id: 't-primary', task_gen: 1, kind: 'issue', repo: 'foo/bar', number: 1, title: 'primary' });
+    relay.handleMessage(JSON.stringify(FIX_PR_TASK('fix-r')), hub);
+    assert.deepStrictEqual(relay.fixPRState().parallel, ['fix-r']);
+    // The primary ends while the fix still runs; the same task arrives again.
+    relay.setCurrentTask(null);
+    relay.handleMessage(JSON.stringify(FIX_PR_TASK('fix-r')), hub);
+    assert.strictEqual(relay.getCurrentTask(), null, 'the duplicate must not become the primary task');
+    assert.deepStrictEqual(relay.fixPRState().parallel, ['fix-r']);
+    assert.strictEqual(sent.filter(m => m.type === 'task_accepted' && m.task_id === 'fix-r').length, 1, JSON.stringify(sent));
+    assert.ok(lines.some(l => /Ignoring duplicate fix-pr fix-r — already running it in a parallel fix session/.test(l)), lines.join('\n'));
+    assert.strictEqual(relay.fixPRRunningWhere('fix-r'), 'in a parallel fix session');
+    assert.strictEqual(relay.fixPRRunningWhere('other'), null);
   } finally { console.log = log; teardown(relay); }
 });
 
@@ -16055,6 +16719,61 @@ test('#8477 already-done no_work_needed carries structured reason kind and evide
   } finally { teardown(relay); }
 });
 
+// An issue with open sub-issues is a parent waiting on its children: an
+// already-done verdict on it must not put the done label on the parent.
+test('already-done label is not applied to an issue that has open sub-issues', () => {
+  const PANE = `HIVE_VERDICT: no_work_needed — already fixed on main by #12\n${IDLE_PANE}`;
+  const relay = loadRelay({ backend: 'copilot', paneText: PANE, subIssuesSummary: { total: 3, completed: 0, percent_completed: 0 } });
+  const log = console.log; const logged = []; console.log = (...a) => logged.push(a.join(' '));
+  try {
+    relay.handleMessage(JSON.stringify({ type: 'auth_ok', contributor_id: 'c1', trust_tier: 'contributor', permissions: ['issues:write'] }));
+    dispatchTask(relay, 'ct-parent-open', 105);
+    relay.__crashTick();
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1, 'the verdict still completes the task');
+    assert.strictEqual(completed[0].verdict, 'no_work_needed');
+    assert.strictEqual(completed[0].verdict_reason_kind, 'already_done', 'the verdict reaches the hub unchanged');
+    assert.strictEqual(relay.__commands.filter(c => /gh api .*repos\/foo\/bar\/issues\/105.*sub_issues_summary/.test(c)).length, 1, 'one read of the issue');
+    assert.strictEqual(relay.__commands.filter(c => /gh (issue edit|label create)/.test(c)).length, 0,
+      `no label on a parent with open sub-issues: ${JSON.stringify(relay.__commands.filter(c => /gh /.test(c)))}`);
+    assert.strictEqual(logged.filter(l => /has 3 open sub-issue\(s\) of 3/.test(l) && /not applying the 'hive\/already-done' label/.test(l)).length, 1,
+      `expected one line saying why, got ${JSON.stringify(logged)}`);
+  } finally { console.log = log; teardown(relay); }
+});
+
+test('already-done label is applied as before when the issue has no sub-issues or all of them are completed', () => {
+  for (const summary of [null, { total: 0, completed: 0 }, { total: 3, completed: 3, percent_completed: 100 }]) {
+    const relay = loadRelay({ subIssuesSummary: summary });
+    const log = console.log; console.log = () => {};
+    try {
+      relay.handleMessage(JSON.stringify({ type: 'auth_ok', contributor_id: 'c1', trust_tier: 'contributor', permissions: ['issues:write'] }));
+      const before = relay.__commands.length;
+      relay.markIssueAlreadyDone({ task_id: 't', kind: 'issue', repo: 'foo/bar', number: 7 }, 'already fixed on main by #12');
+      const after = relay.__commands.slice(before);
+      assert.strictEqual(after.filter(c => /gh issue edit/.test(c) && c.includes('--add-label') && c.includes('hive/already-done')).length, 1,
+        `summary ${JSON.stringify(summary)} must still label: ${JSON.stringify(after)}`);
+      assert.deepStrictEqual(relay.readOpenSubIssues({ repo: 'foo/bar', number: 7 }, process.env),
+        { open: 0, total: summary ? summary.total : 0 });
+    } finally { console.log = log; teardown(relay); }
+  }
+});
+
+test('already-done label is not applied when the sub-issue read fails', () => {
+  const relay = loadRelay({ subIssuesSummary: new Error('Command failed: gh api') });
+  const log = console.log; const logged = []; console.log = (...a) => logged.push(a.join(' '));
+  try {
+    relay.handleMessage(JSON.stringify({ type: 'auth_ok', contributor_id: 'c1', trust_tier: 'contributor', permissions: ['issues:write'] }));
+    const before = relay.__commands.length;
+    relay.markIssueAlreadyDone({ task_id: 't', kind: 'issue', repo: 'foo/bar', number: 7 }, 'already fixed on main by #12');
+    const after = relay.__commands.slice(before);
+    assert.strictEqual(after.filter(c => /gh (issue edit|label create)/.test(c)).length, 0,
+      `a failed read must not label: ${JSON.stringify(after)}`);
+    assert.strictEqual(logged.filter(l => /sub-issues could not be read/.test(l) && /not applying the 'hive\/already-done' label/.test(l)).length, 1,
+      `expected one line saying why, got ${JSON.stringify(logged)}`);
+    assert.ok(relay.readOpenSubIssues({ repo: 'foo/bar', number: 7 }, process.env).error, 'a failed read is reported as an error, never as "no sub-issues"');
+  } finally { console.log = log; teardown(relay); }
+});
+
 test('#7924 the label is for GitHub issue tasks only', () => {
   const relay = loadRelay({});
   try {
@@ -16666,4 +17385,419 @@ test('tls-mismatch: an ordinary error still reconnects with backoff — only the
     console.log = log; console.error = error; console.warn = warn;
     teardown(relay);
   }
+});
+
+test('#16422 standby assignment from an acknowledging non-active hub is accepted', () => {
+  const relay = loadRelay({ env: { ...MULTI_HUB_ENV, HIVE_STANDBY: '1' } });
+  try {
+    const { hubs, sentA, sentB } = attachHubSinks(relay);
+    scopeAuth(relay, hubs[0], []);
+    scopeAuth(relay, hubs[1], ['standby_v1']);
+    relay.handleMessage(JSON.stringify({ type: 'standby_ack', standby: { accepted: [{ lane: 'guide' }], rejected: [] } }), hubs[1]);
+    const offer = { type: 'task_assign', kind: 'issue', repo: 'foo/bar', number: 1, title: 'x' };
+    relay.handleMessage(JSON.stringify({ ...offer, task_id: 'plain' }), hubs[1]);
+    assert.ok(sentB.some(m => m.type === 'task_failed' && m.reason === 'Hub is not the active polling slot'),
+      'non-standby work from a non-active hub is still rejected');
+    relay.handleMessage(JSON.stringify({ ...offer, task_id: 'sb', standby_lane: 'guide' }), hubs[1]);
+    assert.ok(sentB.some(m => m.type === 'task_accepted' && m.task_id === 'sb'));
+    assert.strictEqual(sentA.filter(m => m.type === 'task_failed').length, 0);
+  } finally { relay.setCurrentTask(null); teardown(relay); }
+});
+
+test('#16463 standby acknowledgement does not outlive the connection it was granted on', () => {
+  const relay = loadRelay({ env: { ...MULTI_HUB_ENV, HIVE_STANDBY: '1' } });
+  const log = console.log; const error = console.error;
+  console.log = () => {}; console.error = () => {};
+  try {
+    const { hubs, sentB } = attachHubSinks(relay);
+    const hub = hubs[1];
+    scopeAuth(relay, hubs[0], []);
+    relay.__wsInstances.length = 0;
+    relay.connectHub(hub);
+    const ws = relay.__wsInstances[0];
+    assert.ok(ws, 'setup: connectHub must open a socket');
+    ws.send = p => sentB.push(JSON.parse(p));
+    const ack = JSON.stringify({ type: 'standby_ack', standby: { accepted: [{ lane: 'guide' }], rejected: [] } });
+    const offer = { type: 'task_assign', kind: 'issue', repo: 'foo/bar', number: 1, title: 'x', standby_lane: 'guide' };
+
+    // ws close handler: the socket the ack arrived on dies.
+    scopeAuth(relay, hub, ['standby_v1']);
+    relay.handleMessage(ack, hub);
+    assert.strictEqual(hub.standbyAcked, true, 'setup: standby acknowledged on the first connection');
+    ws.emit('close', 1006, '');
+    if (hub.reconnectTimer) { clearTimeout(hub.reconnectTimer); hub.reconnectTimer = null; }
+    assert.strictEqual(hub.standbyAcked, false, 'the close handler forgets the acknowledgement');
+    // The reconnected hub no longer advertises standby_v1, so declareStandby
+    // never asks and no standby_ack arrives; its standby_lane push must be
+    // refused like any other non-active-hub assignment.
+    scopeAuth(relay, hub, []);
+    relay.handleMessage(JSON.stringify({ ...offer, task_id: 'after-close' }), hub);
+    assert.ok(sentB.some(m => m.type === 'task_failed' && m.task_id === 'after-close' && m.reason === 'Hub is not the active polling slot'),
+      `standby push after reconnect is rejected: ${JSON.stringify(sentB.filter(m => m.task_id === 'after-close'))}`);
+    assert.ok(!sentB.some(m => m.type === 'task_accepted' && m.task_id === 'after-close'));
+
+    // TLS host-mismatch redial: tears the socket down without its close handler.
+    scopeAuth(relay, hub, ['standby_v1']);
+    relay.handleMessage(ack, hub);
+    assert.strictEqual(hub.standbyAcked, true, 'setup: standby acknowledged again');
+    relay.handleTLSHostMismatch(hub, ALTNAME_ERR);
+    assert.strictEqual(hub.standbyAcked, false, 'the mismatch path forgets the acknowledgement too');
+    hub.tlsHostMismatch = false;
+    scopeAuth(relay, hub, []);
+    relay.handleMessage(JSON.stringify({ ...offer, task_id: 'after-mismatch' }), hub);
+    assert.ok(sentB.some(m => m.type === 'task_failed' && m.task_id === 'after-mismatch' && m.reason === 'Hub is not the active polling slot'));
+    assert.ok(!sentB.some(m => m.type === 'task_accepted' && m.task_id === 'after-mismatch'));
+  } finally {
+    console.log = log; console.error = error;
+    relay.setCurrentTask(null); teardown(relay);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// busy_elsewhere_v1: a relay working one hive's task tells its OTHER hives, so
+// they stop counting it as contributor-first cover. Observed on 2026-11-09: a
+// relay set "Acting as: scanner" on projectbluefin worked hivecommons tasks
+// from 14:25Z to 14:32Z and sent projectbluefin no ready.
+// ---------------------------------------------------------------------------
+
+function busyElsewhereFrames(sent) {
+  return sent.filter(m => m.type === 'busy_elsewhere');
+}
+
+function busyAuth(relay, hub, capabilities = ['busy_elsewhere_v1']) {
+  relay.handleMessage(JSON.stringify({ type: 'auth_ok', contributor_id: 'c1', trust_tier: 'contributor', server_capabilities: capabilities }), hub);
+}
+
+// Rotate the polling slot to hive B (as a task_unavailable from A would) and
+// take B's task through the real assignment handler.
+function takeTaskFromHubB(relay, hubs, taskId) {
+  relay.sendReadyForNextTask('unavailable');
+  relay.handleMessage(JSON.stringify({ type: 'task_assign', task_id: taskId, task_gen: 1, kind: 'issue', repo: 'org/b', number: 7, title: 'work on hive B' }), hubs[1]);
+  assert.strictEqual(relay.getCurrentTask() && relay.getCurrentTask().task_id, taskId, 'precondition: the relay took hive B\'s task');
+}
+
+test('busy_elsewhere_v1: another hive\'s task is reported to the other hive, restated on reconnect, and cleared when it finishes', () => {
+  const relay = loadRelay({ env: MULTI_HUB_ENV });
+  const log = console.log; const warn = console.warn;
+  console.log = () => {}; console.warn = () => {};
+  try {
+    const { hubs, sentA, sentB } = attachHubSinks(relay);
+    busyAuth(relay, hubs[0]); busyAuth(relay, hubs[1]);
+    assert.deepStrictEqual(busyElsewhereFrames([...sentA, ...sentB]), [], 'an idle relay is busy nowhere');
+
+    takeTaskFromHubB(relay, hubs, 'b-1');
+    const frames = busyElsewhereFrames(sentA);
+    assert.deepStrictEqual(frames.map(m => m.state), ['busy'], 'hive A must hear about hive B\'s task once');
+    assert.deepStrictEqual(Object.keys(frames[0]).sort(), ['seq', 'since', 'state', 'type'],
+      'the frame names no hive, repository or task: one hive learns nothing about another\'s work');
+    assert.ok(!Number.isNaN(Date.parse(frames[0].since)), `since must be a timestamp: ${frames[0].since}`);
+    assert.deepStrictEqual(busyElsewhereFrames(sentB), [], 'the hive that owns the task is never told it is busy elsewhere');
+
+    // A reconnect to hive A is a new connection that knows nothing: restate.
+    busyAuth(relay, hubs[0]);
+    assert.deepStrictEqual(busyElsewhereFrames(sentA).map(m => m.state), ['busy', 'busy']);
+
+    relay.finishCurrentTask({ completionSignal: 'verdict', summary: 'done', tmuxLines: [], prURL: null, noWork: null });
+    assert.deepStrictEqual(busyElsewhereFrames(sentA).map(m => m.state), ['busy', 'busy', 'clear'],
+      'finishing hive B\'s task must clear the report on hive A');
+    assert.deepStrictEqual(busyElsewhereFrames(sentB), []);
+  } finally { console.log = log; console.warn = warn; relay.setCurrentTask(null); teardown(relay); }
+});
+
+test('busy_elsewhere_v1: a revoked task clears the report', () => {
+  const relay = loadRelay({ env: MULTI_HUB_ENV });
+  const log = console.log; const warn = console.warn;
+  console.log = () => {}; console.warn = () => {};
+  try {
+    const { hubs, sentA } = attachHubSinks(relay);
+    busyAuth(relay, hubs[0]); busyAuth(relay, hubs[1]);
+    takeTaskFromHubB(relay, hubs, 'b-2');
+    relay.handleMessage(JSON.stringify({ type: 'task_revoke', task_id: 'b-2', reason: 'operator stop' }), hubs[1]);
+    assert.strictEqual(relay.getCurrentTask(), null, 'precondition: the revoke ended the task');
+    assert.deepStrictEqual(busyElsewhereFrames(sentA).map(m => m.state), ['busy', 'clear']);
+  } finally { console.log = log; console.warn = warn; relay.setCurrentTask(null); teardown(relay); }
+});
+
+test('busy_elsewhere_v1: a hive that does not advertise the token never sees the frame', () => {
+  const relay = loadRelay({ env: MULTI_HUB_ENV });
+  const log = console.log; const warn = console.warn;
+  console.log = () => {}; console.warn = () => {};
+  try {
+    const { hubs, sentA, sentB } = attachHubSinks(relay);
+    busyAuth(relay, hubs[0], ['quota_hold_v1']); busyAuth(relay, hubs[1]);
+    takeTaskFromHubB(relay, hubs, 'b-3');
+    busyAuth(relay, hubs[0], ['quota_hold_v1']);
+    relay.finishCurrentTask({ completionSignal: 'verdict', summary: 'done', tmuxLines: [], prURL: null, noWork: null });
+    assert.deepStrictEqual(busyElsewhereFrames([...sentA, ...sentB]), [], 'an old hub must see exactly today\'s traffic');
+  } finally { console.log = log; console.warn = warn; relay.setCurrentTask(null); teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// projectbluefin/utah-packages#972 (2026-11-09): the projectbluefin hive sent
+// Karibhou's relay a fix-pr preempt for its own PR at 14:42:58Z while the
+// relay was busy. The relay accepted it and deferred it behind the headless
+// primary, then refused it at 14:45:39Z with "Hub is not the active polling
+// slot" the moment the primary ended, because the polling slot was on another
+// hive. A fix-pr is taken from any subscribed hub.
+// ---------------------------------------------------------------------------
+
+test('#972 a fix-pr pushed by a non-active hub to an idle relay is taken, and the other hive hears busy_elsewhere', () => {
+  const relay = loadRelay({ env: { ...MULTI_HUB_ENV, HIVE_CONTRIBUTOR_QUOTA_GUARD: 'off' } });
+  const log = console.log; const warn = console.warn;
+  console.log = () => {}; console.warn = () => {};
+  try {
+    const { hubs, sentA, sentB } = attachHubSinks(relay);
+    busyAuth(relay, hubs[0]); busyAuth(relay, hubs[1]);
+    relay.setCurrentTask(null);
+    relay.handleMessage(JSON.stringify(FIX_PR_TASK('fix-karibhou-1', { mode: 'preempt' })), hubs[1]);
+    assert.ok(!sentB.some(m => m.type === 'task_failed' && m.task_id === 'fix-karibhou-1'),
+      `the fix must not be refused for the polling slot: ${JSON.stringify(sentB.filter(m => m.type === 'task_failed'))}`);
+    const task = relay.getCurrentTask();
+    assert.strictEqual(task && task.task_id, 'fix-karibhou-1', 'the fix becomes the current task');
+    assert.strictEqual(task._hub, hubs[1], 'the fix belongs to the hive that sent it');
+    assert.deepStrictEqual(busyElsewhereFrames(sentA).map(m => m.state), ['busy'],
+      'the hive the relay was polling must hear that it is busy elsewhere');
+    assert.deepStrictEqual(busyElsewhereFrames(sentB), [], 'the hive that owns the fix is never told it is busy elsewhere');
+
+    // Finishing the fix clears the report on the other hive.
+    relay.finishCurrentTask({ completionSignal: 'verdict', summary: 'done', tmuxLines: [], prURL: null, noWork: null });
+    assert.deepStrictEqual(busyElsewhereFrames(sentA).map(m => m.state), ['busy', 'clear']);
+  } finally { console.log = log; console.warn = warn; relay.setCurrentTask(null); teardown(relay); }
+});
+
+test('#972 a fix-pr deferred behind a headless primary runs when the primary ends, even with the polling slot on another hive', () => {
+  const relay = loadRelay({ backend: 'claude', mode: 'headless', env: { ...MULTI_HUB_ENV, HIVE_MAX_PARALLEL_FIXES: '0', HIVE_CONTRIBUTOR_QUOTA_GUARD: 'off' }, execFileResult: { defer: true } });
+  const log = console.log; const warn = console.warn;
+  console.log = () => {}; console.warn = () => {};
+  try {
+    const { hubs, sentA, sentB } = attachHubSinks(relay);
+    busyAuth(relay, hubs[0]); busyAuth(relay, hubs[1]);
+    relay.setCurrentTask({ task_id: 'pr-review-1794235343201', task_gen: 0, kind: 'pr-review', repo: 'org/a', number: 0, title: 'local review' });
+    relay.handleMessage(JSON.stringify(FIX_PR_TASK('fix-karibhou-1', { mode: 'preempt' })), hubs[1]);
+    assert.deepStrictEqual(relay.fixPRState().deferred, ['fix-karibhou-1'], 'precondition: the fix waits behind the headless primary');
+    assert.ok(sentB.some(m => m.type === 'task_accepted' && m.task_id === 'fix-karibhou-1'), 'precondition: the relay accepted the fix');
+
+    // The primary ends and the relay asks hive A (its polling slot) for work.
+    relay.setCurrentTask(null);
+    relay.requestWork(hubs[0], 'headless_task_complete');
+    assert.ok(!sentB.some(m => m.type === 'task_failed' && m.task_id === 'fix-karibhou-1'),
+      `an accepted fix must not be refused when it starts: ${JSON.stringify(sentB.filter(m => m.type === 'task_failed'))}`);
+    const task = relay.getCurrentTask();
+    assert.strictEqual(task && task.task_id, 'fix-karibhou-1', 'the deferred fix runs');
+    assert.strictEqual(task._hub, hubs[1]);
+    assert.deepStrictEqual(relay.fixPRState().deferred, []);
+    assert.deepStrictEqual(busyElsewhereFrames(sentA).map(m => m.state), ['busy'],
+      'the hive the relay was polling must hear that it is busy elsewhere');
+  } finally { console.log = log; console.warn = warn; relay.setCurrentTask(null); teardown(relay); }
+});
+
+test('#972 the polling-slot refusal still applies to ordinary work from a non-active hub', () => {
+  const relay = loadRelay({ env: MULTI_HUB_ENV });
+  try {
+    const { hubs, sentB } = attachHubSinks(relay);
+    relay.handleMessage(JSON.stringify({ type: 'task_assign', task_id: 'issue-1', kind: 'issue', repo: 'foo/bar', number: 2, title: 'y' }), hubs[1]);
+    assert.strictEqual(relay.getCurrentTask(), null);
+    assert.ok(sentB.some(m => m.type === 'task_failed' && m.task_id === 'issue-1' && m.reason === 'Hub is not the active polling slot'));
+  } finally { teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// quota_hold_v1: a held relay tells the hub, so it stops counting as
+// contributor-first cover. Observed on 2026-11-08: a relay acting as scanner
+// was held by its quota guard (weekly window 15% left, reserve 20%) while the
+// hub kept reporting it as covering the lane, and nobody worked it.
+// ---------------------------------------------------------------------------
+
+function quotaHoldFrames(sent) {
+  return sent.filter(m => m.type === 'quota_hold');
+}
+
+test('quota_hold_v1: the quota guard hold is reported, and released before the relay asks again', () => {
+  const p = tmp6951(JSON.stringify({ state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 15 }] }));
+  const relay = loadRelay({ env: { HIVE_CONTRIBUTOR_QUOTA_READING_FILE: p } });
+  const warn = console.warn; console.warn = () => {};
+  const log = console.log; console.log = () => {};
+  try {
+    relay.setCliReady(true);
+    const sent = [];
+    relay.setWs({ readyState: 1, send: s => sent.push(JSON.parse(s)) });
+    relay.handleMessage(JSON.stringify({ type: 'auth_ok', contributor_id: 'c1', trust_tier: 'contributor', server_capabilities: ['quota_hold_v1'] }));
+    assert.strictEqual(sent.some(m => m.type === 'ready'), false, 'precondition: the guard withholds ready at 15% < 20%');
+    assert.deepStrictEqual(quotaHoldFrames(sent).map(m => [m.state, m.reason]), [['held', 'quota_guard']],
+      `the hub must hear the hold once: ${JSON.stringify(sent.map(m => m.type))}`);
+
+    relay.retryContributorQuota();
+    assert.strictEqual(quotaHoldFrames(sent).length, 1, 'a retry that is still held must not repeat the frame');
+
+    fs.writeFileSync(p, JSON.stringify({ state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 90 }] }));
+    relay.retryContributorQuota();
+    const frames = quotaHoldFrames(sent);
+    assert.deepStrictEqual(frames.map(m => m.state), ['held', 'released'], 'the release must be reported');
+    const releasedAt = sent.indexOf(frames[1]);
+    const readyAt = sent.findIndex(m => m.type === 'ready');
+    assert.ok(readyAt > releasedAt, `released must reach the hub before the next ready: ${JSON.stringify(sent.map(m => m.type + (m.state ? ':' + m.state : '')))}`);
+  } finally { console.warn = warn; console.log = log; fs.unlinkSync(p); teardown(relay); }
+});
+
+test('quota_hold_v1: a hub that does not advertise the token never sees the frame', () => {
+  const p = tmp6951(JSON.stringify({ state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 15 }] }));
+  const relay = loadRelay({ env: { HIVE_CONTRIBUTOR_QUOTA_READING_FILE: p } });
+  const warn = console.warn; console.warn = () => {};
+  const log = console.log; console.log = () => {};
+  try {
+    relay.setCliReady(true);
+    const sent = [];
+    relay.setWs({ readyState: 1, send: s => sent.push(JSON.parse(s)) });
+    relay.handleMessage(JSON.stringify({ type: 'auth_ok', contributor_id: 'c1', trust_tier: 'contributor', server_capabilities: ['standby_v1'] }));
+    relay.enterQuotaHold({ line: 'quota exhausted', resetMs: 60 * 60 * 1000 });
+    fs.writeFileSync(p, JSON.stringify({ state: 'available', limits: [{ id: 'weekly', kind: 'weekly', pct_remaining: 90 }] }));
+    relay.retryContributorQuota();
+    relay.releaseQuotaHold('test');
+    assert.strictEqual(relay.getContributorQuotaPaused(), false, 'precondition: both holds came and went');
+    assert.deepStrictEqual(quotaHoldFrames(sent), [], 'an old hub must see exactly today\'s traffic');
+  } finally { console.warn = warn; console.log = log; fs.unlinkSync(p); teardown(relay); }
+});
+
+test('quota_hold_v1: the provider quota hold is reported, restated on reconnect, and released', () => {
+  const relay = loadRelay({});
+  const warn = console.warn; console.warn = () => {};
+  const log = console.log; console.log = () => {};
+  try {
+    relay.setCliReady(true);
+    const sent = [];
+    relay.setWs({ readyState: 1, send: s => sent.push(JSON.parse(s)) });
+    const authOK = JSON.stringify({ type: 'auth_ok', contributor_id: 'c1', trust_tier: 'contributor', server_capabilities: ['quota_hold_v1'] });
+    relay.handleMessage(authOK);
+    relay.enterQuotaHold({ line: 'quota exhausted', resetMs: 60 * 60 * 1000 });
+    assert.deepStrictEqual(quotaHoldFrames(sent).map(m => [m.state, m.reason]), [['held', 'provider_quota']]);
+
+    // A reconnect is a new connection the hub knows nothing about: restate.
+    relay.handleMessage(authOK);
+    assert.deepStrictEqual(quotaHoldFrames(sent).map(m => m.state), ['held', 'held'],
+      'auth_ok during a hold must tell the new connection, once');
+
+    relay.releaseQuotaHold('test');
+    const frames = quotaHoldFrames(sent);
+    assert.deepStrictEqual(frames.map(m => m.state), ['held', 'held', 'released']);
+    const readyAt = sent.findIndex((m, i) => i > sent.indexOf(frames[2]) && m.type === 'ready');
+    assert.ok(readyAt > 0, `release must still re-advertise after telling the hub: ${JSON.stringify(sent.map(m => m.type))}`);
+  } finally { console.warn = warn; console.log = log; teardown(relay); }
+});
+
+// ── A completion with no PR says why ─────────────────────────────────────────
+//
+// A relay that dropped an issue reached the hub as `verdict=idle
+// verdict_reason=""`: the agent's own sentence after `HIVE_VERDICT: complete —`
+// was parsed and thrown away, and a chrome-idle exit had no sentence at all.
+// Every no-PR completion now carries a `verdict_reason` and still no `verdict`
+// token, so the hub books it idle exactly as before and an older hub sees the
+// shape a tooling-failure blocked verdict already sends.
+
+test('idle reason: idleReasonWireFields names each no-PR ending and stays out of the way of a PR or a no-work verdict', () => {
+  const relay = loadRelay({ backend: 'copilot' });
+  try {
+    const kind = 'issue';
+    assert.deepStrictEqual(relay.idleReasonWireFields({ kind, prURL: '', noWork: null, verdict: null }),
+      { verdict_reason: 'agent exited without a conclusion' });
+    assert.deepStrictEqual(relay.idleReasonWireFields({ kind }), { verdict_reason: relay.IDLE_REASON_NO_CONCLUSION });
+    assert.deepStrictEqual(
+      relay.idleReasonWireFields({ kind, prURL: '', noWork: null, verdict: { verdict: 'complete', reason: ' looked at the module, nothing to change ' } }),
+      { verdict_reason: 'agent reported complete without a pull request: looked at the module, nothing to change' });
+    assert.deepStrictEqual(
+      relay.idleReasonWireFields({ kind, prURL: '', noWork: null, verdict: { verdict: 'complete', reason: '' } }),
+      { verdict_reason: 'agent reported complete without a pull request and gave no reason' });
+    // A PR is the result; it needs no idle reason.
+    assert.deepStrictEqual(
+      relay.idleReasonWireFields({ kind, prURL: 'https://github.com/acme/widgets/pull/9', noWork: null, verdict: { verdict: 'complete', reason: 'PR #9' } }), {});
+    // A fix-pr or review task ends with no new PR by design: nothing to explain.
+    for (const other of ['fix-pr', 'pr-review', '', undefined]) {
+      assert.deepStrictEqual(
+        relay.idleReasonWireFields({ kind: other, prURL: '', noWork: null, verdict: { verdict: 'complete', reason: 'pushed the fix' } }), {}, String(other));
+    }
+    assert.deepStrictEqual(relay.idleReasonWireFields(), {});
+    // The no-work family is verdictWireFields' and is not touched.
+    for (const verdict of ['no_work_needed', 'blocked', 'wrong_base']) {
+      const v = { verdict, reason: 'v6' };
+      assert.deepStrictEqual(relay.idleReasonWireFields({ kind, prURL: '', noWork: v, verdict: v }), {}, verdict);
+    }
+    const tooling = { verdict: 'blocked', reason: 'git push was rejected: permission denied', toolingFailure: true };
+    assert.deepStrictEqual(relay.idleReasonWireFields({ kind, prURL: '', noWork: tooling, verdict: tooling }), {},
+      'a tooling-failure blocked verdict already sends its own reason');
+    assert.deepStrictEqual(relay.verdictWireFields(tooling), { verdict_reason: tooling.reason });
+  } finally { teardown(relay); }
+});
+
+test('idle reason: a complete with no PR sends the agent\'s sentence as verdict_reason and no verdict', () => {
+  let pane = 'Working…';
+  const relay = loadRelay({ backend: 'copilot', paneText: () => pane, prMeta: new Error('gh: offline') });
+  const log = console.log; console.log = () => {};
+  try {
+    dispatchTask(relay, 'ct-idle-reason-complete', 141);
+    pane = `HIVE_VERDICT: complete — read the module, the change belongs in another repository\n${IDLE_PANE}`;
+    relay.__crashTick();
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1, 'the verdict completes the task');
+    assert.strictEqual(completed[0].completion_signal, 'verdict');
+    assert.ok(!completed[0].pr_url, 'no PR is reported');
+    assert.strictEqual(completed[0].verdict, undefined, 'no verdict token: the hub must keep booking this idle');
+    assert.strictEqual(completed[0].verdict_blocked, undefined);
+    assert.strictEqual(completed[0].verdict_reason,
+      'agent reported complete without a pull request: read the module, the change belongs in another repository');
+  } finally { console.log = log; teardown(relay); }
+});
+
+test('idle reason: a chrome-idle completion with no verdict and no PR says the agent exited without a conclusion', () => {
+  const IDLE_NO_VERDICT_NO_PR = [
+    '● Nothing here seems to need a change.',
+    '✻ Cogitated for 9m 24s',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: IDLE_NO_VERDICT_NO_PR });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-idle-reason-chrome');
+    relay.setTaskAgentActivityObserved(true);
+    graceTicks(relay, () => relay.__crashTick());
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1);
+    assert.strictEqual(completed[0].completion_signal, 'chrome_idle');
+    assert.ok(!completed[0].pr_url, 'no PR is reported');
+    assert.strictEqual(completed[0].verdict, undefined);
+    assert.strictEqual(completed[0].verdict_reason, 'agent exited without a conclusion');
+  } finally { teardown(relay); }
+});
+
+test('idle reason: a no_work_needed verdict is sent exactly as before, and a completion with a PR carries no idle reason', () => {
+  let pane = 'Working…';
+  const relay = loadRelay({ backend: 'copilot', paneText: () => pane, prMeta: new Error('gh: offline') });
+  const log = console.log; console.log = () => {};
+  try {
+    dispatchTask(relay, 'ct-idle-reason-no-work', 142);
+    pane = `HIVE_VERDICT: no_work_needed — nothing left to change in this repository\n${IDLE_PANE}`;
+    relay.__crashTick();
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1);
+    assert.strictEqual(completed[0].verdict, 'no_work_needed');
+    assert.strictEqual(completed[0].verdict_reason, 'nothing left to change in this repository',
+      'the no-work reason is the agent\'s sentence, with no idle wording added');
+  } finally { console.log = log; teardown(relay); }
+
+  const IDLE_WITH_PR = [
+    '● Opened https://github.com/foo/bar/pull/778',
+    '✻ Cogitated for 9m 24s',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  const shipped = loadRelay({ backend: 'claude', paneText: IDLE_WITH_PR });
+  try {
+    shipped.setCliReady(true);
+    assignTask(shipped, 't-idle-reason-shipped');
+    shipped.setTaskAgentActivityObserved(true);
+    graceTicks(shipped, () => shipped.__crashTick());
+    const completed = shipped.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1);
+    assert.strictEqual(completed[0].pr_url, 'https://github.com/foo/bar/pull/778');
+    assert.strictEqual(completed[0].verdict_reason, undefined, 'a completion with a PR sends no idle reason');
+  } finally { teardown(shipped); }
 });

@@ -1,8 +1,10 @@
 package dashboard
 
 import (
+	"fmt"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -143,12 +145,17 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		SelfAuthored         *bool    `json:"self_authored"`
-		MaxMerges            *int     `json:"max_merges"`
-		MinHeadAge           *string  `json:"min_head_age"`
-		RequiredChecks       []string `json:"required_checks"`
-		AllowUnprotectedBase []string `json:"allow_unprotected_base"`
-		NoCIOK               []string `json:"no_ci_ok"`
+		MergeTrain *struct {
+			Enabled           *bool `json:"enabled"`
+			MaxRebaseAttempts *int  `json:"max_rebase_attempts"`
+		} `json:"merge_train"`
+		NativeMergeQueue     *nativeQueueSettingsPatch `json:"native_merge_queue"`
+		SelfAuthored         *bool                     `json:"self_authored"`
+		MaxMerges            *int                      `json:"max_merges"`
+		MinHeadAge           *string                   `json:"min_head_age"`
+		RequiredChecks       []string                  `json:"required_checks"`
+		AllowUnprotectedBase []string                  `json:"allow_unprotected_base"`
+		NoCIOK               []string                  `json:"no_ci_ok"`
 		// TrustedBotAuthors is the FULL desired list; an empty (non-nil) list
 		// disables the trusted-bot lane, absent leaves it untouched.
 		TrustedBotAuthors []string `json:"trusted_bot_authors"`
@@ -159,10 +166,21 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 		SquashOnly         []string            `json:"squash_only"`
 		RequireCurrentBase []string            `json:"require_current_base"`
 		HumanMergePaths    map[string][]string `json:"human_merge_paths"`
+		// HumanMergePinOnly is the FULL desired auto_merge.human_merge_pin_only
+		// map, replaced whole like HumanMergePaths: an empty (non-nil) map
+		// clears it, absent leaves it untouched.
+		HumanMergePinOnly map[string]config.PinOnlyException `json:"human_merge_pin_only"`
+		// TrustedBotSkipReview is auto_merge.trusted_bot_skip_review: the
+		// review swarm's verdict is advisory on the trusted-bot lane.
+		TrustedBotSkipReview *bool `json:"trusted_bot_skip_review"`
 		// BotTakeoverEnabled is auto_merge.bot_takeover.enabled; flat so the
 		// dialog's plain toggle can stage it.
 		BotTakeoverEnabled *bool `json:"bot_takeover_enabled"`
-		TrustedAuthors     *struct {
+		// RequireCurrentBaseDefault is auto_merge.require_current_base_default,
+		// the Features toggle "Merge only on current base" (#15335). Per-repo
+		// overrides travel on PUT /api/config/governor/repos.
+		RequireCurrentBaseDefault *bool `json:"require_current_base_default"`
+		TrustedAuthors            *struct {
 			Enabled                 *bool    `json:"enabled"`
 			Repos                   []string `json:"repos"`
 			RequireRole             *string  `json:"require_role"`
@@ -180,6 +198,13 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 			AutoPromotionScope                 *string  `json:"auto_promotion_scope"`
 			ApproveHeldRunsForRegistryTrusted  *bool    `json:"approve_held_runs_for_registry_trusted"`
 			OwnerApprovalReleasesWorkflowFence *bool    `json:"owner_approval_releases_workflow_fence"`
+			WorkflowFenceScope                 *string  `json:"workflow_fence_scope"`
+			// WorkflowFenceScopeRepos sets or clears single repositories'
+			// project.repo_policies[].workflow_fence_scope: "all" or
+			// "human_merge_paths" sets it, null clears it so the repository
+			// reads workflow_fence_scope again. Repositories it does not name
+			// keep their override; the hive-wide value is never changed here.
+			WorkflowFenceScopeRepos map[string]*string `json:"workflow_fence_scope_repos"`
 		} `json:"contributor_lane"`
 	}
 	if err := decodeBody(r, &body); err != nil {
@@ -188,6 +213,15 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- validate before mutating anything ---
+	if body.MergeTrain != nil && body.MergeTrain.MaxRebaseAttempts != nil && *body.MergeTrain.MaxRebaseAttempts < 0 {
+		jsonError(w, "merge_train.max_rebase_attempts must be at least 0 (0 uses the default of 2)", http.StatusBadRequest)
+		return
+	}
+	nativeQueue, err := updateNativeQueueSettings(s.deps.Config.AutoMerge.NativeMergeQueue, body.NativeMergeQueue)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if body.MaxMerges != nil && *body.MaxMerges < 0 {
 		jsonError(w, "max_merges must be 0 (default) or greater", http.StatusBadRequest)
 		return
@@ -227,6 +261,21 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 		}
 		humanMergePaths = paths
 	}
+	var humanMergePinOnly map[string]config.PinOnlyException
+	if body.HumanMergePinOnly != nil {
+		// A new or changed exception is checked against the human-merge paths
+		// this write leaves in place: the ones in the body when it sends them.
+		pathsAfter := s.deps.Config.AutoMerge.HumanMergePaths
+		if body.HumanMergePaths != nil {
+			pathsAfter = humanMergePaths
+		}
+		policies, msg := s.autoMergeHumanMergePinOnly(body.HumanMergePinOnly, s.deps.Config.AutoMerge.HumanMergePinOnly, pathsAfter)
+		if msg != "" {
+			jsonError(w, msg, http.StatusBadRequest)
+			return
+		}
+		humanMergePinOnly = policies
+	}
 	var trustedAuthorRepos []string
 	var trustedAuthorLabels []string
 	if body.TrustedAuthors != nil {
@@ -254,6 +303,8 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 	var contributorLaneLabels []string
 	var contributorLaneTiers []string
 	var contributorLaneScope string
+	var contributorLaneWorkflowFenceScope string
+	var fenceScopeRepos map[string]*string
 	if body.ContributorLane != nil {
 		if body.ContributorLane.SoakMinutes != nil && *body.ContributorLane.SoakMinutes < 0 {
 			jsonError(w, "contributor_lane.soak_minutes must be 0 (default 30) or greater", http.StatusBadRequest)
@@ -288,10 +339,54 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 			}
 			contributorLaneScope = scope.EffectiveAutoPromotionScope()
 		}
+		if body.ContributorLane.WorkflowFenceScope != nil {
+			// An unknown value is refused here; the lane reads anything but
+			// human_merge_paths as the full fence (EffectiveWorkflowFenceScope).
+			scope := config.ContributorLaneAutoMergeConfig{WorkflowFenceScope: *body.ContributorLane.WorkflowFenceScope}
+			if err := scope.Validate(); err != nil {
+				jsonError(w, "contributor_lane.workflow_fence_scope must be one of "+strings.Join(config.ContributorLaneWorkflowFenceScopes, ", "), http.StatusBadRequest)
+				return
+			}
+			contributorLaneWorkflowFenceScope = scope.EffectiveWorkflowFenceScope()
+		}
+		if body.ContributorLane.WorkflowFenceScopeRepos != nil {
+			repos, msg := s.repoOverrideFenceScopeRepos(body.ContributorLane.WorkflowFenceScopeRepos)
+			if msg != "" {
+				jsonError(w, msg, http.StatusBadRequest)
+				return
+			}
+			fenceScopeRepos = repos
+		}
 	}
 
 	// --- apply ---
 	cfg := s.deps.Config
+	previousAutoMerge := cfg.AutoMerge
+	// Per-repository fence scopes go first: they are the only write here that
+	// can still be refused, and a refusal must leave every setting untouched.
+	var fenceScopeChanges []string
+	var previousRepoPolicies []config.RepoPolicy
+	if fenceScopeRepos != nil {
+		previousRepoPolicies = append([]config.RepoPolicy(nil), cfg.Project.RepoPolicies...)
+		changes, err := cfg.SetRepoWorkflowFenceScopes(fenceScopeRepos)
+		if err != nil {
+			jsonError(w, "contributor_lane.workflow_fence_scope_repos: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		fenceScopeChanges = changes
+	}
+	if body.MergeTrain != nil {
+		if body.MergeTrain.Enabled != nil {
+			v := *body.MergeTrain.Enabled
+			cfg.AutoMerge.MergeTrain.Enabled = &v
+		}
+		if body.MergeTrain.MaxRebaseAttempts != nil {
+			cfg.AutoMerge.MergeTrain.MaxRebaseAttempts = *body.MergeTrain.MaxRebaseAttempts
+		}
+	}
+	if body.NativeMergeQueue != nil {
+		cfg.AutoMerge.NativeMergeQueue = nativeQueue
+	}
 	if body.SelfAuthored != nil {
 		v := *body.SelfAuthored
 		cfg.AutoMerge.SelfAuthored = &v
@@ -330,9 +425,20 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 	if body.HumanMergePaths != nil {
 		cfg.AutoMerge.HumanMergePaths = humanMergePaths
 	}
+	if body.HumanMergePinOnly != nil {
+		cfg.AutoMerge.HumanMergePinOnly = humanMergePinOnly
+	}
+	if body.TrustedBotSkipReview != nil {
+		v := *body.TrustedBotSkipReview
+		cfg.AutoMerge.TrustedBotSkipReview = &v
+	}
 	if body.BotTakeoverEnabled != nil {
 		v := *body.BotTakeoverEnabled
 		cfg.AutoMerge.BotTakeover.Enabled = &v
+	}
+	if body.RequireCurrentBaseDefault != nil {
+		v := *body.RequireCurrentBaseDefault
+		cfg.AutoMerge.RequireCurrentBaseDefault = &v
 	}
 	if body.TrustedAuthors != nil {
 		if body.TrustedAuthors.Enabled != nil {
@@ -388,14 +494,34 @@ func (s *Server) handleAutoMergePut(w http.ResponseWriter, r *http.Request) {
 		if body.ContributorLane.AutoPromotionScope != nil {
 			cfg.AutoMerge.ContributorLane.AutoPromotionScope = contributorLaneScope
 		}
+		if body.ContributorLane.WorkflowFenceScope != nil {
+			cfg.AutoMerge.ContributorLane.WorkflowFenceScope = contributorLaneWorkflowFenceScope
+		}
 	}
 	syncAutoMergePolicyToGitHubClient(cfg, s.deps.GHClient)
 
 	if err := s.saveConfig(); err != nil {
 		s.logger.Error("failed to persist config after auto-merge update", "error", err)
+		// A pin-only exception lets PRs past a human-merge hold, so one that
+		// cannot be saved is not left running until the next restart drops it.
+		// A per-repository fence scope can let workflow edits past the fence,
+		// so it is rolled back the same way.
+		if body.NativeMergeQueue != nil || body.MergeTrain != nil || body.HumanMergePinOnly != nil || len(fenceScopeChanges) > 0 {
+			cfg.AutoMerge = previousAutoMerge
+			if len(fenceScopeChanges) > 0 {
+				cfg.Project.RepoPolicies = previousRepoPolicies
+			}
+			syncAutoMergePolicyToGitHubClient(cfg, s.deps.GHClient)
+			jsonError(w, "failed to persist auto-merge settings", http.StatusInternalServerError)
+			return
+		}
 	}
 
-	s.auditFromRequest(r, "config_auto_merge", auditDetail("section", "auto_merge"), "")
+	auditKV := []string{"section", "auto_merge"}
+	if len(fenceScopeChanges) > 0 {
+		auditKV = append(auditKV, "workflow_fence_scope_repos", strings.Join(fenceScopeChanges, "; "))
+	}
+	s.auditFromRequest(r, "config_auto_merge", auditDetail(auditKV...), "")
 	s.refreshAndPersist()
 	jsonResponse(w, s.autoMergeSectionResponseWithBots(cfg))
 }
@@ -434,6 +560,13 @@ func autoMergeSectionResponse(cfg *config.Config) map[string]interface{} {
 	if humanMergePaths == nil {
 		humanMergePaths = map[string][]string{}
 	}
+	humanMergePinOnly := make(map[string]config.PinOnlyException, len(am.HumanMergePinOnly))
+	for repo, policy := range am.HumanMergePinOnly {
+		policy.Paths = emptyIfNilStrings(policy.Paths)
+		policy.Kinds = emptyIfNilStrings(policy.Kinds)
+		policy.TrustedAuthors = emptyIfNilStrings(policy.TrustedAuthors)
+		humanMergePinOnly[repo] = policy
+	}
 	projectRepos := make([]string, 0, len(cfg.Project.Repos))
 	for _, repo := range cfg.Project.Repos {
 		if full := config.QualifyRepo(cfg.Project.Org, repo); full != "" {
@@ -462,21 +595,44 @@ func autoMergeSectionResponse(cfg *config.Config) map[string]interface{} {
 	if contributorLaneLabels == nil {
 		contributorLaneLabels = append([]string{}, config.DefaultContributorLaneExcludeLabels...)
 	}
+	// Repositories whose repo_policies override replaces workflow_fence_scope;
+	// the hive-wide value (and a change to it) does not apply to them.
+	fenceOverrides := cfg.WorkflowFenceScopeRepoOverrides()
+	contributorLaneFenceScopeRepos := make([]map[string]interface{}, 0, len(fenceOverrides))
+	for _, o := range fenceOverrides {
+		contributorLaneFenceScopeRepos = append(contributorLaneFenceScopeRepos, map[string]interface{}{"repo": o.Repo, "workflow_fence_scope": o.Scope})
+	}
 	return map[string]interface{}{
-		"self_authored":           selfAuthored,
-		"self_authored_set":       am.SelfAuthored != nil,
-		"max_merges":              am.MaxMerges,
-		"min_head_age":            am.EffectiveMinHeadAge().String(),
-		"required_checks":         checks,
-		"allow_unprotected_base":  allowUnprotected,
-		"no_ci_ok":                noCIOK,
-		"squash_only":             squashOnly,
-		"require_current_base":    requireCurrentBase,
-		"human_merge_paths":       humanMergePaths,
-		"project_repos":           projectRepos,
-		"trusted_bot_authors":     trustedBots,
-		"trusted_bot_authors_set": am.TrustedBotAuthors != nil,
-		"bot_takeover_enabled":    am.BotTakeover.IsEnabled(),
+		"self_authored":                selfAuthored,
+		"self_authored_set":            am.SelfAuthored != nil,
+		"max_merges":                   am.MaxMerges,
+		"min_head_age":                 am.EffectiveMinHeadAge().String(),
+		"required_checks":              checks,
+		"allow_unprotected_base":       allowUnprotected,
+		"no_ci_ok":                     noCIOK,
+		"squash_only":                  squashOnly,
+		"require_current_base":         requireCurrentBase,
+		"human_merge_paths":            humanMergePaths,
+		"human_merge_pin_only":         humanMergePinOnly,
+		"pin_only_kinds":               config.PinOnlyKinds,
+		"project_repos":                projectRepos,
+		"trusted_bot_authors":          trustedBots,
+		"trusted_bot_authors_set":      am.TrustedBotAuthors != nil,
+		"trusted_bot_skip_review":      am.TrustedBotSkipsReview(),
+		"bot_takeover_enabled":         am.BotTakeover.IsEnabled(),
+		"require_current_base_default": am.CurrentBaseDefaultEnabled(),
+		"skip_current_base":            emptyIfNilStrings(am.SkipCurrentBase),
+		"merge_train": map[string]interface{}{
+			"enabled":             am.MergeTrain.IsEnabled(),
+			"max_rebase_attempts": am.MergeTrain.EffectiveMaxRebaseAttempts(),
+		},
+		"native_merge_queue": map[string]interface{}{
+			"enabled":                am.NativeMergeQueue.Enabled,
+			"repos":                  emptyIfNilStrings(am.NativeMergeQueue.Repos),
+			"bases":                  emptyIfNilStrings(am.NativeMergeQueue.Bases),
+			"skip_current_base_gate": am.NativeMergeQueue.SkipCurrentBaseGate,
+			"probe_ttl":              am.NativeMergeQueue.EffectiveProbeTTL().String(),
+		},
 		"trusted_authors": map[string]interface{}{
 			"enabled":                   ta.Enabled,
 			"repos":                     trustedAuthorRepos,
@@ -498,8 +654,89 @@ func autoMergeSectionResponse(cfg *config.Config) map[string]interface{} {
 			"grantable_tiers":                        config.ContributorLaneGrantableTiers,
 			"approve_held_runs_for_registry_trusted": cl.EffectiveApproveHeldRunsForRegistryTrusted(),
 			"owner_approval_releases_workflow_fence": cl.EffectiveOwnerApprovalReleasesWorkflowFence(),
+			"workflow_fence_scope":                   cl.EffectiveWorkflowFenceScope(),
+			"workflow_fence_scopes":                  config.ContributorLaneWorkflowFenceScopes,
+			"workflow_fence_scope_repos":             contributorLaneFenceScopeRepos,
+
+			// This build takes workflow_fence_scope_repos on PUT/PATCH; the
+			// admin MCP refuses to send it to a hive that does not say so.
+			"workflow_fence_scope_repos_settable": true,
 		},
 	}
+}
+
+type nativeQueueSettingsPatch struct {
+	Enabled             *bool    `json:"enabled"`
+	Repos               []string `json:"repos"`
+	Bases               []string `json:"bases"`
+	SkipCurrentBaseGate *bool    `json:"skip_current_base_gate"`
+	ProbeTTL            *string  `json:"probe_ttl"`
+}
+
+var nativeQueueRepoPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]*/[a-zA-Z0-9_.-]+$`)
+var nativeQueueBasePattern = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_./-]*$`)
+
+func updateNativeQueueSettings(current config.NativeMergeQueueAutoMergeConfig, patch *nativeQueueSettingsPatch) (config.NativeMergeQueueAutoMergeConfig, error) {
+	if patch == nil {
+		return current, nil
+	}
+	next := current
+	if patch.Enabled != nil {
+		next.Enabled = *patch.Enabled
+	}
+	if patch.SkipCurrentBaseGate != nil {
+		next.SkipCurrentBaseGate = *patch.SkipCurrentBaseGate
+	}
+	if patch.ProbeTTL != nil {
+		ttl, err := time.ParseDuration(strings.TrimSpace(*patch.ProbeTTL))
+		if err != nil || ttl < 0 {
+			return current, fmt.Errorf("native_merge_queue.probe_ttl must be a non-negative duration (0 uses 30m)")
+		}
+		next.ProbeTTL = ttl
+	}
+	if patch.Repos != nil {
+		for _, repo := range patch.Repos {
+			repo = strings.TrimSpace(repo)
+			if !nativeQueueRepoPattern.MatchString(repo) || strings.HasSuffix(repo, "/.") || strings.HasSuffix(repo, "/..") {
+				return current, fmt.Errorf("native_merge_queue.repos must contain exact owner/repo names")
+			}
+		}
+		next.Repos = normalizeAutoMergeRepoList(patch.Repos)
+	}
+	if patch.Bases != nil {
+		next.Bases = make([]string, 0, len(patch.Bases))
+		seen := map[string]bool{}
+		for _, scope := range patch.Bases {
+			repo, base, ok := strings.Cut(strings.TrimSpace(scope), "#")
+			if !ok || !nativeQueueRepoPattern.MatchString(repo) || !nativeQueueBasePattern.MatchString(base) ||
+				strings.Contains(base, "..") || strings.Contains(base, "//") || strings.HasSuffix(base, "/") || strings.HasSuffix(base, ".") {
+				return current, fmt.Errorf("native_merge_queue.bases must contain exact owner/repo#base pairs (no wildcards)")
+			}
+			for _, part := range strings.Split(base, "/") {
+				if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+					return current, fmt.Errorf("native_merge_queue.bases contains an invalid branch name")
+				}
+			}
+			key := strings.ToLower(repo) + "#" + base
+			if !seen[key] {
+				next.Bases = append(next.Bases, key)
+				seen[key] = true
+			}
+		}
+	}
+	// Disabling always remains possible, including legacy unscoped YAML.
+	if next.Enabled {
+		if len(next.Repos) == 0 || len(next.Bases) == 0 {
+			return current, fmt.Errorf("enabling native merge queue in Settings requires explicit repositories and owner/repo#base pairs")
+		}
+		for _, scope := range next.Bases {
+			repo, _, _ := strings.Cut(scope, "#")
+			if !next.RepoSet()[strings.ToLower(repo)] {
+				return current, fmt.Errorf("native_merge_queue.bases repository must also appear in repos")
+			}
+		}
+	}
+	return next, nil
 }
 
 func syncAutoMergePolicyToGitHubClient(cfg *config.Config, ghClient *ghpkg.Client) {
@@ -512,6 +749,16 @@ func syncAutoMergePolicyToGitHubClient(cfg *config.Config, ghClient *ghpkg.Clien
 	ghClient.SetMergeRequestAllowUnprotectedBaseRepos(cfg.AutoMerge.AllowUnprotectedBaseSet())
 	ghClient.SetMergeRequestNoCIAllowedRepos(cfg.AutoMerge.NoCIOKSet())
 	ghClient.SetHumanMergePaths(cfg.AutoMerge.HumanMergePaths)
+	// The merge-request relay holds its own copy of the pin-only exception
+	// (cmd/hive's syncAutoMergePolicyToGitHubClient installs it the same way
+	// on boot and reload); the sweep lanes and /approve read cfg directly.
+	pinOnly := make(map[string]ghpkg.PinOnlySpec)
+	for repo := range cfg.AutoMerge.HumanMergePinOnly {
+		if ex, enabled := cfg.AutoMerge.HumanMergePinOnlyFor(repo); enabled {
+			pinOnly[repo] = ghpkg.PinOnlySpec{Enabled: true, Paths: ex.Paths, Kinds: ex.Kinds, TrustedAuthors: ex.TrustedAuthors}
+		}
+	}
+	ghClient.SetHumanMergePinOnly(pinOnly)
 	ghClient.SetAutoMergeMinHeadAge(cfg.AutoMerge.EffectiveMinHeadAge())
 }
 
@@ -559,6 +806,42 @@ func (s *Server) autoMergeWatchedRepo(key, repo string) (full, msg string) {
 	return full, ""
 }
 
+// repoOverrideFenceScopeRepos validates
+// contributor_lane.workflow_fence_scope_repos: every key a repository in
+// project.repos (stored as owner/repo, named once), every value "all",
+// "human_merge_paths" (any case, the rule hive.yaml loads under) or null to
+// clear. A non-empty msg is the 400 to return.
+func (s *Server) repoOverrideFenceScopeRepos(in map[string]*string) (map[string]*string, string) {
+	const key = "contributor_lane.workflow_fence_scope_repos"
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]*string, len(in))
+	seen := map[string]bool{}
+	for _, k := range keys {
+		full, msg := s.autoMergeWatchedRepo(key, strings.TrimSpace(k))
+		if msg != "" {
+			return nil, msg
+		}
+		if seen[strings.ToLower(full)] {
+			return nil, key + ": " + full + " is named twice"
+		}
+		seen[strings.ToLower(full)] = true
+		v := in[k]
+		if v != nil {
+			if strings.TrimSpace(*v) == "" || config.ValidateRepoWorkflowFenceScope(key+": "+full, *v) != nil {
+				return nil, key + ": " + full + " must be one of " + strings.Join(config.ContributorLaneWorkflowFenceScopes, ", ") + ", or null to use the hive-wide workflow_fence_scope"
+			}
+			scope := strings.ToLower(strings.TrimSpace(*v))
+			v = &scope
+		}
+		out[full] = v
+	}
+	return out, ""
+}
+
 // autoMergeHumanMergePaths validates auto_merge.human_merge_paths sent by the
 // dashboard: keys follow autoMergeWatchedRepoList, patterns must be valid
 // globs (the syntax intent.PathMatchesAny uses), and a repo left with no
@@ -588,4 +871,97 @@ func (s *Server) autoMergeHumanMergePaths(paths map[string][]string) (map[string
 		return nil, ""
 	}
 	return out, ""
+}
+
+// autoMergeHumanMergePinOnly validates auto_merge.human_merge_pin_only sent by
+// the dashboard or admin MCP. Keys follow autoMergeWatchedRepo; each list is
+// trimmed and de-duplicated; a disabled entry with nothing in it is dropped;
+// the result must pass config.ValidateHumanMergePinOnly, the rule hive.yaml
+// loads under. An enabled entry the write adds or changes also needs
+// human_merge_paths for its repository (pathsAfter), because the exception
+// only ever lifts a human-merge-path hold: without one it would never apply.
+// A non-empty msg is the 400 to return.
+func (s *Server) autoMergeHumanMergePinOnly(in, current map[string]config.PinOnlyException, pathsAfter map[string][]string) (map[string]config.PinOnlyException, string) {
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := map[string]config.PinOnlyException{}
+	seen := map[string]bool{}
+	for _, k := range keys {
+		full, msg := s.autoMergeWatchedRepo("human_merge_pin_only", strings.TrimSpace(k))
+		if msg != "" {
+			return nil, msg
+		}
+		if seen[strings.ToLower(full)] {
+			return nil, "human_merge_pin_only names " + full + " twice"
+		}
+		seen[strings.ToLower(full)] = true
+		policy := config.PinOnlyException{
+			Enabled:        in[k].Enabled,
+			Paths:          autoMergeDedupeStrings(in[k].Paths),
+			Kinds:          autoMergeDedupeStrings(in[k].Kinds),
+			TrustedAuthors: autoMergeDedupeStrings(in[k].TrustedAuthors),
+		}
+		if !policy.Enabled && len(policy.Paths)+len(policy.Kinds)+len(policy.TrustedAuthors) == 0 {
+			continue
+		}
+		out[full] = policy
+	}
+	if err := (config.AutoMergeConfig{HumanMergePinOnly: out}).ValidateHumanMergePinOnly(); err != nil {
+		return nil, err.Error()
+	}
+	guarded := config.AutoMergeConfig{HumanMergePaths: pathsAfter}
+	for _, repo := range autoMergePinOnlyRepos(out) {
+		policy := out[repo]
+		if !policy.Enabled || autoMergePinOnlyUnchanged(current, repo, policy) {
+			continue
+		}
+		if len(guarded.HumanMergePathsFor(repo)) == 0 {
+			return nil, "human_merge_pin_only: " + repo + " has no human_merge_paths, so a pin-only exception there would never apply; set its human-merge paths first"
+		}
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	return out, ""
+}
+
+// autoMergePinOnlyUnchanged reports whether current already holds policy for repo, so
+// an entry the write sends back untouched is not re-checked.
+func autoMergePinOnlyUnchanged(current map[string]config.PinOnlyException, repo string, policy config.PinOnlyException) bool {
+	for k, was := range current {
+		if strings.EqualFold(strings.TrimSpace(k), repo) {
+			return was.Enabled == policy.Enabled && slices.Equal(was.Paths, policy.Paths) &&
+				slices.Equal(was.Kinds, policy.Kinds) && slices.Equal(was.TrustedAuthors, policy.TrustedAuthors)
+		}
+	}
+	return false
+}
+
+func autoMergePinOnlyRepos(m map[string]config.PinOnlyException) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func autoMergeDedupeStrings(list []string) []string {
+	var out []string
+	for _, v := range normalizeAutoMergeRepoList(list) {
+		if !slices.Contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func emptyIfNilStrings(list []string) []string {
+	if list == nil {
+		return []string{}
+	}
+	return list
 }

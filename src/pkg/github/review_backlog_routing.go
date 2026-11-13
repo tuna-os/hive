@@ -75,6 +75,9 @@ type ReviewBacklogRef struct {
 	// same file but was not folded into because it describes a different
 	// finding (#13906); 0 when there is none.
 	SameFileAs int
+	// SameFilePath is the path the two share; "" when every cited path is
+	// (CreateIssueResult.SameFilePath).
+	SameFilePath string
 }
 
 // ReviewBacklogSink is a backlog destination. The GitHub issue sink lives
@@ -148,17 +151,20 @@ func (s githubIssueBacklogSink) CreateItem(ctx context.Context, item ReviewBackl
 		}
 	}
 	return ReviewBacklogRef{
-		ID:         strconv.Itoa(res.Number),
-		Key:        fmt.Sprintf("#%d", res.Number),
-		Number:     res.Number,
-		URL:        res.URL,
-		Reused:     res.AlreadyExisted,
-		SameFileAs: res.SameFileAs,
+		ID:           strconv.Itoa(res.Number),
+		Key:          fmt.Sprintf("#%d", res.Number),
+		Number:       res.Number,
+		URL:          res.URL,
+		Reused:       res.AlreadyExisted,
+		SameFileAs:   res.SameFileAs,
+		SameFilePath: res.SameFilePath,
 	}, nil
 }
 
 var (
-	reviewBacklogTitleCategoryRE = regexp.MustCompile(`^\s*Review backlog \(([^)]+)\):`)
+	// The optional leading `[<agent>]` tag keeps items filed before titles
+	// carried the filer in the same category as their prefixed successors.
+	reviewBacklogTitleCategoryRE = regexp.MustCompile(`^\s*(?:\[[^\]\s]+\]\s*)?Review backlog \(([^)]+)\):`)
 	reviewBacklogPerspectiveRE   = regexp.MustCompile(`(?m)^\s*Perspective:\s*(\S+)`)
 	reviewBacklogFileLineRE      = regexp.MustCompile(`([A-Za-z0-9_./-]+):(\d+)\b`)
 	reviewBacklogFileNameRE      = regexp.MustCompile(`[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.[a-z]{1,5}\b`)
@@ -183,8 +189,15 @@ var reviewBacklogNonSymbols = map[string]bool{
 // An issue with no recognisable category never matches.
 func reviewBacklogFoldMatches(p review.Perspective, f outputschema.Finding, title, body string) bool {
 	want := strings.ToLower(strings.TrimSpace(string(p)))
-	if want == "" || want != reviewBacklogItemCategory(title, body) {
+	if want == "" {
 		return false
+	}
+	if cat := reviewBacklogItemCategory(title, body); cat != want {
+		// Another perspective's item folds only when it is the same
+		// finding verbatim: same title once per-pass wrapping is stripped,
+		// cited at the same place (hivecommons/hive#15627).
+		n := reviewBacklogNormalisedTitle(f.Title)
+		return cat != "" && n != "" && n == reviewBacklogNormalisedTitle(title) && reviewBacklogNearbyCitation(f, title+"\n"+body)
 	}
 	return reviewBacklogNearbyCitation(f, title+"\n"+body) || reviewBacklogSharesSymbol(f.Title, title)
 }
@@ -340,11 +353,12 @@ func appendLabelOnce(labels []string, label string) []string {
 	return append(labels, label)
 }
 
-// reviewBacklogDailyCap is review.backlog.max_per_pr_per_day when routing is
-// configured, else the legacy per-PR cap.
-func reviewBacklogDailyCap(r ReviewBacklogRouting, routed bool, legacyCap int) int {
+// reviewBacklogPRCap is review.backlog.max_per_pr (per PR lifetime,
+// hivecommons/hive#17065) when routing is configured, else the legacy per-PR
+// cap.
+func reviewBacklogPRCap(r ReviewBacklogRouting, routed bool, legacyCap int) int {
 	if routed {
-		return r.Backlog.EffectiveMaxPerPRPerDay()
+		return r.Backlog.EffectiveMaxPerPR()
 	}
 	if legacyCap <= 0 {
 		return DefaultReviewBacklogIssueCap
@@ -383,6 +397,22 @@ func ReviewFindingBelowLine(f outputschema.Finding, blockAt string) bool {
 		return false
 	}
 	line, err := strconv.Atoi(strings.TrimPrefix(b, "P"))
+	if err != nil {
+		return false
+	}
+	return ReviewFindingPriority(f.Severity) > line
+}
+
+// ReviewFindingBelowMinSeverity reports whether f is below
+// review.backlog.min_severity (P0–P3): such a finding is listed in the PR's
+// Follow-ups comment instead of filed as an item (hivecommons/hive#17065).
+// An unrecognised minSeverity is treated as the default.
+func ReviewFindingBelowMinSeverity(f outputschema.Finding, minSeverity string) bool {
+	m, ok := config.NormalizeReviewBacklogMinSeverity(minSeverity)
+	if !ok {
+		m = config.DefaultReviewBacklogMinSeverity
+	}
+	line, err := strconv.Atoi(strings.TrimPrefix(m, "P"))
 	if err != nil {
 		return false
 	}
@@ -434,6 +464,11 @@ type reviewBacklogFingerprintRecord struct {
 	// BlockState is blocked, lifted or retriage; ReconcileReviewBacklogBlocks
 	// moves it on when BlockedOnPR merges or closes.
 	BlockState string `json:"block_state,omitempty"`
+	// File and Title are the finding's evidence file (repo-relative) and
+	// title, kept so the block sweep can check whether the finding still
+	// applies on the base once BlockedOnPR merges (hivecommons/hive#15627).
+	File  string `json:"file,omitempty"`
+	Title string `json:"title,omitempty"`
 }
 
 func (r reviewBacklogFingerprintRecord) ref() ReviewBacklogRef {
@@ -466,24 +501,6 @@ func (l *reviewBacklogLedger) setFingerprint(repo, fp string, rec reviewBacklogF
 	l.Fingerprints[key][fp] = rec
 }
 
-const reviewBacklogDayLayout = "2006-01-02"
-
-func reviewBacklogDayKey(prKey string, now time.Time) string {
-	return prKey + "@" + now.UTC().Format(reviewBacklogDayLayout)
-}
-
-// pruneDailyCounts drops per-day counters older than yesterday so the ledger
-// does not grow without bound.
-func (l *reviewBacklogLedger) pruneDailyCounts(now time.Time) {
-	cutoff := now.UTC().AddDate(0, 0, -1).Format(reviewBacklogDayLayout)
-	for k := range l.PRDailyCount {
-		i := strings.LastIndex(k, "@")
-		if i < 0 || k[i+1:] < cutoff {
-			delete(l.PRDailyCount, k)
-		}
-	}
-}
-
 func reviewPRURL(owner, repo string, number int) string {
 	return fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, number)
 }
@@ -512,6 +529,15 @@ func reviewBacklogReason(f outputschema.Finding, blockAt string) string {
 	return fmt.Sprintf("a finding below the blocking line (%s)", b)
 }
 
+// writeReviewBacklogEvidence writes the Evidence line, with the permalink on
+// its own line so GitHub renders it as a code widget.
+func writeReviewBacklogEvidence(b *strings.Builder, file string, line int, link string) {
+	fmt.Fprintf(b, "Evidence: `%s:%d`\n", file, line)
+	if link != "" {
+		fmt.Fprintf(b, "%s\n", link)
+	}
+}
+
 func (c *Client) reviewBacklogIssueBody(req ReviewRequest, p review.Perspective, f outputschema.Finding, headSHA, blockAt, fp string) string {
 	owner, repoName := c.splitRepo(req.Repo)
 	var b strings.Builder
@@ -519,11 +545,9 @@ func (c *Client) reviewBacklogIssueBody(req ReviewRequest, p review.Perspective,
 	fmt.Fprintf(&b, "PR: #%d (%s)\n", req.Number, reviewPRURL(owner, repoName, req.Number))
 	fmt.Fprintf(&b, "Perspective: %s\n", p)
 	fmt.Fprintf(&b, "Severity: %s\n", reviewFindingSeverityLine(f))
-	fmt.Fprintf(&b, "Evidence: `%s:%d`", strings.TrimSpace(f.File), f.Line)
-	if link := reviewFindingPermalink(owner, repoName, headSHA, f); link != "" {
-		fmt.Fprintf(&b, " (%s)", link)
-	}
-	fmt.Fprintf(&b, "\nFinding: %s\n\n%s\n\nFingerprint: `%s`\n\n%s\n", strings.TrimSpace(f.Title), strings.TrimSpace(f.Summary), fp, reviewBacklogFooter)
+	fmt.Fprintf(&b, "Finding: %s\n", strings.TrimSpace(f.Title))
+	writeReviewBacklogEvidence(&b, strings.TrimSpace(f.File), f.Line, reviewFindingPermalink(owner, repoName, headSHA, f))
+	fmt.Fprintf(&b, "\n%s\n\nFingerprint: `%s`\n\n%s\n", strings.TrimSpace(f.Summary), fp, reviewBacklogFooter)
 	return b.String()
 }
 
@@ -534,11 +558,8 @@ func (c *Client) reviewBacklogReRaiseComment(req ReviewRequest, p review.Perspec
 	fmt.Fprintf(&b, "Raised again in the Hive review of PR #%d (%s).\n\n", req.Number, reviewPRURL(owner, repoName, req.Number))
 	fmt.Fprintf(&b, "Perspective: %s\n", p)
 	fmt.Fprintf(&b, "Severity: %s\n", reviewFindingSeverityLine(f))
-	fmt.Fprintf(&b, "Evidence: `%s:%d`", strings.TrimSpace(f.File), f.Line)
-	if link := reviewFindingPermalink(owner, repoName, headSHA, f); link != "" {
-		fmt.Fprintf(&b, " (%s)", link)
-	}
-	fmt.Fprintf(&b, "\n\n%s\n", reviewBacklogFooter)
+	writeReviewBacklogEvidence(&b, strings.TrimSpace(f.File), f.Line, reviewFindingPermalink(owner, repoName, headSHA, f))
+	fmt.Fprintf(&b, "\n%s\n", reviewBacklogFooter)
 	return b.String()
 }
 
@@ -561,20 +582,25 @@ func (c *Client) reviewBacklogFoldedComment(req ReviewRequest, p review.Perspect
 	fmt.Fprintf(&b, "- [ ] %s (`%s:%d`)\n\n", strings.TrimSpace(f.Title), file, f.Line)
 	fmt.Fprintf(&b, "Perspective: %s\n", p)
 	fmt.Fprintf(&b, "Severity: %s\n", reviewFindingSeverityLine(f))
-	fmt.Fprintf(&b, "Evidence: `%s:%d`", file, f.Line)
-	if link := reviewFindingPermalink(owner, repoName, headSHA, f); link != "" {
-		fmt.Fprintf(&b, " (%s)", link)
-	}
-	fmt.Fprintf(&b, "\nFinding: %s\n\n%s\n\nFingerprint: `%s`\n\n%s\n", strings.TrimSpace(f.Title), strings.TrimSpace(f.Summary), fp, reviewBacklogFooter)
+	fmt.Fprintf(&b, "Finding: %s\n", strings.TrimSpace(f.Title))
+	writeReviewBacklogEvidence(&b, file, f.Line, reviewFindingPermalink(owner, repoName, headSHA, f))
+	fmt.Fprintf(&b, "\n%s\n\nFingerprint: `%s`\n\n%s\n", strings.TrimSpace(f.Summary), fp, reviewBacklogFooter)
 	return b.String()
 }
 
 // reviewBacklogSameFileComment cross-links a newly filed item to the open
 // issue that cites the same file but was not folded into because it is a
 // different finding (#13906). GitHub backlinks the reference on that issue.
-func reviewBacklogSameFileComment(f outputschema.Finding, sameFileAs int) string {
+// It names the path the two share: projectbluefin/utah-packages#868 said both
+// cite its own evidence file, config/factory-build-backlog.toml, which #852
+// never mentions; the shared path was docs/skills/factory-build-backlog.md.
+func reviewBacklogSameFileComment(f outputschema.Finding, sameFileAs int, sharedPath string) string {
+	shared := strings.TrimSpace(sharedPath)
+	if shared == "" {
+		shared = strings.TrimSpace(f.File)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s%d -->\n", reviewBacklogSameFileMarker, sameFileAs)
-	fmt.Fprintf(&b, "Same file as #%d: both cite `%s`, but this finding does not match that issue's symbol, line range or category, so it was filed separately instead of folded in.\n\n%s\n", sameFileAs, strings.TrimSpace(f.File), reviewBacklogFooter)
+	fmt.Fprintf(&b, "Same file as #%d: both cite `%s`, but this finding does not match that issue's symbol, line range or category, so it was filed separately instead of folded in.\n\n%s\n", sameFileAs, shared, reviewBacklogFooter)
 	return b.String()
 }

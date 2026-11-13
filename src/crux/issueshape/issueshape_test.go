@@ -102,3 +102,91 @@ func TestUnchosenOptionList(t *testing.T) {
 		})
 	}
 }
+
+// Every issue the hive files names its filer in the title; AgentIssueTitle
+// is the one helper that adds the tag, it puts the tag first, and it never
+// adds a second one.
+func TestAgentIssueTitleTagsOnceAndTagFirst(t *testing.T) {
+	cases := []struct{ agent, title, want string }{
+		{"reviewer", "Review backlog (security): token logged", "[reviewer] Review backlog (security): token logged"},
+		{"Reviewer", "  Review backlog (style): x  ", "[reviewer] Review backlog (style): x"},
+		{"reviewer", "[reviewer] Review backlog (security): token logged", "[reviewer] Review backlog (security): token logged"},
+		{"reviewer", "[Reviewer]Review backlog (security): x", "[reviewer] Review backlog (security): x"},
+		{"dedupe", "triage: duplicate and overlapping open issues/PRs to consolidate", "[dedupe] triage: duplicate and overlapping open issues/PRs to consolidate"},
+		{"ci-maintainer", "refactor: src/a.go is a merge hotspot — split into 4 units", "[ci-maintainer] refactor: src/a.go is a merge hotspot — split into 4 units"},
+		{"selfreport", "[selfreport] unclassified_error_repeated: x", "[selfreport] unclassified_error_repeated: x"},
+		// Another hive filer already tagged it: never a second tag.
+		{"governor", "[selfreport] relayed by the hub", "[selfreport] relayed by the hub"},
+		// The tag comes first, before an emoji the title opens with.
+		{"governor", "🐝 Hive Advisory Report", "[governor] 🐝 Hive Advisory Report"},
+		{"reviewer", "🐛 [reviewer] decision lost on refresh", "[reviewer] 🐛 decision lost on refresh"},
+		{"governor", "🐝 [selfreport] relayed", "[selfreport] 🐝 relayed"},
+		// A filer-chosen bracket that is not a filer name is the subject.
+		{"dashboard", "[ACMM L0] Add CI/CD pipeline", "[dashboard] [ACMM L0] Add CI/CD pipeline"},
+		{"tester", "[Tests] v5 test failure on 4536f90", "[tester] [Tests] v5 test failure on 4536f90"},
+		{"", "untagged stays untagged", "untagged stays untagged"},
+		{"scanner", "", ""},
+	}
+	for _, tc := range cases {
+		if got := AgentIssueTitle(tc.agent, tc.title); got != tc.want {
+			t.Errorf("AgentIssueTitle(%q, %q) = %q, want %q", tc.agent, tc.title, got, tc.want)
+		}
+		if again := AgentIssueTitle(tc.agent, AgentIssueTitle(tc.agent, tc.title)); again != tc.want {
+			t.Errorf("AgentIssueTitle is not idempotent for (%q, %q): %q", tc.agent, tc.title, again)
+		}
+	}
+}
+
+// Dedupe compares titles with the tag ignored, so an issue filed before
+// titles carried the filer still matches its tagged re-filing.
+func TestStripAgentPrefixAndSameTitle(t *testing.T) {
+	if got := StripAgentPrefix("[reviewer] Review backlog (security): x"); got != "Review backlog (security): x" {
+		t.Fatalf("StripAgentPrefix = %q", got)
+	}
+	if got := StripAgentPrefix("  no tag here "); got != "no tag here" {
+		t.Fatalf("StripAgentPrefix(untagged) = %q", got)
+	}
+	if got := StripAgentPrefix("[ACMM L0] Add CI/CD pipeline"); got != "[ACMM L0] Add CI/CD pipeline" {
+		t.Fatalf("StripAgentPrefix must keep a non-filer bracket: %q", got)
+	}
+	if got := AgentPrefix("[scanner] split x.go"); got != "scanner" {
+		t.Fatalf("AgentPrefix = %q", got)
+	}
+	if AgentPrefix("plain") != "" || HasAgentPrefix("plain") || AgentPrefix("[Tests] failure") != "" || AgentPrefix("🐛 [reviewer] x") != "" {
+		t.Fatal("a title without a leading filer tag reported one")
+	}
+	if !SameTitle("Review backlog (security): x", "[reviewer] Review backlog (security): x") {
+		t.Fatal("legacy untagged title must match its tagged successor")
+	}
+	if !SameTitle("[ACMM L0] Add CI/CD pipeline", "[dashboard] [ACMM L0] Add CI/CD pipeline") {
+		t.Fatal("legacy ACMM gap title must match its tagged successor")
+	}
+	if !SameTitle("🐝 Hive Advisory Report", "[governor] 🐝 Hive Advisory Report") {
+		t.Fatal("legacy advisory title must match its tagged successor")
+	}
+	if SameTitle("[reviewer] Review backlog (security): x", "[reviewer] Review backlog (security): y") {
+		t.Fatal("different subjects must not match")
+	}
+}
+
+func TestSpekPublished(t *testing.T) {
+	marked := "## Goal\n\nAdd a refresh endpoint.\n\n<!-- spek:publish name=auth artifact_id=spk_1 target=github task=T2 -->"
+	if !SpekPublished(marked) {
+		t.Fatal("body with a valid spek:publish marker not reported as published")
+	}
+	if SpekPublished("## Goal\n\nAdd a refresh endpoint.") {
+		t.Fatal("plain body reported as spek-published")
+	}
+	if SpekPublished("<!-- spek:publish name=<name> artifact_id=<id> target=<t> -->") {
+		t.Fatal("unsubstituted marker template reported as spek-published")
+	}
+	// The marker itself is not an unfilled template placeholder: its content
+	// carries `=` so the angle-bracket scan skips it.
+	if ph, ok := UnsubstitutedTemplatePlaceholder(marked); ok {
+		t.Fatalf("marker flagged as placeholder %q", ph)
+	}
+	// A marker does not excuse a template left unfilled around it.
+	if _, ok := UnsubstitutedTemplatePlaceholder("<analysis>\n\n<!-- spek:publish name=a artifact_id=b target=github -->"); !ok {
+		t.Fatal("placeholder beside a marker must still be flagged")
+	}
+}

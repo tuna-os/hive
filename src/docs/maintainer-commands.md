@@ -15,11 +15,13 @@ https://github.com/hivecommons/hive/blob/v5/src/docs/maintainer-commands.md
 | Command | What it does | Who may use it | Where it works | Pickup speed | Labels changed |
 | --- | --- | --- | --- | --- | --- |
 | `/hive approve` | Accepts the recommendation already written on a parked issue. On a pull request it is a trusted merger's release of the swarm's `requires_human` hold (see [PR approvals](#pr-approvals)). | Human commenter with `write`, `maintain`, or `admin` repository permission; on a pull request, a trusted merger. | Open issues carrying `needs-human` or `stage/045-needs-decision` (or the retired `needs-decision` / `needs-direction` / a pre-045 `stage/085-needs-decision`, until migrated). Open pull requests parked at `stage/085-needs-decision`: the merge lanes read the reply as a hold release and the un-park sweep answers it once, explaining what it does and does not clear and whether a `needs-human` label still blocks the PR ([#13087](https://github.com/hivecommons/hive/issues/13087)). On a hive-authored PR it also lifts a `needs-human` **Hive** added, adds `reviewer-passed` and removes `reviewer-handoff` ([#13309](https://github.com/hivecommons/hive/issues/13309)); it changes no other PR labels. | Next un-park sweep, normally within 5 minutes. | Removes `stage/045-needs-decision` (and the retired spellings) when present; adds `approved-direction`; removes `needs-human` **whoever added it** — your approval is the human input the label asked for ([#13075](https://github.com/hivecommons/hive/issues/13075), [docs#419](https://github.com/hivecommons/docs/issues/419)); the reply names who had added it. Never removes `hold`: add `hold` to keep agents off an issue through a decision. |
-| `/hive decision <text>` | Gives explicit direction for a parked issue. On a hive-authored pull request it is a *changes requested* review in comment form (see [PR approvals](#pr-approvals)). | Human commenter with `write`, `maintain`, or `admin` repository permission; on a pull request, a trusted merger. | Open issues carrying `needs-human` or `stage/045-needs-decision` (or the retired `needs-decision` / `needs-direction` / a pre-045 `stage/085-needs-decision`, until migrated). Open pull requests parked at `stage/085-needs-decision`: on a hive-authored PR it moves the PR to `stage/070-fixing` and kicks the author agent with your text ([#13041](https://github.com/hivecommons/hive/issues/13041)); on any other PR it gets one reply naming the review-side equivalents. | Next un-park sweep, normally within 5 minutes. | Removes `stage/045-needs-decision` (and the retired spellings) when present; adds `approved-direction`; removes `needs-human` **whoever added it** — your decision is the human input the label asked for, and left in place it would re-derive 045 two minutes later ([#13075](https://github.com/hivecommons/hive/issues/13075), [docs#419](https://github.com/hivecommons/docs/issues/419)); the reply names who had added it. Never removes `hold`: add `hold` to keep agents off an issue through a decision. An agent's later re-park on 045 is refused while `approved-direction` is present and the recorded decision text is unchanged. |
+| `/hive decision <text>` | Gives explicit direction for a parked issue. On a hive-authored pull request it is a *changes requested* review in comment form (see [PR approvals](#pr-approvals)). | Human commenter with `write`, `maintain`, or `admin` repository permission; on a pull request, a trusted merger. | Open issues carrying `needs-human` or `stage/045-needs-decision` (or the retired `needs-decision` / `needs-direction` / a pre-045 `stage/085-needs-decision`, until migrated). Open pull requests parked at `stage/085-needs-decision`: on a hive-authored PR it moves the PR to `stage/070-fixing` and kicks the author agent with your text ([#13041](https://github.com/hivecommons/hive/issues/13041)); on any other PR it gets one reply naming the review-side equivalents. | Next un-park sweep, normally within 5 minutes. | Removes `stage/045-needs-decision` (and the retired spellings) when present; adds `approved-direction`; removes `needs-human` **whoever added it** — your decision is the human input the label asked for, and left in place it would re-derive 045 two minutes later ([#13075](https://github.com/hivecommons/hive/issues/13075), [docs#419](https://github.com/hivecommons/docs/issues/419)); the reply names who had added it. Never removes `hold`: add `hold` to keep agents off an issue through a decision. An agent's later re-park on 045 is refused while `approved-direction` is present and the recorded decision text is unchanged; an agent's later `needs-human` (the remaining work is human-only) keeps `approved-direction` and holds the issue out of the pipeline instead of re-deriving `stage/045-needs-decision` ([#16579](https://github.com/hivecommons/hive/issues/16579)). A newer `/hive decision` with different text means direction is changing: an agent's park goes through, the stale `approved-direction` is cleared, and the issue waits at `stage/045-needs-decision` until the sweep applies the new decision. |
 | `/hive done` | Says you did a step only the owner can do (a repository setting, secret, app install, …). Hive un-parks the issue exactly as `/hive approve` does and records the decision "the owner-only step is done; Hive re-checks it and closes the issue once the fix is verified" in its reply; that reply is the hand-off — the lane that next picks the issue up reads it, re-checks the step and closes the issue once verified. No label or queue state carries the decision. The "What to reply" notice offers it on issues an agent parked with `hive-open-issue comment --needs-decision` or filed with `hive-open-issue issue --needs-decision`, while that text lists no lettered options. `/hive help` does not answer the step; only `/hive approve`, `/hive decision` or `/hive done` does. | Human commenter with `write`, `maintain`, or `admin` repository permission. | Open issues carrying `needs-human` or `stage/045-needs-decision` (or the retired `needs-decision` / `needs-direction` / a pre-045 `stage/085-needs-decision`, until migrated); pull requests are ignored. | Next un-park sweep, normally within 5 minutes. | Removes `stage/045-needs-decision` (and the retired spellings) when present; adds `approved-direction`; removes `needs-human` **whoever added it**, exactly as for `/hive approve` ([#13075](https://github.com/hivecommons/hive/issues/13075), [docs#419](https://github.com/hivecommons/docs/issues/419)); never removes `hold`. |
 | `/hive decision proceed — <gap>` | Confirms a feature request parked by the prior-art gate is a real gap. | The issue author, or a human commenter with `write`, `maintain`, or `admin`. | Open issues carrying `stage/017-possible-existing` below a `<!-- hive:prior-art-gate -->` comment. | Next un-park sweep. | Removes `stage/017-possible-existing`, appends a **Scope vs existing** section with `<gap>` to the issue body, records the un-park so the issue re-derives `stage/010-actionable` ([#13575](https://github.com/hivecommons/hive/issues/13575)). |
 | `/hive decision exists` | Agrees the request already exists. | Same as above. | Same as above. | Next un-park sweep. | Adds `already-exists`, closes the issue `not_planned`, replies with a pointer at the quoted findings. Reopen the issue to continue; the gate does not ask again. |
 | `/hive help` | Posts this command list. On parked issues it also repeats the issue-specific approve/decision options. | Any human commenter with at least `triage` repository permission for the on-demand workflow; the sweep path on parked issues requires `write`, `maintain`, or `admin`. | Any open issue or pull request. | GitHub Actions on the new comment; if Actions is unavailable on a parked issue, the next un-park sweep can also answer. | None. |
+| `/hive ack [episode]` | Acknowledges an attention episode on the item: you have seen it, so reminders for it stop. **Acknowledgement is not approval.** See [Attention ack and snooze](#attention-ack-and-snooze). | The episode's named responsible person, or a human with `write`, `maintain`, or `admin` repository permission. Anyone else is ignored in silence. | Open issues and pull requests with an unresolved attention episode, on a repository whose `github.attention.admitter` is this hive. | Next un-park sweep, normally within 5 minutes. | None. Never releases a security, merge or review hold and never opens a merge gate. |
+| `/hive snooze <duration> [episode]` | Pauses reminders for an attention episode until the duration elapses (`90m`, `4h`, `2d`, `1w`; 1m to 30d). | Same as `/hive ack`. | Same as `/hive ack`. | Next un-park sweep, normally within 5 minutes. | None. A snooze releases no hold. |
 | `/fixed` | Confirms that an open issue's fix is verified — or that what a parked issue waited on was done, in or outside the repository — and closes it as completed. Alias: `/close`. Plain-language confirmations such as "yes, this has been fixed" are accepted only when Hive is already waiting for reporter confirmation. | The issue reporter, or a human with `write`, `maintain`, or `admin` repository permission. On a parked issue (`stage/045-needs-decision`, `needs-human`, or a retired park spelling) the un-park sweep honours it from a human with `write`, `maintain`, or `admin` permission. | Open issues only, not pull requests. | GitHub Actions on the new comment where the repository runs the `/fixed` workflow; on parked issues, the next un-park sweep, normally within 5 minutes ([dibs#459](https://github.com/hivecommons/dibs/issues/459)). | Closes the issue as completed. The workflow adds `hive: reporter-confirmed` and removes `hive/likely-done` and `needs-reporter-confirmation` when present. On a parked issue the sweep removes `needs-human` and the retired park spellings, the stage engine strips `stage/*`, and Hive posts one acknowledgement; `hold` is never touched. |
 | `/reopen` | Reopens a closed issue that was closed too early. | The issue reporter, or a human with `write`, `maintain`, or `admin` repository permission. | Closed issues only, not pull requests. | GitHub Actions on the new comment. | Removes `needs-reporter-confirmation` when present. The reopen sticks: close-on-merge does not close the issue again for a PR that merged before the reopen, whether Hive (`<!-- hive-close-on-merge -->` comment) or GitHub's closing keyword closed it; Hive records the latter with a `<!-- hive-reopened-after-merge pr=<pr> -->` comment. A later PR can still close it. |
 | `/help-wanted` | Adds the `help wanted` label. | Any non-bot commenter accepted by the label-helper workflow. | Issues and pull requests. | GitHub Actions on the new comment. | Adds `help wanted`. |
@@ -56,7 +58,12 @@ removes it with the other parking labels. `needs-spec` (and its renamed
 labels) is never handled by these commands.
 
 The "What to reply" notice lists the lettered options (`Option A:`,
-`**A.** …`) the issue body offers, or the newest Hive comment that lists them.
+`**A.** …`, or a list item such as `- A: …`) the issue body offers, or the
+newest Hive comment that lists them. A comment Hive posted to park the issue
+that lists options is a choice, not an owner step, so it never offers
+`/hive done`. Lane policies ask every 045 park to name one option on a
+`Recommended: <letter>, because <reason>` line (`Recommended (owner confirms):`
+where governance rules forbid Hive choosing), which `/hive approve` accepts.
 Each option bullet ends with `: <summary>`, the rest of the option's first
 line with whitespace collapsed, HTML comments and `@mentions` removed, and cut
 to 160 characters with a trailing `…`. When the options came from a comment
@@ -65,31 +72,124 @@ rather than the body, the notice opens with
 to that comment's URL, so a reader can find them.
 `/hive approve` picks the recommended option when the text names one, else the
 first option, and records that choice as the decision ("go with the
-recommendation (option B: …)", "go with option A: …"). When there are no
+recommendation (option B: …)", "go with option A: …"). A "Let hive decide"
+comment (`hive recommends: …`, carrying the `hive:delegated-decision` marker) is
+the delegate's verdict, not the park's text, so it never replaces the options or
+the recommended option the notice offers. When there are no
 options and no recommendation, the notice offers only `/hive decision <your
 instructions>`, and a `/hive approve` gets a reply saying the park names no
 recommendation; the issue stays parked. On a `blocked` park and on an owner
 step `/hive approve` keeps its meaning (the blocker is cleared; accept the
 proposed step) and needs no recommendation.
 
+On an owner step, `/hive done` is the recommended reply when the owner-step
+text asks for it, or when an accepted `/hive approve` already answered the
+same step and an agent parked the issue again (approving cannot do a step only
+the owner can take). A step parked again after an accepted reply is read from
+its own text: the options and recommendation that reply answered do not carry
+over. On a step `/hive approve` already answered, the notice drops
+`/hive approve`, and a second `/hive approve` gets a reply pointing at
+`/hive done`; the issue stays parked (Danathar/goodreads-mcp#443).
+
+The notice is always the newest comment on a parked issue. While nothing newer
+is posted it is edited in place when the options change; once a later comment
+pushes it up the thread (an agent's new owner step, a question, a re-check
+note), the next sweep posts a fresh notice at the bottom and deletes the old
+one, so the issue keeps exactly one. A maintainer's `/hive` or `/fixed`
+command and Hive's reply to it do not move it. The move goes through the
+write-back gate; when the gate refuses (a paused repo, for example), the
+notice is edited where it is. The commands sit in a GitHub
+`[!TIP]` alert, which GitHub shows as a green box in light and dark themes,
+one `` `command` → what it does `` bullet each; the reply `/hive approve`
+accepts is bold and ends `(recommended)` when the park names a recommendation.
+The `/hive help` reply uses the same box.
+
 ### When a park's premise moves
 
 A park is written once, often by a contributor relay, and names the work it
-waits on ("#722 is in progress", "the precedent has not been set"). At the
+waits on ("#722 is in progress", "the precedent has not been set"). The text
+Hive reads as the park is the issue body (when the issue was filed inside the
+park window) plus the comments posted in that window, but only when the author
+is one of the hive's own accounts, a registered contributor at a tier above the
+self-registered `newcomer` default and not revoked (so a relay-authored park
+still counts after its claim expires), or a trusted maintainer; an excluded
+body or comment is logged with its author; the refs and quoted lines it names
+are not read, though a merged PR that refers to the issue still produces a note. At the
 hard-suppress reconcile cadence (`issues.hard_suppress_reconcile_interval`,
 default 30m) Hive re-reads every open issue at `stage/045-needs-decision`.
 When, after the park began, a PR or issue the park text names merged or
 closed, or a PR that refers to the issue ("Refs #N", a closing keyword, "part
 of", …, a list of at most 10 references) merged, Hive posts one note
 (`<!-- hive:park-recheck -->`) listing what changed, and edits it in place as
-more moves. When such a PR closed unmerged because the hive adopted it, Hive
+more moves. When the park offers lettered options that name references, only
+those references count as what the park waits on; the rest of its text is
+evidence. projectbluefin/server#614 parked on #583, which both options merge,
+and the PRs listed only as also red (#584, #588) no longer trigger the note. When such a PR closed unmerged because the hive adopted it, Hive
 follows it to the hive's copy (the App PR whose body says `Supersedes #N`)
 and lists the copy too if it merged or closed unmerged; when a person closed
 the copy, the note quotes the first paragraph of their closing comment (at
 most 300 characters, mentions defanged) and adds the replies that act on it,
 `/fixed` or `/hive decision <your instructions>`
 ([projectbluefin/utah#13](https://github.com/projectbluefin/utah/issues/13)).
+When the park quotes the change it asks for in a fenced code block, Hive also
+reads the patch of each named PR that merged, and of the merged PR that closed
+each named issue (at most three named items per issue, a closer read and a
+patch read each). If that patch removes a line
+of 16 or more characters the park quotes, in a file the park names, the change
+landed: the note says which PR and file ("#633 was closed by merged #635, which
+changed the lines this issue asks to change in `.github/workflows/build.yml`"),
+and the "What to reply" notice puts **`/fixed`** first as the one recommended
+reply ([Danathar/arch-bootc#634](https://github.com/Danathar/arch-bootc/issues/634)).
 The note never un-parks the issue: leaving 045 stays a maintainer's reply.
+
+The note goes through the write-back gate as `needs_decision_comment`. On a
+park the hive applied itself, it needs no review opt-in label and is not held
+back because the issue is older than the hive's write access. The note still
+needs ACMM L5 (`writeback.kinds.needs_decision_comment.min_level`), and a
+paused repository, `writeback.per_repo` mode `off`, `issues-only` or
+`labels-only`, and `own_only` still refuse it.
+
+A park counts as the hive's only when every label that parks the issue on a
+person was put there by the hive. Hive checks two things in the issue's
+timeline:
+
+- the label event the park is dated from was made by one of the hive's own
+  accounts (the App bot, an additional hive bot login, or `ai_author`), which
+  is how a contributor relay parks an issue;
+- for every hard-suppress label the issue carries now (`needs-human`,
+  `stage/045-needs-decision`, `stage/085-needs-decision`, `needs-spec`,
+  `needs-decision`, `needs-direction`, `stage/017-possible-existing`, and
+  the labels configured under `project.issue_filter.hard_suppress_labels`),
+  the newest `labeled` event was made by one of those accounts. A label with
+  no `labeled` event in the timeline does not count as the hive's.
+
+So a park that rests on a label a person applied is asked as before, and the
+note is posted only when the issue carries the opt-in label. That covers a
+maintainer's `needs-spec`, which Hive mirrors as `stage/045-needs-decision`,
+and a park label a person removed and added again. On a hive that runs on a
+personal access token, `ai_author` is one of the hive's accounts: when that
+is the operator's own account, a park the operator applies by hand under it
+counts as the hive's.
+
+A note that is allowed only because the hive applied the park lists less
+than a note on an issue with the opt-in label. It lists the items the park
+text names, and the pull requests that refer to the issue and merged in the
+issue's own repository or another repository of the project
+(`project.repos`). A pull request in any other repository that refers to the
+issue is left out, and when nothing else changed no note is posted. Such a
+note also says less about what it lists. It says "the change this issue asks
+for has landed", with the `/fixed` reply, only for an item in one of those
+repositories; a named item elsewhere is listed as merged or closed and
+nothing more. And it quotes the closing comment of the hive's copy of a pull
+request only when GitHub says who closed the copy; otherwise the copy is
+listed as closed without a quote. On an issue with the opt-in label, and on
+an issue Hive filed, the note lists and says everything it did before.
+
+When the gate refuses the note, Hive logs `park re-check note held by
+writeback gate` with the repository, issue, reason and detail, who applied
+the park label, and whether that counted as the hive's. The line is logged
+at info level once per issue and reason, and at debug level on the passes
+that repeat it.
 
 The on-demand `/hive help` workflow uses the same first-line command shape, is
 ignored for bot comments, and allows `triage`, `write`, `maintain`, or `admin`
@@ -115,6 +215,22 @@ merger's approval, the label a person must remove, or a manual merge
 approve` reply on a parked PR gets one reply (deduplicated per comment)
 saying exactly that; a reply from someone who is not a trusted merger is
 ignored in silence, like every other ineligible command.
+
+**Your move.** A PR that waits on a person also says how to answer it. While a
+PR at `stage/085-needs-decision` or `stage/070-fixing` waits on you (parked
+for a decision, or held by the swarm's verdict with no trusted merger's
+release yet), the hive status comment at the top of the PR carries a *Your
+move* section listing the replies that answer it:
+
+- `/hive approve` when the swarm's verdict holds it;
+- `/hive decision approve <why>` when it is parked for a decision;
+- `/hive decision <what to change>` on a hive-authored PR, or a GitHub
+  **Request changes** review on any other.
+
+It also names the GitHub **Approve** review that does the same. The section is
+edited in place, so it notifies nobody. It goes away once the wait ends: on the
+next pass after the release, when the PR moves to another stage, or when it
+closes.
 
 The verdict release does not touch labels, so a `needs-human` label still
 blocks the PR on every lane. On a **hive-authored** PR parked at
@@ -164,18 +280,41 @@ The whole comment after `/hive decision` is the instruction — numbered points
 on the lines below the command are kept and quoted verbatim — and the
 decision on the current head outranks the swarm's decision-requested verdict
 on that head, so the stage moves in the same pass as the acknowledgement
-rather than waiting on a re-review. A bare `/hive decision approve` (nothing
-beyond the approval word) is recorded as your answer to the swarm's question
-instead: no fix is kicked, requires_human is released for that head and the
+rather than waiting on a re-review. A `/hive decision` whose first word is
+`approve`, `approved`, or `lgtm` (a trailing comma or period is fine) is
+recorded as approval; the rest of the comment is retained as its rationale. A
+bare `yes` approves too, but `yes, but …` is a conditional answer and is routed
+as an instruction. To request changes, start with the instruction
+(e.g. `/hive decision change the PR body to Refs #123`). No fix is kicked
+for an approval, requires_human is released for that head and the
 PR follows the normal merge path. An acknowledged decision whose record did
 not survive a pod restart is rebuilt from the comment thread; a decision
 answered for an older head is left alone
 ([#14679](https://github.com/hivecommons/hive/issues/14679)).
+The sweep also reads `/hive decision` at `stage/070-fixing`: approve the
+current head after a body or metadata fix to release a standing request without
+pushing a cosmetic commit. A later trusted GitHub APPROVED review on the same
+head also supersedes the recorded request; an older approval does not. If
+that review is later dismissed, or the reviewer asks for changes again on the
+same head, the review-backed approval is dropped and the earlier instruction
+stands again — a `/hive decision approve` comment is durable and is not.
+Issue-link repair preserves edited `Refs` bodies and PRs with a recorded
+decision, so it cannot restore auto-close over the owner's direction.
 The 085 entry comment names both actions. The commenter must hold `write` or better on the
 repo *and* be in the hive's trusted-merger set (the bar a human approval
-already meets). `/hive decision` on a PR the hive did **not** open, or `/hive
-approve` / `/hive help` on any PR, gets one reply naming the review-side
+already meets). `/hive decision <text>` on a PR the hive did **not** open, or
+`/hive approve` / `/hive help` on any PR, gets one reply naming the review-side
 equivalents instead of silence; the hive never pushes to a PR it did not open.
+A bare `/hive decision approve` on such a PR is recorded as the approval for
+the current head, as the dashboard's approval is, and answers its
+`requires_human` question: on the owner's own PR GitHub refuses the Approve
+review, so this is the owner's command. On a PR that edits workflow files it
+also releases the workflow-path fence, which `/hive approve` never does. The
+contributor lane records it as the answer on every PR it evaluates — when it
+reads the comment for the fence, and on a PR no fence trips while the verdict
+still asks for a person — so it counts even where the PR carries no stage label
+([Danathar/zfs-aurora-complex#254](https://github.com/Danathar/zfs-aurora-complex/pull/254),
+hivecommons/hive#16121).
 
 The self-merge sweep's review verdict hold (App-authored and trusted-author
 PRs, [review-swarm.md](review-swarm.md)) is released by a person's GitHub
@@ -240,6 +379,32 @@ parking labels. Replaying an answered command cannot create another release.
 The App performs this operation; the agent `gh release create` prohibition is
 unchanged.
 
+## Attention ack and snooze
+
+Attention episodes ([#16270](https://github.com/hivecommons/hive/issues/16270))
+ask one named person to act on one condition. `/hive ack` and
+`/hive snooze <duration>` let that person, or a maintainer, answer the ask
+without resolving it ([#16359](https://github.com/hivecommons/hive/issues/16359)):
+
+- The command must be the first non-empty line of a recent, unedited comment
+  by a human, outside quotes and fences — the same rules as the un-park
+  commands. Only the hive named by `github.attention.admitter` for the
+  repository answers, so a fleet replies once.
+- Without an `[episode]` argument the command applies to every unresolved
+  episode on the item that you may act on. To target one, pass the key prefix
+  shown in the item's attention status section, e.g. `/hive ack 3f9a0c12b7de`.
+- `/hive ack` records who acknowledged and when; `/hive snooze` records who
+  snoozed and until when. Both are stored on the episode in the attention
+  ledger, refresh the status section, and get one reply.
+- **Acknowledgement is not approval.** Neither command adds or removes a
+  label, releases a security, merge or review hold, or opens a merge gate. To
+  release a hold use the lever the hold names (for example a trusted merger's
+  GitHub **Approve** review); to resolve the episode, fix the condition — it
+  resolves when Hive no longer observes it.
+- A caller who is neither the episode's responsible person nor a maintainer
+  is ignored in silence and nothing is recorded. A malformed duration from an
+  eligible caller gets a reply explaining the accepted forms.
+
 ## Prose replies on parked issues
 
 Plain approvals such as "approved", "go ahead", "sounds good", or "ship it" do
@@ -247,6 +412,19 @@ not un-park an issue. When an eligible maintainer writes prose that looks like
 assent, Hive posts a hint asking for `/hive approve` or `/hive decision <text>`
 and leaves all labels unchanged. This avoids turning casual agreement into a
 state-changing instruction.
+
+## Model-defined replies
+
+A repository bound to a [workflow model](design/workflow-models.md) may
+declare its own human-gate verbs per state (`replies`). On a parked issue in
+such a repository, `/hive <verb>` with one of those verbs — multi-word verbs
+are fine, case does not matter — is accepted like `/hive decision`: the
+parking labels are cleared, `approved-direction` is added, the label the model
+maps to the verb's target state is applied when it declares one, and the reply
+comment says what the model did with the verb. Any text after the verb is kept
+as the decision. The Activity Monitor's human-gate pill offers the same verbs
+after the built-in ones. Repositories without a binding, and pull requests,
+behave exactly as described above; the model's verbs are not recognised there.
 
 ## Idempotency markers
 

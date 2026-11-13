@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -18,6 +19,8 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/crux/logscrub"
+	"github.com/hivecommons/hive/pkg/attention"
+	"github.com/hivecommons/hive/pkg/authorkind"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/effects"
 	"github.com/hivecommons/hive/pkg/forgestate"
@@ -26,8 +29,10 @@ import (
 	"github.com/hivecommons/hive/pkg/redmain"
 	"github.com/hivecommons/hive/pkg/revertsheriff"
 	"github.com/hivecommons/hive/pkg/review"
+	"github.com/hivecommons/hive/pkg/spekmarker"
 	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/stagelabels"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // ErrNoGitHubClient is returned by *Client methods invoked on a nil receiver.
@@ -63,7 +68,12 @@ type Client struct {
 	graphQLPRBatchEnabled  func() bool
 	graphQLPRBatchPageSize func() int
 	prBatchMu              sync.Mutex
+	// ciRefetch coalesces the check-run re-reads CI webhook deliveries ask
+	// for on heads no listing has covered (webhook_ci_evidence.go).
+	ciRefetchOnce          sync.Once
+	ciRefetch              *ciRefetcher
 	prBatchCheckRuns       map[prBatchCheckRunKey][]*gh.CheckRun
+	prBatchCheckObservedAt map[prBatchCheckRunKey]time.Time
 	prBatchReviews         map[string]map[int]prReviewState
 	prBatchStats           GraphQLPRBatchStats
 	prBatchGraphQLRate     RateLimitEntry
@@ -75,7 +85,11 @@ type Client struct {
 	// enumeration goroutine is deciding what work exists. Nil (the zero value,
 	// and what every test constructs) means nothing is paused, so the client
 	// behaves exactly as it did before.
-	repoPaused func(repo string) bool
+	repoPaused           func(repo string) bool
+	scheduledBaseRefresh func(repo string) bool
+	// writeback is the unsolicited write-back gate (writeback_gate.go);
+	// nil allows everything.
+	writeback *writeback.Gate
 	// agentServesRepo reports whether an agent is scoped to a repo (#6204).
 	// Guarded by reposMu because the dashboard can re-scope an agent while a
 	// relay goroutine is deciding whether to fulfil a request. Nil (the zero
@@ -120,6 +134,17 @@ type Client struct {
 	issueFilter                IssueAdmitter
 	agentIssueDecisionPolicyMu sync.RWMutex
 	agentIssueDecisionPolicy   string
+	// workflowsLane names the lane a workflow-only park is handed to
+	// (SetWorkflowsLaneFunc, issue_workflows_handoff.go).
+	workflowsLaneMu sync.RWMutex
+	workflowsLane   func(agent, repo string) string
+	// workflowsSelfPush reports whether an agent's own token asks for the
+	// Workflows permission (SetWorkflowsSelfPushFunc); workflowsGrant caches
+	// the installation's answer (installationGrantsWorkflows).
+	workflowsSelfPush func(agent string) bool
+	workflowsGrant    workflowsGrantCache
+	// citedLines caches the stale-finding check (issue_cited_lines.go).
+	citedLines citedCache
 	// reporterConfirmationEnabled restores the legacy close gate for all
 	// human-filed bug-family issues when configured. Nil/false means only
 	// per-issue opt-in markers activate the gate.
@@ -145,14 +170,20 @@ type Client struct {
 	mergePolicyMu             sync.RWMutex
 	allowUnprotectedBaseRepos map[string]bool
 	noCIAllowedRepos          map[string]bool
-	humanMergePaths           map[string][]string // auto_merge.human_merge_paths; see SetHumanMergePaths
-	sentinelHeads             sentinelHeadsSeen   // head SHAs the sentinel sweep already evaluated
+	humanMergePaths           map[string][]string    // auto_merge.human_merge_paths; see SetHumanMergePaths
+	humanMergePinOnly         map[string]PinOnlySpec // guarded by mergePolicyMu
+	sentinelHeads             sentinelHeadsSeen      // head SHAs the sentinel sweep already evaluated
 	autoMergeMinHeadAge       time.Duration
 	mergeAlertMu              sync.Mutex
 	mergeAlertSink            MergeFailureAlertSink
-	mergeAlertIDsByRepo       map[string]map[string]mergeAlertEntry
+	mergeAlertIDsByRepo       map[string]map[string]*mergeAlertEntry
 	mergeAlertLastRevalidate  time.Time
 	logger                    *slog.Logger
+	codeScanning              codeScanningState
+	workflowApprovals         workflowApprovalLedger
+	heldRunApprovals          HeldRunApprovals
+	installationPerms         installationPermissionCache
+	mergedClaimScanTransient  sync.Map        // repo -> true while its merged-PR scan is timing out
 	stageFacts                stageFactsState // out-of-cycle stage writes; see StageFacts
 	apiBudget                 apiBudgetState
 	appAuth                   *AppAuth // nil for token-authenticated clients
@@ -175,6 +206,10 @@ type Client struct {
 	selfLoginPending    chan struct{} // closed when the in-flight GET /user completes
 	additionalBotLogins []string
 	noBotIdentityWarned sync.Once
+	// sharedState holds process-wide values other packages keep on the
+	// Client (SharedState), such as the automerge sweeps' once-per-head marks.
+	sharedStateMu sync.Mutex
+	sharedState   map[string]any
 	// approvalDesk is the RFC #4000 approval-desk consultation performed per PR
 	// by the self-authored auto-merge sweep. nil (the default) means the sweep
 	// behaves exactly as it did before the desk existed. Set by SetApprovalDesk
@@ -190,6 +225,10 @@ type Client struct {
 	// so the self-approval guard treats a base and its replicas as one
 	// author. nil compares exact lane names.
 	agentBase func(agent string) string
+	// relayKnown reports that a login has a contributor profile on this
+	// hive (runs a relay that targets it), so a PR under that login is an
+	// agent's, not a person's — see SetRelayKnownFunc.
+	relayKnown func(login string) bool
 	// priorArtFiling* enforce the prior-art filing verdict on relayed issue
 	// creates (issue_request_prior_art.go, hivecommons/hive#13879).
 	priorArtFilingGate   func() config.PriorArtGateConfig
@@ -269,12 +308,35 @@ type Client struct {
 	// created once by revertSheriffLedger.
 	revertSheriff     *revertsheriff.Ledger
 	revertSheriffOnce sync.Once
+	// sharedCIRerunForbidden records when the App was last refused a rerun in
+	// a repo (403 "Resource not accessible by integration"), keyed
+	// "owner/repo". Guarded by sharedCIRerunMu.
+	sharedCIRerunForbidden map[string]time.Time
 	// combinedPerspectivesFn / maxReviewsPerHeadFn feed the per-head review
 	// backstop (perHeadReviewRefusal); read live so a dashboard change applies
 	// without a client rebuild. maxReviewsPerHeadFn returning 0 means derive;
 	// a negative value disables the backstop.
 	combinedPerspectivesFn func() bool
 	maxReviewsPerHeadFn    func() int
+	// quietNotificationsFn is github.notifications.mode != normal, read
+	// live: fold the hive's PR notes into one edited status comment, post no
+	// no-findings review, one hive review per head. nil (nothing wired)
+	// reads as normal, so unwired clients behave as before.
+	quietNotificationsFn func() bool
+	attentionConfig      func() attention.Config
+	attentionHiveID      string
+	// notifications counts comments created, edited and suppressed; logged
+	// hourly so the effect of quiet mode is measurable.
+	notifications notificationTally
+	// shadowNotificationsFn is github.notifications.shadow, read live: when
+	// it returns true every notification-capable write is classified and
+	// recorded in notificationShadow. nil reads as off.
+	shadowNotificationsFn func() bool
+	notificationShadow    notificationShadow
+	// attentionPilotFn is github.notifications.attention_pilot, read live:
+	// when it returns true routine issue notes fold into the issue's
+	// hive:status card (issue_status_card.go). nil reads as off.
+	attentionPilotFn func() bool
 	// reviewRequireLabelsFn returns review.require_labels, read live so a
 	// Features-tab edit gates the next relay request without a rebuild. nil
 	// or empty means the gate is off.
@@ -319,6 +381,12 @@ type Client struct {
 	// clanker-requested parking (pr_clanker_requested.go). nil knows no relay
 	// contributors.
 	relayContributor func(login string) bool
+	// parkTextContributor reports whether a login is contributor provenance
+	// for the park re-check (issue_park_recheck.go). The embedder supplies a
+	// durable, registry-backed predicate: the re-check reads park text long
+	// after the relay claim's TTL, so relayContributor alone is not enough.
+	// nil knows no contributors.
+	parkTextContributor func(login string) bool
 	// prSignedCommits, when set and returning true, makes the PR-request watcher
 	// re-author each head branch through createCommitOnBranch before opening the
 	// PR, so the commit is GitHub-signed (Verified) and authored by the App bot.
@@ -339,7 +407,13 @@ type Client struct {
 	// handoff summary included), used by PR follow-up resume (#9583).
 	prOpenedDetailHook     atomic.Pointer[PROpenedDetailHook]
 	prTerminalObservedHook atomic.Pointer[PRTerminalObservedHook]
-	prRepoPolicyGate       atomic.Pointer[PRRepoPolicyGate]
+	// prReviewObservedHook and prTerminalReviews: other people's reviews on
+	// terminal PRs, read once per PR by the settle scan (#16116). See
+	// prreviews_observed.go.
+	prReviewObservedHook atomic.Pointer[PRReviewObservedHook]
+	prTerminalReviews    prTerminalReviewCache
+	prTerminalEnrichment terminalEnrichmentState
+	prRepoPolicyGate     atomic.Pointer[PRRepoPolicyGate]
 	// agentStartHook is told when an agent's own relay request shows it
 	// working an issue (#10527). See agent_start_hook.go.
 	agentStartHook atomic.Pointer[AgentStartHook]
@@ -422,6 +496,10 @@ type Client struct {
 	// stageArchived memoises repos GitHub refused label writes on because
 	// they are archived (hivecommons/hive#14026); the sweep skips them.
 	stageArchived coveredByPRLabelState
+	// stageLabelForbidden memoises repos where the GitHub App was refused
+	// label writes with 403 "Resource not accessible by integration"
+	// (hivecommons/hive#17582); the sweep skips them until restart.
+	stageLabelForbidden coveredByPRLabelState
 	// legacyDecisionLabels memoises repos whose retired needs-decision /
 	// needs-direction definitions were deleted (hivecommons/hive#12683), or
 	// whose definition cleanup was denied integration permission (#14372).
@@ -429,6 +507,9 @@ type Client struct {
 	// issueStage resolves the live `governor.labels.stage` policy for the
 	// issue stage reconciler; nil disables it.
 	issueStage func() IssueStagePolicy
+	// authorKindLabels resolves the live governor.labels.author names for
+	// dashboard decisions; nil uses the default names.
+	authorKindLabels func() authorkind.Names
 	// mergeReEngage is Fix #2's re-engagement hook. When a merge attempt fails
 	// terminally BECAUSE a required check failed (not a true conflict or a
 	// permission error), the watcher calls this instead of silently abandoning
@@ -445,6 +526,15 @@ type Client struct {
 	// it. nil hold disables the gate. Set by SetMergeReviewVerdictGate.
 	mergeReviewVerdictHold  ReviewVerdictHoldFunc
 	mergeReviewHoldReleaser func(login string) bool
+	// prReplyOptions tracks the PRs whose status comment carries the "Your
+	// move" section (pr_reply_options.go).
+	prReplyOptions prReplyOptions
+	// unparkReads is the un-park sweep's per-item read cache
+	// (issue_unpark_read_cache.go). Zero value is ready to use.
+	unparkReads unparkReadCache
+	// noPRParkChecks paces the issue stage sweep's look at stalled 010
+	// issues the hive may have answered without a PR (issue_no_pr_park.go).
+	noPRParkChecks noPRParkChecks
 	// mergePolicyGate is the merge-request relay's lane-policy gate (see
 	// MergeRequestPolicyGate). nil installs no gate: the relay then applies
 	// only its own authz, label and CI checks, as before the gate existed.
@@ -460,6 +550,11 @@ type Client struct {
 	mergeStatePath   string
 	mergeState       map[string]mergeRequestPRState
 	mergeStateLoaded bool
+	// mergeHeadFirstSeen is the in-memory first observation of each PR head
+	// the CI gate judged without an expect_sha (no persisted wait state), so
+	// the min_head_age skew fallback has a stable start (#16152). Guarded by
+	// mergeStateMu.
+	mergeHeadFirstSeen map[string]mergeRequestPRState
 	// attribution holds the invocation-attribution hooks (trailer gate,
 	// per-agent metadata resolver, audit sink) — see attribution.go. Guarded by
 	// attribMu because the hooks are installed in stages during startup while
@@ -488,6 +583,28 @@ type Client struct {
 	// issues:write) still surface within ~an hour instead of never. Guarded by
 	// advisoryMu.
 	advisoryDigestSkips map[string]int
+	// advisoryDigestAnchors memoizes, per "owner/repo#issue", the ID of the
+	// App-authored digest comment the last successful write landed on
+	// (#16439). It is the pin the digest returns to when a foreign-authored
+	// digest comment sits newer on the issue, and the key for the per-anchor
+	// last-written material fingerprint in advisoryDigestAnchorHashes, which
+	// lets an unchanged re-render skip the PATCH even when the listed body is
+	// stale. Guarded by advisoryMu.
+	advisoryDigestAnchors      map[string]int
+	advisoryDigestAnchorHashes map[string]string
+	// advisoryForeignDigestWarned records, per "owner/repo#issue", that the
+	// "digest comment not authored by this App" condition has already been
+	// logged at Warn in this process; later cycles log it at Debug (#16439).
+	// Guarded by advisoryMu.
+	advisoryForeignDigestWarned map[string]bool
+	// advisoryDigestMinInterval is the floor between two writes of a CHANGED
+	// digest to the same target (governor.advisory.digest_min_interval,
+	// #17435); 0 disables the gate. advisoryDigestLastWrite records, per
+	// "owner/repo#issue", when this process last wrote the digest, so the
+	// gate holds even while the listed comment's updated_at lags the PATCH.
+	// Both guarded by advisoryMu.
+	advisoryDigestMinInterval time.Duration
+	advisoryDigestLastWrite   map[string]time.Time
 	// hiveIdentity records which accounts count as "this hive" for the
 	// self-authorization gate (pr_self_authorization.go, #5117). It is optional
 	// — the gate recognises the App bot without it — and exists so an issue
@@ -518,6 +635,9 @@ type Client struct {
 	stageEngineMu sync.Mutex
 	stageWriter   *stageWriter
 	stageEngines  map[*stagelabels.Store]stageengine.Reconciler
+	// baseRefresh is the decision carry's memo (pr_decision_base_refresh.go).
+	baseRefreshOnce sync.Once
+	baseRefresh     *BaseRefreshChecker
 }
 
 func (c *Client) SetCanaryScanner(enabled, failClosed bool, reg *ioscan.CanaryRegistry, onLeak func(ioscan.CanaryLeak)) {
@@ -657,6 +777,29 @@ func (c *Client) SetAgentBaseFunc(fn func(agent string) string) {
 	c.agentBase = fn
 }
 
+// SetRelayKnownFunc tells the client which logins are relay contributors
+// registered on this hive. The duplicate-fix sweep uses it to tell the
+// hive's own contributor agent (closable, writes allowed as a hive item)
+// from a person who happens to have no author/* label yet
+// (hivecommons/hive#15469: a relay's duplicate PR read as a person's, so
+// the gate refused the notice and the pair rode the merge train together).
+func (c *Client) SetRelayKnownFunc(fn func(login string) bool) {
+	if c == nil {
+		return
+	}
+	c.relayKnown = fn
+}
+
+// IsRelayContributorLogin reports whether login runs a registered relay on
+// this hive; false when no registry is installed.
+func (c *Client) IsRelayContributorLogin(login string) bool {
+	login = strings.TrimSpace(login)
+	if c == nil || c.relayKnown == nil || login == "" {
+		return false
+	}
+	return c.relayKnown(login)
+}
+
 func (c *Client) agentBaseName(agent string) string {
 	agent = strings.TrimSpace(agent)
 	if agent == "" || c == nil || c.agentBase == nil {
@@ -676,6 +819,24 @@ func (c *Client) agentBaseName(agent string) string {
 func (c *Client) SetReviewCadenceLimits(combined func() bool, maxPerHead func() int) {
 	c.combinedPerspectivesFn = combined
 	c.maxReviewsPerHeadFn = maxPerHead
+}
+
+// SetNotificationsQuiet wires github.notifications.mode (quiet when fn
+// returns true). Read live so a config reload applies to the next write.
+func (c *Client) SetNotificationsQuiet(fn func() bool) {
+	if c == nil {
+		return
+	}
+	c.quietNotificationsFn = fn
+}
+
+// notificationsQuiet reports whether the hive is in quiet notification
+// mode: a new comment or review is an email to the author and every
+// watcher, and the Activity Monitor already carries what the comment would
+// say. The config default is quiet; a client nothing wired (tests) behaves
+// as before.
+func (c *Client) notificationsQuiet() bool {
+	return c != nil && c.quietNotificationsFn != nil && c.quietNotificationsFn()
 }
 
 func (c *Client) SetConfidenceScore(enabled func() bool) {
@@ -824,6 +985,9 @@ type Issue struct {
 	// stage/030-pr-in-progress from stage/020-claimed; the claim's kind
 	// alone never does (hivecommons/hive#13069).
 	ClaimPRStarted bool `json:"claim_pr_started,omitempty"`
+	// ClaimHive is the marker's hive= — the hive that recorded the live
+	// claim — when the claim came from a `hive:claim` marker; empty otherwise.
+	ClaimHive string `json:"claim_hive,omitempty"`
 	// ClaimAdvisory is set when the issue carries a live contributor claim
 	// the live-claim filter chose NOT to honour — the issue is in contributor
 	// cool-off, or contributor claims have kept hive agents off it past the
@@ -930,7 +1094,19 @@ type PullRequest struct {
 	// CI (#7471). Never consulted by any gate — mergeableFromState owns the
 	// policy; this is the evidence the pill tooltip shows for it.
 	MergeableState string `json:"mergeable_state,omitempty"`
-	CIStatus       string `json:"ci_status"`
+	// Supersedes is the PR this one declares it supersedes ("Supersedes
+	// #N" in the body: the hive's adoption / takeover / re-author copy of
+	// a contributor PR), read from the list payload; 0 when none.
+	// IsHiveSupersedingPR pairs it with AppAuthored.
+	Supersedes int `json:"supersedes,omitempty"`
+	// BaseDiffEmpty is true when the per-PR detail fetch reported zero
+	// changed files, additions and deletions against the base: the PR
+	// carries nothing the base does not already have (an adoption whose
+	// original landed another way, hivecommons/hive#15499). Only the
+	// single-PR GET carries these counts; false until EnrichCIStatus ran.
+	BaseDiffEmpty bool          `json:"base_diff_empty,omitempty"`
+	CIStatus      string        `json:"ci_status"`
+	CIActivity    *PRCIActivity `json:"ci_activity,omitempty"`
 	// CIRealCheckRuns is the count of non-meta check runs observed on the head.
 	// CIRealCheckRunsKnown distinguishes an observed metadata-only head from
 	// older/test payloads that did not collect this evidence.
@@ -988,9 +1164,11 @@ type PullRequest struct {
 	HeadTree string `json:"head_tree,omitempty"`
 	// SharedCIIncident is the open [shared-ci] incident issue (same repo)
 	// that the newest `<!-- hive-shared-ci-<n> -->` marker on this red PR
-	// defers it to; 0 when the PR carries no marker, the incident is closed,
-	// or the lookup failed. Kick builders keep such a PR out of their repair
-	// lists until the incident closes (hivecommons/hive#10528).
+	// defers it to; 0 when the PR carries no marker, the incident is closed
+	// (and the PR's failed jobs were re-run, or the close is older than the
+	// re-run grace), or the lookup failed. Kick builders keep such a PR out
+	// of their repair lists until the incident closes and its checks are
+	// re-run (hivecommons/hive#10528).
 	SharedCIIncident int `json:"shared_ci_incident,omitempty"`
 	// ExternalCIDeferred reports that every failing check run on this red
 	// PR's current head carries a
@@ -1085,7 +1263,9 @@ type PullRequest struct {
 	// larger response. EnrichReviewSignalsAndWorkPRs stamps them on stale
 	// drafts.
 	// Display only: the 🔗 #N badge on a PR pill mirrors the issue column's
-	// linked-PR badge (#8876); nothing gates on any of them.
+	// linked-PR badge (#8876); nothing gates on any of them. The your-turn
+	// decision reads LinkedIssues to see that a hive PR closes a parked
+	// issue (hiveClosingPRFor).
 	CommentCount      int             `json:"comment_count,omitempty"`
 	ReviewThreadCount int             `json:"review_thread_count,omitempty"`
 	LinkedIssues      []PRLinkedIssue `json:"linked_issues,omitempty"`
@@ -1143,18 +1323,41 @@ type PRReworkStats struct {
 	FixerBackends       []string  `json:"fixer_backends,omitempty"`
 }
 
-// HasFailingRequiredCheck reports whether this PR has a completed, non-meta
-// (required) check whose conclusion was failure/action_required. It is the
-// GENERIC "this PR is red because a required check failed" predicate shared by
-// the merge-watcher re-engagement (#2), claim-suppression release (#3), and the
-// governor stuck-PR reaper (#4). It keys ONLY off the check state that
-// EnrichCIStatus already computed (CIStatus + FailingChecks) — it never inspects
-// a specific linter, language, or check name, so nothing here is
-// project-specific. CIStatus=="failure" is only ever set when at least one
+// HasFailingCheck reports whether this PR has a completed, non-meta check run
+// whose conclusion was failure/action_required, required or not. It keys ONLY
+// off the check state that EnrichCIStatus already computed (CIStatus +
+// FailingChecks). CIStatus=="failure" is only ever set when at least one
 // non-meta check failed (isMetaCheck already excludes tide/guardrails/netlify/
 // copilot), so the FailingChecks guard is belt-and-suspenders.
-func (p PullRequest) HasFailingRequiredCheck() bool {
+func (p PullRequest) HasFailingCheck() bool {
 	return p.CIStatus == "failure" && len(p.FailingChecks) > 0
+}
+
+// HasFailingRequiredCheck is the GENERIC "this PR is red because a required
+// check failed" predicate shared by the claim-suppression release (#3), the
+// governor stuck-PR reaper and escalation ledger (#4), and the dependency-bot
+// red-CI handoff. It is HasFailingCheck, except that a PR whose failing checks
+// all lie outside the base branch's required set is not red
+// (OnlyNonRequiredChecksFailing): GitHub reports such a PR unstable, not
+// blocked, and the automerge sweep merges it, so a fix kick has nothing to
+// repair. Before this a red advisory job (continue-on-error, not in the
+// ruleset) spent the whole re-dispatch budget on a mergeable PR and parked it
+// with needs-human. When the required set is unknown, empty, or not fully
+// reported as check runs, it fails closed exactly as HasFailingCheck does.
+// It never inspects a specific linter, language, or check name, so nothing
+// here is project-specific.
+func (p PullRequest) HasFailingRequiredCheck() bool {
+	return p.HasFailingCheck() && !p.OnlyNonRequiredChecksFailing()
+}
+
+// OnlyNonRequiredChecksFailing reports that EnrichCIStatus determined the base
+// branch's required checks (Protection.RequiredChecksKnown), every one of them
+// reported as a check run on the head (Protection.RequiredChecksAllReported),
+// and none of them is failing. Any failing check on such a PR is non-required.
+// It says nothing about whether a check is failing at all.
+func (p PullRequest) OnlyNonRequiredChecksFailing() bool {
+	f := p.Protection
+	return f != nil && f.RequiredChecksKnown && f.RequiredChecksAllReported && len(f.FailingRequiredChecks) == 0
 }
 
 // Mergeable is a tri-state mergeability verdict for a pull request.
@@ -1438,6 +1641,12 @@ type IssueCluster struct {
 var HoldLabels = []string{"hold", "on-hold", "hold/review"}
 
 var PermanentExemptLabels = []string{"do-not-merge"}
+
+// wipMirrorLabel is the label prow's `wip` plugin applies to every draft PR
+// as a mirror of the draft bit. It carries no information beyond "this is a
+// draft", so it must not shield a hive-authored draft from the stale-draft
+// rule the way a deliberate do-not-merge/hold does (#16246).
+const wipMirrorLabel = "do-not-merge/work-in-progress"
 
 // AutoMergeQueuedLabel is the fallback label a merger/owner queue action
 // applies when a hive has not configured `governor.labels.automerge`. Prefer
@@ -1813,6 +2022,8 @@ func (c *Client) splitRepo(repo string) (owner, repoName string) {
 func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, reporterTrustWaitBudget *reporterTrustWaitBudget) (actionable []Issue, held []HoldItem, totalIssues int, breakdown RepoIssueBreakdown, details []RepoWorkIssue, err error) {
 	issueFilter := c.getIssueFilter()
 	owner, repoName := c.splitRepo(repo)
+	// Stale-finding checks this pass may refresh (issue_cited_lines.go).
+	citedBudget := citedMaxChecksPerRepo
 	// Taken before the list call: a hold recorded after the listing snapshot
 	// must outlive this pass's prune of the local hold-source record.
 	passStart := time.Now().UTC()
@@ -1914,7 +2125,7 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		if hasBlockedLabel(labels) {
 			breakdown.Filtered++
 			breakdown.Blocked++
-			row := c.workIssue(repo, issue, labels, "filtered", blockedFilterReason(issue.GetBody()))
+			row := c.workIssue(repo, issue, labels, "filtered", blockedFilterReasonFor(repo, issue.GetNumber(), issue.GetBody()))
 			setBlockedRowFacts(&row, issue.GetBody(), blockedCounts[issue.GetNumber()])
 			details = append(details, row)
 			continue
@@ -1928,7 +2139,23 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		if suppress := hardSuppressIssueBucket(issueFilter, labels); suppress != "" {
 			breakdown.Filtered++
 			breakdown.addHardSuppress(suppress)
-			details = append(details, c.workIssue(repo, issue, labels, "filtered", suppress))
+			row := c.workIssue(repo, issue, labels, "filtered", suppress)
+			// A decision park blocked by another open decision park waits
+			// on that one's answer, not on its own (the dashboard's
+			// ownership), so its blockers are read: one call, only for a
+			// decision park with an open blocker. An unreadable list
+			// leaves the row an ask of its own.
+			row.OpenBlockedBy = blockedCounts[issue.GetNumber()]
+			if row.OpenBlockedBy > 0 && (labelPresent(labels, c.needsDecisionLabel()) || labelPresent(labels, NeedsDecisionStageLabel)) {
+				deps, depErr := c.githubBlockedByDependencies(ctx, owner, repoName, repo, issue.GetNumber())
+				if depErr != nil {
+					c.logger.Warn("issue enumeration: could not read a parked issue's \"blocked by\" dependencies; it stays its own ask this cycle",
+						slog.String("repo", repo), slog.Int("number", issue.GetNumber()), slog.String("error", depErr.Error()))
+				} else {
+					row.OpenBlockers = Issue{DependsOn: deps}.OpenBlockers()
+				}
+			}
+			details = append(details, row)
 			continue
 		}
 
@@ -1961,7 +2188,9 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 
 		if !issueFilter.Admits(labels) {
 			breakdown.Filtered++
-			details = append(details, c.workIssue(repo, issue, labels, "filtered", issueFilterReason))
+			row := c.workIssue(repo, issue, labels, "filtered", issueFilterReason)
+			row.CitedLinesGone = c.citedLinesGone(ctx, owner, repoName, issue, labels, &citedBudget)
+			details = append(details, row)
 			continue
 		}
 
@@ -2267,7 +2496,7 @@ func (c *Client) fetchPRsWithDetails(ctx context.Context, repo string, clankerBu
 			continue
 		}
 
-		if c.isExempt(labels) {
+		if c.isExempt(labels) && !c.isDraftExemptOnlyByWIPMirror(pr.GetDraft(), labels) {
 			breakdown.Filtered++
 			sidelined = append(sidelined, c.repoWorkPR(repo, pr, labels, hasAttr, workBucketPRFiltered, "Exempt label"))
 			continue
@@ -2352,6 +2581,7 @@ func (c *Client) fetchPRsWithDetails(ctx context.Context, repo string, clankerBu
 			RequestedTeams:     reqTeams,
 			ReferencedIssues:   PRReferencedIssues(pr.GetTitle(), pr.GetBody(), repo, pr.GetNumber()),
 			DependsOn:          ParseDependsOn(pr.GetBody(), repo),
+			Supersedes:         prSupersedesNumberOrZero(pr.GetBody()),
 		})
 	}
 
@@ -2550,17 +2780,31 @@ func (c *Client) EnrichCIStatus(ctx context.Context, prs []PullRequest) {
 		return
 	}
 	facts := newProtectionCollector(c)
-	incidents := map[string]bool{}
+	incidents := map[string]sharedCIIncidentState{}
 	for i := range prs {
 		reported := c.enrichPRCI(ctx, &prs[i])
+		// Unreported checks may be workflow runs waiting on GitHub's
+		// approve-workflows gate (dependabot, forks); only a pending head
+		// pays for the extra listing (hivecommons/hive#16599).
+		if prs[i].CIStatus == "pending" && prs[i].CIActivity != nil {
+			prs[i].CIActivity.WorkflowApproval = c.workflowApprovalWithLedger(prs[i].Repo, prs[i].Number, prs[i].HeadSHA, c.workflowRunsAwaitingApproval(ctx, prs[i].Repo, prs[i].HeadSHA))
+		}
 		if prs[i].CIStatus == "failure" {
-			if texts, ok := c.redPRCommentTexts(ctx, &prs[i]); ok {
+			if texts, hiveTexts, ok := c.redPRCommentTexts(ctx, &prs[i]); ok {
 				prs[i].SharedCIIncident = c.openSharedCIIncident(ctx, &prs[i], texts, incidents)
 				prs[i].ExternalCIDeferred = externalCIDeferred(texts, prs[i].HeadSHA, prs[i].FailingCheckRunIDs)
-				prs[i].TransientCITriaged = transientCITriaged(texts, prs[i].HeadSHA, prs[i].FailingCheckRunIDs)
+				prs[i].TransientCITriaged = transientCITriaged(hiveTexts, prs[i].HeadSHA, prs[i].FailingCheckRunIDs)
 			}
 		}
 		facts.attach(ctx, &prs[i], reported)
+		// The listing is the head's complete observation; checks delivered
+		// by webhook since then are laid over it (hivecommons/hive#16521).
+		owner, name := c.splitRepo(prs[i].Repo)
+		if prs[i].CIStatus == "success" {
+			CIFailureSignals().forgetGreenHead(owner+"/"+name, prs[i].Number, prs[i].HeadSHA)
+		}
+		sharedCIEvidence().recordListed(owner+"/"+name, prs[i].HeadSHA, prs[i].CIActivity)
+		prs[i].CIActivity = sharedCIEvidence().merged(owner+"/"+name, prs[i].HeadSHA, prs[i].CIActivity)
 	}
 	c.enrichBaseBranchRed(ctx, prs)
 }
@@ -2605,6 +2849,7 @@ func (c *Client) enrichPRCI(ctx context.Context, pr *PullRequest) map[string]boo
 	const ciStatusSuccess = "success"
 	const ciStatusFailure = "failure"
 	const ciStatusPending = "pending"
+	pr.CIActivity = nil
 
 	if pr.HeadSHA == "" {
 		pr.CIStatus = ciStatusPending
@@ -2619,39 +2864,55 @@ func (c *Client) enrichPRCI(ctx context.Context, pr *PullRequest) map[string]boo
 	full, ok := c.cachedPRDetailFromList(pr.Repo, pr.Number, pr.HeadSHA, pr.UpdatedAt)
 	if !ok {
 		var err error
-		started := sharedWebhookTracker.now()
+		started := sharedWebhookTracker().now()
 		full, _, err = c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:enrich_pr_ci"), owner, repoName, pr.Number)
 		if err != nil {
 			c.logger.Warn("failed to fetch PR mergeability", "repo", pr.Repo, "pr", pr.Number, "error", err)
 		} else {
 			c.storePRDetail(pr.Repo, pr.Number, full)
-			sharedWebhookTracker.clearDirtyBefore(pr.Repo, pr.Number, started)
+			sharedWebhookTracker().clearDirtyBefore(pr.Repo, pr.Number, started)
 		}
 	}
 	if full != nil {
 		pr.Mergeable = mergeableFromState(full.GetMergeableState(), full.Mergeable)
 		pr.MergeableState = full.GetMergeableState()
 		pr.MaintainerCanModify = full.GetMaintainerCanModify()
+		pr.BaseDiffEmpty = PRChangedFilesClaimsEmpty(full)
 		if base := full.GetBase().GetSHA(); base != "" {
 			pr.BaseSHA = base
 		}
 	}
 
 	var allCheckRuns []*gh.CheckRun
-	if cached, ok := c.graphQLBatchCheckRuns(pr.Repo, pr.Number, pr.HeadSHA); ok {
+	checkSource := "github-check-runs"
+	var checkObservedAt *time.Time
+	if cached, observedAt, ok := c.graphQLBatchCheckRunsObservation(pr.Repo, pr.Number, pr.HeadSHA); ok {
 		allCheckRuns = cached
+		checkSource = "github-graphql-cache"
+		checkObservedAt = observedAt
 	} else {
-		checkRuns, _, err := c.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, pr.HeadSHA, &gh.ListCheckRunsOptions{
+		options := &gh.ListCheckRunsOptions{
 			ListOptions: gh.ListOptions{PerPage: 100},
-		})
-		if err != nil {
-			c.logger.Warn("failed to fetch check runs", "repo", pr.Repo, "pr", pr.Number, "error", err)
-			pr.CIStatus = ciStatusPending
-			return nil
 		}
-		allCheckRuns = checkRuns.CheckRuns
+		for {
+			checkRuns, response, err := c.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, pr.HeadSHA, options)
+			if err != nil || checkRuns == nil || checkRuns.CheckRuns == nil {
+				c.logger.Warn("failed to fetch check runs", "repo", pr.Repo, "pr", pr.Number, "error", err)
+				pr.CIStatus = ciStatusPending
+				return nil
+			}
+			allCheckRuns = append(allCheckRuns, checkRuns.CheckRuns...)
+			if response == nil || response.NextPage == 0 {
+				break
+			}
+			options.Page = response.NextPage
+		}
+		at := time.Now().UTC()
+		checkObservedAt = &at
 	}
-	latestCheckRuns := latestCheckRunsByNameAndApp(allCheckRuns)
+	currentHeadRuns := checkRunsOnHead(allCheckRuns, pr.HeadSHA)
+	latestCheckRuns := latestCheckRunsByNameAndApp(currentHeadRuns)
+	pr.CIActivity = prCIActivity(pr.HeadSHA, checkSource, activityCheckRunsByNameAndApp(currentHeadRuns), checkObservedAt)
 	// Snapshot the CI verdict for the evidence bundle once it is known. Never
 	// affects the verdict or any merge decision.
 	// Keyed by owner/name: pr.Repo may be the bare repo name, and a bundle
@@ -2741,8 +3002,7 @@ func (c *Client) headTreeOID(ctx context.Context, owner, repoName string, pr *Pu
 // for hours (2026-08-04). The merge step itself re-enforces these gates —
 // counting them here only poisons the eligibility signal.
 func isMetaCheck(name string) bool {
-	switch name {
-	case "tide", "enforce-guardrails":
+	if isProwMergeGateContext(name) {
 		return true
 	}
 
@@ -2826,6 +3086,9 @@ func (c *Client) fetchFailureExcerpt(ctx context.Context, owner, repo string, ru
 	seen := map[string]bool{}
 	perRun := make([][]string, 0, len(runIDs))
 	for idx, id := range runIDs {
+		if id <= 0 {
+			continue
+		}
 		if idx >= excerptMaxRuns {
 			break
 		}
@@ -2929,6 +3192,27 @@ func (c *Client) IssueCommentsContain(ctx context.Context, repo string, number i
 	}
 }
 
+// issueCommentsContainAny reports whether any comment on repo#number
+// contains any of needles, in one pass.
+func (c *Client) issueCommentsContainAny(ctx context.Context, repo string, number int, needles ...string) (bool, error) {
+	if c == nil {
+		return false, ErrNoGitHubClient
+	}
+	owner, repoName := c.splitRepo(repo)
+	comments, err := c.listIssueComments(ctx, owner, repoName, number)
+	if err != nil {
+		return false, err
+	}
+	for _, comment := range comments {
+		for _, needle := range needles {
+			if needle != "" && strings.Contains(comment.GetBody(), needle) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // CreateIssueComment posts a comment on an issue or PR. The signature mirrors
 // forge.Forge.CreateIssueComment so escalation callers can swap in a neutral
 // forge adapter on non-GitHub hives without changing call sites.
@@ -2968,6 +3252,10 @@ func (c *Client) CreateIssueComment(ctx context.Context, repo string, number int
 		}
 		return effects.Result{Provenance: comment.GetHTMLURL()}, apiErr
 	})
+	if err == nil {
+		c.noteCommentCreated()
+	}
+	c.recordNotificationWrite(ctx, notificationWrite{kind: notificationWriteComment, repo: owner + "/" + repoName, item: number, body: body, err: err})
 	return err
 }
 
@@ -3097,71 +3385,164 @@ func (c *Client) QueuePRAutoMerge(ctx context.Context, repo string, number int, 
 // queuer). The dashboard's delegated decision uses it to carry the
 // owner-delegate audit marker on the review itself.
 func (c *Client) QueuePRAutoMergeWithNote(ctx context.Context, repo string, number int, queuedBy, note string) error {
+	_, err := c.QueuePRAutoMergeWithNoteResult(ctx, repo, number, queuedBy, note)
+	return err
+}
+
+// PRAutoMergeQueueResult reports how QueuePRAutoMergeWithNoteResult
+// recorded the queue: HeadSHA is the head it applies to; ReviewSubmitted is
+// false when the hive could not review the PR because it is the hive's own
+// (GitHub refuses "Can not approve your own pull request"), in which case
+// the queue line was left as a comment instead and the caller records the
+// operator's approval in the hive's own store so the self-authored lane
+// merges on it (hivecommons/hive#15666).
+type PRAutoMergeQueueResult struct {
+	// ReportingError is optional Prow bridge failure, not a lost approval.
+	ReportingError  string
+	HeadSHA         string
+	ReviewSubmitted bool
+	SelfAuthored    bool
+}
+
+// ownPullRequestReviewRefusal is the phrase in GitHub's 422 for an APPROVE
+// (or REQUEST_CHANGES) review on the caller's own pull request.
+const ownPullRequestReviewRefusal = "own pull request"
+
+// IsOwnPullRequestReviewRefusal reports whether err is GitHub's 422 "Review
+// Can not approve your own pull request" (or the request-changes twin): the
+// reviewer is the PR author, which no retry changes. Callers treat it as a
+// policy answer, not a fault, and fall back to a comment.
+func IsOwnPullRequestReviewRefusal(err error) bool {
+	if err == nil || !githubStatusError(err, http.StatusUnprocessableEntity) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), ownPullRequestReviewRefusal)
+}
+
+// pullRequestSelfAuthored reports whether pr is the hive's own: opened by
+// one of its posting identities or stamped author/hive by the classifier.
+func (c *Client) pullRequestSelfAuthored(pr *gh.PullRequest) bool {
+	if c == nil || pr == nil {
+		return false
+	}
+	if c.isHiveAccount(pr.GetUser()) || c.IsHiveAuthorLogin(safeGetLogin(pr.GetUser())) {
+		return true
+	}
+	names := authorkind.Names{}
+	if c.authorKindLabels != nil {
+		names = c.authorKindLabels()
+	}
+	return authorkind.FromLabels(labelNames(pr.Labels), names) == authorkind.Hive
+}
+
+// QueuePRAutoMergeWithNoteResult is QueuePRAutoMergeWithNote reporting how
+// the queue was recorded. On the hive's own PR the App cannot approve
+// (GitHub 422 "Can not approve your own pull request"), so no review is
+// attempted: the queue line is posted as an issue comment and the label
+// applied. The same fallback runs when GitHub answers that 422 for an
+// author the hive did not recognise as itself.
+func (c *Client) QueuePRAutoMergeWithNoteResult(ctx context.Context, repo string, number int, queuedBy, note string) (PRAutoMergeQueueResult, error) {
+	return c.QueuePRAutoMergeWithNoteResultAtHead(ctx, repo, number, queuedBy, note, "")
+}
+
+// QueuePRAutoMergeWithNoteResultAtHead refuses a queue write if the head moved
+// after the operator's decision was validated.
+func (c *Client) QueuePRAutoMergeWithNoteResultAtHead(ctx context.Context, repo string, number int, queuedBy, note, expectedHead string) (PRAutoMergeQueueResult, error) {
 	if c == nil {
-		return ErrNoGitHubClient
+		return PRAutoMergeQueueResult{}, ErrNoGitHubClient
 	}
 	queuedBy = strings.TrimSpace(queuedBy)
 	if queuedBy == "" {
-		return errors.New("queuedBy is required for auto-merge audit and self-merge checks")
+		return PRAutoMergeQueueResult{}, errors.New("queuedBy is required for auto-merge audit and self-merge checks")
 	}
 	owner, repoName := c.splitRepo(repo)
 	pr, _, err := c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:queue_pr_automerge"), owner, repoName, number)
 	if err != nil {
-		return fmt.Errorf("fetching PR head for auto-merge approval: %w", err)
+		return PRAutoMergeQueueResult{}, fmt.Errorf("fetching PR head for auto-merge approval: %w", err)
 	}
 	headSHA := ""
 	if pr.GetHead() != nil {
 		headSHA = pr.GetHead().GetSHA()
 	}
 	if headSHA == "" {
-		return errors.New("PR head SHA is required for auto-merge approval")
+		return PRAutoMergeQueueResult{}, errors.New("PR head SHA is required for auto-merge approval")
 	}
+	if expectedHead != "" && headSHA != expectedHead {
+		return PRAutoMergeQueueResult{}, errors.New("PR head changed since approval; queue reporting deferred")
+	}
+	full := owner + "/" + repoName
+	res := PRAutoMergeQueueResult{HeadSHA: headSHA, SelfAuthored: c.pullRequestSelfAuthored(pr)}
 	if blocked := c.sentinelBlockedLabel(labelNames(pr.Labels)); blocked != "" {
 		c.recordWriteAudit(AuditActionSentinelBlockedApproval, InvocationMeta{Agent: AttributionAgentGovernor},
-			WriteTarget{Repo: owner + "/" + repoName, Number: number},
+			WriteTarget{Repo: full, Number: number},
 			"agent", queuedBy, "label", blocked)
-		return fmt.Errorf("approving PR: %s label blocks Hive approval and auto-merge", blocked)
+		return res, fmt.Errorf("approving PR: %s label blocks Hive approval and auto-merge", blocked)
 	}
 	label := c.AutoMergeLabel()
 	if err := c.ensureLabel(ctx, owner, repoName, label); err != nil {
-		return fmt.Errorf("ensuring %s label: %w", label, err)
+		return res, fmt.Errorf("ensuring %s label: %w", label, err)
 	}
 	body := fmt.Sprintf("Approved by @%s for Hive auto-merge on green CI.", queuedBy)
 	if note = strings.TrimSpace(note); note != "" {
 		body += "\n\n" + note
 	}
-	provenance := owner + "/" + repoName + "#" + strconv.Itoa(number)
-	_, err = effects.ExecuteReconciling(ctx, c.mutationBoundary(), effects.Claim{
-		Repo:   owner + "/" + repoName,
-		Kind:   effects.KindReviewSubmit,
-		Target: strconv.Itoa(number),
-		Inputs: map[string]string{"event": "APPROVE", "head_sha": headSHA, "body": effects.StableDigest(body)},
-	}, func(ctx context.Context) (effects.ExternalState, error) {
-		return c.observeReviewSubmit(ctx, owner, repoName, number, body, headSHA, provenance)
-	}, effects.DefaultUnresolvedTTL, func(ctx context.Context) (effects.Result, error) {
-		_, _, apiErr := c.client.PullRequests.CreateReview(ctx, owner, repoName, number, &gh.PullRequestReviewRequest{
-			CommitID: gh.Ptr(headSHA),
-			Body:     gh.Ptr(body),
-			Event:    gh.Ptr("APPROVE"),
+	refusedAsOwn := false
+	if !res.SelfAuthored {
+		provenance := full + "#" + strconv.Itoa(number)
+		_, err = effects.ExecuteReconciling(ctx, c.mutationBoundary(), effects.Claim{
+			Repo:   full,
+			Kind:   effects.KindReviewSubmit,
+			Target: strconv.Itoa(number),
+			Inputs: map[string]string{"event": "APPROVE", "head_sha": headSHA, "body": effects.StableDigest(body)},
+		}, func(ctx context.Context) (effects.ExternalState, error) {
+			return c.observeReviewSubmit(ctx, owner, repoName, number, body, headSHA, provenance)
+		}, effects.DefaultUnresolvedTTL, func(ctx context.Context) (effects.Result, error) {
+			_, _, apiErr := c.client.PullRequests.CreateReview(ctx, owner, repoName, number, &gh.PullRequestReviewRequest{
+				CommitID: gh.Ptr(headSHA),
+				Body:     gh.Ptr(body),
+				Event:    gh.Ptr("APPROVE"),
+			})
+			if IsOwnPullRequestReviewRefusal(apiErr) {
+				// Policy, not a fault: nothing to reconcile later.
+				refusedAsOwn = true
+				return effects.Result{Provenance: provenance}, nil
+			}
+			return effects.Result{Provenance: provenance}, apiErr
 		})
-		return effects.Result{Provenance: owner + "/" + repoName + "#" + strconv.Itoa(number)}, apiErr
-	})
-	if err != nil {
-		return fmt.Errorf("approving PR: %w", err)
+		if !refusedAsOwn {
+			c.recordNotificationWrite(ctx, notificationWrite{kind: notificationWriteReview, repo: full, item: number, body: body, class: NotificationClassRequiredReview, err: err})
+		}
+		if err != nil {
+			return res, fmt.Errorf("approving PR: %w", err)
+		}
+		res.ReviewSubmitted = !refusedAsOwn
+		res.SelfAuthored = res.SelfAuthored || refusedAsOwn
 	}
-	// Audit the review so it counts as activity on the trail. This is the hive's
-	// own auto-merge self-approval (a governor action); agent-authored reviews
-	// come through the review-request watcher, which audits separately.
-	c.recordWriteAudit(AuditActionPRReviewed, InvocationMeta{Agent: AttributionAgentGovernor},
-		WriteTarget{Repo: owner + "/" + repoName, Number: number},
-		"agent", queuedBy, "state", "approved")
-	if err := c.AddLabels(ctx, owner+"/"+repoName, number, []string{label}); err != nil {
-		return fmt.Errorf("adding %s label: %w", label, err)
+	if res.ReviewSubmitted {
+		// Audit the review so it counts as activity on the trail. This is the hive's
+		// own auto-merge self-approval (a governor action); agent-authored reviews
+		// come through the review-request watcher, which audits separately.
+		c.recordWriteAudit(AuditActionPRReviewed, InvocationMeta{Agent: AttributionAgentGovernor},
+			WriteTarget{Repo: full, Number: number},
+			"agent", queuedBy, "state", "approved")
+	} else {
+		// The App cannot review its own pull request: leave the queue line
+		// as a comment so the decision stays visible and attributed; the
+		// caller records the operator's approval in the hive's store.
+		if err := c.CreateIssueComment(ctx, full, number, body); err != nil {
+			return res, fmt.Errorf("posting auto-merge queue note: %w", err)
+		}
+		c.info("auto-merge queue: the PR is the hive's own, approval left as a comment instead of a review", "repo", full, "pr", number, "queued_by", queuedBy, "head", headSHA)
+	}
+	if err := c.AddLabels(ctx, full, number, []string{label}); err != nil {
+		return res, fmt.Errorf("adding %s label: %w", label, err)
 	}
 	if strings.EqualFold(label, prowLgtmLabel) {
-		c.bindProwLgtm(ctx, owner, repoName, number, headSHA, queuedBy)
+		if err := c.bindProwLgtm(ctx, owner, repoName, number, headSHA, queuedBy); err != nil {
+			res.ReportingError = err.Error()
+		}
 	}
-	return nil
+	return res, nil
 }
 
 // observeReviewSubmit is the authoritative observation of a review submission
@@ -3212,12 +3593,30 @@ const (
 	prowLgtmLabel         = "lgtm"
 	prowLgtmStatusContext = "prow/lgtm"
 	prowStatusDescMaxLen  = 140
+
+	prowLgtmWarningMarker = "<!-- hive-prow-lgtm-status-warning -->"
+	prowWarningTimeout    = 15 * time.Second
+
+	// prowLgtmStatusForbiddenMsg is the WARN logged when GitHub answers the
+	// prow/lgtm status write with 403. Its text is the keyword behind the
+	// github_app_statuses_permission_missing self-report class
+	// (pkg/fleetreport/runtime.go), so it is emitted only for that case.
+	prowLgtmStatusForbiddenMsg = "could not set the prow/lgtm commit status: the GitHub App lacks the statuses: write permission"
 )
 
+// isStatusesPermissionDenied reports whether err is GitHub refusing the
+// status write with 403 ("Resource not accessible by integration"), the
+// signature of an App installation without Commit statuses read & write.
+func isStatusesPermissionDenied(err error) bool {
+	var ghErr *gh.ErrorResponse
+	return errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusForbidden
+}
+
 // bindProwLgtm records the `prow/lgtm` success status on headSHA, the commit
-// the queue review approved. The label and review are already in place, so a
-// failure is logged and surfaced on the PR but never returned.
-func (c *Client) bindProwLgtm(ctx context.Context, owner, repoName string, number int, headSHA, queuedBy string) {
+// the queue review approved. On failure it returns the error, logs it when a
+// logger is available, and attempts to surface a warning on the PR. The caller
+// records the reporting error without undoing the already-placed label and review.
+func (c *Client) bindProwLgtm(ctx context.Context, owner, repoName string, number int, headSHA, queuedBy string) error {
 	sha7 := headSHA
 	if len(sha7) > 7 {
 		sha7 = sha7[:7]
@@ -3240,17 +3639,51 @@ func (c *Client) bindProwLgtm(ctx context.Context, owner, repoName string, numbe
 		return effects.Result{Provenance: owner + "/" + repoName + "@" + headSHA}, apiErr
 	})
 	if err == nil {
-		return
+		return nil
 	}
 	if c.logger != nil {
-		c.logger.Warn("could not set the prow/lgtm commit status; the GitHub App likely lacks the statuses: write permission",
-			"repo", owner+"/"+repoName, "number", number, "error", err)
+		// Only a 403 names the permission gap: that line is the
+		// github_app_statuses_permission_missing self-report keyword. Any
+		// other failure (5xx, 422, transport, deadline) stays neutral so a
+		// transient outage is not filed as an installation-permission fault.
+		if isStatusesPermissionDenied(err) {
+			c.logger.Warn(prowLgtmStatusForbiddenMsg,
+				"repo", owner+"/"+repoName, "number", number, "error", err)
+		} else {
+			c.logger.Warn("could not set the prow/lgtm commit status",
+				"repo", owner+"/"+repoName, "number", number, "error", err)
+		}
 	}
 	note := "Hive queued this PR but could not set the `prow/lgtm` commit status, so Prow may strip the `lgtm` label and the auto-merge queue may not hold."
-	if cerr := c.CreateIssueComment(ctx, owner+"/"+repoName, number, note); cerr != nil && c.logger != nil {
-		c.logger.Warn("could not post the prow/lgtm status warning comment",
-			"repo", owner+"/"+repoName, "number", number, "error", cerr)
+	// A caller that withdrew has nothing left to warn about; a caller whose
+	// deadline the status call spent still does. The warning gets its own
+	// bounded deadline but keeps following the caller's cancellation, and is
+	// posted once per PR, not once per sweep.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return fmt.Errorf("Prow status reporting: %w", err)
 	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prowWarningTimeout)
+	defer cancel()
+	if ctx.Err() == nil {
+		// Follow only an explicit withdrawal: the caller's deadline running
+		// out mid-warning is exactly the case the live context exists for.
+		defer context.AfterFunc(ctx, func() {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				cancel()
+			}
+		})()
+	}
+	if _, found, ferr := c.findOwnMarkerComment(wctx, owner, repoName, number, prowLgtmWarningMarker); ferr == nil && found {
+		return fmt.Errorf("Prow status reporting: %w", err)
+	}
+	if cerr := c.CreateIssueComment(wctx, owner+"/"+repoName, number, prowLgtmWarningMarker+"\n"+note); cerr != nil {
+		if c.logger != nil {
+			c.logger.Warn("could not post the prow/lgtm status warning comment",
+				"repo", owner+"/"+repoName, "number", number, "error", cerr)
+		}
+		return fmt.Errorf("Prow status reporting: %w; warning comment: %v", err, cerr)
+	}
+	return fmt.Errorf("Prow status reporting: %w", err)
 }
 
 func (c *Client) ensureLabel(ctx context.Context, owner, repo, name string) error {
@@ -3264,10 +3697,34 @@ func (c *Client) ensureLabel(ctx context.Context, owner, repo, name string) erro
 		Color:       gh.Ptr("8250df"),
 		Description: gh.Ptr("Approved by a Hive merger/owner for auto-merge on green CI"),
 	})
-	if ghErr, ok := err.(*gh.ErrorResponse); ok && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusUnprocessableEntity {
+	if labelAlreadyExists(err) {
 		return nil
 	}
 	return err
+}
+
+// labelAlreadyExists reports whether a CreateLabel error is GitHub's 422
+// for a label that already exists (a concurrent creator won the race): the
+// desired end state holds and the caller may proceed. Any other 422 — "name
+// is too long", "name is invalid" — is a real failure: the label was not
+// created, the AddLabels that follows will fail too, and swallowing it
+// here hid the reason from the dashboard (hivecommons/hive#17037). A 422
+// without an error list is kept as "already exists" for GitHub-compatible
+// forges that omit it.
+func labelAlreadyExists(err error) bool {
+	var ghErr *gh.ErrorResponse
+	if !errors.As(err, &ghErr) || ghErr.Response == nil || ghErr.Response.StatusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	if len(ghErr.Errors) == 0 {
+		return true
+	}
+	for _, e := range ghErr.Errors {
+		if e.Code == "already_exists" {
+			return true
+		}
+	}
+	return false
 }
 
 // EnsureIssueLabel creates an issue label if it does not already exist.
@@ -3304,9 +3761,9 @@ func (c *Client) EnsureIssueLabel(ctx context.Context, repo, name, color, descri
 	_, _, err := c.client.Issues.CreateLabel(ctx, owner, repoName, &gh.Label{
 		Name:        gh.Ptr(name),
 		Color:       gh.Ptr(color),
-		Description: gh.Ptr(strings.TrimSpace(description)),
+		Description: gh.Ptr(clampLabelDescription(description)),
 	})
-	if ghErr, ok := err.(*gh.ErrorResponse); ok && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusUnprocessableEntity {
+	if labelAlreadyExists(err) {
 		return nil
 	}
 	return err
@@ -3384,6 +3841,50 @@ func (c *Client) removeLabelObserved(ctx context.Context, repo string, number in
 		c.forgeWriteThrough(repo, number, forgestate.Mutation{Op: forgestate.OpLabelRemove, Labels: []string{label}})
 	}
 	return err
+}
+
+// reconcileLabelMutation resolves a label mutation the mutation journal holds
+// as unresolved — an earlier attempt at the SAME logical operation is still
+// Planned (a concurrent writer mid-call, or a process that died between
+// intent and acknowledgment) or ended Unknown (ambiguous API failure) — from
+// authoritative external state, then replays the mutation once. A label is
+// the easy case: it is either on the item or it is not, and one Issues.Get
+// says which. Before this the claimed-by label write simply failed with
+// "op:… is Planned" and the claim went un-labelled until the next renewal
+// (hivecommons/hive#13579). When the read itself fails a young operation
+// keeps the needs-reconciliation refusal, but one unresolved for longer than
+// effects.DefaultUnresolvedTTL is expired to not-applied and the mutation
+// replays: adding or removing a label is idempotent, so a replay cannot do
+// harm, whereas a read that keeps failing (item transferred or deleted,
+// persistent API error) would otherwise fence every retry forever
+// (hivecommons/hive#15944).
+func (c *Client) reconcileLabelMutation(ctx context.Context, claim effects.Claim,
+	effect func(context.Context) (effects.Result, error), journalErr error, observe func(context.Context) (effects.ExternalState, error)) (effects.Result, error) {
+	if c == nil || c.client == nil {
+		return effects.Result{}, journalErr
+	}
+	state, lookupErr := observe(ctx)
+	if lookupErr != nil {
+		expired, expErr := effects.ExpireUnresolved(ctx, c.mutationBoundary(), claim, effects.DefaultUnresolvedTTL)
+		if expErr != nil {
+			return effects.Result{}, fmt.Errorf("%w (label read for reconciliation failed: %v; expiry failed: %v)", journalErr, lookupErr, expErr)
+		}
+		if !expired {
+			return effects.Result{}, fmt.Errorf("%w (label read for reconciliation failed: %v)", journalErr, lookupErr)
+		}
+		return effects.Execute(ctx, c.mutationBoundary(), claim, effect)
+	}
+	if recErr := effects.Reconcile(ctx, c.mutationBoundary(), claim, state); recErr != nil {
+		return effects.Result{}, fmt.Errorf("%w (reconciliation failed: %v)", journalErr, recErr)
+	}
+	if c.logger != nil {
+		c.logger.Info("label mutation: reconciled unresolved operation against the item's current labels",
+			slog.String("repo", claim.Repo), slog.String("number", claim.Target), slog.Bool("applied", state.Applied))
+	}
+	if state.Applied {
+		return effects.Result{Provenance: state.Provenance}, nil
+	}
+	return effects.Execute(ctx, c.mutationBoundary(), claim, effect)
 }
 
 // labelsAllPresent reports whether every wanted label is in current
@@ -3508,7 +4009,7 @@ func HasHoldLabelWith(labels, extraHoldLabels []string) bool {
 	for _, label := range extraHoldLabels {
 		label = strings.ToLower(strings.TrimSpace(label))
 		if label != "" {
-			if strings.HasPrefix(label, "hive-pause/") {
+			if strings.HasPrefix(label, HiveHoldLabelPrefix) {
 				exactHoldLabels = append(exactHoldLabels, label)
 			} else {
 				holdLabels = append(holdLabels, label)
@@ -3533,7 +4034,7 @@ func HasHoldLabelWith(labels, extraHoldLabels []string) bool {
 			}
 		}
 		for _, exact := range exactHoldLabels {
-			if strings.HasPrefix(exact, "hive-pause/") {
+			if strings.HasPrefix(exact, HiveHoldLabelPrefix) {
 				if strings.EqualFold(strings.TrimSpace(label), exact) {
 					return true
 				}
@@ -3555,6 +4056,32 @@ func isProvenanceLabel(lower string) bool {
 
 func isHeld(labels []string) bool { return HasHoldLabel(labels) }
 
+// HiveHoldLabelPrefix is the prefix of the per-hive dashboard hold label
+// (CanonicalHiveHoldLabel). Readers that recognise the label by prefix
+// (HasHoldLabelWith, IssueStageFor, the duplicate guard) key off it.
+const HiveHoldLabelPrefix = "hive-pause/"
+
+// githubLabelNameMaxLen is GitHub's cap on a label name: POST
+// /repos/{o}/{r}/labels answers 422 "name is too long (maximum is 50
+// characters)" above it.
+const githubLabelNameMaxLen = 50
+
+// hiveHoldLabelHashLen is the hex length of the FNV-1a digest appended to a
+// truncated hive id so two hives whose ids share a long prefix never collide
+// on the same hold label.
+const hiveHoldLabelHashLen = 8
+
+// CanonicalHiveHoldLabel is the exact label the dashboard Hold button writes
+// and every hold reader matches exactly: hive-pause/<hive-id>, or "hold" for
+// a hive without an id.
+//
+// The result always fits GitHub's 50-character label-name cap. A hosted hive
+// id such as hosted-available-oke-11-placeholder-r05x (40 chars) makes the
+// plain spelling 51 chars; GitHub rejects creating it with 422, so Hold on
+// that hive could never write its label and the dashboard reported "hive
+// unavailable" (hivecommons/hive#17037). Over the cap the id is truncated
+// and suffixed with a short hash of the full id, so the name stays unique
+// per hive and stable across restarts.
 func CanonicalHiveHoldLabel(hiveID string) string {
 	hiveID = strings.TrimSpace(hiveID)
 	if hiveID == "" {
@@ -3563,7 +4090,15 @@ func CanonicalHiveHoldLabel(hiveID string) string {
 	// Avoid "hold" in this hive-scoped spelling: generic hold labels are
 	// substring-matched for backwards compatibility, while this label must be
 	// matched exactly so hive/<id> can stay provenance-only.
-	return "hive-pause/" + hiveID
+	label := HiveHoldLabelPrefix + hiveID
+	if len(label) <= githubLabelNameMaxLen {
+		return label
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(hiveID))
+	digest := fmt.Sprintf("%08x", h.Sum32())[:hiveHoldLabelHashLen]
+	keep := githubLabelNameMaxLen - len(HiveHoldLabelPrefix) - 1 - hiveHoldLabelHashLen
+	return HiveHoldLabelPrefix + strings.TrimRight(hiveID[:keep], "-") + "-" + digest
 }
 
 // HiveProvenanceLabel is the retired hive/<hive-id> label
@@ -3759,6 +4294,23 @@ func (c *Client) isExempt(labels []string) bool {
 	return HasExemptLabel(labels, c.exemptLabels)
 }
 
+// isDraftExemptOnlyByWIPMirror reports whether a draft PR's exemption comes
+// solely from prow's do-not-merge/work-in-progress mirror label. Such a draft
+// must fall through to the draft branch so the stale-draft rule can still
+// surface it; any other exempt label keeps the PR filtered (#16246).
+func (c *Client) isDraftExemptOnlyByWIPMirror(draft bool, labels []string) bool {
+	if !draft {
+		return false
+	}
+	rest := make([]string, 0, len(labels))
+	for _, l := range labels {
+		if !strings.EqualFold(l, wipMirrorLabel) {
+			rest = append(rest, l)
+		}
+	}
+	return len(rest) != len(labels) && !c.isExempt(rest)
+}
+
 func HasExemptLabel(labels, exemptLabels []string) bool {
 	for _, label := range labels {
 		for _, perm := range PermanentExemptLabels {
@@ -3841,7 +4393,10 @@ func IsTrackerIssue(title string, labels []string, body string) bool {
 	if len(trackerTaskListRe.FindAllString(body, trackerTaskListMin)) >= trackerTaskListMin {
 		return true
 	}
-	return false
+	// A Spek-published RFC (spektacular#114) is the umbrella by
+	// construction: its publish marker carries no `task=`, and its children
+	// are the work.
+	return spekmarker.IsUmbrella(body)
 }
 
 func isTracker(title string, labels []string, body string) bool {
@@ -3909,7 +4464,22 @@ type ETagCacheInfo struct {
 	Hits    int64 `json:"hits"`
 	Misses  int64 `json:"misses"`
 	Entries int64 `json:"entries"`
+	// Bytes / MaxBytes / MaxEntries show the fill level of a size-bounded
+	// cache so an operator can see eviction pressure, and Evictions how many
+	// entries the bounds pushed out (ETagCacheSnapshot). The PR detail cache
+	// has no byte bound and leaves them zero.
+	Bytes      int64 `json:"bytes,omitempty"`
+	MaxBytes   int64 `json:"max_bytes,omitempty"`
+	MaxEntries int64 `json:"max_entries,omitempty"`
+	Evictions  int64 `json:"evictions,omitempty"`
 }
+
+// etagCacheInfo snapshots the shared ETag cache's counters and fill level.
+func etagCacheInfo() ETagCacheInfo { return ETagCacheSnapshot() }
+
+// ETagCacheInfoSnapshot is etagCacheInfo for callers outside the package
+// that assemble their own RateLimitInfo (the hub's token-less poller).
+func ETagCacheInfoSnapshot() ETagCacheInfo { return etagCacheInfo() }
 
 type RateLimitEntry struct {
 	Limit     int       `json:"limit"`
@@ -3962,6 +4532,11 @@ func (c *Client) RateLimits(ctx context.Context) (*RateLimitInfo, error) {
 	// See ratelimit_window.go for the mechanism and why the obvious
 	// reset-based clamp does not work.
 	info.Core = c.rateLimits.observe("core", info.Core)
+	// The hive's own responses, not this one sample, say which core window is
+	// being spent and keep observed_at moving (rateLimitTracker.adopt).
+	if ev, ok := coreRateLimitEvidence(); ok && c.rateLimits.clock().Before(ev.Reset) {
+		info.Core = c.rateLimits.adopt("core", ev)
+	}
 	info.Search = c.rateLimits.observe("search", info.Search)
 	info.GraphQL = c.rateLimits.observe("graphql", info.GraphQL)
 	if c != nil {
@@ -3972,9 +4547,8 @@ func (c *Client) RateLimits(ctx context.Context) (*RateLimitInfo, error) {
 		info.GraphQLPRBatch = c.prBatchStats
 		c.prBatchMu.Unlock()
 	}
-	hits, misses, entries := ETagCacheStats()
-	info.ETagCache = ETagCacheInfo{Hits: hits, Misses: misses, Entries: entries}
-	hits, misses, entries = PRDetailCacheStats()
+	info.ETagCache = etagCacheInfo()
+	hits, misses, entries := PRDetailCacheStats()
 	info.PRDetailCache = ETagCacheInfo{Hits: hits, Misses: misses, Entries: entries}
 	info.Webhooks = WebhookHealthSnapshot()
 	info.TopConsumers = RESTTopConsumers(10)
@@ -4608,9 +5182,21 @@ func (c *Client) RecordPRMergedAudit(repo string, number int, method, sha, path 
 	// Every merge path ends here, so this is where the merged head's evidence
 	// bundle gains its merge event and the PR gets its evidence pointer.
 	c.recordReviewEvidenceMerge(repo, number, method, sha, path, credit.Logins())
-	// A successful App merge on any path proves the repo is mergeable, so
-	// retire its "merge blocked" alerts (#11924).
-	c.clearMergeFailureAlertsForRepo(repo)
+	// A merge resolves this PR's blockers and proven repository-level causes,
+	// not another PR's required checks or review/head-specific conditions.
+	c.clearMergeFailureAlertsAfterMerge(repo, number, method)
+}
+
+// RecordWorkflowLabelRemoved records the deletion of a workflow model's
+// stale label from repo (automerge's label garbage collection,
+// hivecommons/hive#17620). model is the binding that made it stale
+// (name@version) or "unbound".
+func (c *Client) RecordWorkflowLabelRemoved(repo, label, model string) {
+	if c == nil {
+		return
+	}
+	c.recordWriteAudit(AuditActionWorkflowLabelRemoved, InvocationMeta{Agent: AttributionAgentGovernor},
+		WriteTarget{Repo: repo}, "label", label, "workflow", model)
 }
 
 // RepoWorkBreakdown explains the raw open issue and PR totals for one
@@ -4652,6 +5238,10 @@ type RepoWorkPR struct {
 	Reason         string    `json:"reason,omitempty"`
 	// BaseRef is the target branch, retained for the covering-PR chip.
 	BaseRef string `json:"base_ref,omitempty"`
+	// HeadSHA is the PR's head commit from the list payload, so the activity
+	// monitor can match webhook-delivered CI evidence to a sidelined row
+	// (hivecommons/hive#16521).
+	HeadSHA string `json:"head_sha,omitempty"`
 	// LinkedIssues mirrors PullRequest.LinkedIssues so a sidelined PR can
 	// still stand under the issue its `Fixes #N` names in the activity
 	// monitor. Stamped by EnrichReviewSignalsAndWorkPRs, not by the
@@ -4683,6 +5273,7 @@ func (c *Client) repoWorkPR(repo string, pr *gh.PullRequest, labels []string, hi
 		UpdatedAt:      pr.GetUpdatedAt().Time,
 		URL:            pr.GetHTMLURL(),
 		BaseRef:        prBaseRef(pr),
+		HeadSHA:        prHeadSHA(pr),
 		Bucket:         bucket,
 		Reason:         reason,
 		// The list payload carries the body, so the soft issue links cost
@@ -4697,8 +5288,10 @@ type RepoWorkIssue struct {
 	Title     string          `json:"title"`
 	OwnerStep *IssueOwnerStep `json:"owner_step,omitempty"`
 	Author    string          `json:"author,omitempty"`
-	Labels    []string        `json:"labels,omitempty"`
-	Assignees []string        `json:"assignees,omitempty"`
+	// AuthorIsHuman carries the same reporter classification as Issue.
+	AuthorIsHuman bool     `json:"author_is_human,omitempty"`
+	Labels        []string `json:"labels,omitempty"`
+	Assignees     []string `json:"assignees,omitempty"`
 	// HumanAcknowledged carries the issue's human acknowledgement so the
 	// your-turn decision can honour it on non-actionable rows.
 	HumanAcknowledged bool      `json:"human_acknowledged,omitempty"`
@@ -4709,12 +5302,18 @@ type RepoWorkIssue struct {
 	Reason            string    `json:"reason,omitempty"`
 	// ReporterConfirmationGate mirrors Issue.ReporterConfirmationGate.
 	ReporterConfirmationGate bool `json:"reporter_confirmation_gate,omitempty"`
+	// CitedLinesGone names the citation ("path:163") of an agent finding the
+	// issue filter refuses when every permalink it cites is gone from the
+	// default branch (issue_cited_lines.go); "" when any is still there or
+	// it was not checked.
+	CitedLinesGone string `json:"cited_lines_gone,omitempty"`
 	// ClaimKind, ClaimedBy and ClaimPRStarted are Issue.ClaimKind /
 	// Issue.ClaimedBy / Issue.ClaimPRStarted, copied for the issue stage
 	// reconciler.
 	ClaimKind      string `json:"claim_kind,omitempty"`
 	ClaimedBy      string `json:"claimed_by,omitempty"`
 	ClaimPRStarted bool   `json:"claim_pr_started,omitempty"`
+	ClaimHive      string `json:"claim_hive,omitempty"`
 	// LinkedPRs and ClaimContext carry the PR-claim evidence of an issue the
 	// duplicate-PR guard suppressed into the claimed_by_pr bucket
 	// (hivecommons/hive#12144), so the repo card can render the same
@@ -4742,6 +5341,14 @@ type RepoWorkIssue struct {
 	// (liftBlockedMarkerless).
 	ReviewBacklog bool `json:"review_backlog,omitempty"`
 	OpenBlockedBy int  `json:"open_blocked_by,omitempty"`
+	// OpenBlockers are the keys ("repo#N") of a decision park's open
+	// blocked-by issues, read only for such a park; the dashboard checks
+	// whether one is itself a decision park (Issue.OpenBlockers).
+	OpenBlockers []string `json:"open_blockers,omitempty"`
+	// Advisory is the body-derived advisory classification (dedupe
+	// checklist marker, "Decision required: no"), read here because the
+	// body itself is not carried (hivecommons/hive#15381).
+	Advisory *IssueAdvisory `json:"advisory,omitempty"`
 }
 
 func repoWorkIssueFromIssue(issue Issue, bucket, reason string) RepoWorkIssue {
@@ -4752,6 +5359,7 @@ func repoWorkIssueFromIssue(issue Issue, bucket, reason string) RepoWorkIssue {
 		Title:             issue.Title,
 		OwnerStep:         issue.OwnerStep,
 		Author:            issue.Author,
+		AuthorIsHuman:     issue.AuthorIsHuman,
 		Labels:            append([]string(nil), issue.Labels...),
 		Assignees:         append([]string(nil), issue.Assignees...),
 		HumanAcknowledged: issue.HumanAcknowledged,
@@ -4765,11 +5373,13 @@ func repoWorkIssueFromIssue(issue Issue, bucket, reason string) RepoWorkIssue {
 		ClaimKind:                issue.ClaimKind,
 		ClaimedBy:                issue.ClaimedBy,
 		ClaimPRStarted:           issue.ClaimPRStarted,
+		ClaimHive:                issue.ClaimHive,
 		LinkedPRs:                append([]IssueLinkedPR(nil), issue.LinkedPRs...),
 		ClaimContext:             issue.ClaimContext,
 		Children:                 issue.Children,
 		TrackerProgress:          progress,
 		IsTracker:                RendersAsTracker(issue.IsTracker, issue.Labels, progress),
+		Advisory:                 IssueAdvisoryFromBody(issue.Body),
 	}
 }
 
@@ -4790,6 +5400,9 @@ func appendRepoWorkIssueDetail(result *ActionableResult, issue Issue, bucket, re
 func (c *Client) workIssue(repo string, issue *gh.Issue, labels []string, bucket, reason string) RepoWorkIssue {
 	out := c.repoWorkIssueAcked(repo, issue, labels, bucket, reason)
 	out.ReporterConfirmationGate = c.reporterConfirmationGateApplies(issue)
+	if issue != nil {
+		out.AuthorIsHuman = c.isHumanAuthor(issue.GetUser())
+	}
 	return out
 }
 
@@ -4820,6 +5433,7 @@ func (c *Client) repoWorkIssue(repo string, issue *gh.Issue, labels []string, bu
 		TrackerProgress: progress,
 		Bucket:          bucket,
 		Reason:          reason,
+		Advisory:        IssueAdvisoryFromBody(issue.GetBody()),
 	}
 }
 

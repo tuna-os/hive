@@ -6,6 +6,8 @@ import (
 	"unicode"
 
 	gh "github.com/google/go-github/v72/github"
+
+	"github.com/hivecommons/hive/pkg/delegatedecision"
 )
 
 // unparkOwnerStepMarker tags a body the hive posted with `hive-open-issue
@@ -37,6 +39,10 @@ type unparkMenu struct {
 	// optionSource is the html_url of the hive comment the options came
 	// from; "" when they came from the issue body.
 	optionSource string
+	// optionsFromBody is true when options came from the issue body rather
+	// than a hive comment. It is the provenance signal, not optionSource:
+	// a comment read without its html_url still carries hive-authored text.
+	optionsFromBody bool
 	// recommended is the option the text recommends, or "" when none is named.
 	recommended string
 	// hasRecommendation is true when the issue states a recommendation.
@@ -44,10 +50,35 @@ type unparkMenu struct {
 	// ownerStep is true when the issue is parked on a step only the owner can
 	// do, so `/hive done` is offered.
 	ownerStep bool
+	// landedBy is the merged PR a park re-check note says landed the change
+	// this issue asks for (parkRecheckLandedBy); `/fixed` is then the reply
+	// offered first.
+	landedBy string
 	// releaseStep is the typed release proposal. The repo policy decides
 	// whether `/hive approve` may execute it; without that opt-in it remains
 	// descriptive metadata and the legacy manual-step menu is unchanged.
 	releaseStep *IssueOwnerStep
+	// asksDone is true when the owner-step text itself asks the owner to
+	// reply `/hive done`; that reply is then the recommended one.
+	asksDone bool
+	// approveAnswered is true when an accepted `/hive approve` already
+	// answered this same owner step and the hive parked it again: approving
+	// did not do the step, so the menu recommends `/hive done` and offers
+	// no `/hive approve` (Danathar/goodreads-mcp#443).
+	approveAnswered bool
+}
+
+// doneRecommended reports whether `/hive done` is the recommended reply:
+// the issue waits on an owner step that either asks for `/hive done` or
+// was already approved once without being done.
+func (m unparkMenu) doneRecommended() bool {
+	return m.ownerStep && (m.asksDone || m.approveAnswered)
+}
+
+// unparkAsksDone reports whether park text asks the owner to reply
+// `/hive done`.
+func unparkAsksDone(text string) bool {
+	return strings.Contains(strings.ToLower(text), "/hive done")
 }
 
 // unparkMenuFromBody reads the menu from the issue body alone. An issue
@@ -55,6 +86,7 @@ type unparkMenu struct {
 // marker in its body; it is an owner step when it lists no options.
 func unparkMenuFromBody(issueBody string) unparkMenu {
 	m := unparkMenu{options: unparkOptionLabels(issueBody), optionText: unparkOptionTexts(issueBody)}
+	m.optionsFromBody = len(m.options) > 0
 	m.hasRecommendation = unparkMentionsRecommendation(issueBody)
 	if m.hasRecommendation {
 		m.recommended = unparkRecommendedOption(issueBody, m.options)
@@ -62,6 +94,7 @@ func unparkMenuFromBody(issueBody string) unparkMenu {
 	m.ownerStep = isUnparkOwnerStepText(issueBody)
 	if m.ownerStep {
 		m.releaseStep = parseIssueOwnerStep(issueBody)
+		m.asksDone = unparkAsksDone(issueBody)
 	}
 	return m
 }
@@ -81,18 +114,38 @@ func isUnparkOwnerStepText(text string) bool {
 // recommended option is read from the newest text that states a
 // recommendation, so a body-level recommendation is never pinned onto
 // options a later comment listed.
+//
+// An owner step the hive parks again after an accepted reply answered the
+// earlier ask is read from its own text: the earlier options and
+// recommendation were answered, so they do not carry over. When the
+// accepted reply was a `/hive approve` on the same owner step, approving did
+// not do it, and the menu says so (approveAnswered).
 func (c *Client) unparkMenuFor(issueBody string, issueAuthor *gh.User, comments []*gh.IssueComment) unparkMenu {
 	m := unparkMenuFromBody(issueBody)
 	if !c.isHiveAccount(issueAuthor) {
 		// Only a hive-authored body can park the issue on an owner step; the
 		// author of any other issue could otherwise edit the marker in.
-		m.ownerStep, m.releaseStep = false, nil
+		m.ownerStep, m.releaseStep, m.asksDone = false, nil, false
 	}
 	recommendationSource := ""
 	if m.hasRecommendation {
 		recommendationSource = issueBody
 	}
 	ownerStep := m.ownerStep
+	// pendingStep is the marker of the newest unanswered owner step;
+	// approvedStep is the marker of the owner step an accepted `/hive
+	// approve` answered. answered is true from an accepted reply until the
+	// next owner-step park.
+	pendingStep, approvedStep, answered := "", "", false
+	if ownerStep {
+		pendingStep = ownerStepMarkerRE.FindString(issueBody)
+	}
+	byID := make(map[int64]*gh.IssueComment, len(comments))
+	for _, cm := range comments {
+		if cm != nil && cm.GetID() != 0 {
+			byID[cm.GetID()] = cm
+		}
+	}
 	for _, cm := range comments {
 		if cm == nil || !c.isHiveAccount(cm.GetUser()) {
 			continue
@@ -102,8 +155,19 @@ func (c *Client) unparkMenuFor(issueBody string, issueAuthor *gh.User, comments 
 			// Accepted command replies and dashboard release replies both
 			// answer the step. Only command replies carry a per-comment
 			// unparkReplyMarkerPrefix.
-			ownerStep = false
+			if ownerStep && pendingStep != "" && c.unparkReplyAnswersApprove(body, byID) {
+				approvedStep = pendingStep
+			}
+			ownerStep, pendingStep, answered = false, "", true
 			m.releaseStep = nil
+			m.asksDone, m.approveAnswered = false, false
+			m.landedBy = ""
+			continue
+		}
+		if strings.Contains(body, parkRecheckMarker) {
+			// The re-check note is not park text: it names no options and
+			// states no recommendation, but it may say the change landed.
+			m.landedBy = parkRecheckLandedBy(body)
 			continue
 		}
 		if strings.Contains(body, unparkReplyMarkerPrefix) {
@@ -111,20 +175,50 @@ func (c *Client) unparkMenuFor(issueBody string, issueAuthor *gh.User, comments 
 			// the owner step open.
 			continue
 		}
+		if strings.Contains(body, parkWithdrawnMarkerPrefix) {
+			// The agent took its ask back: its options and recommendation
+			// go with it, so a later park starts from its own text.
+			ownerStep, pendingStep = false, ""
+			m.releaseStep = nil
+			m.asksDone, m.approveAnswered = false, false
+			m.options, m.optionText, m.optionSource, m.optionsFromBody = nil, nil, "", false
+			m.hasRecommendation, recommendationSource = false, ""
+			continue
+		}
 		if strings.Contains(body, unparkNoticeMarker) {
+			continue
+		}
+		if delegatedecision.IsDelegatedComment(body) {
+			// The delegate's verdict on the park, not the park's own text:
+			// a recommend-only "hive recommends: …" must not replace the
+			// option the issue recommends, or `/hive approve` would switch
+			// from "option A" to an unnamed recommendation between two
+			// notices (Danathar/goodreads-mcp#440).
 			continue
 		}
 		if hasOwnerStepMarker(body) {
 			ownerStep = isUnparkOwnerStepText(body)
 			m.releaseStep = nil
+			m.asksDone, m.approveAnswered, pendingStep = false, false, ""
 			if ownerStep {
 				m.releaseStep = parseIssueOwnerStep(body)
+				pendingStep = ownerStepMarkerRE.FindString(body)
+				m.asksDone = unparkAsksDone(body)
+				m.approveAnswered = approvedStep != "" && pendingStep == approvedStep
+				if answered {
+					// A re-park after an answered ask: what was answered
+					// does not carry over to the new step.
+					m.options, m.optionText, m.optionSource, m.optionsFromBody = nil, nil, "", false
+					m.hasRecommendation, recommendationSource = false, ""
+				}
 			}
+			answered = false
 		}
 		if opts := unparkOptionLabels(body); len(opts) > 0 {
 			m.options = opts
 			m.optionText = unparkOptionTexts(body)
 			m.optionSource = cm.GetHTMLURL()
+			m.optionsFromBody = false
 		}
 		if unparkMentionsRecommendation(body) {
 			m.hasRecommendation, recommendationSource = true, body
@@ -157,45 +251,99 @@ func (m unparkMenu) bullets() string {
 	return m.bulletsFor(false)
 }
 
+// unparkReply is one command the "What to reply" block offers.
+type unparkReply struct {
+	command, does string
+	recommended   bool
+}
+
 // bulletsFor lists the commands after applying the repository's release policy.
 func (m unparkMenu) bulletsFor(releaseOnApprove bool) string {
-	var b strings.Builder
+	return renderUnparkReplies(m.replies(releaseOnApprove))
+}
+
+func (m unparkMenu) replies(releaseOnApprove bool) []unparkReply {
+	var out []unparkReply
+	add := func(command, does string, recommended bool) {
+		// When the change already landed, closing the issue is the one
+		// recommended reply; the park's own recommendation predates it.
+		out = append(out, unparkReply{command: command, does: does, recommended: recommended && m.landedBy == ""})
+	}
+	if m.landedBy != "" {
+		out = append(out, unparkReply{command: "/fixed", does: "the change this issue asks for already landed in " + m.landedBy + "; close it as completed", recommended: true})
+	}
+	doneFirst := m.doneRecommended()
 	if m.ownerStep {
-		fmt.Fprintln(&b, "- `/hive done`: you did the step only you can do; Hive re-checks it and closes the issue once it is verified")
+		add("/hive done", "you did the step only you can do; Hive re-checks it and closes the issue once it is verified", doneFirst)
+	}
+	// addApprove offers `/hive approve`; it is never the recommended reply
+	// when `/hive done` is.
+	addApprove := func(does string, recommended bool) {
+		add("/hive approve", does, recommended && !doneFirst)
 	}
 	switch {
 	case releaseOnApprove && m.releaseStep != nil:
-		fmt.Fprintf(&b, "- `/hive approve`: Hive creates release `%s` from `%s`\n", m.releaseStep.Tag, m.releaseStep.Target)
-		fmt.Fprintln(&b, "- `/hive decision <your instructions>`: go ahead, following your instructions")
+		add("/hive approve", fmt.Sprintf("Hive creates release `%s` from `%s`", m.releaseStep.Tag, m.releaseStep.Target), false)
+		add("/hive decision <your instructions>", "go ahead, following your instructions", false)
+	case m.ownerStep && m.approveAnswered:
+		// `/hive approve` already answered this step and did not do it.
+		add("/hive decision <your instructions>", "go ahead, following your instructions", false)
 	case len(m.options) > 0 && m.recommended != "":
-		fmt.Fprintf(&b, "- `/hive approve`: go with the recommendation (option %s)%s\n", m.recommended, m.summaryFor(m.recommended))
+		addApprove("go with the recommendation (option "+m.recommended+")"+m.summaryFor(m.recommended), true)
 		for _, opt := range m.options {
 			if opt == m.recommended {
 				continue
 			}
-			fmt.Fprintf(&b, "- `/hive decision %s`: go with option %s%s\n", opt, opt, m.summaryFor(opt))
+			add("/hive decision "+opt, "go with option "+opt+m.summaryFor(opt), false)
 		}
 	case len(m.options) > 0 && m.hasRecommendation:
 		// A recommendation is stated but names none of the listed options,
 		// so no option is attributed to it; every option stays an explicit
 		// decision.
-		fmt.Fprintln(&b, "- `/hive approve`: go with the recommendation")
+		addApprove("go with the recommendation", true)
 		for _, opt := range m.options {
-			fmt.Fprintf(&b, "- `/hive decision %s`: go with option %s%s\n", opt, opt, m.summaryFor(opt))
+			add("/hive decision "+opt, "go with option "+opt+m.summaryFor(opt), false)
 		}
 	case len(m.options) > 0:
 		first := m.options[0]
-		fmt.Fprintf(&b, "- `/hive approve`: go with option %s%s\n", first, m.summaryFor(first))
+		addApprove("go with option "+first+m.summaryFor(first), false)
 		for _, opt := range m.options[1:] {
-			fmt.Fprintf(&b, "- `/hive decision %s`: go with option %s%s\n", opt, opt, m.summaryFor(opt))
+			add("/hive decision "+opt, "go with option "+opt+m.summaryFor(opt), false)
 		}
 	case m.hasRecommendation:
-		fmt.Fprintln(&b, "- `/hive approve`: go with the recommendation")
-		fmt.Fprintln(&b, "- `/hive decision <your instructions>`: go ahead, following your instructions")
+		addApprove("go with the recommendation", true)
+		add("/hive decision <your instructions>", "go ahead, following your instructions", false)
 	default:
-		fmt.Fprintln(&b, "- `/hive decision <your instructions>`: go ahead, following your instructions")
+		add("/hive decision <your instructions>", "go ahead, following your instructions", false)
 	}
-	fmt.Fprintln(&b, "- `/hive help`: show these again")
+	add("/hive help", "show these again", false)
+	return out
+}
+
+// renderUnparkReplies renders one bullet per command, the recommended
+// reply, when there is one, in bold.
+func renderUnparkReplies(replies []unparkReply) string {
+	var b strings.Builder
+	for _, r := range replies {
+		if r.recommended {
+			fmt.Fprintf(&b, "- **`%s` → %s (recommended)**\n", r.command, r.does)
+			continue
+		}
+		fmt.Fprintf(&b, "- `%s` → %s\n", r.command, r.does)
+	}
+	return b.String()
+}
+
+// unparkReplyBox renders title, the options' source line and the commands
+// as a GitHub TIP alert: a green box GitHub themes for light and dark, so
+// the replies stand out at the bottom of the issue.
+func (m unparkMenu) unparkReplyBox(title string, releaseOnApprove bool) string {
+	inner := title + "\n" + m.sourceLine() + m.bulletsFor(releaseOnApprove)
+	var b strings.Builder
+	b.WriteString("> [!TIP]\n")
+	for _, line := range strings.Split(strings.TrimRight(inner, "\n"), "\n") {
+		b.WriteString(strings.TrimRight("> "+line, " ") + "\n")
+	}
 	return b.String()
 }
 
@@ -216,6 +364,12 @@ func (m unparkMenu) approveDecision() (string, bool) {
 	}
 	return "", false
 }
+
+// unparkApproveAnsweredReply answers `/hive approve` on an owner step an
+// earlier `/hive approve` already answered: the hive parked it again because
+// approving does not do a step only the owner can take, so a second approve
+// would only repeat the loop (Danathar/goodreads-mcp#443).
+const unparkApproveAnsweredReply = "`/hive approve` was already accepted for this step, and the hive parked the issue again because approving does not do a step only you can take. The issue stays parked. Do the step the newest park comment names, then reply `/hive done`; or reply `/hive decision <your instructions>` to un-park it with your own instructions, or `/hive help` for the commands."
 
 // unparkApproveNothingReply answers `/hive approve` on a park with no
 // recommendation and no options; the park stays.
@@ -283,6 +437,40 @@ func unparkBoldOptionLetter(line string) string {
 			if strings.HasPrefix(after, sep) {
 				return letter
 			}
+		}
+	}
+	return ""
+}
+
+// unparkPlainOptionAt reads a plain lettered option on a list item or
+// heading, such as "- A: Keep the rule", "* B. text", "+ C) text" or
+// "## D — text". It returns the line from the letter on, or "" when the line
+// is not one. The list marker is required, so a prose "A: yes" answer line or
+// a sentence opening "A." is never read as an option.
+func unparkPlainOptionAt(line string) string {
+	s := strings.TrimSpace(line)
+	switch {
+	case strings.HasPrefix(s, "#"):
+		s = strings.TrimLeft(s, "#")
+	case strings.HasPrefix(s, "-"), strings.HasPrefix(s, "*"), strings.HasPrefix(s, "+"):
+		s = s[1:]
+	default:
+		return ""
+	}
+	if s == "" || (s[0] != ' ' && s[0] != '\t') {
+		return ""
+	}
+	s = strings.TrimLeft(s, " \t")
+	if len(s) < 2 || s[0] < 'A' || s[0] > 'F' {
+		return ""
+	}
+	after := s[1:]
+	if strings.ContainsAny(after[:1], ".:)") && (len(after) == 1 || after[1] == ' ' || after[1] == '\t') {
+		return s
+	}
+	for _, sep := range []string{" — ", " – ", " - "} {
+		if strings.HasPrefix(after, sep) {
+			return s
 		}
 	}
 	return ""

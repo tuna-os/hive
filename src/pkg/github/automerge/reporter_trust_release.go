@@ -64,7 +64,26 @@ func (c *Engine) holdProvenance(ctx context.Context, owner, repo string, number 
 	if notice != nil && !notice.PostedAt.Before(since.Add(-reporterTrustNoticeSlack)) {
 		return notice.Finding.HoldProvenance(since), notice, nil
 	}
+	// The human-merge-path refusal posts its notice once per PR and re-adds
+	// the label on later heads, so its notice explains the hold whenever the
+	// App wrote it (projectbluefin/utah#1097: told "the lane merges on its
+	// next pass" while the notice said a person must merge it).
+	if humanMergePathNoticed(comments, appBot) {
+		return &stagelabels.HoldProvenance{By: stagelabels.HoldByHive, Source: stagelabels.HoldSourceHumanMergePath,
+			Reason: "it changes " + stagelabels.HumanMergePathReason, Since: since}, notice, nil
+	}
 	return &stagelabels.HoldProvenance{By: stagelabels.HoldByHive, Source: stagelabels.HoldSourceLabel, Since: since}, notice, nil
+}
+
+// humanMergePathNoticed reports whether the App posted the human-merge-path
+// hold notice on the thread.
+func humanMergePathNoticed(comments []*gh.IssueComment, appBot string) bool {
+	for _, cm := range comments {
+		if cm != nil && strings.EqualFold(hgithub.SafeGetLogin(cm.GetUser()), appBot) && strings.Contains(cm.GetBody(), hgithub.HumanMergePathMarker) {
+			return true
+		}
+	}
+	return false
 }
 
 // reporterTrustNoticeSlack is how far before the `hold` label event the
@@ -93,6 +112,12 @@ func (c *Engine) listAllIssueComments(ctx context.Context, owner, repo string, n
 // latestHoldLabelEvent returns the newest labeled / unlabeled event for the
 // literal `hold` label, nil when there is none.
 func (c *Engine) latestHoldLabelEvent(ctx context.Context, owner, repo string, number int) (*gh.IssueEvent, error) {
+	return c.latestLabelEvent(ctx, owner, repo, number, "hold")
+}
+
+// latestLabelEvent returns the newest labeled / unlabeled event for the
+// named label, nil when there is none.
+func (c *Engine) latestLabelEvent(ctx context.Context, owner, repo string, number int, name string) (*gh.IssueEvent, error) {
 	var latest *gh.IssueEvent
 	opts := &gh.ListOptions{PerPage: 100}
 	for {
@@ -101,7 +126,7 @@ func (c *Engine) latestHoldLabelEvent(ctx context.Context, owner, repo string, n
 			return nil, fmt.Errorf("listing issue events: %w", err)
 		}
 		for _, event := range events {
-			if event == nil || !strings.EqualFold(event.GetLabel().GetName(), "hold") {
+			if event == nil || !strings.EqualFold(event.GetLabel().GetName(), name) {
 				continue
 			}
 			if event.GetEvent() != "labeled" && event.GetEvent() != "unlabeled" {

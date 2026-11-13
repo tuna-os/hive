@@ -20,10 +20,11 @@ import (
 const (
 	// githubWebhookPath is the PUBLIC path GitHub (or the hub relay) posts App
 	// webhooks to. Not actually open: the handler fails closed without
-	// GITHUB_WEBHOOK_SECRET and verifies X-Hub-Signature-256 over the raw body.
+	// GITHUB_WEBHOOK_SECRET or a hub relay key, and verifies
+	// X-Hub-Signature-256 or the hub relay signature over the raw body.
 	githubWebhookPath = "/api/webhook/github"
 
-	githubWebhookSecretEnvVar = "GITHUB_WEBHOOK_SECRET"
+	githubWebhookSecretEnvVar = github.WebhookSecretEnvVar
 	githubWebhookMaxBodyBytes = 1 << 20
 )
 
@@ -61,7 +62,10 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret := strings.TrimSpace(os.Getenv(githubWebhookSecretEnvVar))
-	if secret == "" {
+	// A hosted spoke holds no App webhook secret; it verifies the hub's relay
+	// signature with this hive's own relay key instead (#17911).
+	relayKey := github.WebhookRelayKey()
+	if secret == "" && relayKey == "" {
 		const msg = "github webhook rejected: no webhook secret configured (set GITHUB_WEBHOOK_SECRET to enable signed webhooks)"
 		warned := false
 		s.webhookNoSecretOnce.Do(func() {
@@ -71,14 +75,28 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		if !warned {
 			s.webhookLogger().Debug(msg)
 		}
+		// Counted like any other rejected delivery so /api/status.webhooks
+		// (mode_reason_code no_secret, rejected_1h, last_rejected_at) and
+		// /api/health/deep say why the spoke is polling; the log stays at one
+		// WARN per process (#13666).
+		github.RecordWebhookDeliveryFailure(github.WebhookReasonNoSecret)
 		jsonError(w, "webhooks disabled: no secret configured", http.StatusServiceUnavailable)
 		return
 	}
-	if !verifyGitHubWebhookSignature(body, r.Header.Get("X-Hub-Signature-256"), secret) {
-		s.webhookLogger().Warn("github webhook signature verification failed", "event", event)
-		github.RecordWebhookDeliveryFailure()
-		jsonError(w, "invalid signature", http.StatusUnauthorized)
-		return
+	if secret == "" || !verifyGitHubWebhookSignature(body, r.Header.Get("X-Hub-Signature-256"), secret) {
+		if relayKey == "" || r.Header.Get(webhookRelaySignatureHeader) == "" {
+			s.webhookLogger().Warn("github webhook signature verification failed", "event", event)
+			github.RecordWebhookDeliveryFailure(github.WebhookReasonSignatureFailed)
+			jsonError(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+		if reason := s.verifyWebhookRelay(r.Header, body, relayKey, time.Now()); reason != "" {
+			s.webhookLogger().Warn("hub-relayed github webhook rejected", "event", event, "reason", reason,
+				"delivery", r.Header.Get("X-GitHub-Delivery"))
+			github.RecordWebhookDeliveryFailure(reason)
+			jsonError(w, "relay rejected: "+reason, http.StatusUnauthorized)
+			return
+		}
 	}
 	if event == githubWebhookEventProjectsV2Item {
 		// Organization-scoped: no repository to resolve, so it never reaches
@@ -97,13 +115,17 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.deps.GHClient.HandleWebhookEvent(event, body)
 	if err != nil {
-		github.RecordWebhookDeliveryFailure()
+		github.RecordWebhookDeliveryFailure(github.WebhookReasonDeliveriesRejected)
 		jsonError(w, "invalid webhook payload", http.StatusBadRequest)
 		return
 	}
 	if !res.KnownRepo {
 		jsonResponse(w, map[string]any{"status": "ignored", "reason": "unknown repository", "event": event})
 		return
+	}
+	s.observeNativeQueueEvent(event, body, receivedAt)
+	if err := s.observeIntegrationWebhook(event, r.Header.Get("X-GitHub-Delivery"), body, receivedAt); err != nil {
+		s.webhookLogger().Error("integration observation not durable", "event", event, "error", err)
 	}
 	// HandleWebhookEvent is the legacy writer: it invalidated the PR cache
 	// and dirtied issues for the next cycle. The forgestate writer records
@@ -125,6 +147,15 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	if reason, ok := webhookWakeReason(event, res); ok && s.deps.WebhookWake != nil {
 		s.deps.WebhookWake(reason)
 		resp["wake"] = reason
+	}
+	if err := s.integrationFailureIdentity(event, body, res.CIFailure); err != nil {
+		s.webhookLogger().Warn("integration failure identity unavailable", "error", err)
+	}
+	if reactions := s.reactToCIFailure(res); len(reactions) > 0 {
+		resp["ci_failure"] = reactions
+	}
+	if res.CIEvidence != nil {
+		resp["ci_evidence"] = res.CIEvidence
 	}
 	if n, ok := sentinelPREventTarget(event, body); ok && s.deps.SentinelPREvent != nil {
 		s.deps.SentinelPREvent(res.ConfiguredRepo, n)

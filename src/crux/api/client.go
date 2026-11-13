@@ -135,6 +135,13 @@ func IsUnauthorized(err error) bool {
 	return errors.As(err, &se) && se.Status == http.StatusUnauthorized
 }
 
+// IsUnavailable reports whether err is a 503 carrying CodeUnavailable: a
+// server that is up but cannot serve.
+func IsUnavailable(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.Status == http.StatusServiceUnavailable && se.Body.Code == CodeUnavailable
+}
+
 // Health is GET /v1/health.
 func (c *Client) Health(ctx context.Context) (Health, error) {
 	var out Health
@@ -183,9 +190,22 @@ func (c *Client) Logs(ctx context.Context, name, source string, lines int) (Logs
 // FollowLogs is GET /v1/agents/{name}/logs?follow=1: fn is called with
 // each chunk of new lines until ctx ends, the server closes the stream, or
 // fn returns an error (which is returned). A terminal api.EventState record
-// (the server lost the agent's output) is returned as an error.
+// (the server lost the agent's output) is returned as an error. The server
+// first replays its default window of buffered lines.
 func (c *Client) FollowLogs(ctx context.Context, name string, fn func(LogChunk) error) error {
-	return c.stream(ctx, LogsPath(url.PathEscape(name))+"?"+QueryFollow+"=1", func(typ string, data []byte) error {
+	return c.FollowLogsLines(ctx, name, -1, fn)
+}
+
+// FollowLogsLines is FollowLogs with the initial replay bounded to the last
+// lines buffered lines (sent as n; 0 streams only new lines). A negative
+// lines leaves the server's default window.
+func (c *Client) FollowLogsLines(ctx context.Context, name string, lines int, fn func(LogChunk) error) error {
+	q := url.Values{}
+	q.Set(QueryFollow, "1")
+	if lines >= 0 {
+		q.Set(QueryLines, strconv.Itoa(lines))
+	}
+	return c.stream(ctx, LogsPath(url.PathEscape(name))+"?"+q.Encode(), func(typ string, data []byte) error {
 		switch typ {
 		case EventLog:
 			var chunk LogChunk
@@ -266,7 +286,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	if err := checkStatus(resp); err != nil {
 		return err
 	}
-	if out == nil {
+	if out == nil || resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -345,21 +365,33 @@ func (a Address) target() string {
 }
 
 // WaitReady polls GET /v1/health until it answers or ctx ends; it is for a
-// caller that just started `crux serve` and needs to know when to begin.
+// caller that just started `crux serve` and needs to know when to begin. A
+// 401 or a 503 unavailable verdict (the server is up but cannot serve, e.g.
+// "tmux not found on PATH") returns at once. On any other failure it keeps
+// polling, and when ctx ends the error wraps ctx.Err() and names the last
+// health answer.
 func (c *Client) WaitReady(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		interval = 100 * time.Millisecond
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	var lastErr error
 	for {
 		if _, err := c.Health(ctx); err == nil {
 			return nil
-		} else if IsUnauthorized(err) {
+		} else if IsUnauthorized(err) || IsUnavailable(err) {
 			return err
+		} else if ctx.Err() == nil || lastErr == nil {
+			// A probe cut short by ctx ending is not a health answer; keep
+			// the last real one so the deadline error still names it.
+			lastErr = err
 		}
 		select {
 		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("%w (last health answer: %v)", ctx.Err(), lastErr)
+			}
 			return ctx.Err()
 		case <-t.C:
 		}

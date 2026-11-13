@@ -83,6 +83,13 @@ type ParkFacts struct {
 	HumanOnlyReason   string // lane rule unrelated to trust (workflow edits, tests removed, …)
 	ApprovedDirection bool   // /hive approve|decision recorded; un-park keeps needs-human (#12715)
 	DecisionQuestion  string
+	// DecisionSuperseded says a newer `/hive decision` with different text
+	// is on the timeline after the recorded one: direction is changing, so
+	// the `approved-direction` the issue still wears is stale and a
+	// `needs-human` park re-derives 045 with the ack cleared instead of
+	// standing down on it (FactSink.ReparkedOnNewDecision;
+	// hivecommons/hive#16579).
+	DecisionSuperseded bool
 }
 
 // AdoptionFacts is the stage-074 ownership state of a contributor PR.
@@ -113,6 +120,12 @@ const (
 	// (#9665) holds out until a maintainer adds the triage label; it
 	// derives 015-triage-needed.
 	BucketReporterTriage IssueBucket = "reporter_triage"
+	// BucketDependencyDashboard and BucketHiveAdvisory are the standing meta
+	// issues (a bot's Dependency Dashboard, the hive's own advisory report):
+	// structurally not work, so they derive no stage at all — not even 045
+	// from a `needs-human` a triage bot put on them.
+	BucketDependencyDashboard IssueBucket = "dependency_dashboard"
+	BucketHiveAdvisory        IssueBucket = "hive_advisory"
 )
 
 // IssueFacts is the issue-side evidence.
@@ -151,9 +164,34 @@ type IssueFacts struct {
 	// NeedsHumanLabel names the needs-human label when Park.NeedsHuman is
 	// set (the reason cites it).
 	NeedsHumanLabel string
+	// Blocker is the structured blocker kind recorded on the issue
+	// (pkg/blocker: "capability:workflows-permission", …), "" when none.
+	// A parked issue with a blocker stays 045 whatever direction a person
+	// gave: no decision grants the App a permission
+	// (hivecommons/hive#15099).
+	Blocker string
+	// BlockerShort is the blocker's pill text ("App lacks workflows
+	// permission") for the reason.
+	BlockerShort string
+	// ApprovedDirectionLabel is the `approved-direction` label the issue
+	// wears (a recorded /hive approve|decision), "" when absent. Next to
+	// `needs-human` and a structured Blocker it is the stale one and the
+	// writer clears it (hivecommons/hive#15099); next to a plain
+	// `needs-human` the decision stands and the remainder is held for a
+	// person out of the pipeline, not re-parked at 045
+	// (hivecommons/hive#16579) — unless Park.DecisionSuperseded says a
+	// newer, different decision is pending, when the ack is stale again
+	// and the park re-derives 045 with it cleared.
+	ApprovedDirectionLabel string
 	// UmbrellaLabel is the never-claim label the issue carries
 	// (governor.claims.never_claim_labels, default `epic`).
 	UmbrellaLabel string
+	// DiscussionLabel is the proposal / design label the issue carries
+	// (`proposal`, `kind/design`), "" when it carries none. An unclaimed
+	// issue wearing one derives 018-open-for-discussion instead of
+	// 010/015; a live claim or covering PR stages it as on any issue
+	// (hivecommons/hive#17150).
+	DiscussionLabel string
 	// TriageAwaiting is why an actionable issue is still untriaged (015):
 	// the reporter-trust awaiting label it carries or the gate's
 	// reporter_triage bucket.
@@ -270,6 +308,37 @@ type PRPassFacts struct {
 	// fixing stage but the reason names the failed replay, not the
 	// generic conflict, so the owner sees why the copy never opened.
 	AdoptionRefusedReason string
+	// RebaseFailedTwice is set on the hive's own adoption copy when it
+	// still conflicts after the fixer's two rebase-resolve attempts: the
+	// PR reads 085 with stagelabels.LaneReasonRebaseFailedTwice so a
+	// person decides (hivecommons/hive#15307).
+	RebaseFailedTwice bool
+	// BotAuthorFinding is the PR author's login when another bot opened
+	// the PR and the reviewer asked for changes on its head: the PR reads
+	// 085 with stagelabels.LaneReasonBotAuthorFinding instead of returning
+	// to an author that cannot act on a review.
+	BotAuthorFinding string
+	// FixerExhausted is the attempt count when the review fix dispatcher
+	// refuses another fix for this hive-authored PR because the
+	// re-engagement cap is spent: the PR reads 085 with
+	// stagelabels.FixerExhaustedReason(n) so a person decides instead of
+	// the row claiming "Fixing" with nobody on it (hivecommons/hive#15744).
+	FixerExhausted int
+	// Reauthoring is the issue the hive is re-authoring this PR for after
+	// its fixer gave up: the PR is closed as superseded and a fresh hive
+	// PR opens for that issue from the current base, so the PR stays on
+	// its fixing stage with stagelabels.ReauthoringReason(issue) rather
+	// than parking at 085 (a hive agent's PR needs no re-author pill).
+	// Zero when no re-author is under way.
+	Reauthoring int
+	// RecoveryUnauthorized is an observed exact-head CI recovery permission
+	// refusal. It parks the item without treating infrastructure as source work.
+	RecoveryUnauthorized string
+	// FixerExcluded is true when no fix job is active and the dispatcher
+	// bars one for any reason (exhausted, no enabled fixer, …): a stale
+	// answered decision on the same head must not pull the PR back from
+	// 085 to 070 and strip stage/stalled (hivecommons/hive#15744).
+	FixerExcluded bool
 	// Stalled is the pass's dwell verdict (stagelabels.StalledWith over the
 	// store record after this pass's Observe); KindLabels are the
 	// configured author/<kind> names. Both are outputs of the pass the
@@ -285,6 +354,9 @@ type PriorStage struct {
 	Stage        stagelabels.Stage
 	Reason       string
 	ActivityHead string
+	// AdmittedHead is the head a trusted person admitted (`/hive decision
+	// approve`); it releases a same-head 085 hold (#16974).
+	AdmittedHead string
 }
 
 // ReviewFacts is THE "what counts as reviewed" fact (ADR-0025 Decision §6).

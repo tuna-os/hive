@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/github"
 )
 
@@ -56,6 +57,7 @@ func (s *Scheduler) buildScannerMessage(issues []github.Issue, actionable *githu
 				tier, issue.ModelRec,
 				strings.Join(issue.Labels, ","),
 				title, tracker))
+			b.WriteString(spekPublishedContext(issue))
 			shown++
 		}
 	}
@@ -240,9 +242,9 @@ func (s *Scheduler) ghAuthInstructions() string {
       --body "<body citing the issue>" --issues <N>
   --body-file <path> is accepted in place of --body, exactly as gh accepts it.
   Title convention (the repo's required "PR Type" check reads the first
-  character): ✨ feature, 🐛 fix, 📖 docs, 📝 proposal, ⚠️ breaking, 🌱 chore/other.
-  A docs PR is "📖 docs: …" — 📝 is for proposals only, and the hive corrects an
-  emoji that contradicts the type ("📝 docs:" → "📖 docs:") when it opens the PR.
+  character): ✨ feature, 🐛 fix, 📖 docs/proposal, ⚠️ breaking, 🌱 chore/other.
+  A docs PR is "📖 docs: …" and a proposal is "📖 proposal: …"; the hive corrects
+  an emoji that contradicts the type ("📝 proposal:" → "📖 proposal:") when it opens the PR.
   Pass --issues <N> naming the issue this PR is for whenever the work started
   from an issue: the hive verifies the body actually references that issue and
   refuses the request otherwise, and it always refuses an empty body.
@@ -493,29 +495,72 @@ func (s *Scheduler) buildMergeEligibleListFor(keep func(repo string) bool, refsO
 	if err != nil {
 		return "(none)\n"
 	}
-	return formatMergeEligibleDataFor(data, keep, s.prCap(), refsOnly)
+	return formatMergeEligibleDataScoped(data, keep, s.mergeListRepoAutoMergeOff(), s.prCap(), refsOnly)
+}
+
+// mergeListRepoAutoMergeOffReason is the NEEDS MAINTAINER MERGE reason a kick
+// gives for a PR that passed every per-PR gate on a repo whose auto-merge
+// switch is off.
+const mergeListRepoAutoMergeOffReason = "auto-merge is off for this repo (project.repo_policies[].auto_merge), so hive-merge refuses it; a person merges it"
+
+// mergeListRepoAutoMergeOff reports which repos have auto-merge switched off
+// at an L6 hive, or nil when no repo can be.
+//
+// writeMergeEligible keeps such PRs in merge-eligible.json on purpose (#13874)
+// and relies on each reader applying the repo switch itself. The merge relay
+// does (crux/agent AuthorizeMerge, the same cfg.RepoAutoMergeEnabled); the
+// kick did not, so the scanner was told to hive-merge PRs the relay refuses
+// every time. On knuckle on 2026-11-10 one scheduled scanner kick spent its
+// whole turn on nine such refusals and dispatched no issue work.
+//
+// Below L6 RepoAutoMergeEnabled is false for every repo, and the merge lanes
+// there are gated by the agent's mode, not this switch, so the list is left
+// as it was.
+func (s *Scheduler) mergeListRepoAutoMergeOff() func(repo string) bool {
+	if s == nil || s.cfg == nil || s.cfg.ACMMLevelOrZero() < config.SelfMergeMinACMMLevel {
+		return nil
+	}
+	cfg := s.cfg
+	return func(repo string) bool { return !cfg.RepoAutoMergeEnabled(repo) }
 }
 
 // formatMergeEligibleDataFor narrows to the repos keep accepts (#6204, nil =
 // all) and caps the rendered list at limit (governor.kick_limits.max_prs,
 // hivecommons/hive#7368; 0 = uncapped).
 func formatMergeEligibleDataFor(data []byte, keep func(repo string) bool, limit int, refsOnly ...bool) string {
+	return formatMergeEligibleDataScoped(data, keep, nil, limit, refsOnly...)
+}
+
+// formatMergeEligibleDataScoped is formatMergeEligibleDataFor plus
+// autoMergeOff: a merge-eligible PR on a repo it reports is listed under NEEDS
+// MAINTAINER MERGE with mergeListRepoAutoMergeOffReason instead of under
+// MERGE-ELIGIBLE (nil = no repo is switched off).
+func formatMergeEligibleDataScoped(data []byte, keep, autoMergeOff func(repo string) bool, limit int, refsOnly ...bool) string {
 	refsOnlyList := len(refsOnly) > 0 && refsOnly[0]
-	var payload struct {
-		Items []struct {
-			Number int    `json:"number"`
-			Repo   string `json:"repo"`
-			Title  string `json:"title"`
-			Queued bool   `json:"queued"`
-		} `json:"merge_eligible"`
+	type mergeRow struct {
+		Number int    `json:"number"`
+		Repo   string `json:"repo"`
+		Title  string `json:"title"`
+		Queued bool   `json:"queued"`
+		Reason string `json:"reason"`
 	}
-	if json.Unmarshal(data, &payload) != nil || len(payload.Items) == 0 {
+	var payload struct {
+		Items           []mergeRow `json:"merge_eligible"`
+		NeedsMaintainer []mergeRow `json:"needs_maintainer_merge"`
+	}
+	if json.Unmarshal(data, &payload) != nil {
 		return "(none)\n"
 	}
 	var b strings.Builder
 	shown := 0
+	var handMerge []mergeRow
 	for i, pr := range payload.Items {
 		if keep != nil && !keep(pr.Repo) {
+			continue
+		}
+		if autoMergeOff != nil && autoMergeOff(pr.Repo) {
+			pr.Reason = mergeListRepoAutoMergeOffReason
+			handMerge = append(handMerge, pr)
 			continue
 		}
 		if limit > 0 && shown >= limit {
@@ -534,7 +579,24 @@ func formatMergeEligibleDataFor(data []byte, keep func(repo string) bool, limit 
 		}
 	}
 	if b.Len() == 0 {
-		return "(none)\n"
+		b.WriteString("(none)\n")
+	}
+	needsMaintainer := handMerge
+	for _, pr := range payload.NeedsMaintainer {
+		if keep == nil || keep(pr.Repo) {
+			needsMaintainer = append(needsMaintainer, pr)
+		}
+	}
+	if len(needsMaintainer) > 0 {
+		b.WriteString("\nNEEDS MAINTAINER MERGE (excluded from MERGE-ELIGIBLE; do not request hive-merge):\n")
+		b.WriteString("A maintainer can review and merge manually. A trusted merger can admit the current head with dashboard Approve or /hive decision approve. An operator can also grant an allowed contributor registry tier (when enabled), or resolve the verified hive claim on the linked closing issue. Agent review approval alone does not grant contributor trust.\n")
+		for i, pr := range needsMaintainer {
+			if limit > 0 && i >= limit {
+				b.WriteString(prListOverflowLine(len(needsMaintainer)-i, limit))
+				break
+			}
+			b.WriteString(fmt.Sprintf("  #%d %s — %s: %s\n", pr.Number, pr.Repo, pr.Title, pr.Reason))
+		}
 	}
 	return b.String()
 }

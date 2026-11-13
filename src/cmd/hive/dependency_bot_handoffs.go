@@ -38,7 +38,16 @@ const depBotRedCIGrace = 4 * time.Hour
 const (
 	depBotHoldHeldPrefix         = "required-check-held:"
 	depBotHoldNeverStartedPrefix = "required-check-never-started:"
-	depBotHoldNeverRanPrefix     = "required-check-never-ran:"
+	// depBotHoldNeverRanPrefix: the automerge sweep's one bot takeover for
+	// this head (a github-actions[bot] PR) left no App PR in its place.
+	// Older builds also reported it for an autofix-pushed Dependabot head
+	// after posting `@dependabot rebase` as the App, which Dependabot
+	// refuses; on a Dependabot PR it is read as the autofix case.
+	depBotHoldNeverRanPrefix = "required-check-never-ran:"
+	// depBotHoldNeverRanAutofixPrefix: an automation (github-actions[bot])
+	// pushed the Dependabot PR's head, so GitHub did not run the required
+	// check, and Hive cannot ask Dependabot to re-push.
+	depBotHoldNeverRanAutofixPrefix = "required-check-never-ran-autofix:"
 	// depBotHoldApprovalPrefix: runs held for approval; the sweep has posted
 	// `/ok-to-test` and the repository's hive-ok-to-test workflow should
 	// approve them, so this alone is not handed off (hivecommons/hive#13013).
@@ -55,6 +64,9 @@ type depBotObservation struct {
 	HeadSHA string    `json:"head_sha"`
 	Reason  string    `json:"reason,omitempty"`
 	Since   time.Time `json:"since"`
+	// RerunOwedSince is when the sweep first saw this head's transient
+	// re-run owed (depBotTransientRerunOwedSince); zero until then.
+	RerunOwedSince time.Time `json:"rerun_owed_since,omitzero"`
 }
 
 // depBotHold is the latest terminal required-check hold the automerge sweep
@@ -67,9 +79,11 @@ type depBotHold struct {
 // dependencyBotRedCI reports a red required check on the PR's current head
 // that the bot PR itself must answer for: CI has settled, and the failure was
 // not triaged as an upstream or shared-CI incident. A failure triaged as
-// transient (TransientCITriaged) is still handed off, because nothing in Hive
-// re-runs a single PR's check, but dependencyBotRedCIComment then asks for a
-// re-run instead of blaming the bump (hivecommons/hive#12977).
+// transient (TransientCITriaged) is a red-CI reason too, but on a trusted-bot
+// PR the sweep holds the hand-off while the hive's one re-run of the head is
+// owed (dependency_bot_transient_rerun.go), and dependencyBotRedCIComment
+// then says whether that re-run happened and failed again or was not
+// allowed, instead of blaming the bump (hivecommons/hive#12977).
 func dependencyBotRedCI(pr github.PullRequest) bool {
 	return pr.HasFailingRequiredCheck() && !pr.CIChecksRunning && !pr.ExternalCIDeferred && pr.SharedCIIncident == 0
 }
@@ -99,6 +113,9 @@ func depBotHandoffResolved(rec depBotConflictRecord, pr github.PullRequest) bool
 		// A new head re-creates the checks; a check that completes green
 		// lets automerge merge (closed is handled by the caller).
 		return pr.HeadSHA != "" && pr.HeadSHA != rec.HeadSHA
+	case depBotHandoffStranded:
+		// The bot (or a person) moved the head, or the PR caught up.
+		return (pr.HeadSHA != "" && pr.HeadSHA != rec.HeadSHA) || depBotStuckResolved(pr)
 	default:
 		return depBotConflictResolved(pr)
 	}
@@ -152,9 +169,12 @@ func dependencyBotWaitedConflictComment(author, base string) string {
 
 // dependencyBotRedCIComment is posted when a required check has stayed red on
 // the PR's current head past depBotRedCIGrace. It does not assume the bump is
-// at fault: when a hive-ci-transient triage marker covers every failing run
-// at this head, it says so and asks only for a re-run (hivecommons/hive#12977).
-func dependencyBotRedCIComment(pr github.PullRequest) string {
+// at fault: when Hive re-ran the head's failed jobs after a transient triage
+// it says they failed again; when that re-run re-ran nothing it says why;
+// and when a hive-ci-transient triage marker covers every failing run at
+// this head with no re-run (the author is not a trusted bot), it asks only
+// for a re-run (hivecommons/hive#12977).
+func dependencyBotRedCIComment(pr github.PullRequest, rerun depBotTransientRerun) string {
 	checks := "a required check"
 	if len(pr.FailingChecks) > 0 {
 		names := pr.FailingChecks
@@ -171,7 +191,19 @@ func dependencyBotRedCIComment(pr github.PullRequest) string {
 	}
 	name := dependencyBotDisplayName(pr.Author)
 	waited := depBotHours(depBotRedCIGrace)
-	if pr.TransientCITriaged {
+	switch {
+	case rerun.State == depBotRerunDone:
+		return fmt.Sprintf("This %s PR has failed %s on its current head for over %s. "+
+			"Hive's triage of this head found the failure transient or infrastructure-related, so Hive re-ran the failed jobs once, and they failed again. "+
+			"To fix it, read the new run's log: if the cause is still outside this PR, re-run the failed check once it has cleared; "+
+			"if the bump breaks the build, fix the code or lockfile on this branch, pin or ignore the dependency in the bot's config, or close the PR.",
+			name, checks, waited)
+	case rerun.State == depBotRerunNotRun:
+		return fmt.Sprintf("This %s PR has failed %s on its current head for over %s. "+
+			"Hive's triage of this head found the failure transient or infrastructure-related, not caused by the bump, but %s. "+
+			"To fix it, re-run the failed check once the cause has cleared.",
+			name, checks, waited, depBotRerunNotRunText(rerun.Skipped))
+	case pr.TransientCITriaged:
 		return fmt.Sprintf("This %s PR has failed %s on its current head for over %s. "+
 			"Hive's triage of this head found the failure transient or infrastructure-related, not caused by the bump, "+
 			"and nothing has re-run the check since. "+
@@ -187,6 +219,11 @@ func dependencyBotRedCIComment(pr github.PullRequest) string {
 
 // dependencyBotHeldCheckComment is posted for a terminal required-check hold
 // the automerge sweep reported (held for approval, never started, never ran).
+// Each never-ran comment says what actually happened: on a Dependabot PR an
+// automation pushed the head and Dependabot takes no command from Hive (the
+// old `required-check-never-ran:` reason on a Dependabot PR meant the same
+// head shape, so it reads the same); otherwise Hive's one takeover attempt
+// did not replace the PR.
 func dependencyBotHeldCheckComment(author, holdReason string) string {
 	name := dependencyBotDisplayName(author)
 	check := func(prefix string) string {
@@ -204,14 +241,32 @@ func dependencyBotHeldCheckComment(author, holdReason string) string {
 		return fmt.Sprintf("The required check %s on this %s PR is waiting for approval to run, and Hive could not approve it. "+
 			"To fix it, click 'Approve and run' on the held workflow runs (or run `gh run approve <run-id>`), or merge the PR by hand.",
 			check(depBotHoldHeldPrefix), name)
+	case strings.HasPrefix(holdReason, depBotHoldNeverRanAutofixPrefix):
+		return dependencyBotAutofixNeverRanComment(check(depBotHoldNeverRanAutofixPrefix))
+	case strings.HasPrefix(holdReason, depBotHoldNeverRanPrefix) && strings.EqualFold(author, "dependabot[bot]"):
+		return dependencyBotAutofixNeverRanComment(check(depBotHoldNeverRanPrefix))
 	case strings.HasPrefix(holdReason, depBotHoldNeverRanPrefix):
-		return fmt.Sprintf("The required check %s has not run on this %s PR's current head, even after a rebase was requested. "+
+		return fmt.Sprintf("The required check %s has not run on this %s PR's current head: an automation opened or pushed it with a workflow's token, and GitHub does not start workflows for that. "+
+			"Hive tried once to re-open the change as its own PR so the check could run, and that did not replace this PR. "+
 			"To fix it, push to the branch again or close and reopen the PR so the check is created, or merge the PR by hand.",
 			check(depBotHoldNeverRanPrefix), name)
 	}
 	return fmt.Sprintf("The required check %s never started on this %s PR's current head. "+
 		"To fix it, push to the branch again or close and reopen the PR so the check is created, or merge the PR by hand.",
 		check(depBotHoldNeverStartedPrefix), name)
+}
+
+// dependencyBotAutofixNeverRanComment is the hand-off for a Dependabot PR
+// whose head an automation pushed: GitHub does not start workflows for a push
+// made with a workflow's token, and Dependabot refuses commands from apps
+// (dependabot/dependabot-core#9147), so only a person can get the check to run.
+func dependencyBotAutofixNeverRanComment(check string) string {
+	return fmt.Sprintf("The required check %s has not run on this Dependabot PR's current head. "+
+		"An automation (`github-actions[bot]`) pushed the last commit, so GitHub did not run the check: it does not start workflows for commits pushed with a workflow's token. "+
+		"Hive cannot ask Dependabot to redo the branch, because Dependabot does not accept commands from apps. "+
+		"To fix it, someone with push access comments `%s` on this PR (it discards any commits on the branch that are not Dependabot's), "+
+		"or pushes to the branch, or closes and reopens the PR, or merges the PR by hand.",
+		check, github.DependabotRecreateCommand)
 }
 
 // noteDependencyBotTerminalHold is the automerge sweep's OnTerminalHold hook:
@@ -275,6 +330,23 @@ func (s *depBotConflictStore) observe(key, headSHA, reason string, now time.Time
 	s.observed[key] = &depBotObservation{HeadSHA: headSHA, Reason: reason, Since: now}
 	s.saveObservedLocked()
 	return now
+}
+
+// rerunOwedSince returns when this head's transient re-run was first seen
+// owed, stamping now on the first sighting. It rides on the observation
+// observe just recorded for the head, so a new head starts a fresh clock.
+func (s *depBotConflictStore) rerunOwedSince(key, headSHA string, now time.Time) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.observed[key]
+	if o == nil || o.HeadSHA != headSHA {
+		return now
+	}
+	if o.RerunOwedSince.IsZero() {
+		o.RerunOwedSince = now
+		s.saveObservedLocked()
+	}
+	return o.RerunOwedSince
 }
 
 // pruneObservations drops grace clocks for PRs that no longer show a waiting

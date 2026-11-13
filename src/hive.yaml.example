@@ -108,6 +108,20 @@ project:
 #   docs_url: https://github.com/hivecommons/hive/blob/v5/src/docs
 #   comment_template: ""    # text/template over gfi.Vars; must contain {{ .Marker }}
 
+# Code scanning issues (default OFF): file a repo's open GitHub code scanning
+# alerts (CodeQL, OSSF Scorecard, Trivy, ...) as grouped issues sized for one
+# PR, and close them when every alert is fixed or dismissed. Needs the App
+# permission "Code scanning alerts: Read-only". See docs/code-scanning.md.
+# code_scanning:
+#   interval: 1h              # pass cadence (at least 10m)
+#   min_severity: high        # critical | high | medium | low | note
+#   include_tools: []         # empty = every tool, e.g. [CodeQL, Trivy]
+#   exclude_rules: []         # added to the default Scorecard posture list; "!SASTID" re-includes
+#   max_new_issues_per_run: 5 # new issues per repo per pass
+#   repos:
+#     acme/widget:
+#       enabled: true
+
 # Optional contributor help/community links. Shown on /contribute Onboarding,
 # Operations, and printed by relays when they connect. Empty/omitted defaults to
 # Hive's contributor docs and issue tracker. URLs must be absolute http(s).
@@ -248,6 +262,9 @@ ioscan:
 # for known agent names. New/custom agents should set these fields explicitly.
 agents:
   # github_api_hourly_cap: 300            # Per-agent charged GitHub API responses/hour through the proxy; 0 disables.
+  # cli_memory:                           # Fleet CLI auto-memory policy; each agent may override it with its own cli_memory block
+  #   drain_to_knowledge: false           # Drain each CLI memory fact into a draft knowledge entry (kick, Claude SessionEnd hook)
+  #   drain_on_write: false               # Also drain a Claude memory file as soon as it is written (PostToolUse hook); needs drain_to_knowledge
   scanner:
     # id: scan-01                         # Stable internal key (defaults to YAML key)
     enabled: true
@@ -271,7 +288,8 @@ agents:
     include_repos: true                   # Append repos section to kicks (prompt text only —
                                           #   authorizes repos, does not clone them)
     # task_mcp:
-    #   drop_stuffed_context: false       # When a hub task MCP URL is present, render
+    #   drop_stuffed_context: false       # When this agent has the hive-task MCP server
+                                          #   (Claude Code launches only), render
                                           #   ISSUE_LIST/PR_LIST/MERGE_ELIGIBLE as
                                           #   repo#N refs only; default false.
     # repos: [repo-one]                   # WHICH repos this agent serves. Omit (the default)
@@ -381,6 +399,18 @@ agents:
     #   auto_dispatch: false
     #   min_model_capability: T1
     #   daily_cap_per_contributor: 0
+    # Contributor-first lane: make a connected contributor relay that is
+    # "Acting as" this role the lane's PRIMARY worker. While one is connected
+    # (fresh heartbeat, not failure-paused) the governor withholds this
+    # agent's kicks, so the hive's own inference budget is not spent on work a
+    # contributor is already covering — the opposite order from standby, which
+    # offers paused BUDGET work. Kicks resume on the normal cadence once no
+    # relay has covered the role for contributor_first_grace. The role must be
+    # delegatable (hub.contribute_delegatable_roles, or the default scanner /
+    # quality / outreach) or the hive fails to load. See
+    # src/docs/agent-configuration.md#contributor-first-lanes-contributor_first.
+    # contributor_first: false
+    # contributor_first_grace: 10m
   architect:
     enabled: false                        # Disabled by default — enable for design work
     backend: claude
@@ -534,6 +564,14 @@ agents:
 
 # Governor — adaptive scheduler that adjusts agent cadences based on queue depth
 governor:
+  # GitHub's "Approve and run workflows" gate (#16603). Approval starts CI
+  # only; writeback, hold, review and merge gates still apply.
+  # ci:
+  #   auto_approve_workflows: true
+  #   auto_approve_workflow_actors: ['dependabot[bot]', 'renovate[bot]']
+  # An explicit [] trusts only this hive's App and heads a person admitted
+  # from the dashboard (Approve); the automerge label alone never counts.
+  # Approving uses the App token: the App needs Actions: Read and write.
   eval_interval_s: 300                    # Seconds between governor evaluations
   eval_interval_max_s: 1800               # Cap when API budget mode stretches evals
   eval_interval_webhook_s: 900            # Base interval while GitHub webhooks are healthy (see /api/webhook/github)
@@ -541,6 +579,8 @@ governor:
   webhook_wake_min_gap_s: 30              # Minimum gap between webhook-triggered eval cycles
   conserve_interval_multiplier: 2         # Eval interval multiplier in API budget conserve mode
   optional_sweep_every_n_cycles: 1        # Run optional sweeps every Nth normal cycle (1 = every cycle)
+  # api_budget_pacing: true               # Off by default. Lengthen the eval and sweep intervals when the current GitHub call rate
+  #                                       # would use up the budget (above github.api_reserve) before the rate-limit window resets
 
   # First-time contributor welcome (see docs/good-first-issue.md#welcoming-first-time-contributors).
   # When a human whose GitHub author_association is FIRST_TIME_CONTRIBUTOR /
@@ -634,6 +674,7 @@ governor:
       # contributor_nudge:              # stage/072: one @-mention comment per head + relay fix-pr interrupt (#12436)
       #   enabled: true
       #   renudge_interval: 24h         # second (and last) nudge; default = the stage dwell
+      #   ci_failure_cooldown: 6h       # a new head red on a different check set inside this window folds into the one nudge comment (#17328)
       # presence_window: 15m            # relay heartbeat this fresh = contributor online → relay interrupt, else comment only
       # contributor_grace_online: 2h    # nudge unanswered this long (online author) → stage/074 adoption
       # contributor_grace_offline: 15m  # same for offline / external authors (comment-only nudge)
@@ -646,6 +687,8 @@ governor:
       #   after_offline: 15m            # default 15m; registered relay offline, measured from the later
       #                                 # of its last heartbeat and the first stage/072 nudge
       #   after_unregistered: 15m       # default 15m; no contributor profile, wait after the nudge with no new head
+      #   rebase_attempt_timeout: 15m   # default 15m; a fixer rebase attempt with no push by then counts as failed;
+      #                                 # once attempts are spent an in-place adoption re-homes to a superseding PR
       #   supersede:
       #     close_first: true           # default true; close the original (hive/superseded, one note naming the
       #                                 # copy) in the pass that opens the copy; reopened if the copy fails.
@@ -754,6 +797,12 @@ governor:
     # transcript_lines: 200
     # on_divergence: pause               # pause | alert
     # exempt_agents: [outreach]
+
+  # How the one-shot reviewer turns (Let hive decide's model step, grounded
+  # chat answers) reach a model: auto (the endpoint above when one resolves,
+  # else the Claude CLI on the hive's Claude login, run with every tool off),
+  # http (endpoint only) or claude-cli (always the CLI).
+  # reviewer_backend: auto
 
   # LiteLLM inference backend (optional) — route agents through an
   # OpenAI-compatible LiteLLM proxy. Agents using backend "litellm" launch
@@ -978,7 +1027,8 @@ governor:
 #   reviewers:
 #     autoscale:        # size the reviewer lane to its backlog (#14685); off by default
 #       enabled: false
-#       agent: ""       # base reviewer to scale; default: first role:reviewer agent, else reviewer_agents[0]
+#       agent: ""       # base reviewer to scale; must be an agent the swarm dispatches reviews to.
+#                       # Default: the first reviewer_agents entry, else the first "review" keyword match
 #       min: 1          # floor of active replicas (the base agent is never retired)
 #       max: 4          # ceiling; capped at the agents.<name>.replicas limit (5)
 #       target_backlog_per_reviewer: 2 # PRs waiting per reviewer before the lane is "behind"
@@ -991,6 +1041,11 @@ governor:
 #                               # perspective; shared review boilerplate is sent once instead of once
 #                               # per perspective. Verdicts stay per-perspective. Default false.
 #   fixer_agent: ""     # optional override; defaults to the PR lane, then scanner
+#   fixer_fallback_agents: [] # opt-in ordered repair lanes, e.g. [fixer, scanner-2]
+#   fixer_fallback_after_undeliverable: 3 # consecutive refusals before rerouting;
+#                       # 0 defaults to 3 only when the fallback list is non-empty.
+#                       # A busy fixer silent past its busy_no_activity_threshold
+#                       # (default 30m) also yields. No turn is interrupted.
 #   pending_ttl: 45m    # re-dispatch a review whose kick posted no verdict after this long
 #                       # (Go duration; default 45m; negative disables expiry)
 #   pending_fix_ttl: 2h # dispatch the next bounded fix attempt when a fixer turn has
@@ -1048,6 +1103,13 @@ github:
   token: ${HIVE_GITHUB_TOKEN}
   # Reuse per-PR detail GETs while list head.sha/updated_at still match.
   pr_detail_ttl_s: 1800
+  # Memory for the conditional-request (ETag / 304) response cache, in MiB of
+  # gzip-compressed bodies (default 128, max 2048), and its entry cap (default
+  # 8192). A cache that fills within hours evicts bodies other pollers are
+  # about to revalidate and charged fetches climb; raise it. Env overrides:
+  # HIVE_GITHUB_ETAG_CACHE_MAX_MB / HIVE_GITHUB_ETAG_CACHE_MAX_ENTRIES.
+  etag_cache_max_mb: 128
+  etag_cache_max_entries: 8192
   # Batch open PR detail and CI rollups with GraphQL during scans (default true).
   graphql_pr_batch: true
   graphql_pr_batch_page_size: 50
@@ -1128,6 +1190,7 @@ dashboard:
   # authorized_users: [owner, reviewer:read, maintainer:read-write]
   # hub_proxied: false                    # True when trusted hub nginx injects identity headers
   # agent_poll_interval_s: 5
+  # kick_failure_threshold: 3             # Consecutive failed deliveries before agent health fails
   # stage_tracker:
   #   cache_ttl_s: 300                    # Hive activity monitor payload cache; default = governor.eval_interval_s
   # theme: hive                         # Built-in theme id from /api/themes (for example hive, hive-dark, hive-light, star-wars, dungeons-and-dragons, star-trek, cyberpunk, terminal, solarized-dark, nord); or custom
@@ -1383,6 +1446,29 @@ knowledge:
       - decision
     merge_strategy: precedence               # personal > project > org > community
 
+# Write-back containment — what the platform may say on GitHub unasked.
+# Applies to comments/labels/reviews on PRs and issues hive did not open and
+# nobody opted in on (platform sweeps: sentinel, hold-gate notices, stage
+# labels, supersession, duplicate-fix, reporter-trust …). Never gates hive's
+# own PRs/issues, /hive command replies or dashboard-triggered work.
+# See docs/acmm-policy-matrix.md "What hive will say on GitHub at each level".
+# writeback:
+#   unsolicited:
+#     min_level: 5            # raises every per-kind floor below; never lowers one
+#     require_labels: true    # foreign PRs also need review.require_labels (fallback hive-review)
+#     backfill: false         # never touch items created before hive first saw / could write to the repo
+#   per_repo:
+#     torch-spyre/torch-spyre: { mode: issues-only }   # off | issues-only | labels-only | full
+#   kinds:                    # per-kind overrides; defaults in docs/acmm-policy-matrix.md
+#     sentinel: { min_level: 5, require_label: true, unlabeled_min_level: 6 }
+#     hold_gate_notice: { min_level: 4 }               # hive-authored PRs only, always
+#   dedupe:                   # content-aware suppression of duplicate / burst comments (comment kinds with a body only)
+#     enabled: true
+#     same_item_ttl: 24h      # identical body on the same item is held this long
+#     burst_items: 2          # distinct items that may get one body inside burst_window; the rest are held
+#     burst_window: 60s
+#     hourly_cap: 60          # comments per repo per kind per hour; merge-path kinds exempt; -1 disables
+
 # Data directories — all persistent state
 data:
   metrics_dir: /data/metrics
@@ -1435,3 +1521,14 @@ nous:
 #     role: experimenter
 #     engine: nous
 #     interval: 24h
+
+# Workflow models (hivecommons/hive#17620, docs/design/workflow-models.md).
+# Repositories are bound to a model on Settings → Repos (project.workflow_bindings).
+# A binding always changes the Activity Monitor's columns for that repository;
+# `enabled` decides whether the bound model's rules also derive its stages and
+# whether the model's labels are provisioned in the repository. Owners can flip
+# it from Settings → Workflows → Library (PUT /api/workflows/enabled) without
+# editing this file; the change applies on the next derivation pass.
+# workflow:
+#   enabled: false           # false (default): bindings are columns only
+#   label_gc: true           # delete labels a previous binding provisioned once nothing wears them

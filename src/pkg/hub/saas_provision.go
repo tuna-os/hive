@@ -240,6 +240,18 @@ type ClusterConfig struct {
 	InferenceEndpoint string `json:"inference_endpoint,omitempty" yaml:"inference_endpoint,omitempty"`
 	GitHubBaseURL     string `json:"github_base_url,omitempty" yaml:"github_base_url,omitempty"`
 	GitHubAPIURL      string `json:"github_api_url,omitempty" yaml:"github_api_url,omitempty"`
+	// UpstreamProxy names a corporate HTTP forward proxy the hives on THIS
+	// cluster must chain selected hosts through (e.g. an enterprise GitHub
+	// reachable only via the proxy). Injected into new pool slots as
+	// HIVE_UPSTREAM_PROXY_URL / HIVE_UPSTREAM_PROXY_HOSTS / HIVE_NO_PROXY.
+	UpstreamProxy *ClusterUpstreamProxy `json:"upstream_proxy,omitempty" yaml:"upstream_proxy,omitempty"`
+	// HostAliases are Pod hostAliases entries rendered into every hive
+	// Deployment on THIS cluster, for GitHub Enterprise hosts reachable only
+	// through a TLS reverse proxy pinned to a fixed IP (no CONNECT proxy, so
+	// upstream_proxy cannot express it). Validated at load by
+	// normalizeClusterHostAliases; existing hives are converged by the
+	// host_aliases reconcile sweep (cluster_host_aliases.go, #17801).
+	HostAliases []ClusterHostAlias `json:"host_aliases,omitempty" yaml:"host_aliases,omitempty"`
 	// GitHubAppSlug is the GitHub App's URL slug on THIS cluster's GitHub
 	// host. A GitHub Enterprise instance hosts its own App registration,
 	// which is rarely named "kubestellar-hive" — without this the spoke's
@@ -784,6 +796,15 @@ type SaaSHive struct {
 	// nil means nothing is queued. It is CLEARED on confirmation, not on
 	// delivery (see AppIdentityDelivered), so a lost beat is retried.
 	PendingAppConfig *PendingAppIdentity `json:"pending_app_config,omitempty"`
+
+	// WebhookRelayKey is this hive's own HMAC key for webhooks the hub relays
+	// to its spoke (webhook_relay_key.go, hivecommons/hive#17911). Minted at
+	// provisioning (or on the first heartbeat of a hive provisioned before
+	// relay keys existed) and delivered over the heartbeat. Per hive so one
+	// spoke's key can never sign a relay another spoke accepts, and so no
+	// spoke ever needs the GitHub App webhook secret. Replacing or clearing it
+	// rotates the key: the next beat delivers the new one.
+	WebhookRelayKey string `json:"webhook_relay_key,omitempty"`
 
 	// RequestedRestartAt (RFC3339) arms a rolling restart of this hive's spoke,
 	// delivered on every heartbeat inside spokeRestartDeliveryWindow and then
@@ -2069,15 +2090,26 @@ func saveSaaSHive(h *SaaSHive) error {
 		return fmt.Errorf("invalid hive ID for save: %q", h.ID)
 	}
 	dir := filepath.Join(saasHivesDir, h.ID)
-	// Best-effort: a failed mkdir surfaces via the WriteFile error below.
-	_ = os.MkdirAll(dir, 0o755)
+	// meta.json carries WebhookRelayKey, so it is written rw------- under an
+	// rwx------ directory like the other hub secret stores (cluster App keys,
+	// generation stores). Best-effort: a failed mkdir surfaces via the
+	// WriteFile error below.
+	_ = os.MkdirAll(dir, 0o700)
+	// MkdirAll leaves pre-existing directories untouched, so tighten hives
+	// provisioned before meta.json carried key material. Only group/other
+	// bits are stripped: owner bits are left as found so a directory an
+	// operator (or a test) made read-only is never silently widened back to
+	// writable, and the WriteFile below still reports the failure.
+	if fi, err := os.Stat(dir); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		_ = os.Chmod(dir, fi.Mode().Perm()&^0o077)
+	}
 	data, err := json.MarshalIndent(h, "", "  ")
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(dir, "meta.json")
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
@@ -2647,15 +2679,20 @@ func provisionHive(h *SaaSHive, req *CreateHiveRequest, cluster *ClusterConfig, 
 			}
 			return "anyuid"
 		}(),
-		"InitContainerUID":  initContainerUID,
-		"InitContainerGID":  initContainerGID,
-		"InferenceEndpoint": cluster.InferenceEndpoint,
-		"HasInference":      cluster.InferenceEndpoint != "",
-		"IsPublic":          h.IsPublic,
-		"HiveType":          "hosted",
-		"HasGHE":            effectiveGitHubBaseURL(h, cluster) != "",
-		"GitHubBaseURL":     effectiveGitHubBaseURL(h, cluster),
-		"GitHubAPIURL":      effectiveGitHubAPIURL(h, cluster),
+		"InitContainerUID":     initContainerUID,
+		"InitContainerGID":     initContainerGID,
+		"InferenceEndpoint":    cluster.InferenceEndpoint,
+		"HasInference":         cluster.InferenceEndpoint != "",
+		"HasUpstreamProxy":     cluster.UpstreamProxy.enabled(),
+		"UpstreamProxyURL":     cluster.UpstreamProxy.url(),
+		"UpstreamProxyHosts":   cluster.UpstreamProxy.hosts(),
+		"UpstreamProxyNoProxy": cluster.UpstreamProxy.noProxy(),
+		"HostAliases":          cluster.HostAliases,
+		"IsPublic":             h.IsPublic,
+		"HiveType":             "hosted",
+		"HasGHE":               effectiveGitHubBaseURL(h, cluster) != "",
+		"GitHubBaseURL":        effectiveGitHubBaseURL(h, cluster),
+		"GitHubAPIURL":         effectiveGitHubAPIURL(h, cluster),
 		// app_slug follows the hive's GitHub host: a GHE hive gets the cluster's
 		// GHE App slug (e.g. "kubestellar-hive-ghe"); a public-GitHub hive emits
 		// none, letting config.ResolvedAppSlug() supply the public default. Only
@@ -3395,6 +3432,18 @@ spec:
         app: hive
         hive-id: {{.ID}}
     spec:
+{{- if .HostAliases}}
+      # Per-cluster host_aliases (clusters.json): pins GHE hostnames to a TLS
+      # reverse-proxy IP where no CONNECT proxy exists. See #17801.
+      hostAliases:
+{{- range .HostAliases}}
+      - ip: "{{.IP}}"
+        hostnames:
+{{- range .Hostnames}}
+        - "{{.}}"
+{{- end}}
+{{- end}}
+{{- end}}
 {{- if .RequiresSCC}}
       serviceAccountName: hive-sa
 {{- else}}
@@ -3431,7 +3480,17 @@ spec:
         # Both runtime names are probed: ~16 of 50 live spokes still carry only
         # the legacy hive.yaml.bak, so keying on the new name alone would treat
         # them as first-boot and re-seed a hive that has real config on its PVC.
-        command: ["sh", "-c", "if [ -s /data/hive.yaml.runtime ]; then echo runtime-config-exists-for-recovery; elif [ -s /data/hive.yaml.bak ]; then echo legacy-runtime-config-exists-for-recovery; else cp /etc/hive-seed/hive.yaml /etc/hive/hive.yaml && echo configmap-copied-first-boot; fi"]
+        #
+        # Steady state (#17468): /etc/hive is an emptyDir, so a regular file
+        # there is a throwaway cache and operator edits to it vanished on
+        # restart. Symlink it to the PVC runtime config instead, so the path
+        # every runbook names IS the persisted boot source. Config.Save
+        # resolves the link and renames its temp file onto the TARGET
+        # (#17862), so the link survives saves. Only the NEW name is linked:
+        # the legacy .bak is refreshed by the entrypoint from a good runtime
+        # file on clean boots (never written by Save), and linking it would
+        # make every save write it.
+        command: ["sh", "-c", "if [ -s /data/hive.yaml.runtime ]; then echo runtime-config-exists-for-recovery; ln -sf /data/hive.yaml.runtime /etc/hive/hive.yaml && echo config-path-linked-to-runtime || echo config-path-link-failed; elif [ -s /data/hive.yaml.bak ]; then echo legacy-runtime-config-exists-for-recovery; else cp /etc/hive-seed/hive.yaml /etc/hive/hive.yaml && echo configmap-copied-first-boot; fi"]
         volumeMounts:
         - name: config
           mountPath: /etc/hive-seed
@@ -3621,6 +3680,18 @@ spec:
 {{- if .HasInference}}
         - name: HIVE_VLLM_ENDPOINT
           value: "{{.InferenceEndpoint}}"
+{{- end}}
+{{- if .HasUpstreamProxy}}
+        - name: HIVE_UPSTREAM_PROXY_URL
+          value: "{{.UpstreamProxyURL}}"
+{{- if .UpstreamProxyHosts}}
+        - name: HIVE_UPSTREAM_PROXY_HOSTS
+          value: "{{.UpstreamProxyHosts}}"
+{{- end}}
+{{- if .UpstreamProxyNoProxy}}
+        - name: HIVE_NO_PROXY
+          value: "{{.UpstreamProxyNoProxy}}"
+{{- end}}
 {{- end}}
         ports:
         - name: terminal

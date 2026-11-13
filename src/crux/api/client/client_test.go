@@ -140,8 +140,10 @@ func TestParityHostVersusSetterTable(t *testing.T) {
 			t.Errorf("api.HostSetters[%q] has unknown kind %q", name, row.Kind)
 		}
 	}
-	if api.HostSetters["SetSpanStarter"].Kind != api.HostSetterInProcessOnly {
-		t.Error("SetSpanStarter is the one in-process-only setter")
+	for _, name := range []string{"SetSpanStarter", "SetKnowledgeAdviser"} {
+		if api.HostSetters[name].Kind != api.HostSetterInProcessOnly {
+			t.Errorf("%s is an in-process-only setter", name)
+		}
 	}
 }
 
@@ -233,6 +235,7 @@ func TestEveryMethodReachesTheRuntime(t *testing.T) {
 	must("Stop", rt.Stop("alpha"))
 	must("Restart", rt.Restart(ctx, "alpha"))
 	must("RestartWithBootstrap", rt.RestartWithBootstrap(ctx, "alpha", "hello"))
+	must("RestartAfterModelChange", rt.RestartAfterModelChange(ctx, "alpha", "me"))
 	must("Pause", rt.Pause("alpha", "op", "why"))
 	must("PauseBy", rt.PauseBy("alpha", "op", "why", "me"))
 	must("PauseByCause", rt.PauseByCause("alpha", "op", "why", "me", crux.PauseCausation{Depth: 1, HookName: "h"}))

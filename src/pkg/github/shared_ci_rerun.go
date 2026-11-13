@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"fmt"
+	"maps"
 	"regexp"
 	"sort"
 	"strconv"
@@ -19,6 +20,10 @@ const (
 	// closes the sweep keeps looking for PRs stamped with its marker.
 	DefaultSharedCIRerunLookback = 72 * time.Hour
 
+	// sharedCIRerunForbiddenTTL is how long a refused rerun suppresses further
+	// rerun attempts (and the warning) for that repo.
+	sharedCIRerunForbiddenTTL = time.Hour
+
 	sharedCIIncidentTitlePrefix = "[shared-ci]"
 	sharedCIRerunMaxIssuePages  = 3
 )
@@ -28,8 +33,17 @@ const (
 // once-per-PR-per-incident record; sharedCIMarkerRE does not match it.
 var sharedCIRerunMarkerRE = regexp.MustCompile(`<!-- hive-shared-ci-rerun-([1-9][0-9]*) -->`)
 
+// sharedCILiftedMarkerRE matches the marker that says the deferral to
+// incident <n> was lifted on this PR (hivecommons/hive#17500). The sweep
+// stamps it next to the rerun marker; either one dedupes.
+var sharedCILiftedMarkerRE = regexp.MustCompile(`<!-- hive-shared-ci-lifted-([1-9][0-9]*) -->`)
+
 func sharedCIRerunMarker(incident int) string {
 	return fmt.Sprintf("<!-- hive-shared-ci-rerun-%d -->", incident)
+}
+
+func sharedCILiftedMarker(incident int) string {
+	return fmt.Sprintf("<!-- hive-shared-ci-lifted-%d -->", incident)
 }
 
 // SharedCIRerunOptions bounds one SweepSharedCIReruns pass.
@@ -66,6 +80,34 @@ type SharedCIRerunResult struct {
 type sharedCIRerunSeen struct {
 	updatedAt time.Time
 	incidents string
+	block     SharedCIRerunBlock
+}
+
+// SharedCIRerunBlock is an observed permission refusal, not a CI verdict.
+type SharedCIRerunBlock struct {
+	HeadSHA string
+	RunID   int64
+}
+
+// SharedCIRerunBlocked returns the recovery step owed on this exact head.
+// The block survives the retry cooldown until a sweep observes recovery.
+func (c *Client) SharedCIRerunBlocked(repo string, number int, head string) (SharedCIRerunBlock, bool) {
+	owner, name := c.splitRepo(repo)
+	c.sharedCIRerunMu.Lock()
+	defer c.sharedCIRerunMu.Unlock()
+	seen := c.sharedCIRerunSeen[fmt.Sprintf("%s/%s#%d", owner, name, number)]
+	return seen.block, seen.block.RunID != 0 && seen.block.HeadSHA == head
+}
+
+func (c *Client) hasSharedCIRerunBlocks(owner, repo string) bool {
+	c.sharedCIRerunMu.Lock()
+	defer c.sharedCIRerunMu.Unlock()
+	for key, seen := range c.sharedCIRerunSeen {
+		if strings.HasPrefix(key, owner+"/"+repo+"#") && seen.block.RunID != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // SweepSharedCIReruns re-runs the failed jobs on open PRs that a fix lane
@@ -103,7 +145,7 @@ func (c *Client) SweepSharedCIReruns(ctx context.Context, opts SharedCIRerunOpti
 		if err != nil {
 			return result, err
 		}
-		if len(closed) == 0 {
+		if len(closed) == 0 && !c.hasSharedCIRerunBlocks(owner, repoName) {
 			continue
 		}
 		result.Incidents += len(closed)
@@ -145,7 +187,7 @@ func (c *Client) recentlyClosedSharedCIIncidents(ctx context.Context, owner, rep
 		State:       "closed",
 		Sort:        "updated",
 		Direction:   "desc",
-		Since:       since,
+		Since:       cacheableSince(since), // the closed_at filter below keeps the exact since
 		ListOptions: gh.ListOptions{PerPage: 100},
 	}
 	out := map[int]bool{}
@@ -211,6 +253,11 @@ func pendingSharedCIReruns(texts []string, closed map[int]bool) []int {
 				done[n] = true
 			}
 		}
+		for _, m := range sharedCILiftedMarkerRE.FindAllStringSubmatch(text, -1) {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				done[n] = true
+			}
+		}
 	}
 	var out []int
 	for n := range stamped {
@@ -226,12 +273,12 @@ func (c *Client) trySharedCIRerun(ctx context.Context, repo, owner, repoName str
 	if labels := labelNames(pr.Labels); c.isHeld(labels) || c.isExempt(labels) {
 		return SharedCIRerunEvent{}, false, nil
 	}
-	seenKey := fmt.Sprintf("%s#%d", repo, pr.GetNumber())
+	seenKey := fmt.Sprintf("%s/%s#%d", owner, repoName, pr.GetNumber())
 	updatedAt := pr.GetUpdatedAt().Time
 	c.sharedCIRerunMu.Lock()
 	prev, known := c.sharedCIRerunSeen[seenKey]
 	c.sharedCIRerunMu.Unlock()
-	if known && prev.incidents == incidentKey && prev.updatedAt.Equal(updatedAt) {
+	if known && prev.incidents == incidentKey && prev.updatedAt.Equal(updatedAt) && prev.block.RunID == 0 {
 		return SharedCIRerunEvent{}, false, nil
 	}
 	markSeen := func() {
@@ -242,6 +289,17 @@ func (c *Client) trySharedCIRerun(ctx context.Context, repo, owner, repoName str
 		c.sharedCIRerunSeen[seenKey] = sharedCIRerunSeen{updatedAt: updatedAt, incidents: incidentKey}
 		c.sharedCIRerunMu.Unlock()
 	}
+	markBlocked := func(runID int64) {
+		c.sharedCIRerunMu.Lock()
+		defer c.sharedCIRerunMu.Unlock()
+		if c.sharedCIRerunSeen == nil {
+			c.sharedCIRerunSeen = map[string]sharedCIRerunSeen{}
+		}
+		c.sharedCIRerunSeen[seenKey] = sharedCIRerunSeen{
+			updatedAt: updatedAt, incidents: incidentKey,
+			block: SharedCIRerunBlock{HeadSHA: pr.GetHead().GetSHA(), RunID: runID},
+		}
+	}
 
 	comments, err := c.listIssueComments(ctx, owner, repoName, pr.GetNumber())
 	if err != nil {
@@ -250,6 +308,20 @@ func (c *Client) trySharedCIRerun(ctx context.Context, repo, owner, repoName str
 	texts := make([]string, 0, len(comments))
 	for _, cm := range comments {
 		texts = append(texts, cm.GetBody())
+	}
+	if prev.block.RunID != 0 && prev.block.HeadSHA == pr.GetHead().GetSHA() {
+		// Discovery's lookback must not strand an already-observed refusal.
+		// Keep its incident eligible without broadening discovery for other PRs.
+		closed = maps.Clone(closed)
+		if closed == nil {
+			closed = map[int]bool{}
+		}
+		for _, raw := range strings.Split(prev.incidents, ",") {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				closed[n] = true
+			}
+		}
+		incidentKey = sharedCIIncidentSetKey(closed)
 	}
 	incidents := pendingSharedCIReruns(texts, closed)
 	if len(incidents) == 0 {
@@ -271,8 +343,25 @@ func (c *Client) trySharedCIRerun(ctx context.Context, repo, owner, repoName str
 
 	event := SharedCIRerunEvent{Repo: repo, Number: pr.GetNumber(), HeadSHA: sha, Incidents: incidents}
 	var rerun []*gh.WorkflowRun
+	blocked := false
 	for _, run := range runs {
-		if _, err := c.client.Actions.RerunFailedJobsByID(ctx, owner, repoName, run.GetID()); err != nil {
+		if c.sharedCIRerunRefused(repo) {
+			markBlocked(run.GetID())
+			blocked = true
+			break
+		}
+		if err := c.rerunSharedCIRun(ctx, owner, repoName, run); err != nil {
+			if isWriteForbiddenError(err) {
+				// The App installation lacks the Actions write permission for
+				// rerun-failed-jobs: a permanent gap, so stop this pass and
+				// warn once per repo per TTL instead of once per run.
+				if c.markSharedCIRerunForbidden(repo) {
+					c.logger.Warn("shared-ci rerun forbidden: the App installation lacks Actions write permission for rerun-failed-jobs", "repo", repo, "pr", pr.GetNumber(), "run", run.GetID(), "error", err)
+				}
+				markBlocked(run.GetID())
+				blocked = true
+				break
+			}
 			c.logger.Warn("shared-ci rerun failed", "repo", repo, "pr", pr.GetNumber(), "run", run.GetID(), "error", err)
 			continue
 		}
@@ -280,24 +369,74 @@ func (c *Client) trySharedCIRerun(ctx context.Context, repo, owner, repoName str
 		event.RunIDs = append(event.RunIDs, run.GetID())
 	}
 	if len(rerun) == 0 {
-		// Every re-run was refused (permissions, run too old to re-run).
-		// Memoize so the sweep does not retry each pass for this PR state.
-		markSeen()
+		// A permission refusal must remain retryable after the repo cooldown,
+		// even when neither the PR nor the incident changed.
+		if !blocked {
+			markSeen()
+		}
 		return SharedCIRerunEvent{}, false, nil
+	}
+	if blocked {
+		// Do not stamp an incident complete when only some runs were accepted.
+		return event, true, nil
 	}
 
 	body := renderSharedCIRerunComment(incidents, sha, rerun)
 	if _, _, err := c.client.Issues.CreateComment(ctx, owner, repoName, pr.GetNumber(), &gh.IssueComment{Body: &body}); err != nil {
 		return event, false, fmt.Errorf("stamping shared-CI rerun marker on %s#%d: %w", repo, pr.GetNumber(), err)
 	}
+	markSeen()
 	for _, incident := range incidents {
 		c.logger.Info("shared-ci rerun", "repo", repo, "pr", pr.GetNumber(), "incident", "#"+strconv.Itoa(incident), "head", sha, "runs", len(event.RunIDs))
 	}
 	return event, true, nil
 }
 
+// sharedCIRerunRefused reports whether a rerun was refused for repo within the TTL.
+func (c *Client) sharedCIRerunRefused(repo string) bool {
+	c.sharedCIRerunMu.Lock()
+	defer c.sharedCIRerunMu.Unlock()
+	at, ok := c.sharedCIRerunForbidden[repo]
+	return ok && time.Since(at) < sharedCIRerunForbiddenTTL
+}
+
+// markSharedCIRerunForbidden records a refusal and reports whether it is the
+// first one in the current TTL window (so the caller logs it once).
+func (c *Client) markSharedCIRerunForbidden(repo string) bool {
+	c.sharedCIRerunMu.Lock()
+	defer c.sharedCIRerunMu.Unlock()
+	if at, ok := c.sharedCIRerunForbidden[repo]; ok && time.Since(at) < sharedCIRerunForbiddenTTL {
+		return false
+	}
+	if c.sharedCIRerunForbidden == nil {
+		c.sharedCIRerunForbidden = map[string]time.Time{}
+	}
+	c.sharedCIRerunForbidden[repo] = time.Now()
+	return true
+}
+
+// rerunSharedCIRun re-runs one red workflow run. A failed or timed-out run
+// gets its failed jobs re-run; a cancelled run (a job that hit its
+// timeout-minutes is recorded as cancelled, hivecommons/hive#17500) has no
+// "failed" job for that endpoint, so the whole workflow is re-run.
+func (c *Client) rerunSharedCIRun(ctx context.Context, owner, repo string, run *gh.WorkflowRun) error {
+	if run.GetConclusion() == sharedCIConclusionCancelled {
+		_, err := c.client.Actions.RerunWorkflowByID(ctx, owner, repo, run.GetID())
+		return err
+	}
+	_, err := c.client.Actions.RerunFailedJobsByID(ctx, owner, repo, run.GetID())
+	return err
+}
+
+// sharedCIConclusionCancelled is GitHub's conclusion for a run whose job
+// was cancelled, including by its own timeout-minutes.
+const sharedCIConclusionCancelled = "cancelled"
+
 // latestFailedWorkflowRuns returns, per workflow, the newest run for sha when
-// that run completed as failure or timed_out.
+// that run completed red: failure, timed_out, or cancelled (a job cut off
+// by timeout-minutes, which is how the shared-CI `mutation` incident of
+// hivecommons/hive#17463 presented). Newest-per-workflow keeps a run
+// cancelled by a later push or re-run out of the list.
 func (c *Client) latestFailedWorkflowRuns(ctx context.Context, owner, repo, sha string) ([]*gh.WorkflowRun, error) {
 	if sha == "" {
 		return nil, nil
@@ -332,7 +471,7 @@ func (c *Client) latestFailedWorkflowRuns(ctx context.Context, owner, repo, sha 
 			continue
 		}
 		switch run.GetConclusion() {
-		case "failure", "timed_out":
+		case "failure", "timed_out", sharedCIConclusionCancelled:
 			out = append(out, run)
 		}
 	}
@@ -345,13 +484,22 @@ func renderSharedCIRerunComment(incidents []int, sha string, runs []*gh.Workflow
 	refs := make([]string, len(incidents))
 	for i, n := range incidents {
 		fmt.Fprintln(&b, sharedCIRerunMarker(n))
+		fmt.Fprintln(&b, sharedCILiftedMarker(n))
 		refs[i] = "#" + strconv.Itoa(n)
 	}
 	short := sha
 	if len(short) > 7 {
 		short = short[:7]
 	}
-	fmt.Fprintf(&b, "Shared-CI incident %s is closed, so Hive re-ran the failed jobs on `%s`:\n\n", strings.Join(refs, ", "), short)
+	names := make([]string, 0, len(runs))
+	for _, run := range runs {
+		name := run.GetName()
+		if name == "" {
+			name = fmt.Sprintf("run %d", run.GetID())
+		}
+		names = append(names, "`"+name+"`")
+	}
+	fmt.Fprintf(&b, "Shared-CI incident %s closed — re-running %s on `%s`:\n\n", strings.Join(refs, ", "), strings.Join(names, ", "), short)
 	for _, run := range runs {
 		name := run.GetName()
 		if name == "" {
@@ -364,6 +512,6 @@ func renderSharedCIRerunComment(incidents []int, sha string, runs []*gh.Workflow
 		}
 	}
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "_Hive re-runs a PR at most once per incident; the new results are this PR's verdict._")
+	fmt.Fprintln(&b, "_The deferral to that incident is lifted; Hive re-runs a PR at most once per incident and the new results are this PR's verdict._")
 	return b.String()
 }

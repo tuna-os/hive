@@ -150,6 +150,37 @@ func TestSubstituteTemplate_FiltersIssuesToAgentRepos(t *testing.T) {
 	}
 }
 
+// An unscoped red-team lane (hivecommons/hive#17420) is handed no repository
+// and no work, and is told why: every write it makes is refused, so the kick
+// must not present repos or a queue it could act on.
+func TestKickForUnscopedRedTeamOffersNothing(t *testing.T) {
+	s := scopeScheduler(t, map[string]config.AgentConfig{
+		"redteam": {Backend: "claude", Role: config.RedTeamRole},
+	})
+	section := s.buildReposSectionFor("redteam")
+	for _, unwanted := range []string{"my-org/console", "my-org/dashboard", "my-org/docs", "currently paused"} {
+		if strings.Contains(section, unwanted) {
+			t.Errorf("unscoped red-team kick offered %q:\n%s", unwanted, section)
+		}
+	}
+	if !strings.Contains(section, "serves no repository until the operator sets its repos: scope") {
+		t.Errorf("unscoped red-team kick does not say why it has no repos:\n%s", section)
+	}
+
+	issues := []github.Issue{
+		{Repo: "console", Number: 1, Title: "console thing", URL: "u1"},
+		{Repo: "dashboard", Number: 2, Title: "dashboard thing", URL: "u2"},
+	}
+	actionable := &github.ActionableResult{Issues: github.IssueResultFromItems(issues)}
+	got, _ := s.substituteTemplateWithPolicy("${ISSUE_LIST}|${QUEUE_ISSUES}|${PROJECT_REPOS_LIST}|", actionable, "redteam", issues)
+	if strings.Contains(got, "console thing") || strings.Contains(got, "dashboard thing") {
+		t.Errorf("unscoped red-team kick listed work:\n%s", got)
+	}
+	if !strings.Contains(got, "|0|") || !strings.HasSuffix(got, "||") {
+		t.Errorf("unscoped red-team kick should count no queue and list no repos:\n%s", got)
+	}
+}
+
 func TestFormatMergeEligibleDataFor_FiltersByRepo(t *testing.T) {
 	data := []byte(`{"merge_eligible":[{"number":1,"repo":"console","title":"a"},{"number":2,"repo":"dashboard","title":"b"}]}`)
 
@@ -165,6 +196,40 @@ func TestFormatMergeEligibleDataFor_FiltersByRepo(t *testing.T) {
 	none := formatMergeEligibleDataFor(data, func(string) bool { return false }, 0)
 	if strings.TrimSpace(none) != "(none)" {
 		t.Errorf("fully filtered list = %q, want (none)", none)
+	}
+}
+
+func TestFormatMergeEligibleDataFor_SeparatesMaintainerMerges(t *testing.T) {
+	data := []byte(`{"merge_eligible":[{"number":1,"repo":"console","title":"ready"}],"needs_maintainer_merge":[{"number":2,"repo":"dashboard","title":"approved contributor PR","reason":"contributor-lane:no-claim"},{"number":3,"repo":"console","title":"untrusted tier","reason":"contributor-lane:claim-tier-untrusted"},{"number":4,"repo":"console","title":"another trust hold","reason":"contributor-lane:no-claim"}]}`)
+	out := formatMergeEligibleData(data, 0)
+	eligible, maintainer, ok := strings.Cut(out, "NEEDS MAINTAINER MERGE")
+	if !ok {
+		t.Fatalf("missing maintainer section: %s", out)
+	}
+	if !strings.Contains(eligible, "#1 console") || strings.Contains(eligible, "#2") || strings.Contains(eligible, "#3") {
+		t.Errorf("eligible section includes refused PRs or loses ready PR: %s", eligible)
+	}
+	for _, want := range []string{"#2 dashboard", "#3 console", "#4 console", "contributor-lane:no-claim", "contributor-lane:claim-tier-untrusted", "do not request hive-merge", "merge manually", "registry tier", "verified hive claim"} {
+		if !strings.Contains(maintainer, want) {
+			t.Errorf("maintainer section missing %q: %s", want, maintainer)
+		}
+	}
+	// Filtering applies independently to both sections; a scoped agent can
+	// see maintainer work even when it has no eligible PRs.
+	only := formatMergeEligibleDataFor(data, func(repo string) bool { return repo == "dashboard" }, 0)
+	if !strings.HasPrefix(only, "(none)\n") || !strings.Contains(only, "#2 dashboard") || strings.Contains(only, "console") {
+		t.Errorf("dashboard-only list = %q, want only its maintainer row", only)
+	}
+	console := formatMergeEligibleDataFor(data, func(repo string) bool { return repo == "console" }, 1)
+	if !strings.Contains(console, "#3 console") || strings.Contains(console, "#4 console") || !strings.Contains(console, "1 more") {
+		t.Errorf("maintainer list did not respect the cap after repo filtering: %s", console)
+	}
+	if none := formatMergeEligibleDataFor(data, func(string) bool { return false }, 0); none != "(none)\n" {
+		t.Errorf("fully filtered list = %q, want (none)", none)
+	}
+	legacy := formatMergeEligibleData([]byte(`{"merge_eligible":[{"number":1,"repo":"console","title":"ready"}]}`), 0)
+	if strings.Contains(legacy, "NEEDS MAINTAINER MERGE") {
+		t.Errorf("legacy payload gained an empty maintainer section: %s", legacy)
 	}
 }
 

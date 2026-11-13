@@ -308,6 +308,7 @@ func TestAgentEnvPairs_NonInference_NoProxyLoopback(t *testing.T) {
 		Config: config.AgentConfig{Backend: "claude", Model: "sonnet"},
 	}
 
+	t.Setenv("OMP_AUTH_BROKER_URL", "")
 	count := 0
 	for _, p := range m.agentEnvPairs(ap) {
 		if p.Key == "NO_PROXY" {
@@ -338,7 +339,7 @@ func TestAgentEnvPairs_NoProxyIncludesCredentialBroker(t *testing.T) {
 	}
 }
 
-func TestAgentNoProxy(t *testing.T) {
+func TestAgentNoProxyBrokerURL(t *testing.T) {
 	for in, want := range map[string]string{
 		"":                            "127.0.0.1,localhost,::1",
 		"http://172.18.0.1:18765":     "127.0.0.1,localhost,::1,172.18.0.1",
@@ -347,8 +348,9 @@ func TestAgentNoProxy(t *testing.T) {
 		"not a url":                   "127.0.0.1,localhost,::1",
 		"://":                         "127.0.0.1,localhost,::1",
 	} {
-		if got := agentNoProxy(in); got != want {
-			t.Errorf("agentNoProxy(%q) = %q, want %q", in, got, want)
+		t.Setenv("OMP_AUTH_BROKER_URL", in)
+		if got := agentNoProxy(); got != want {
+			t.Errorf("agentNoProxy() with broker %q = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -1913,6 +1915,32 @@ func TestClearExpiredTokens_MissingFile(t *testing.T) {
 // ---------------------------------------------------------------------------
 // fixSharedConfigPerms — with actual path
 // ---------------------------------------------------------------------------
+
+// A symlink at the shared config path is left alone: the file it points at
+// keeps its mode.
+func TestFixSharedConfigPerms_SymlinkIsNotFollowed(t *testing.T) {
+	cleanup := configTestHelper(t)
+	defer cleanup()
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, sharedCopilotConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(map[string]config.AgentConfig{
+		"scanner": {Backend: "claude"},
+	}, discardLogger(), ProjectContext{})
+	m.mu.RLock()
+	agent := m.agents["scanner"]
+	m.mu.RUnlock()
+
+	m.fixSharedConfigPerms(agent)
+
+	if info, _ := os.Stat(victim); info.Mode().Perm() != 0o600 {
+		t.Fatalf("victim mode = %v, want 0600 untouched", info.Mode())
+	}
+}
 
 func TestFixSharedConfigPerms_FixesPerms(t *testing.T) {
 	cleanup := configTestHelper(t)

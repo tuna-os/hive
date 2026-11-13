@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,8 +19,14 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
+	"github.com/hivecommons/hive/pkg/authorkind"
 	hgithub "github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/intent"
+	"github.com/hivecommons/hive/pkg/review"
+	hreview "github.com/hivecommons/hive/pkg/review"
+	"github.com/hivecommons/hive/pkg/stageengine"
+	"github.com/hivecommons/hive/pkg/stageengine/prstage"
+	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
 const (
@@ -42,6 +49,7 @@ func contributorClaimMarkerTier(who, kind, hive, fields string) string {
 }
 
 type contributorLaneFixture struct {
+	nodeID          string
 	author          string
 	body            string
 	labels          []string
@@ -57,15 +65,25 @@ type contributorLaneFixture struct {
 	recheckHeadSHA  string
 	issueComments   []map[string]any // comments on the linked issue
 	prComments      []map[string]any // comments on the PR
-	mergedHistory   []map[string]any
+	// otherPRComments holds the comments of acme/widget PRs other than #7,
+	// keyed by number, for tests that admit several PRs by one author.
+	otherPRComments map[int][]map[string]any
+	// commentTargets lists the PR numbers comments were posted on, in order.
+	commentTargets []int
+	mergedHistory  []map[string]any
 	// otherHistory is the closed-PR list of the hive's other repositories
 	// (acme/<name>), served to the hive-wide auto-promotion walk; the fake
 	// search/issues endpoint reports a repo only when it holds a merged PR
 	// by the searched author.
-	otherHistory    map[string][]map[string]any
-	searchStatus    int
-	searches        int
-	searchQuery     string
+	otherHistory  map[string][]map[string]any
+	searchStatus  int
+	searches      int
+	searchQuery   string
+	searchQueries []string
+	// unsearchable lists the owner/repo names the fake search/issues
+	// endpoint refuses with GitHub's 422 Validation Failed whenever a query
+	// names them, as it does for a renamed or invisible repository.
+	unsearchable    map[string]bool
 	otherLists      []string
 	issueCommentsSt int
 	reviews         []map[string]any
@@ -78,6 +96,9 @@ type contributorLaneFixture struct {
 	updates         int
 	lastComment     string
 	allComments     []string
+	// commentEdits records the bodies written by PATCH /issues/comments/ID,
+	// which also rewrites the matching prComments entry.
+	commentEdits []string
 	// checkCompletedAt, when set, is the completed_at the check-runs
 	// endpoint reports for sha7 (RFC 3339); empty omits the field.
 	checkCompletedAt string
@@ -92,6 +113,9 @@ type contributorLaneFixture struct {
 	// headStatus, when set, is the combined-status state and check-run
 	// conclusion reported for sha7; empty means "success".
 	headStatus string
+	// headStatuses is what GET commits/sha7/statuses (every commit status,
+	// with its creator) serves; nil serves an empty list.
+	headStatuses []map[string]any
 	// baseRef, when set, gives the PR base a branch name and serves the
 	// branch, protection and compare routes the current-base gate
 	// (automerge_current_base.go) and release hold need; empty leaves the
@@ -99,6 +123,15 @@ type contributorLaneFixture struct {
 	baseRef  string
 	behindBy int // behind_by reported by compare/<baseRef>...sha7
 	compares int
+	// headCommit, when set, is what GET commits/sha7 serves — the parents
+	// and GitHub author the workflow-fence base-refresh carry reads; nil
+	// serves a one-parent commit by the PR author.
+	headCommit map[string]any
+	// compareFiles and compareMergeBase are the files and merge-base SHA
+	// compare/<baseRef>...<head> serves for each head, for the base-refresh
+	// carry; a head without files is answered as before.
+	compareFiles     map[string][]map[string]any
+	compareMergeBase map[string]string
 	// requiredContexts, when set with baseRef, is what branch protection
 	// declares as required_status_checks.contexts; empty keeps the branch
 	// unprotected. The status/check-runs routes only ever report ci/build,
@@ -137,6 +170,10 @@ type contributorLaneFixture struct {
 	labelsCreated int
 	labelsAdded   []string
 	labelsRemoved []string
+	// updateStatus, when set, is the status every PUT update-branch
+	// answers with, carrying updateMessage.
+	updateStatus  int
+	updateMessage string
 }
 
 func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.Server {
@@ -167,8 +204,13 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 		if headStatus == "" {
 			headStatus = "success"
 		}
+		baseRef := fx.baseRef
+		if baseRef == "" {
+			baseRef = "main"
+		}
 		pull := func(sha string) map[string]any {
 			p := map[string]any{
+				"node_id":         fx.nodeID,
 				"number":          7,
 				"state":           "open",
 				"draft":           fx.draft,
@@ -177,11 +219,12 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				"mergeable":       state == "clean",
 				"user":            map[string]string{"login": author},
 				"head":            map[string]any{"sha": sha, "repo": map[string]string{"full_name": headRepo}},
-				"base":            map[string]any{"repo": map[string]string{"full_name": "acme/widget"}},
+				"base":            map[string]any{"ref": "main", "sha": "base1", "repo": map[string]string{"full_name": "acme/widget"}},
 				"labels":          labels,
 			}
 			if fx.baseRef != "" {
 				p["base"].(map[string]any)["ref"] = fx.baseRef
+				p["base"].(map[string]any)["sha"] = "base1"
 			}
 			if !fx.omitAssociation {
 				p["author_association"] = association
@@ -208,6 +251,7 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 		case r.Method == http.MethodGet && r.URL.Path == "/search/issues":
 			fx.searches++
 			fx.searchQuery = r.URL.Query().Get("q")
+			fx.searchQueries = append(fx.searchQueries, fx.searchQuery)
 			if fx.searchStatus != 0 {
 				http.Error(w, "search error", fx.searchStatus)
 				return
@@ -220,6 +264,14 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 					searchedAuthor = strings.TrimPrefix(term, "author:")
 				case strings.HasPrefix(term, "repo:"):
 					searchedRepos = append(searchedRepos, strings.TrimPrefix(term, "repo:"))
+				}
+			}
+			for _, full := range searchedRepos {
+				if fx.unsearchable[full] {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					json.NewEncoder(w).Encode(map[string]any{"message": "Validation Failed", "errors": []map[string]string{{"resource": "Search", "field": "q", "code": "invalid", "message": "The listed users and repositories cannot be searched either because the resources do not exist or you do not have permission to view them."}}})
+					return
 				}
 			}
 			items := []map[string]any{}
@@ -249,7 +301,7 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			sha := "sha7"
-			if fetches > 1 && fx.recheckHeadSHA != "" {
+			if fetches > 2 && fx.recheckHeadSHA != "" {
 				sha = fx.recheckHeadSHA
 			}
 			json.NewEncoder(w).Encode(pull(sha))
@@ -317,6 +369,12 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				"total_count": 1,
 				"statuses":    []map[string]string{{"context": "ci/build", "state": headStatus}},
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/sha7/statuses":
+			statuses := fx.headStatuses
+			if statuses == nil {
+				statuses = []map[string]any{}
+			}
+			json.NewEncoder(w).Encode(statuses)
 		case r.Method == http.MethodGet && (r.URL.Path == "/repos/acme/widget/commits/sha7/check-runs" ||
 			(fx.recheckHeadSHA != "" && r.URL.Path == "/repos/acme/widget/commits/"+fx.recheckHeadSHA+"/check-runs")):
 			if fx.noCIEvidence {
@@ -347,9 +405,9 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]any{"merged": !fx.mergeNotApplied, "sha": "merge7"})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+fx.baseRef:
-			json.NewEncoder(w).Encode(map[string]any{"name": fx.baseRef, "commit": map[string]string{"sha": "base1"}})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+fx.baseRef+"/protection/required_status_checks":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+baseRef:
+			json.NewEncoder(w).Encode(map[string]any{"name": baseRef, "commit": map[string]string{"sha": "base1"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/"+baseRef+"/protection/required_status_checks":
 			if len(fx.requiredContexts) > 0 {
 				json.NewEncoder(w).Encode(map[string]any{"strict": false, "contexts": fx.requiredContexts})
 				return
@@ -374,7 +432,7 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/rules/branches/"+fx.baseRef:
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/rules/branches/"+baseRef:
 			if len(fx.rulesetContexts) > 0 {
 				checks := make([]map[string]string, 0, len(fx.rulesetContexts))
 				for _, name := range fx.rulesetContexts {
@@ -384,13 +442,33 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				return
 			}
 			json.NewEncoder(w).Encode([]any{})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/base1/status":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/base1/status":
 			json.NewEncoder(w).Encode(map[string]any{"state": "success", "total_count": 0, "statuses": []any{}})
-		case fx.baseRef != "" && r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/compare/"+fx.baseRef+"...sha7":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/compare/"+baseRef+"...sha7":
 			fx.compares++
-			json.NewEncoder(w).Encode(map[string]any{"behind_by": fx.behindBy, "ahead_by": 1})
+			cmp := map[string]any{"behind_by": fx.behindBy, "ahead_by": 1}
+			if files, ok := fx.compareFiles["sha7"]; ok {
+				cmp["files"] = files
+				cmp["merge_base_commit"] = map[string]string{"sha": fx.compareMergeBase["sha7"]}
+			}
+			json.NewEncoder(w).Encode(cmp)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/acme/widget/compare/"+baseRef+"...") && fx.compareFiles[strings.TrimPrefix(r.URL.Path, "/repos/acme/widget/compare/"+baseRef+"...")] != nil:
+			head := strings.TrimPrefix(r.URL.Path, "/repos/acme/widget/compare/"+baseRef+"...")
+			json.NewEncoder(w).Encode(map[string]any{"files": fx.compareFiles[head], "merge_base_commit": map[string]string{"sha": fx.compareMergeBase[head]}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/sha7":
+			commit := fx.headCommit
+			if commit == nil {
+				commit = map[string]any{"sha": "sha7", "parents": []map[string]string{{"sha": "sha6"}}, "author": map[string]string{"login": author}, "committer": map[string]string{"login": author}}
+			}
+			json.NewEncoder(w).Encode(commit)
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/acme/widget/pulls/7/update-branch":
 			fx.updates++
+			if fx.updateStatus != 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(fx.updateStatus)
+				json.NewEncoder(w).Encode(map[string]any{"message": fx.updateMessage})
+				return
+			}
 			json.NewEncoder(w).Encode(map[string]any{"message": "Updating pull request branch."})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widget/labels":
 			fx.labelsCreated++
@@ -413,6 +491,7 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widget/issues/7/comments":
 			fx.comments++
+			fx.commentTargets = append(fx.commentTargets, 7)
 			if fx.commentStatus != 0 {
 				http.Error(w, "comment error", fx.commentStatus)
 				return
@@ -431,10 +510,67 @@ func newContributorLaneAPI(t *testing.T, fx *contributorLaneFixture) *httptest.S
 				"body": payload.Body,
 			})
 			json.NewEncoder(w).Encode(map[string]any{"id": 1000 + fx.comments})
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/repos/acme/widget/issues/comments/"):
+			id, _ := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/repos/acme/widget/issues/comments/"), 10, 64)
+			var payload struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			for _, c := range fx.prComments {
+				if cid, ok := c["id"]; ok && fmt.Sprint(cid) == strconv.FormatInt(id, 10) {
+					c["body"] = payload.Body
+				}
+			}
+			fx.commentEdits = append(fx.commentEdits, payload.Body)
+			json.NewEncoder(w).Encode(map[string]any{"id": id, "body": payload.Body})
+		case r.Method == http.MethodGet && otherPRCommentsNumber(r.URL.Path) > 0:
+			comments := fx.otherPRComments[otherPRCommentsNumber(r.URL.Path)]
+			if comments == nil {
+				comments = []map[string]any{}
+			}
+			json.NewEncoder(w).Encode(comments)
+		case r.Method == http.MethodPost && otherPRCommentsNumber(r.URL.Path) > 0:
+			number := otherPRCommentsNumber(r.URL.Path)
+			fx.comments++
+			fx.commentTargets = append(fx.commentTargets, number)
+			var payload struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			fx.lastComment = payload.Body
+			fx.allComments = append(fx.allComments, payload.Body)
+			if fx.otherPRComments == nil {
+				fx.otherPRComments = map[int][]map[string]any{}
+			}
+			fx.otherPRComments[number] = append(fx.otherPRComments[number], map[string]any{
+				"id":   1000 + fx.comments,
+				"user": map[string]string{"login": testHiveAppBotLogin},
+				"body": payload.Body,
+			})
+			json.NewEncoder(w).Encode(map[string]any{"id": 1000 + fx.comments})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
 	}))
+}
+
+// otherPRCommentsNumber returns the PR number of an acme/widget
+// issues/<n>/comments path for PRs other than #7 and the linked issue #42,
+// or 0 when the path is something else.
+func otherPRCommentsNumber(path string) int {
+	rest, ok := strings.CutPrefix(path, "/repos/acme/widget/issues/")
+	if !ok {
+		return 0
+	}
+	numText, ok := strings.CutSuffix(rest, "/comments")
+	if !ok {
+		return 0
+	}
+	number, err := strconv.Atoi(numText)
+	if err != nil || number == 7 || number == contributorLaneTestIssue {
+		return 0
+	}
+	return number
 }
 
 // contributorLaneClock is a mutable fake clock injected via Options.Now.
@@ -480,6 +616,9 @@ func newContributorLaneEngineRepos(apiURL string, repos []string, policy Contrib
 	client := hgithub.NewClient("token", "acme", repos, nil, apiURL)
 	client.SetAppBotLogin(testHiveAppBotLogin)
 	opts.ContributorLanePolicy = func() ContributorLanePolicy { return policy }
+	if opts.BasePreparation == nil {
+		opts.BasePreparation = NewBasePreparationStore("")
+	}
 	if opts.ContributorLaneVerdict == nil {
 		opts.ContributorLaneVerdict = approvedVerdict
 	}
@@ -490,6 +629,12 @@ func newContributorLaneEngineRepos(apiURL string, repos []string, policy Contrib
 	// the first updated_at seen for acme/widget#7@sha7 across tests.
 	if opts.HeadFirstSeen == nil {
 		opts.HeadFirstSeen = NewHeadFirstSeenTracker()
+	}
+	// Likewise the process-wide stage store, which since
+	// hivecommons/hive#15443 remembers which authors' auto-promotion was
+	// announced; sharing it would leak one test's announcement into the next.
+	if opts.StageStore == nil {
+		opts.StageStore = stagelabels.NewStore("", nil)
 	}
 	if clock != nil {
 		opts.Now = clock.now
@@ -543,7 +688,7 @@ func TestTrySweepContributorLanePRSkipReasons(t *testing.T) {
 		{name: "hold label", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"hold"} }, wantReason: "label:hold"},
 		{name: "do-not-merge slash label", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"do-not-merge/wip"} }, wantReason: "label:do-not-merge/wip"},
 		{name: "needs-rebase label returns author fix", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"needs-rebase"} }, wantReason: "label:needs-rebase"},
-		{name: "policy exclude label", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"blocked"} }, wantReason: "excluded-label:blocked"},
+		{name: "blocked label (shared merge gate)", mutate: func(fx *contributorLaneFixture) { fx.labels = []string{"blocked"} }, wantReason: autoMergeReasonLabelBlocked},
 		{name: "conflict outranks untrusted claim tier", mutate: func(fx *contributorLaneFixture) {
 			fx.mergeableState = "dirty"
 			tierClaim(" tier=newcomer verified=true")(fx)
@@ -677,6 +822,31 @@ func TestTrySweepContributorLanePRSkipReasons(t *testing.T) {
 			wantReason: contributorLaneReasonNoVerdict,
 		},
 		{
+			// hive-wild-mole, 2026-11-07: a reviewer agent exists but the
+			// review swarm is off, so no verdict will ever come. no-verdict
+			// parked twelve PRs at 050 "review swarm requested" for good.
+			name: "review swarm off names the stall",
+			verdict: func(string, int, string) ContributorLaneVerdict {
+				return ContributorLaneVerdict{Configured: true, ReviewOff: true}
+			},
+			wantReason: contributorLaneReasonReviewOff,
+		},
+		{
+			name:   "review swarm off still merges when verdict not required",
+			policy: func(p *ContributorLanePolicy) { p.RequireReviewerVerdict = false },
+			verdict: func(string, int, string) ContributorLaneVerdict {
+				return ContributorLaneVerdict{Configured: true, ReviewOff: true}
+			},
+			wantMerges: 1,
+		},
+		{
+			name: "review swarm off keeps a recorded changes request",
+			verdict: func(string, int, string) ContributorLaneVerdict {
+				return ContributorLaneVerdict{Configured: true, ReviewOff: true, Verdict: "changes_requested"}
+			},
+			wantReason: contributorLaneReasonChangesRequested,
+		},
+		{
 			name:       "no reviewer configured skips",
 			verdict:    func(string, int, string) ContributorLaneVerdict { return ContributorLaneVerdict{} },
 			wantReason: contributorLaneReasonNoReviewer,
@@ -804,6 +974,51 @@ func TestTrySweepContributorLaneTrustedHumanApprovalClearsRequiresHuman(t *testi
 			}
 			if reason != tt.wantReason || fx.merges != tt.wantMerges {
 				t.Fatalf("reason=%q merges=%d, want %q/%d", reason, fx.merges, tt.wantReason, tt.wantMerges)
+			}
+		})
+	}
+}
+
+// An owner's dashboard Approve admits the untrusted-author head
+// (hivecommons/hive#15136) once the sentinel it released stays released:
+// the recorded approval by a trusted merger admits the newcomer-tier claim
+// the lane would otherwise refuse, and the PR merges. While the alert label
+// is back on the PR — the sentinel re-applying it undid the approval on
+// dibs#510 — the lane still stands down with sentinel-blocked, so the label
+// memory, not the admission, is what the owner's approval depends on.
+func TestTrySweepContributorLaneOperatorApprovalAdmitsReleasedSentinel(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		labels     []string
+		wantReason string
+		wantMerges int
+	}{
+		{name: "sentinel released", labels: []string{"stage/085-needs-decision"}, wantMerges: 1},
+		{name: "sentinel re-applied", labels: []string{"stage/085-needs-decision", "hive-sentinel"}, wantReason: contributorLaneReasonSentinelBlocked},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := validContributorFixture()
+			fx.labels = tt.labels
+			fx.issueComments[0]["body"] = contributorClaimMarkerTier(contributorLaneTestAuthor, "contributor", contributorLaneTestHive, " tier=newcomer verified=true")
+			api := newContributorLaneAPI(t, &fx)
+			defer api.Close()
+			policy := defaultContributorLanePolicy()
+			clock := &contributorLaneClock{at: time.Date(2026, 10, 15, 13, 0, 0, 0, time.UTC)}
+			store := review.NewHumanChangeRequests("")
+			if err := store.Record(review.HumanChangeRequest{Repo: "acme/widget", Number: 7, HeadSHA: "sha7", Actor: "clubanderson", Kind: review.HumanChangeRequestKindApprove, Source: review.HumanChangeRequestSourceDecision, SourceID: 1}); err != nil {
+				t.Fatal(err)
+			}
+			engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock), HumanChangeRequests: store})
+			engine.SetMergerAuthorizer(func(login string) bool { return strings.EqualFold(login, "clubanderson") })
+			event, reason, err := engine.trySweepContributorLanePR(context.Background(), "widget", "acme", "widget", 7, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reason != tt.wantReason || fx.merges != tt.wantMerges {
+				t.Fatalf("reason=%q merges=%d, want %q/%d", reason, fx.merges, tt.wantReason, tt.wantMerges)
+			}
+			if tt.wantMerges == 1 && (!strings.Contains(fx.lastComment, "operator-approval:clubanderson") || event.Number != 7) {
+				t.Fatalf("merge comment must name the admission: %q (event %+v)", fx.lastComment, event)
 			}
 		})
 	}
@@ -1116,6 +1331,7 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 		own          []map[string]any
 		other        map[string][]map[string]any
 		searchStatus int
+		unsearchable []string
 		wantReason   string
 		wantMerges   int
 		wantSearches int
@@ -1191,9 +1407,31 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 			name:         "search failure degrades to the PR's repository",
 			own:          cleanHistory(1),
 			other:        map[string][]map[string]any{"hive": cleanHistory(9)},
-			searchStatus: http.StatusUnprocessableEntity,
+			searchStatus: http.StatusInternalServerError,
 			wantReason:   contributorLaneReasonClaimTier,
 			wantSearches: 1,
+		},
+		// hivecommons/hive#17148: GitHub refuses the whole query when one
+		// listed repository cannot be searched; the others still count. The
+		// PR's own repository is part of the chunk on v6 (per-author cache,
+		// #15088), so the per-repository fallback asks for it too.
+		{
+			name:         "an unsearchable repository does not hide the others",
+			own:          cleanHistory(1),
+			other:        map[string][]map[string]any{"hive": cleanHistory(9)},
+			unsearchable: []string{"acme/docs"},
+			wantMerges:   1,
+			wantSearches: 5,
+			wantLists:    []string{"hive"},
+			wantComment:  "merged=5 scope=hive repos=widget:1,hive:4 -->",
+		},
+		{
+			name:         "an unsearchable author degrades to the PR's repository",
+			own:          cleanHistory(1),
+			other:        map[string][]map[string]any{"hive": cleanHistory(9)},
+			unsearchable: []string{"acme/hive", "acme/docs", "acme/homebrew-hive"},
+			wantReason:   contributorLaneReasonClaimTier,
+			wantSearches: 5,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1202,6 +1440,10 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 			fx.mergedHistory = tc.own
 			fx.otherHistory = tc.other
 			fx.searchStatus = tc.searchStatus
+			fx.unsearchable = map[string]bool{}
+			for _, full := range tc.unsearchable {
+				fx.unsearchable[full] = true
+			}
 			api := newContributorLaneAPI(t, &fx)
 			defer api.Close()
 			policy := defaultContributorLanePolicy()
@@ -1223,16 +1465,17 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 				t.Fatalf("searches = %d, want %d (q=%q)", fx.searches, tc.wantSearches, fx.searchQuery)
 			}
 			if fx.searches > 0 {
+				first := fx.searchQueries[0]
 				for _, want := range []string{"is:pr", "is:merged", "author:" + contributorLaneTestAuthor, "repo:acme/hive", "repo:acme/docs", "repo:acme/homebrew-hive"} {
-					if !strings.Contains(fx.searchQuery, want) {
-						t.Fatalf("search query %q missing %q", fx.searchQuery, want)
+					if !strings.Contains(first, want) {
+						t.Fatalf("search query %q missing %q", first, want)
 					}
 				}
 				// The answer is cached per author for every active repository,
 				// so the PR's own repository is searched too; it is never walked
 				// twice (wantLists below).
-				if !strings.Contains(fx.searchQuery, "repo:acme/widget") {
-					t.Fatalf("search query %q must cover the PR's own repository for the per-author cache", fx.searchQuery)
+				if !strings.Contains(first, "repo:acme/widget") {
+					t.Fatalf("search query %q must cover the PR's own repository for the per-author cache", first)
 				}
 			}
 			if strings.Join(fx.otherLists, ",") != strings.Join(tc.wantLists, ",") {
@@ -1260,6 +1503,153 @@ func TestTrySweepContributorLanePRAutoPromotionScope(t *testing.T) {
 				if !strings.Contains(auditComment, tc.wantComment) {
 					t.Fatalf("audit comment %q should contain %q", auditComment, tc.wantComment)
 				}
+			}
+		})
+	}
+}
+
+// Regression for hivecommons/hive#15443: the promotion announcement is
+// author-wide, posted once per (hive, author). Two open PRs by the same
+// author in one sweep get one comment; a restart that reloads the stage
+// store posts none; revert evidence that demotes the author and a later
+// clean history that re-promotes them post exactly one more.
+func TestAdmitContributorAnnouncesPromotionOncePerAuthor(t *testing.T) {
+	cleanHistory := func(n int) []map[string]any {
+		history := make([]map[string]any, 0, n)
+		for i := 0; i < n; i++ {
+			history = append(history, mergedHistoryPR(contributorLaneTestAuthor, "fix: clean change"))
+		}
+		return history
+	}
+	revertedHistory := append(cleanHistory(2), mergedHistoryPR(contributorLaneTestAuthor, "Revert \"fix: clean change\""))
+	pr := func(number int) *gh.PullRequest {
+		return &gh.PullRequest{
+			Number: gh.Ptr(number),
+			Body:   gh.Ptr("Fixes #42"),
+			User:   &gh.User{Login: gh.Ptr(contributorLaneTestAuthor)},
+			Head:   &gh.PullRequestBranch{SHA: gh.Ptr(fmt.Sprintf("sha%d", number))},
+		}
+	}
+
+	fx := validContributorFixture()
+	fx.issueComments[0]["body"] = contributorClaimMarkerTier(contributorLaneTestAuthor, "contributor", contributorLaneTestHive, " tier=contributor verified=true")
+	fx.mergedHistory = cleanHistory(5)
+	api := newContributorLaneAPI(t, &fx)
+	defer api.Close()
+	policy := defaultContributorLanePolicy()
+	policy.AutoPromoteAfterMergedPR = 5
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 29, 17, 20, 0, 0, time.UTC)}
+	statePath := filepath.Join(t.TempDir(), "stage.json")
+	store := stagelabels.NewStore(statePath, clock.now)
+	engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock), StageStore: store})
+
+	for _, step := range []struct {
+		name          string
+		prs           []int
+		history       []map[string]any
+		restart       bool
+		wantPromoted  bool
+		wantComments  int
+		wantTargets   []int
+		wantAnnounced bool
+	}{
+		{name: "two PRs by the author in one sweep announce once", prs: []int{7, 8}, wantPromoted: true, wantComments: 1, wantTargets: []int{7}, wantAnnounced: true},
+		{name: "a later PR by the author announces nothing", prs: []int{9}, wantPromoted: true, wantComments: 1, wantTargets: []int{7}, wantAnnounced: true},
+		{name: "a restart reloading the store announces nothing", prs: []int{8, 9}, restart: true, wantPromoted: true, wantComments: 1, wantTargets: []int{7}, wantAnnounced: true},
+		{name: "revert evidence demotes and forgets the announcement", prs: []int{7}, history: revertedHistory, wantComments: 1, wantTargets: []int{7}},
+		{name: "regaining promotion announces once more", prs: []int{8, 7}, history: cleanHistory(5), wantPromoted: true, wantComments: 2, wantTargets: []int{7, 8}, wantAnnounced: true},
+		{name: "and then stays quiet again", prs: []int{9}, wantPromoted: true, wantComments: 2, wantTargets: []int{7, 8}, wantAnnounced: true},
+	} {
+		if step.history != nil {
+			fx.mergedHistory = step.history
+		}
+		if step.restart {
+			if err := store.Save(); err != nil {
+				t.Fatalf("%s: save: %v", step.name, err)
+			}
+			store = stagelabels.NewStore(statePath, clock.now)
+			if err := store.Load(); err != nil {
+				t.Fatalf("%s: load: %v", step.name, err)
+			}
+			engine = newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock), StageStore: store})
+		}
+		for _, number := range step.prs {
+			match, err := engine.admitContributor(context.Background(), "acme", "widget", pr(number), policy)
+			if err != nil {
+				t.Fatalf("%s: admit #%d: %v", step.name, number, err)
+			}
+			if match.admittedByAutoPromotion() != step.wantPromoted {
+				t.Fatalf("%s: admit #%d promoted = %v, want %v (match=%+v)", step.name, number, match.admittedByAutoPromotion(), step.wantPromoted, match)
+			}
+		}
+		if fx.comments != step.wantComments || !slices.Equal(fx.commentTargets, step.wantTargets) {
+			t.Fatalf("%s: comments = %d on %v, want %d on %v", step.name, fx.comments, fx.commentTargets, step.wantComments, step.wantTargets)
+		}
+		if got := store.TrustPromotionAnnounced(contributorLaneTestAuthor); got != step.wantAnnounced {
+			t.Fatalf("%s: announced = %v, want %v", step.name, got, step.wantAnnounced)
+		}
+	}
+	for _, want := range []string{
+		"<!-- hive:trust-promoted login=" + contributorLaneTestAuthor + " merged=5 scope=hive repos=widget:5 -->",
+		"@" + contributorLaneTestAuthor + " is now trusted for contributor-lane merging in this hive (last 5 merged PRs: no reverts or sentinel alerts). Applies to their open and future PRs here; CI, review verdicts, diff fences, soak and branch protection still apply.",
+	} {
+		if !strings.Contains(fx.lastComment, want) {
+			t.Fatalf("announcement %q missing %q", fx.lastComment, want)
+		}
+	}
+	if strings.Contains(fx.lastComment, "on this PR") {
+		t.Fatalf("announcement %q must not read as per-PR", fx.lastComment)
+	}
+}
+
+// A store rebuilt from scratch must not repeat an announcement that is
+// already on the PR, in either the current or the pre-#15443 marker form;
+// a failed post releases the claim so the next PR announces instead.
+func TestCommentContributorAutoPromotionMarkerFallbackAndRelease(t *testing.T) {
+	cleanHistory := func(n int) []map[string]any {
+		history := make([]map[string]any, 0, n)
+		for i := 0; i < n; i++ {
+			history = append(history, mergedHistoryPR(contributorLaneTestAuthor, "fix: clean change"))
+		}
+		return history
+	}
+	for _, tc := range []struct {
+		name          string
+		existing      string
+		commentStatus int
+		wantComments  int
+		wantAnnounced bool
+	}{
+		{name: "current marker on the PR", existing: "<!-- hive:trust-promoted login=" + contributorLaneTestAuthor + " merged=5 scope=hive repos=widget:5 -->\nold", wantAnnounced: true},
+		{name: "legacy marker on the PR", existing: "<!-- hive:contributor-auto-promoted author=" + contributorLaneTestAuthor + " merged=5 scope=hive repos=widget:5 -->\nold", wantAnnounced: true},
+		{name: "another author's marker does not count", existing: "<!-- hive:trust-promoted login=someone-else merged=5 scope=hive repos=widget:5 -->\nold", wantComments: 1, wantAnnounced: true},
+		{name: "failed post releases the claim", commentStatus: http.StatusBadGateway, wantComments: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := validContributorFixture()
+			fx.issueComments[0]["body"] = contributorClaimMarkerTier(contributorLaneTestAuthor, "contributor", contributorLaneTestHive, " tier=contributor verified=true")
+			fx.mergedHistory = cleanHistory(5)
+			fx.commentStatus = tc.commentStatus
+			if tc.existing != "" {
+				fx.prComments = []map[string]any{{"id": 1, "user": map[string]string{"login": testHiveAppBotLogin}, "body": tc.existing}}
+			}
+			api := newContributorLaneAPI(t, &fx)
+			defer api.Close()
+			policy := defaultContributorLanePolicy()
+			policy.AutoPromoteAfterMergedPR = 5
+			clock := &contributorLaneClock{at: time.Date(2026, 10, 29, 17, 20, 0, 0, time.UTC)}
+			store := stagelabels.NewStore("", clock.now)
+			engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock), StageStore: store})
+			pr := &gh.PullRequest{Number: gh.Ptr(7), Body: gh.Ptr("Fixes #42"), User: &gh.User{Login: gh.Ptr(contributorLaneTestAuthor)}, Head: &gh.PullRequestBranch{SHA: gh.Ptr("sha7")}}
+			match, err := engine.admitContributor(context.Background(), "acme", "widget", pr, policy)
+			if err != nil || !match.admittedByAutoPromotion() {
+				t.Fatalf("admit = %+v, %v", match, err)
+			}
+			if fx.comments != tc.wantComments {
+				t.Fatalf("comments = %d, want %d", fx.comments, tc.wantComments)
+			}
+			if got := store.TrustPromotionAnnounced(contributorLaneTestAuthor); got != tc.wantAnnounced {
+				t.Fatalf("announced = %v, want %v", got, tc.wantAnnounced)
 			}
 		})
 	}
@@ -1402,21 +1792,33 @@ func TestTrySweepContributorLanePRSoakTiming(t *testing.T) {
 	engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: tracker})
 	ctx := context.Background()
 
-	// First green observation: soak starts now, nothing merges.
-	_, reason, err := engine.trySweepContributorLanePR(ctx, "widget", "acme", "widget", 7, policy)
-	if err != nil || reason != contributorLaneReasonSoaking+"(remaining=2h0m0s)" {
+	// First green observation: soak starts now, nothing merges. The reason
+	// is the bare token — the countdown is not in it (hivecommons/hive#15729:
+	// a reason that moved every pass re-stamped the stage record); the
+	// clock rides on the evaluation.
+	eval, reason, err := engine.evaluateContributorLanePR(ctx, "widget", "acme", "widget", 7, policy, false)
+	if err != nil || reason != contributorLaneReasonSoaking {
 		t.Fatalf("first pass reason=%q err=%v", reason, err)
+	}
+	if !eval.soakStartedAt.Equal(clock.at) || eval.soakRemaining != 2*time.Hour {
+		t.Fatalf("first pass soak clock = %v / %v, want %v / 2h", eval.soakStartedAt, eval.soakRemaining, clock.at)
 	}
 	firstGreen, ok := tracker.FirstGreen("acme", "widget", 7, "sha7")
 	if !ok || !firstGreen.Equal(clock.at) {
 		t.Fatalf("first green = %v ok=%v, want %v", firstGreen, ok, clock.at)
 	}
 
-	// Half-way through the soak the remaining time is reported.
+	// Half-way through the soak the reason is unchanged; the clock counts.
 	clock.advance(time.Hour)
-	_, reason, err = engine.trySweepContributorLanePR(ctx, "widget", "acme", "widget", 7, policy)
-	if err != nil || reason != contributorLaneReasonSoaking+"(remaining=1h0m0s)" {
+	eval, reason, err = engine.evaluateContributorLanePR(ctx, "widget", "acme", "widget", 7, policy, false)
+	if err != nil || reason != contributorLaneReasonSoaking {
 		t.Fatalf("mid-soak reason=%q err=%v", reason, err)
+	}
+	if !eval.soakStartedAt.Equal(firstGreen) || eval.soakRemaining != time.Hour {
+		t.Fatalf("mid-soak clock = %v / %v, want %v / 1h", eval.soakStartedAt, eval.soakRemaining, firstGreen)
+	}
+	if _, reason, err = engine.trySweepContributorLanePR(ctx, "widget", "acme", "widget", 7, policy); err != nil || reason != contributorLaneReasonSoaking {
+		t.Fatalf("mid-soak sweep reason=%q err=%v", reason, err)
 	}
 	if got, _ := tracker.FirstGreen("acme", "widget", 7, "sha7"); !got.Equal(firstGreen) {
 		t.Fatalf("first green moved to %v", got)
@@ -1447,9 +1849,9 @@ func TestTrySweepContributorLanePRSoakSurvivesRestart(t *testing.T) {
 	engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: tracker})
 	ctx := context.Background()
 
-	_, reason, err := engine.trySweepContributorLanePR(ctx, "widget", "acme", "widget", 7, policy)
-	if err != nil || reason != contributorLaneReasonSoaking+"(remaining=30m0s)" {
-		t.Fatalf("fresh process reason=%q err=%v, want 30m remaining from the check's completed_at", reason, err)
+	eval, reason, err := engine.evaluateContributorLanePR(ctx, "widget", "acme", "widget", 7, policy, false)
+	if err != nil || reason != contributorLaneReasonSoaking || eval.soakRemaining != 30*time.Minute {
+		t.Fatalf("fresh process reason=%q remaining=%v err=%v, want 30m remaining from the check's completed_at", reason, eval.soakRemaining, err)
 	}
 	if first, ok := tracker.FirstGreen("acme", "widget", 7, "sha7"); !ok || !first.Equal(clock.at.Add(-90*time.Minute)) {
 		t.Fatalf("first green = %v ok=%v, want seeded from completed_at", first, ok)
@@ -1468,8 +1870,8 @@ func TestTrySweepContributorLanePRSoakSurvivesRestart(t *testing.T) {
 	api2 := newContributorLaneAPI(t, &fx2)
 	defer api2.Close()
 	engine2 := newContributorLaneEngine(api2.URL, policy, clock, Options{ContributorSoak: NewContributorSoakTracker()})
-	if _, reason, err := engine2.trySweepContributorLanePR(ctx, "widget", "acme", "widget", 7, policy); err != nil || reason != contributorLaneReasonSoaking+"(remaining=2h0m0s)" {
-		t.Fatalf("future completed_at reason=%q err=%v", reason, err)
+	if eval, reason, err := engine2.evaluateContributorLanePR(ctx, "widget", "acme", "widget", 7, policy, false); err != nil || reason != contributorLaneReasonSoaking || eval.soakRemaining != 2*time.Hour {
+		t.Fatalf("future completed_at reason=%q remaining=%v err=%v", reason, eval.soakRemaining, err)
 	}
 }
 
@@ -1636,9 +2038,6 @@ func TestContributorLanePolicyHelpers(t *testing.T) {
 	}
 	if got := p.excludedLabel([]string{"ok"}); got != "" {
 		t.Fatalf("excludedLabel = %q, want empty", got)
-	}
-	if got := contributorLaneSoakReason(90*time.Minute + 20*time.Second); got != "contributor-lane:soaking(remaining=1h30m0s)" {
-		t.Fatalf("soak reason = %q", got)
 	}
 	var nilEngine *Engine
 	if nilEngine.currentContributorLanePolicy().Enabled {
@@ -1870,5 +2269,121 @@ func TestContributorPromotionSkipsBots(t *testing.T) {
 				t.Fatalf("bot triggered %d searches", fx.searches)
 			}
 		})
+	}
+}
+
+func TestContributorTrustedChangeRequestAnswersRequiresHuman(t *testing.T) {
+	fx := validContributorFixture()
+	fx.reviews = []map[string]any{humanReview(1, "clubanderson", "CHANGES_REQUESTED", "sha7", "please fix the metadata")}
+	api := newContributorLaneAPI(t, &fx)
+	defer api.Close()
+	policy := defaultContributorLanePolicy()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 28, 3, 0, 0, 0, time.UTC)}
+	engine := newContributorLaneEngine(api.URL, policy, clock, Options{
+		ContributorLaneVerdict: func(string, int, string) ContributorLaneVerdict {
+			return ContributorLaneVerdict{Configured: true, Verdict: "requires_human", DecisionRequested: true}
+		},
+	})
+	engine.SetMergerAuthorizer(func(login string) bool { return login == "clubanderson" })
+	engine.stageTracker = NewStageTracker()
+	engine.stageLabelPolicy = func() StageLabelPolicy { return StageLabelPolicy{Enabled: true} }
+	_, reason, err := engine.trySweepContributorLanePR(context.Background(), "widget", "acme", "widget", 7, policy)
+	if err != nil || reason != contributorLaneReasonChangesRequested || fx.merges != 0 {
+		t.Fatalf("reason=%s err=%v merges=%d", reason, err, fx.merges)
+	}
+	detail := engine.stageTracker.details[stageKey("acme", "widget", 7)]
+	// Production observations include the author kind; the lane alone does
+	// not distinguish an automated contributor (072) from a human (071).
+	o := stageObservation{AuthorKind: authorkind.Clanker, Lane: stageLaneContributor, HeadSHA: "sha7", Reason: reason, Detail: detail}
+	if v := classifyStage(o); v.Stage != stagelabels.ReturnedToContributor {
+		t.Fatalf("stage=%+v, want returned to contributor", v)
+	}
+}
+
+// TestTrySweepContributorLaneSentinelYieldsToHumanChangesRequested: the
+// sentinel alert parks a contributor PR for a human; a trusted human's
+// CHANGES_REQUESTED review on the current head is that human. The lane
+// reports human-changes-requested (→ 071/072) instead of sentinel-blocked
+// (→ 085), reads the standing request from the durable store too, and
+// re-arms the park on a new head (hivecommons/hive#15159).
+func TestTrySweepContributorLaneSentinelYieldsToHumanChangesRequested(t *testing.T) {
+	review := func(state, commit, login string) []map[string]any {
+		return []map[string]any{{"id": 1, "state": state, "commit_id": commit, "user": map[string]string{"login": login}, "body": "drop the workflow change"}}
+	}
+	for _, tt := range []struct {
+		name       string
+		reviews    []map[string]any
+		trusted    bool
+		store      *hreview.HumanChangeRequests
+		wantReason string
+	}{
+		{name: "no review stays parked", trusted: true, wantReason: contributorLaneReasonSentinelBlocked},
+		{name: "trusted changes requested on head", reviews: review("CHANGES_REQUESTED", "sha7", "clubanderson"), trusted: true, wantReason: autoMergeReasonHumanChangesRequested},
+		{name: "untrusted reviewer stays parked", reviews: review("CHANGES_REQUESTED", "sha7", "clubanderson"), wantReason: contributorLaneReasonSentinelBlocked},
+		{name: "review on an older head re-arms", reviews: review("CHANGES_REQUESTED", "sha6", "clubanderson"), trusted: true, wantReason: contributorLaneReasonSentinelBlocked},
+		{name: "approval is not a change request", reviews: review("APPROVED", "sha7", "clubanderson"), trusted: true, wantReason: contributorLaneReasonSentinelBlocked},
+		{name: "standing request in the store", trusted: true, store: storedChangeRequest(t, "sha7"), wantReason: autoMergeReasonHumanChangesRequested},
+		{name: "stored request on an older head re-arms", trusted: true, store: storedChangeRequest(t, "sha6"), wantReason: contributorLaneReasonSentinelBlocked},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := validContributorFixture()
+			fx.labels = []string{"hive-sentinel"}
+			fx.reviews = tt.reviews
+			api := newContributorLaneAPI(t, &fx)
+			defer api.Close()
+			policy := defaultContributorLanePolicy()
+			clock := &contributorLaneClock{at: time.Date(2026, 10, 15, 13, 0, 0, 0, time.UTC)}
+			engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock), HumanChangeRequests: tt.store})
+			if tt.trusted {
+				engine.SetMergerAuthorizer(func(login string) bool { return strings.EqualFold(login, "clubanderson") })
+			}
+			_, reason, err := engine.trySweepContributorLanePR(context.Background(), "widget", "acme", "widget", 7, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if fx.merges != 0 {
+				t.Fatalf("merged %d, want 0", fx.merges)
+			}
+		})
+	}
+}
+
+func storedChangeRequest(t *testing.T, head string) *hreview.HumanChangeRequests {
+	t.Helper()
+	store := hreview.NewHumanChangeRequests("")
+	if err := store.Record(hreview.HumanChangeRequest{Repo: "acme/widget", Number: 7, HeadSHA: head, Source: hreview.HumanChangeRequestSourceDecision, Actor: "clubanderson", Body: "drop it"}); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+// Owner invariant (hivecommons/hive#15640), verbatim: "i always have the
+// last word when it comes to merge of untrusted". A green, approved,
+// soaked PR from a contributor the lane cannot vouch for (self-registered
+// newcomer, untrusted tier) is never auto-merged: the lane refuses with
+// claim-tier-untrusted and the stage engine parks it at 090
+// ready-for-human-merge — the merge gate, not an 085 decision in review.
+func TestContributorLaneUntrustedGreenApprovedParksForHumanMerge(t *testing.T) {
+	fx := validContributorFixture()
+	fx.issueComments[0]["body"] = contributorClaimMarkerTier(contributorLaneTestAuthor, "contributor", contributorLaneTestHive, " tier=newcomer verified=false")
+	api := newContributorLaneAPI(t, &fx)
+	defer api.Close()
+	policy := defaultContributorLanePolicy()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 15, 13, 0, 0, 0, time.UTC)}
+	engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock)})
+
+	_, reason, err := engine.trySweepContributorLanePR(context.Background(), "widget", "acme", "widget", 7, policy)
+	if err != nil || reason != contributorLaneReasonClaimTier {
+		t.Fatalf("reason = %q err = %v, want %q", reason, err, contributorLaneReasonClaimTier)
+	}
+	if fx.merges != 0 {
+		t.Fatalf("untrusted author auto-merged (%d merges)", fx.merges)
+	}
+	v := stageengine.ClassifyStage(prstage.Observation{Lane: stageLaneContributor, Reason: reason, HeadSHA: "sha7", Detail: prstage.Detail{VerdictKnown: true, Verdict: approvedVerdict("acme/widget", 7, "sha7")}})
+	if v.Stage != stagelabels.ReadyForHumanMerge || !v.Human {
+		t.Fatalf("stage = %+v, want 090 ready-for-human-merge awaiting the operator", v)
 	}
 }

@@ -103,7 +103,7 @@ func TestUpdateBranchAndSkipWorkflowPermission(t *testing.T) {
 			defer srv.Close()
 
 			c := newAutoMergeSweepClient(srv.URL)
-			event, reason, err := c.updateBranchAndSkip(context.Background(), "acme/widget", "acme", "widget", 7, head, "sha-base", "behind", tc.fork)
+			event, reason, err := c.updateBranchAndSkip(context.Background(), "acme/widget", "acme", "widget", 7, head, "sha-base", "behind", currentBaseTestPR(tc.fork, "feature", "alice", "behind"))
 			if reason != tc.wantReason || (err != nil) != tc.wantErr {
 				t.Fatalf("reason, err = %q, %v; want %q, wantErr %v", reason, err, tc.wantReason, tc.wantErr)
 			}
@@ -135,7 +135,7 @@ func updateBranchRefusalServer(t *testing.T, message string, head *string, extra
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = fmt.Fprintf(w, `{"message":%q}`, message)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7":
-			_, _ = fmt.Fprintf(w, `{"number":7,"head":{"sha":%q}}`, *head)
+			_, _ = fmt.Fprintf(w, `{"number":7,"state":"open","head":{"sha":%q},"base":{"ref":"main"}}`, *head)
 		case extra != nil:
 			extra(w, r)
 		default:
@@ -171,7 +171,7 @@ func TestUpdateBranchAndSkipWorkflowRefusalNotRetried(t *testing.T) {
 			c := newAutoMergeSweepClient(srv.URL)
 			tick := func(step, head, base string, wantUpdates int) {
 				t.Helper()
-				_, reason, err := c.updateBranchAndSkip(context.Background(), "acme/widget", "acme", "widget", 7, head, base, "behind", tc.fork)
+				_, reason, err := c.updateBranchAndSkip(context.Background(), "acme/widget", "acme", "widget", 7, head, base, "behind", currentBaseTestPR(tc.fork, "feature", "alice", "behind"))
 				if reason != tc.wantReason || err != nil {
 					t.Fatalf("%s: reason, err = %q, %v; want %q", step, reason, err, tc.wantReason)
 				}
@@ -200,7 +200,7 @@ func TestUpdateBranchAndSkipRetriesOtherRefusals(t *testing.T) {
 	defer srv.Close()
 	c := newAutoMergeSweepClient(srv.URL)
 	for i := 1; i <= 2; i++ {
-		if _, reason, err := c.updateBranchAndSkip(context.Background(), "acme/widget", "acme", "widget", 7, head, "sha-base", "behind", true); reason != autoMergeReasonForkNotEditable || err != nil {
+		if _, reason, err := c.updateBranchAndSkip(context.Background(), "acme/widget", "acme", "widget", 7, head, "sha-base", "behind", currentBaseTestPR(true, "feature", "alice", "behind")); reason != autoMergeReasonForkNotEditable || err != nil {
 			t.Fatalf("tick %d: reason, err = %q, %v; want %q", i, reason, err, autoMergeReasonForkNotEditable)
 		}
 		if got := updates(); got != i {
@@ -219,14 +219,22 @@ func TestCurrentBaseGateWorkflowRefusalKeyedOnBaseTip(t *testing.T) {
 	var baseMu sync.Mutex
 	baseTip := "sha-base-1"
 	compare := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/repos/acme/widget/compare/main...sha-head" {
+		if r.Method != http.MethodGet {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		baseMu.Lock()
 		defer baseMu.Unlock()
-		_, _ = fmt.Fprintf(w, `{"behind_by":12,"ahead_by":1,"base_commit":{"sha":%q}}`, baseTip)
+		switch r.URL.Path {
+		case "/repos/acme/widget/compare/main...sha-head":
+			_, _ = fmt.Fprintf(w, `{"behind_by":12,"ahead_by":1,"base_commit":{"sha":%q}}`, baseTip)
+		case "/repos/acme/widget/branches/main":
+			_, _ = fmt.Fprintf(w, `{"name":"main","commit":{"sha":%q}}`, baseTip)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}
 	srv, updates := updateBranchRefusalServer(t, workflowPermissionRefusal, &head, compare)
 	defer srv.Close()
@@ -234,7 +242,7 @@ func TestCurrentBaseGateWorkflowRefusalKeyedOnBaseTip(t *testing.T) {
 	c.requireCurrentBase = func(string) bool { return true }
 	sweep := func(step string, wantUpdates int) {
 		t.Helper()
-		_, reason, stop, err := c.currentBaseGate(context.Background(), "acme/widget", "acme", "widget", 7, "main", head, true, "behind", true)
+		_, reason, stop, err := c.currentBaseGate(context.Background(), "acme/widget", "acme", "widget", 7, "main", head, true, "behind", currentBaseTestPR(true, "feature", "alice", "behind"))
 		if !stop || reason != autoMergeReasonForkWorkflowUpdate || err != nil {
 			t.Fatalf("%s: stop, reason, err = %v, %q, %v; want true, %q", step, stop, reason, err, autoMergeReasonForkWorkflowUpdate)
 		}

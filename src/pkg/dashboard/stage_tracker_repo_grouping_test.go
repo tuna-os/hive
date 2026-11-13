@@ -69,6 +69,14 @@ func TestStageTrackerRepoGroupingWiring(t *testing.T) {
 	}
 }
 
+// runNodeStdin feeds the script to node over stdin: the lifted harnesses
+// are past Linux's per-argument limit for -e.
+func runNodeStdin(node, script string) ([]byte, error) {
+	cmd := exec.Command(node, "-")
+	cmd.Stdin = strings.NewReader(script)
+	return cmd.CombinedOutput()
+}
+
 func stageTrackerRepoGroupingHarness(t *testing.T, html string) string {
 	t.Helper()
 	return strings.Join([]string{
@@ -89,6 +97,7 @@ func stageTrackerRepoGroupingHarness(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_SOFT_LINK_TIP"),
 		jsConstLine(t, html, "STAGE_TRACKER_TRIAGE_NEEDED"),
 		jsConstLine(t, html, "STAGE_TRACKER_POSSIBLY_EXISTS"),
+		jsConstLine(t, html, "STAGE_TRACKER_OPEN_FOR_DISCUSSION"),
 		jsConstLine(t, html, "STAGE_TRACKER_ISSUE_DECISION_COLUMN"),
 		jsConstLine(t, html, "STAGE_TRACKER_PRE_MERGE_SOAK"),
 		jsConstLine(t, html, "STAGE_TRACKER_ACTIVE_WORD"),
@@ -145,6 +154,10 @@ func stageTrackerRepoGroupingHarness(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerMotion"),
 		jsFunc(t, html, "stageTrackerHoldLabels"),
 		jsFunc(t, html, "stageTrackerSoakLeft"),
+		jsFunc(t, html, "stageTrackerWaitingOnPerson"),
+		jsFunc(t, html, "stageTrackerTrackRunning"),
+		jsFunc(t, html, "stageTrackerAgoWord"),
+		jsFunc(t, html, "stageTrackerActivityTrackHtml"),
 		jsFunc(t, html, "stageTrackerStripItems"),
 		jsFunc(t, html, "stageTrackerCurrentStageHtml"),
 		jsFunc(t, html, "stageTrackerStageWord"),
@@ -158,9 +171,12 @@ func stageTrackerRepoGroupingHarness(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerTrailText"),
 		jsFunc(t, html, "stageTrackerTooltip"),
 		jsFunc(t, html, "stageTrackerChipsHtml"),
+		stageTrackerHumanGateJS(t, html),
 		jsFunc(t, html, "stageTrackerHeadColsHtml"),
 		jsFunc(t, html, "stageTrackerSinceHtml"),
 		jsFunc(t, html, "stageTrackerSubRowHtml"),
+		jsFunc(t, html, "stageTrackerPRPillsHtml"),
+		jsFunc(t, html, "stageTrackerBasePillHtml"),
 		jsFunc(t, html, "stageTrackerLinkedPRItem"),
 		jsFunc(t, html, "stageTrackerLinkedPROpen"),
 		jsFunc(t, html, "stageTrackerNestedOpenPRs"),
@@ -169,8 +185,14 @@ func stageTrackerRepoGroupingHarness(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerLinkedTip"),
 		jsConstLine(t, html, "STAGE_TRACKER_LINKED_GLYPH"),
 		jsFunc(t, html, "stageTrackerLinkedDrawnHere"),
+		jsFunc(t, html, "stageTrackerLinkedSuperseder"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededGone"),
+		jsFunc(t, html, "stageTrackerLinkedSupersededTip"),
 		jsFunc(t, html, "stageTrackerLinkedSorted"),
 		stageTrackerTierJS(t, html),
+		jsConstLine(t, html, "STAGE_TRACKER_COVERED_BY_PR"),
+		jsFunc(t, html, "stageTrackerLeadStage"),
+		jsFunc(t, html, "stageTrackerLead"),
 		jsFunc(t, html, "stageTrackerSortKey"),
 		jsFunc(t, html, "esc"),
 		jsFunc(t, html, "agentNowAgo"),
@@ -186,10 +208,20 @@ func stageTrackerRepoGroupingHarness(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerRowToolsHtml"),
 		jsFunc(t, html, "stageTrackerRowHtml"),
 		jsFunc(t, html, "stageTrackerPRIssueSlot"),
+		jsFunc(t, html, "stageTrackerClosedChipHtml"),
+		jsFunc(t, html, "stageTrackerSplitTitleTag"),
+		jsFunc(t, html, "stageTrackerTitleHtml"),
+		jsFunc(t, html, "stageTrackerItemURL"),
 		jsFunc(t, html, "stageTrackerItemKey"),
 		jsFunc(t, html, "stageTrackerMoveAttrs"),
 		jsFunc(t, html, "stageTrackerNeedsAttention"),
 		jsFunc(t, html, "stageTrackerVisible"),
+		jsFunc(t, html, "stageTrackerIsReviewNote"),
+		jsFunc(t, html, "stageTrackerIsStandingMeta"),
+		jsFunc(t, html, "stageTrackerStandingCount"),
+		jsFunc(t, html, "stageTrackerFoldedReviewNotes"),
+		jsFunc(t, html, "stageTrackerReviewNotesHtml"),
+		jsFunc(t, html, "stageTrackerFoldedCount"),
 		jsFunc(t, html, "stageTrackerRepoTint"),
 		jsFunc(t, html, "stageTrackerRepoShort"),
 		jsFunc(t, html, "stageTrackerIsPrimary"),
@@ -201,6 +233,9 @@ func stageTrackerRepoGroupingHarness(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerGroupHeaderHtml"),
 		jsFunc(t, html, "stageTrackerRepoChipSetting"),
 		jsFunc(t, html, "stageTrackerSetRepoChip"),
+		// No am.* URL view (#15924): the group persists in localStorage.
+		"var _stageTrackerUrlView = null;",
+		jsFunc(t, html, "stageTrackerUrlView"),
 		jsFunc(t, html, "stageTrackerGroupSetting"),
 		jsFunc(t, html, "stageTrackerSetGroup"),
 		jsFunc(t, html, "stageTrackerLoadCollapsed"),
@@ -312,7 +347,7 @@ const section = stageTrackerRepoSectionHtml('always', 'repo');
 assert.ok(section.includes('id="sts-repos"') && /value="always" checked/.test(section) && !/value="multi" checked/.test(section), section);
 assert.ok(/<option value="repo" selected>Repo<\/option>/.test(section) && /<option value="none">None<\/option>/.test(section), section);
 `
-	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
+	if out, err := runNodeStdin(node, script); err != nil {
 		t.Fatalf("node repo chip fixture failed: %v\n%s", err, out)
 	}
 }
@@ -435,7 +470,7 @@ assert.strictEqual(_stageTrackerGroup, 'repo');
 assert.deepStrictEqual(_stageTrackerCollapsed, { 'hivecommons/docs': true });
 assert.strictEqual(stageTrackerPrimaryRepo(), 'hivecommons/hive');
 `
-	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
+	if out, err := runNodeStdin(node, script); err != nil {
 		t.Fatalf("node group-by-repo fixture failed: %v\n%s", err, out)
 	}
 }

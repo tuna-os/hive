@@ -11,6 +11,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	gh "github.com/google/go-github/v72/github"
+
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // The three live shapes (2026-10-25), reduced to the facts the re-check
@@ -60,6 +64,12 @@ type parkFake struct {
 	edited    []string
 	labelOps  int
 	nextID    int64
+	// closedBy names the merged PR GitHub's closedByPullRequestsReferences
+	// reports for an issue; prFiles serves pulls/{n}/files.
+	closedBy map[int]int
+	prFiles  map[int][]map[string]any
+	// fileReads records the pulls/{n}/files reads, in order.
+	fileReads []int
 }
 
 func newParkFake(t *testing.T, f *parkFake) *httptest.Server {
@@ -126,6 +136,27 @@ func newParkFake(t *testing.T, f *parkFake) *httptest.Server {
 		case strings.Contains(path, "/labels"):
 			f.labelOps++
 			w.WriteHeader(http.StatusTeapot)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/graphql"):
+			var q struct {
+				Variables struct {
+					Issue int `json:"issue"`
+				} `json:"variables"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&q)
+			nodes := []any{}
+			if pr, ok := f.closedBy[q.Variables.Issue]; ok {
+				nodes = append(nodes, map[string]any{"number": pr, "url": fmt.Sprintf("https://github.com/org/repo/pull/%d", pr), "merged": true, "mergedAt": prTS(parkT0.Add(time.Hour))})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{
+				"closedByPullRequestsReferences": map[string]any{"pageInfo": map[string]any{"hasNextPage": false}, "nodes": nodes}}}}})
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "pulls/") && strings.HasSuffix(path, "/files"):
+			num, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(path, "pulls/"), "/files"))
+			f.fileReads = append(f.fileReads, num)
+			if got, ok := f.prFiles[num]; ok {
+				_ = json.NewEncoder(w).Encode(got)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
 		default:
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusTeapot)
@@ -139,11 +170,16 @@ func parkClient(t *testing.T, srv *httptest.Server) *Client {
 	t.Helper()
 	c := newTestClient(t, srv, "org", []string{"repo"})
 	c.SetAppBotLogin("hive[bot]")
+	// The re-check runs days after the park, so the relay's live contributor
+	// claim (claims.DefaultContributorTTL) is gone; the registry-backed
+	// predicate is what still knows the park author.
+	c.SetRelayContributor(func(string) bool { return false })
+	c.SetParkTextContributor(func(login string) bool { return login == "contributor" })
 	return c
 }
 
 // parkedIssue is an open issue parked at parkT0 by a relay comment (posted
-// under a contributor account just before the label) carrying parkText.
+// under a contributor relay account just before the label) carrying parkText.
 func prParkedIssue(number int, parkText string) *parkFake {
 	return &parkFake{
 		issue: map[string]any{"number": number, "state": "open", "title": "t", "body": "reporter body, no refs",
@@ -196,6 +232,28 @@ func TestParkRecheckReferencedPRMerged(t *testing.T) {
 	}
 	wantNote(t, f.posted[0], "parked for a maintainer (`stage/045-needs-decision`) since 2026-10-03",
 		"- #409 merged on 2026-10-06 (it refers to this issue).", "does not un-park")
+}
+
+func TestParkRecheckWritebackRefusalDoesNotPostOrEdit(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(strconv.FormatBool(existing), func(t *testing.T) {
+			f := prParkedIssue(385, "Maintainer decision needed.")
+			f.timeline = append(f.timeline, prCrossRef("org/repo", 409, true, "closed", parkT0.Add(50*time.Hour), parkT0.Add(50*time.Hour), "Refs #385"))
+			if existing {
+				f.comments = append(f.comments, map[string]any{"id": int64(99), "body": parkRecheckMarker + "\nstale", "user": map[string]any{"login": "hive[bot]"}})
+			}
+			client := parkClient(t, newParkFake(t, f))
+			gate := writeback.New(writeback.Config{}, writeback.Deps{LevelFor: func(string) int { return 1 }}, "")
+			client.SetWritebackGate(gate)
+			res, err := client.RecheckParkedIssues(context.Background(), ParkRecheckConfig{Repos: []string{"org/repo"}})
+			if err != nil || res.Posted != 0 || res.Updated != 0 || len(f.posted)+len(f.edited) != 0 {
+				t.Fatalf("result=%+v err=%v posted=%q edited=%q", res, err, f.posted, f.edited)
+			}
+			if suppressed := gate.Recent(); len(suppressed) != 1 || suppressed[0].Kind != writeback.KindNeedsDecisionComment || suppressed[0].Number != 385 {
+				t.Fatalf("suppressed=%+v", suppressed)
+			}
+		})
+	}
 }
 
 // utah#13: the park said #722 was in progress and agents should leave the
@@ -542,5 +600,104 @@ func TestParkCopyQuote(t *testing.T) {
 	}
 	if got := parkCopyQuote("Short."); got != "Short." {
 		t.Fatalf("short quote = %q", got)
+	}
+}
+
+func TestParkTextTrustedAuthors(t *testing.T) {
+	c := parkClient(t, newParkFake(t, &parkFake{}))
+	c.SetReporterTrusted(func(login, association string) bool { return association == "MEMBER" })
+	// Which contributors count is the embedder's call (cmd/hive
+	// parkTextContributorKnown, covered there); here only "contributor" is.
+	at := prTS(parkT0.Add(-20 * time.Second))
+	comment := func(login, association, body string) map[string]any {
+		return map[string]any{"user": map[string]any{"login": login}, "author_association": association, "body": body, "created_at": at}
+	}
+	tests := []struct {
+		name    string
+		comment map[string]any
+		want    string
+	}{
+		{"hive account included", comment("hive[bot]", "NONE", "waiting on org/other#7"), "waiting on org/other#7"},
+		{"registered contributor with expired relay claim included", comment("contributor", "NONE", "waiting on org/other#7"), "waiting on org/other#7"},
+		{"trusted maintainer included", comment("maint", "MEMBER", "waiting on org/other#7"), "waiting on org/other#7"},
+		{"untrusted commenter excluded", comment("stranger", "NONE", "see evil/repo#9"), ""},
+		{"unknown contributor excluded", comment("newcomer", "NONE", "see evil/repo#9"), ""},
+		{"hive notice excluded", comment("hive[bot]", "NONE", parkRecheckMarker+" see org/other#7"), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := json.Marshal([]map[string]any{tt.comment})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var comments []*gh.IssueComment
+			if err := json.Unmarshal(raw, &comments); err != nil {
+				t.Fatal(err)
+			}
+			if got := c.parkText(&gh.Issue{}, comments, parkT0); got != tt.want {
+				t.Errorf("parkText = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A hive that knows no contributors (nil predicate) reads a relay-style NONE
+// comment as untrusted: the live relay claim alone is not park-text
+// provenance, since it has expired by the time the re-check runs.
+func TestParkTextLiveRelayClaimIsNotProvenance(t *testing.T) {
+	c := newTestClient(t, newParkFake(t, &parkFake{}), "org", []string{"repo"})
+	c.SetRelayContributor(func(login string) bool { return login == "contributor" })
+	raw, err := json.Marshal([]map[string]any{{"user": map[string]any{"login": "contributor"}, "author_association": "NONE", "body": "waiting on org/other#7", "created_at": prTS(parkT0.Add(-20 * time.Second))}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var comments []*gh.IssueComment
+	if err := json.Unmarshal(raw, &comments); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.parkText(&gh.Issue{}, comments, parkT0); got != "" {
+		t.Fatalf("parkText = %q, want empty without a known-contributor predicate", got)
+	}
+	c.SetParkTextContributor(func(login string) bool { return login == "contributor" })
+	if got := c.parkText(&gh.Issue{}, comments, parkT0); got != "waiting on org/other#7" {
+		t.Fatalf("parkText = %q, want the registered contributor's comment", got)
+	}
+}
+
+// The issue body is park text only when the issue was filed inside the
+// window and its reporter passes the same author gate as a comment: an
+// untrusted reporter whose issue is parked straight after filing cannot seed
+// refs either (#16697 folded-in finding).
+func TestParkTextIssueBodyTrustedReporter(t *testing.T) {
+	c := parkClient(t, newParkFake(t, &parkFake{}))
+	c.SetReporterTrusted(func(login, association string) bool { return association == "MEMBER" })
+	issue := func(login, association string) *gh.Issue {
+		raw, err := json.Marshal(map[string]any{"user": map[string]any{"login": login}, "author_association": association, "body": "filed parked on org/other#7", "created_at": prTS(parkT0.Add(-20 * time.Second))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out gh.Issue
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatal(err)
+		}
+		return &out
+	}
+	tests := []struct {
+		name  string
+		issue *gh.Issue
+		want  string
+	}{
+		{"hive account included", issue("hive[bot]", "NONE"), "filed parked on org/other#7"},
+		{"registered contributor included", issue("contributor", "NONE"), "filed parked on org/other#7"},
+		{"trusted maintainer included", issue("maint", "MEMBER"), "filed parked on org/other#7"},
+		{"untrusted reporter excluded", issue("stranger", "NONE"), ""},
+		{"unknown contributor excluded", issue("newcomer", "CONTRIBUTOR"), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := c.parkText(tt.issue, nil, parkT0); got != tt.want {
+				t.Errorf("parkText = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

@@ -27,6 +27,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/hivecommons/hive/pkg/blocker"
 )
 
 // PolicyName is the policy identifier the audit marker carries.
@@ -45,7 +47,7 @@ const PolicyText = `Owner-delegate policy (how the owner decides; the hive appli
 - Be decisive; except for the safety rails below, never ask the owner a question back. Pick the option that keeps work moving and is reversible.
 - PRs: prefer an adequate human/contributor PR over a hive duplicate — if both exist and the contributor's is mergeable and current, recommend a human comparison of issue coverage, checks and review approval; keep the hive PR open and parked until adequacy is confirmed, and never close it solely on an issue reference. Otherwise supersede the contributor's with the hive's and close theirs with credit. Approve small, necessary, low-risk changes (CI pins, RBAC read-only adds, warning text, workflow hygiene) once the sentinel finding is checked and explained as intended. Sensitive-path sentinel alerts on trusted-author PRs: approve with a one-line "reviewed, intended" rationale. Clear reporter-trust holds when the fixing PR is sound.
 - Contributors offline: adopt now in supersede mode — do not wait for a deadline (hivecommons/hive#13975).
-- Issues: dedupe aggressively (close the newer duplicate with "Duplicate of #N", cross-link overlaps); secrets / PAT / org-permission items are owner-only → label needs-owner + hold with one comment stating the exact owner action, and stop opening more failure issues for that root cause; flaky tests → quarantine with retry + a deflake task rather than block; CI hygiene gate proposals (actionlint, duplication ratchets, link-checker allowlists) → approve as ratchets (baseline, fail only on increases; warning-only briefly, then enforce); design proposals with concrete acceptance criteria → accept as proposed with explicit defaults; "review backlog items blocked on their PR" → never auto-close when the PR closes unmerged (drop the relation, comment, re-triage).
+- Issues: dedupe aggressively (close the newer duplicate with "Duplicate of #N", cross-link overlaps); secrets / PAT / org-permission items are owner-only → label needs-owner + hold with one comment stating the exact owner action, and stop opening more failure issues for that root cause; flaky tests → quarantine with retry + a deflake task rather than block; CI hygiene gate proposals (actionlint, duplication ratchets, link-checker allowlists) → approve as ratchets (baseline, fail only on increases; warning-only briefly, then enforce); design proposals with concrete acceptance criteria → accept as proposed with explicit defaults; "review backlog items blocked on their PR" → never auto-close when the PR closes unmerged (drop the relation, comment, re-triage); a fleet self-report whose remedy is the operator's (an expired provider login, credentials, disk, network, App setup on the reporting spoke) is not code work → tell that spoke's owner(s) exactly what to do, no approved-direction, no implementer, keep it out of the actionable set, and never post the same direction twice; a hive-filed proposal is paid for by evidence → approve it when it cites an incident it would have prevented or prior instances of the same class fixed one at a time, otherwise decline it for now (comment the reason, close as not planned; re-propose with evidence) — a person's proposal is never declined this way; a hive advisory (a dedupe checklist, a triage note) is never work for a person → the hive ticks its items as they close and closes it as completed when all are resolved; while items remain open nothing is written.
 - Record the decision as a "/hive decision <text>" comment on the item (and the auto-merge queue approval on the PR head when the decision is to release a PR), remove stage/085-needs-decision, add triage/accepted where applicable, and stamp the delegated-decision marker so it is auditable.
 - Safety rails: never merge a PR (the auto-merge engine does that per repo settings); never act on an item carrying hold; never grant org membership, secrets or permissions (always the owner); leave an item untouched when the question is a policy or scope change to the hive itself (settings, governance docs, security posture) — post "hive recommends: …; owner to confirm" instead and keep 085.`
 
@@ -89,12 +91,19 @@ const (
 	// ActionRecommendOnly posts "hive recommends: …; owner to confirm" and
 	// keeps the park.
 	ActionRecommendOnly ActionKind = "recommend-only"
+	// ActionCloseNotNow posts the "not now" reason and closes the issue as
+	// not planned: the established way a declined proposal leaves the
+	// tracker (the dashboard's Won't-fix path).
+	ActionCloseNotNow ActionKind = "close-not-now"
+	// ActionCloseCompleted closes a hive advisory whose checklist items are
+	// all resolved, as completed (hivecommons/hive#15754).
+	ActionCloseCompleted ActionKind = "close-completed"
 )
 
 // AllowedActions is the allowed set in a fixed order.
 var AllowedActions = []ActionKind{
 	ActionCommentDecision, ActionApproveReview, ActionLabelsAdd, ActionLabelsRemove,
-	ActionCloseDuplicate, ActionLink, ActionAdoptSupersede, ActionRecommendOnly,
+	ActionCloseDuplicate, ActionLink, ActionAdoptSupersede, ActionRecommendOnly, ActionCloseNotNow, ActionCloseCompleted,
 }
 
 // Action is one step of a decision.
@@ -121,17 +130,49 @@ const (
 	VerdictAdoptSupersede  Verdict = "adopt-supersede"
 	VerdictRecommendOnly   Verdict = "recommend-only"
 	VerdictRefused         Verdict = "refused"
+	// VerdictOperatorAction: not code work — the reporting spoke's owner
+	// acts (re-authenticates, grants, frees disk). The item keeps its park
+	// and never reaches an implementer lane.
+	VerdictOperatorAction Verdict = "operator-action"
+	// VerdictNotNow declines a hive-filed proposal for now: no incident or
+	// recurrence justifies its cost yet; closed as not planned.
+	VerdictNotNow Verdict = "not-now"
+	// VerdictClose closes a hive advisory as completed: its checklist
+	// items are all resolved, so nothing is left for a person to read.
+	VerdictClose Verdict = "close"
 )
+
+// Advisory rule names (hivecommons/hive#15754).
+const (
+	// RuleAdvisoryResolved: every item of the advisory's checklist is
+	// resolved; the delegate closes it as completed.
+	RuleAdvisoryResolved = "advisory-resolved"
+	// RuleAdvisoryInProgress: items remain open; the hive's sweep is
+	// working them, so the delegate writes nothing and keeps it open.
+	RuleAdvisoryInProgress = "advisory-in-progress"
+)
+
+// AdvisoryChecklist is the progress of a hive advisory's checklist: how
+// many of its items are resolved. Total 0 is an advisory without items.
+type AdvisoryChecklist struct {
+	Resolved int
+	Total    int
+}
 
 // Labels the delegate writes or reads.
 const (
 	// LabelAdoptSupersede is the durable request consumed by the adoption engine.
 	LabelAdoptSupersede = "adoption/supersede"
+	// RuleCapabilityGap is the recommend-only rule for a blocker no decision
+	// can clear: the GitHub App lacks a permission (hivecommons/hive#15099).
+	RuleCapabilityGap   = "capability-gap"
 	LabelNeedsOwner     = "needs-owner"
 	LabelHold           = "hold"
 	LabelTriageAccepted = "triage/accepted"
 	LabelFlakyTest      = "flaky-test"
 	LabelNeedsDecision  = "stage/085-needs-decision"
+	// LabelIssueNeedsDecision is the issue-side park (hivecommons/hive#15021).
+	LabelIssueNeedsDecision = "stage/045-needs-decision"
 )
 
 // CompetingPR is another open PR for the same work.
@@ -140,20 +181,34 @@ type CompetingPR struct {
 	HiveAuthored bool
 	Mergeable    bool
 	Current      bool
+	// HeldDuplicate: the merge queue holds this competitor out of the
+	// train as a duplicate of the item (same `Fixes #N`,
+	// hivecommons/hive#15395); the item is the PR the queue kept.
+	HeldDuplicate bool
 }
 
 // Input is everything the delegate reads about one parked item.
 type Input struct {
-	Repo   string
-	Number int
-	Kind   Kind
-	Title  string
-	Body   string
-	Labels []string
+	Repo    string
+	Number  int
+	Kind    Kind
+	Title   string
+	Body    string
+	HeadSHA string
+	Labels  []string
 	// Reasons are the park reasons; Question is the reviewer's decision
 	// question, when one was recorded.
 	Reasons  []string
 	Question string
+	// Options are the alternatives an issue offers its owner, read from its
+	// body or the hive's park comment; RecommendedOption is the Label of the
+	// one that text recommends, "" when it names none.
+	Options           []Option
+	RecommendedOption string
+	// SignOffQuestion: the caller classified Question as a policy sign-off
+	// using the reviewer's wording and the head's changed files. Scope and
+	// follow-up questions remain eligible for the superseder auto-decision.
+	SignOffQuestion bool
 	// Author is the PR's / issue's GitHub login, for plain-words answers.
 	Author string
 	// HiveAuthored: the hive opened the PR / filed the issue.
@@ -163,8 +218,13 @@ type Input struct {
 	// SentinelAlert: the sentinel label is on; SentinelReason says why.
 	SentinelAlert  bool
 	SentinelReason string
-	// CIGreen / Conflicting / DCOMissing describe a PR head.
+	// CIGreen / Conflicting / DCOMissing describe a PR head. CIPending
+	// refines a head that is not green: its checks are still running and
+	// none has failed, so no fix is owed and "CI is red" is not true of it
+	// (hivecommons/hive#15722's preview said so of a green head whose only
+	// pending context was tide).
 	CIGreen     bool
+	CIPending   bool
 	Conflicting bool
 	DCOMissing  bool
 	// Small: a size/XS or size/S PR (also read from the labels).
@@ -175,19 +235,146 @@ type Input struct {
 	// ContributorOnline: the author is reachable (relay heartbeat / recent
 	// activity); false for an external author who went quiet.
 	ContributorOnline bool
+	// HumanAuthor: the PR carries the author/human label — a person pushed
+	// it themselves. OwnerAuthor: the author is one of this hive's owners
+	// (dashboard.authorized_users). Neither has a hive that can be "offline",
+	// and the delegate never adopts their work (hivecommons/hive#15202).
+	HumanAuthor bool
+	OwnerAuthor bool
 	// DuplicateOf is the older issue this one duplicates (0 = none known).
 	DuplicateOf int
 	// Overlaps lists issues that overlap without duplicating.
 	Overlaps []int
 	// Competing lists the other open PRs for the same work.
 	Competing []CompetingPR
+	// TrainDuplicateOf is the open PR the merge queue kept for the same
+	// issue when it held this one as a duplicate (0 = not held);
+	// TrainDuplicateIssue is that issue (hivecommons/hive#15395).
+	TrainDuplicateOf    int
+	TrainDuplicateIssue int
+	// ClaimConflictWith is the open PR in another merge lane that claims
+	// the same issue as this one while no decision is recorded, so the
+	// queue admits neither (0 = none); ClaimConflictIssue is that issue
+	// (hivecommons/hive#15810).
+	ClaimConflictWith  int
+	ClaimConflictIssue int
 	// ReporterTrustHold: the park is the reporter-trust gate on the fixing PR.
 	ReporterTrustHold bool
 	// AdoptionStalled: a contributor PR whose adoption parked at 085.
 	AdoptionStalled bool
+	// AdoptionGraceElapsed: a contributor PR at 072 whose offline grace
+	// has run out and whose adoption the engine holds (maintainer policy,
+	// or nothing moved). The delegate picks Adopt now
+	// (RuleAdoptNow) rather than wait any longer (hivecommons/hive#15038).
+	AdoptionGraceElapsed bool
+	// WorkflowPath: the PR edits `.github/workflows/*` (read from its file
+	// list or from an `adoption-stalled:…workflow-path` park reason). The
+	// hive's App has no `workflows` permission, so supersede-adoption is
+	// refused by the adoption fence: deciding to adopt cannot take effect
+	// (hivecommons/hive#15188).
+	WorkflowPath bool
+	// WorkflowsPushable: the hive checked that it can land a
+	// .github/workflows change in this repository. The App installation
+	// grants `workflows: write` and an enabled lane whose token carries it
+	// serves the repository. An agent writing "the hive's token cannot
+	// change workflow files" is then describing its own lane's ceiling, not
+	// a missing App permission (Danathar/goodreads-mcp#440).
+	WorkflowsPushable bool
 	// BlockedOnPRClosed: a review-backlog item whose PR closed unmerged.
 	BlockedOnPRClosed bool
+	// SupersededBy names the merged PR that already delivered this PR's
+	// work (its issue is closed by that merge, or that PR declares
+	// `Supersedes #N`); nil when none is known (hivecommons/hive#15289).
+	SupersededBy *MergedCloser
+	// DiffEmpty: the PR's diff against its base is empty (+0/−0, no
+	// changed files) — with SupersededBy that is the already-landed case
+	// (hivecommons/hive#15732), and the preview says so instead of
+	// talking about the author's trust.
+	DiffEmpty bool
+	// AuthorTooling: what the author drives (hive / clanker / person);
+	// picks the words a decision uses for them (AuthorWord).
+	AuthorTooling AuthorTooling
+	// ReworkPickedUp: the author's relay has acknowledged, claimed or
+	// pushed the requested rework (hivecommons/hive#15280's signal), so
+	// they are responsive even without recent activity.
+	ReworkPickedUp bool
+	// RepoPaused: the repo is under an operator pause; a decision that
+	// would write (close) is recommend-only instead.
+	RepoPaused bool
+	// Advisory is set for a hive advisory issue (triage/advisory, a dedupe
+	// checklist): not work, the hive's sweep ticks and closes it itself.
+	Advisory *AdvisoryChecklist
+	// AdoptedByHive: the hive adopted this contributor PR in place (stage
+	// 074, contributor-lane:adopted-by-hive) and its fix lane owns the
+	// branch, so a direction is the hive's own fixer's to carry out — not
+	// the contributor's (hivecommons/hive#15722: "send #15722 back to its
+	// author" on a PR the hive had adopted).
+	AdoptedByHive bool
+	// AdoptedPushRefused names why the hive cannot push the adopted PR's
+	// branch (fork-rehome-refused, a fork without maintainer edits or with
+	// a workflow-file diff, a recorded capability blocker); "" when it can.
+	// The fixer cannot carry out a direction then (projectbluefin/utah#919,
+	// projectbluefin/testsuite#1037).
+	AdoptedPushRefused string
+	// ReviewerRequiresHuman: the recorded park reason is the reviewer
+	// swarm's requires_human on the current head; ReviewerFinding is what
+	// the review found ("the reviewer marked this change high-risk"), and
+	// SecurityFinding says that finding is the security review's — a
+	// policy call no fixer can make for a person.
+	ReviewerRequiresHuman bool
+	ReviewerFinding       string
+	SecurityFinding       bool
+	// ChangesRequestedBy are the maintainers whose standing GitHub review
+	// asks for changes: their latest opinionated review is
+	// CHANGES_REQUESTED, the request that keeps GitHub's reviewDecision at
+	// CHANGES_REQUESTED and blocks the merge. The hive's own reviews are
+	// not listed; HeadReviewVerdict carries the swarm's.
+	ChangesRequestedBy []string
+	// HeadReviewVerdict is the review swarm's aggregate verdict on the
+	// current head ("changes_requested", "requires_human", …); "" when the
+	// head has none recorded.
+	HeadReviewVerdict string
+	// HiveSuperseding: the hive App's own superseding copy of another PR
+	// (hive-authored, body declares `Supersedes #N`). The owner's rule is
+	// that it auto-merges with no operator decision; HiveSupersederHardStop
+	// is the one stagelabels.HiveSupersederHardStop* token that parked it
+	// anyway ("" when the park is an ordinary one the rule overrides).
+	HiveSuperseding        bool
+	HiveSupersederHardStop string
 }
+
+// CIRed reports a head that is not green because a check failed (or none
+// ever reported), as opposed to one still waiting on running checks.
+func (in Input) CIRed() bool { return !in.CIGreen && !in.CIPending }
+
+// Swarm verdicts on the head that hold it back from the merge queue.
+const (
+	headVerdictChangesRequested = "changes_requested"
+	headVerdictRequiresHuman    = "requires_human"
+)
+
+// ChangeRequest names the standing request for changes on the PR, in
+// plain words: a maintainer's GitHub review, else the swarm's verdict on
+// the current head. "" when nothing asks for changes.
+func (in Input) ChangeRequest() string {
+	if len(in.ChangesRequestedBy) > 0 {
+		return "the changes @" + strings.Join(in.ChangesRequestedBy, ", @") + " requested on GitHub"
+	}
+	if strings.EqualFold(strings.TrimSpace(in.HeadReviewVerdict), headVerdictChangesRequested) {
+		return "the changes the hive's review requested on this head"
+	}
+	return ""
+}
+
+// HeadNeedsPerson: the swarm's verdict on the current head is
+// requires_human, a question for a person rather than a change request.
+func (in Input) HeadNeedsPerson() bool {
+	return strings.EqualFold(strings.TrimSpace(in.HeadReviewVerdict), headVerdictRequiresHuman)
+}
+
+// RuleAdoptNow is the rule name of the grace-elapsed Adopt now decision;
+// the dashboard runs it as a forced adoption (Adopt now), not a queued one.
+const RuleAdoptNow = "grace-elapsed-adopt-now"
 
 // Decision is what the delegate decided and how to record it.
 type Decision struct {
@@ -201,6 +388,12 @@ type Decision struct {
 	// KeepsPark is true when the item stays at 085/045 (recommend-only,
 	// owner-only, refused).
 	KeepsPark bool `json:"keeps_park"`
+	// Ladder is the contributor-PR rung the decision landed on and why
+	// the rungs above it did not apply (hivecommons/hive#15289).
+	Ladder *Ladder `json:"ladder,omitempty"`
+	// Option is the issue's option the decision goes with, when it offered
+	// several (RuleRecommendedOption).
+	Option *Option `json:"option,omitempty"`
 }
 
 // Marker is the audit stamp every delegated comment carries.
@@ -222,10 +415,12 @@ var (
 	flakyRE      = regexp.MustCompile(`(?i)\b(flak(?:y|e|iness)|intermittent(?:ly)? fail\w*|non-?deterministic test)\b`)
 	ratchetRE    = regexp.MustCompile(`(?i)\b(actionlint|ratchet|duplication (?:gate|threshold|check)|link[- ]?checker|allow-?list|lint gate|hygiene gate|shellcheck|yamllint|markdownlint)\b`)
 	proposalRE   = regexp.MustCompile(`(?i)\bacceptance criteria\b`)
-	hivePolicyRE = regexp.MustCompile(`(?i)\b(hive\.ya?ml|governance|security posture|hive (?:settings?|config(?:uration)?|policy|policies)|branch protection|CODEOWNERS|required checks?|autonomy level|acmm level)\b`)
-	// capabilityGapRE matches a blocker no direction decision can clear: the
-	// GitHub App lacks a permission (for example `workflows`).
-	capabilityGapRE = regexp.MustCompile(`(?i)\b(?:app(?: token)?|installation|github app)\b[^\n]{0,80}\b(?:cannot|can't|lacks?|no|without|missing)\b[^\n]{0,60}\b(?:workflows?|permissions?)\b|\bno [\x60]?workflows[\x60]? permission\b`)
+	hivePolicyRE = regexp.MustCompile(`(?i)\b(hive\.ya?ml|governance|security posture|hive (?:settings?|config(?:uration)?|policy|policies)|branch protection|CODEOWNERS|required checks?|autonomy level|acmm level|issue[_ ]filter|hive-filed|unacknowledged proposals?)\b`)
+	// appPermissionRE preserves the park for App permissions that have no
+	// specific capability kind in the blocker ledger, and for free-text
+	// workflow headlines ("the App cannot push workflows") that name no
+	// permission or path shape the ledger's workflows rule recognises.
+	appPermissionRE = regexp.MustCompile(`(?i)\b(?:app(?: token)?|installation|github app)\b[^\n]{0,80}\b(?:cannot|can't|lacks?|missing|without|no)\b[^\n]{0,60}\b(?:workflows?|permissions?)\b`)
 	duplicateOfRE   = regexp.MustCompile(`(?i)\bduplicate of #(\d+)`)
 	blockedOnPRRE   = regexp.MustCompile(`(?i)\b(review backlog|blocked on (?:its|their|the) PR)\b`)
 )
@@ -235,6 +430,7 @@ const (
 	labelKindProposal = "kind/proposal"
 	labelProposal     = "proposal"
 	labelRFC          = "rfc"
+	labelKindDesign   = "kind/design"
 	labelGovernance   = "governance"
 	labelFlaky        = "flaky"
 	labelSizeXS       = "size/xs"
@@ -298,10 +494,21 @@ func HivePolicyChange(in Input) bool {
 }
 
 // CapabilityGap reports a needs-human whose blocker is a missing GitHub App
-// capability rather than an open question.
+// capability rather than an open question. Shared ledger inference handles
+// known capability kinds; a generic App-permission guard keeps other missing
+// permissions parked. Human-only blockers are handled by the ledger. Prose
+// claiming the workflows permission is missing is not a gap when the hive
+// checked that it can push workflow files here (WorkflowsPushable).
 func CapabilityGap(in Input) bool {
-	return capabilityGapRE.MatchString(in.headline()) ||
-		in.Kind == KindIssue && capabilityGapRE.MatchString(firstLines(in.Body, 12))
+	isCapability := func(text string) bool {
+		k, ok := blocker.Infer(text)
+		if ok && k == blocker.CapabilityWorkflowsPermission && in.WorkflowsPushable {
+			return false
+		}
+		return ok && k.IsCapability() || appPermissionRE.MatchString(text)
+	}
+	return isCapability(in.headline()) ||
+		in.Kind == KindIssue && isCapability(firstLines(in.Body, 12))
 }
 
 // OwnerOnly reports a secrets / PAT / org-permission item.
@@ -344,11 +551,22 @@ func ownerOnlyDecision(in Input, rationale string) Decision {
 
 func decideIssue(in Input) Decision {
 	ref := "#" + strconv.Itoa(in.Number)
+	if in.Advisory != nil {
+		return advisoryDecision(ref, *in.Advisory)
+	}
+	// A self-report whose remedy is the spoke operator's comes first: its
+	// body names tokens and credentials, which would otherwise read as an
+	// owner-only secrets item and hold it forever.
+	if sr, ok := ParseSelfReport(in.Title, in.Body); ok {
+		if remedy, ops := selfreportOpsClass(sr.Class); ops {
+			return operatorActionDecision(sr, remedy)
+		}
+	}
 	if HivePolicyChange(in) {
-		return recommendOnly("hive-policy", "this changes the hive's own policy or scope (settings, governance, security posture); the owner confirms those", "accept the proposal as written with its stated defaults, or close it as won't-fix if it widens the hive's write scope")
+		return recommendOnly("hive-policy", "this changes the hive's own policy or scope (settings, governance, security posture); the owner confirms those", hivePolicyRecommendation(in))
 	}
 	if CapabilityGap(in) {
-		return recommendOnly("capability-gap", "the blocker is a missing GitHub App permission; approving a direction would un-park the item only for the same needs-human to be re-applied, so the park stays until the permission changes",
+		return recommendOnly(RuleCapabilityGap, "the blocker is a missing GitHub App permission; approving a direction would un-park the item only for the same needs-human to be re-applied, so the park stays until the permission changes",
 			"grant the App the missing permission (for example `workflows`) or have a human apply the change, then re-check; hive cannot clear this by deciding")
 	}
 	if OwnerOnly(in) {
@@ -365,6 +583,11 @@ func decideIssue(in Input) Decision {
 	if in.BlockedOnPRClosed || blockedOnPRRE.MatchString(in.text()) && strings.Contains(strings.ToLower(in.text()), "unmerged") {
 		return approveIssue("review-backlog", "keep "+ref+" open: drop the relation to the closed PR, note it here and re-triage; a review-backlog item is never auto-closed when its PR closes unmerged",
 			"the PR closing unmerged leaves the work undone")
+	}
+	// Every rule below approves a direction. An issue that offers a choice
+	// is approved only as the option it recommends, never as a bare one.
+	if d, ok := competingOptionsDecision(in); ok {
+		return d
 	}
 	if hasLabel(in.Labels, labelFlaky) || flakyRE.MatchString(in.Title) || flakyRE.MatchString(firstLines(in.Body, 6)) {
 		d := approveIssue("flaky-test", "quarantine the flaky test with a retry and file a deflake task; do not block on it",
@@ -385,12 +608,91 @@ func decideIssue(in Input) Decision {
 		d.Verdict = VerdictAcceptProposal
 		return d
 	}
+	if IsProposal(in.Title, in.Labels) {
+		if kind, detail, ok := ProposalEvidence(in.Title, in.Body); ok {
+			return approveIssue("proposal-approve-evidence", "approve as proposed: "+detail+", so the cost of the gate is already paid for",
+				"the proposal carries "+kind+" evidence — "+detail+" — which is what justifies a new gate")
+		}
+		if hiveFiled(in) {
+			return notNowDecision(ref)
+		}
+	}
 	d := approveIssue("default-approve", "go with the recommendation; where options remain, take the one that keeps work moving and is reversible",
 		"no owner rule singles this out; the standing default is the hive's own recommendation")
 	for _, n := range sortedInts(in.Overlaps) {
 		d.Actions = append(d.Actions, Action{Kind: ActionLink, Target: n, Text: fmt.Sprintf("overlaps #%d", n)})
 	}
 	return d
+}
+
+// hivePolicyRecommendation is the sentence the owner reads on a hive-policy
+// item: a real recommendation, in the owner's terms, not "no rule applies".
+func hivePolicyRecommendation(in Input) string {
+	if in.Kind != KindIssue {
+		return "accept the proposal as written with its stated defaults, or close it as won't-fix if it widens the hive's write scope"
+	}
+	rec := "approve `" + strings.TrimSpace(in.Title) + "` as proposed"
+	lower := strings.ToLower(in.Body)
+	if strings.Contains(lower, "proposal") && (strings.Contains(lower, "acknowledg") || strings.Contains(lower, "approved-direction")) {
+		rec += " — proposals nobody has acknowledged should not be actionable"
+	}
+	if strings.Contains(lower, "opt-in") {
+		rec += "; make it default-on for the lanes it names rather than opt-in"
+	}
+	return rec
+}
+
+// operatorActionDecision answers a self-report whose fix is the spoke
+// owner's: one comment naming who does what, no approved-direction, no
+// implementer, the park kept so the actionable set never sees it.
+func operatorActionDecision(sr SelfReport, remedy string) Decision {
+	text := operatorActionPrefix + sr.OperatorInstruction(remedy)
+	return Decision{
+		Verdict: VerdictOperatorAction, Rule: "selfreport-operator-action", Text: text,
+		Rationale: "the `" + sr.Class + "` self-report is not code work: the remedy is on the reporting spoke, so handing it to an implementer agent only loops back here; it closes itself once the report stops recurring (or `/fixed`)",
+		KeepsPark: true,
+		Actions: []Action{
+			{Kind: ActionLabelsAdd, Labels: []string{LabelNeedsOwner}},
+			{Kind: ActionRecommendOnly, Text: text},
+		},
+	}
+}
+
+// notNowDecision declines a hive-filed proposal that shows neither an
+// incident nor a recurrence: the reason is posted and the issue is closed
+// as not planned, the way a declined proposal leaves the tracker.
+// advisoryDecision decides a hive advisory (hivecommons/hive#15754). Its
+// items are the hive's own work: while any is open nothing is written and
+// the advisory stays open (not parked — the tracker never parks one); once
+// all are resolved it is closed as completed.
+func advisoryDecision(ref string, adv AdvisoryChecklist) Decision {
+	if adv.Total > 0 && adv.Resolved < adv.Total {
+		return Decision{
+			Verdict: VerdictRefused, Rule: RuleAdvisoryInProgress,
+			Text:      fmt.Sprintf("keep %s open: the hive is working its items (%d/%d resolved)", ref, adv.Resolved, adv.Total),
+			Rationale: fmt.Sprintf("the hive is working the items (%d/%d resolved); the advisory closes itself when all are", adv.Resolved, adv.Total),
+			KeepsPark: true,
+		}
+	}
+	text := fmt.Sprintf("close %s: its items are tracked by the hive", ref)
+	rationale := "an advisory is a note, not work; nothing waits on it"
+	if adv.Total > 0 {
+		text = fmt.Sprintf("close %s: all %d items are resolved", ref, adv.Total)
+		rationale = fmt.Sprintf("all %d of the advisory's items are resolved; nothing is left to read", adv.Total)
+	}
+	return Decision{
+		Verdict: VerdictClose, Rule: RuleAdvisoryResolved, Text: text, Rationale: rationale,
+		Actions: []Action{{Kind: ActionCloseCompleted, Text: text}},
+	}
+}
+
+func notNowDecision(ref string) Decision {
+	text := "not now: no incident or recurrence justifies the cost of " + ref + " yet; re-propose with the incident or the repeated instances it would have prevented"
+	return Decision{
+		Verdict: VerdictNotNow, Rule: "proposal-not-now", Text: text,
+		Rationale: "a hive-filed proposal is paid for by evidence; without an incident it would have prevented or a class it would end, the cost is speculative",
+		Actions:   []Action{{Kind: ActionCloseNotNow, Text: text}},
+	}
 }
 
 func approveIssue(rule, text, rationale string) Decision {
@@ -429,6 +731,9 @@ func decidePR(in Input) Decision {
 	if OwnerOnly(in) {
 		return ownerOnlyDecision(in, "secrets, PATs and org permissions are the owner's alone")
 	}
+	if d, ok := decideHiveSuperseder(in, ref); ok {
+		return d
+	}
 	if in.SentinelAlert {
 		if !in.TrustedAuthor {
 			return recommendOnly("sentinel-untrusted", "a sentinel alert on a PR from an author without write access is a human review", "review the sentinel finding on "+ref+" and remove the sentinel label if intended")
@@ -444,6 +749,17 @@ func decidePR(in Input) Decision {
 			Actions:   []Action{decisionComment(text), {Kind: ActionApproveReview}},
 		}
 	}
+	// Two open PRs for one issue in different lanes (hivecommons/hive#15810):
+	// the queue holds both and the hive only names the choice.
+	if d, ok := decideClaimConflict(in, ref); ok {
+		return d
+	}
+	// Two open PRs for one issue (hivecommons/hive#15395): the merge
+	// queue already picked the survivor (green first, then earlier); the
+	// held one closes as superseded, the kept one is released.
+	if d, ok := decideTrainDuplicate(in, ref); ok {
+		return d
+	}
 	// A head parked on DCO or the reporter-trust gate must clear that gate
 	// before a competing-PR rule can release or supersede it.
 	if !in.DCOMissing && !in.ReporterTrustHold {
@@ -451,41 +767,230 @@ func decidePR(in Input) Decision {
 			return d
 		}
 	}
-	if !in.HiveAuthored && !in.ContributorOnline && (in.AdoptionStalled || in.Conflicting || !in.CIGreen || in.DCOMissing) {
-		text := "supersede now: adopt " + ref + " in supersede mode, preserving the author's commits and sign-off; do not wait for the grace deadline"
-		return Decision{
-			Verdict: VerdictAdoptSupersede, Rule: "contributor-offline", Text: text,
-			Rationale: "the contributor is offline; adoption in supersede mode keeps the work moving (hivecommons/hive#13975)",
-			Actions:   []Action{decisionComment(text), {Kind: ActionAdoptSupersede}},
+	// A PR the hive adopted in place is the hive's own to fix: the
+	// reviewer's finding and the head's blockers go to the fixer, never
+	// "back to the author" (hivecommons/hive#15722).
+	if d, ok := decideAdoptedByHive(in, ref); ok {
+		return d
+	}
+	// The contributor-PR ladder (hivecommons/hive#15289): already fixed →
+	// mergeable as-is → rebase-then-merge → return to contributor →
+	// adopt-supersede, in that order, so a PR whose issue a merged PR
+	// already closed is closed as superseded rather than adopted. A
+	// person's PR leaves the ladder after the already-fixed rung.
+	if d, ok := decideLadder(in, ref); ok {
+		return d
+	}
+	// A person pushed this PR themselves (an owner, or author/human):
+	// it is theirs to fix, never the hive's to adopt (hivecommons/hive#15202).
+	if in.PersonAuthored() {
+		if d, ok := decideReturnToAuthor(in, ref); ok {
+			return d
 		}
+	}
+	if !in.HiveAuthored && !in.PersonAuthored() && !in.ContributorOnline && in.WorkflowPath && (in.AdoptionStalled || in.AdoptionGraceElapsed || in.Conflicting || in.CIRed() || in.DCOMissing) {
+		// The adoption engine refuses to publish a contributor's workflow
+		// edits from the App (contributor-lane:workflow-path), so an
+		// adopt-supersede here is decided and never executed
+		// (hivecommons/hive#15188). Same rule as the issue-side gap
+		// (#15127) so the tracker routes it to the capability blocker.
+		return recommendOnly(RuleCapabilityGap, "the PR edits .github/workflows and the hive's GitHub App lacks the `workflows` permission, so the adoption fence refuses to supersede it; deciding to adopt cannot take effect",
+			"grant the App the `workflows` permission and re-run the decision, or have a person rebase and merge "+ref+" on GitHub, or close it as superseded")
 	}
 	if in.ReporterTrustHold && in.CIGreen && !in.Conflicting && !in.DCOMissing {
 		d := releasePR("reporter-trust", "approve "+ref+": the fixing PR is sound, so the reporter-trust hold is cleared", "a reporter-trust hold is cleared when the fixing PR is sound")
 		d.Actions = append(d.Actions, Action{Kind: ActionLabelsAdd, Labels: []string{LabelTriageAccepted}})
 		return d
 	}
-	if in.Conflicting || in.DCOMissing || !in.CIGreen {
-		var fix []string
-		if in.Conflicting {
-			fix = append(fix, "rebase onto the base branch")
-		}
-		if in.DCOMissing {
-			fix = append(fix, "add the DCO sign-off")
-		}
-		if !in.CIGreen {
-			fix = append(fix, "make CI green without widening scope")
-		}
-		text := strings.Join(fix, ", ") + "; keep the smallest reversible change, then it merges"
-		return Decision{
-			Verdict: VerdictDirection, Rule: "fix-then-merge", Text: text,
-			Rationale: "the head is not mergeable yet; the direction names the fix and nothing else",
-			Actions:   []Action{decisionComment(text)},
-		}
+	if fix := fixList(in); len(fix) > 0 {
+		return fixThenMerge(fix)
 	}
 	if in.IsSmall() || in.LowRiskPaths {
 		return releasePR("small-low-risk", "approve "+ref+": small, necessary, low-risk change on a green head", "small low-risk changes (CI pins, read-only RBAC, warning text, workflow hygiene) are approved once checked")
 	}
 	return releasePR("default-release", "approve "+ref+": green head, reviewer question answered with the reversible default — proceed as implemented", "no owner rule holds this back; a merge is reversible and keeps work moving")
+}
+
+// RuleAdoptedFixer: the hive adopted the PR in place, so the reviewer's
+// finding and the head's blockers are its own fixer's to address; no person
+// and no contributor is asked. RuleAdoptedSecurityFinding is the one case
+// the fixer cannot settle alone: the security review withheld approval,
+// and that policy call is a person's (hivecommons/hive#15722).
+const (
+	RuleAdoptedFixer           = "adopted-fixer"
+	RuleAdoptedSecurityFinding = "adopted-security-finding"
+	// RuleAdoptedPushRefused: the hive adopted the PR but cannot push its
+	// branch and the author is offline, so a person pushes or closes it.
+	RuleAdoptedPushRefused = "adopted-push-refused"
+)
+
+// decideAdoptedByHive is the adopted-in-place branch of decidePR. The hive
+// owns the branch, so "send it back to its author" is wrong — the hive is
+// the author now. A reviewer requires_human or a head blocker becomes a
+// direction the hive's fixer carries out; a security finding is named in
+// full and left to a person. A green, unquestioned adopted head falls
+// through to the ordinary rules.
+func decideAdoptedByHive(in Input, ref string) (Decision, bool) {
+	if in.Kind != KindPR || !in.AdoptedByHive || in.HiveAuthored || in.PersonAuthored() {
+		return Decision{}, false
+	}
+	finding := strings.TrimSpace(in.ReviewerFinding)
+	if in.ReviewerRequiresHuman && in.SecurityFinding {
+		what := "the security review withheld approval"
+		if finding != "" {
+			what = finding
+		}
+		return recommendOnly(RuleAdoptedSecurityFinding,
+			"the hive adopted "+ref+" and owns its branch, but the reviewer's finding is a security one — "+what+" — and that policy call is a person's, not the fixer's",
+			"read the finding on "+ref+" ("+what+") and reply `/hive decision <instruction>` for the hive's fixer to carry out, or close it"), true
+	}
+	var fix []string
+	if in.ReviewerRequiresHuman {
+		item := "address the reviewer's finding"
+		if finding != "" {
+			item += " (" + finding + ")"
+		}
+		fix = append(fix, item)
+	}
+	fix = append(fix, fixList(in)...)
+	if len(fix) == 0 {
+		return Decision{}, false
+	}
+	if why := strings.TrimSpace(in.AdoptedPushRefused); why != "" {
+		return decideAdoptedPushRefused(in, ref, why, fix), true
+	}
+	text := "hive's fixer: " + strings.Join(fix, ", ") + " on " + ref + "; then it merges"
+	return Decision{
+		Verdict: VerdictDirection, Rule: RuleAdoptedFixer, Text: text,
+		Rationale: "the hive adopted " + ref + " in place and owns its branch, so the reviewer's finding is the hive's own fixer's to address — not the contributor's and not a person's (hivecommons/hive#15722)",
+		Actions:   []Action{decisionComment(text)},
+	}, true
+}
+
+// decideAdoptedPushRefused answers an adopted PR whose branch the hive
+// cannot push. A connected author can push it, so it goes back to them with
+// the fix list; otherwise only a person can, so the park stays with the one
+// who asked, with the reason.
+func decideAdoptedPushRefused(in Input, ref, why string, fix []string) Decision {
+	if in.ContributorOnline || in.ReworkPickedUp {
+		who := in.AuthorWord()
+		text := who + " is connected and the hive cannot push " + ref + " (" + why + "): " + strings.Join(fix, ", ") + " on " + ref + "; then it merges"
+		return Decision{
+			Verdict: VerdictDirection, Rule: RuleReturnToContributor, Text: text,
+			Rationale: "the hive adopted " + ref + " but cannot push its branch — " + why + " — and " + who + " is connected, so the fix list goes back to them",
+			Actions:   []Action{decisionComment(text)},
+		}
+	}
+	return recommendOnly(RuleAdoptedPushRefused,
+		"the hive adopted "+ref+" but cannot push its branch — "+why+" — so its fixer cannot carry out a direction, and "+in.OfflineWording(),
+		"a maintainer pushes the fix to "+ref+" ("+strings.Join(fix, ", ")+") or closes it; the hive cannot")
+}
+
+// RuleHiveSuperseder is the owner's superseder rule: "if a pr is superseded
+// by a pr that a hive agent creates, it should auto merge" — the only
+// exception being the sentinel or some other emergent problem with the PR.
+const RuleHiveSuperseder = "hive-superseder-automerge"
+
+// decideHiveSuperseder applies RuleHiveSuperseder to the hive's own
+// superseding PR. Without a hard stop or a recorded sign-off question the
+// PR is released (the lane merges it once CI/review are clean; an ordinary
+// reviewer finding is the fixer's, not a decision). A hard stop or a
+// sign-off question keeps the park and is named in the recommendation.
+func decideHiveSuperseder(in Input, ref string) (Decision, bool) {
+	if in.Kind != KindPR || !in.HiveSuperseding {
+		return Decision{}, false
+	}
+	if stop := strings.TrimSpace(in.HiveSupersederHardStop); stop != "" {
+		return recommendOnly(RuleHiveSuperseder,
+			"the hive's superseding PR auto-merges by the owner's rule, except for the sentinel or an emergent problem — and this one has one: "+stop,
+			"look at "+ref+" ("+stop+"): clear the stop (acknowledge the sentinel finding, release the hold, or fix the head) and the lane merges it; else close it"), true
+	}
+	if question := strings.TrimSpace(in.Question); in.SignOffQuestion && question != "" {
+		return recommendOnly(RuleHiveSuperseder,
+			"the hive's superseding PR has a recorded reviewer sign-off question; sign-off is still required even without a hard stop",
+			"answer the reviewer's question on "+ref+": "+question), true
+	}
+	if in.SentinelAlert {
+		return Decision{}, false
+	}
+	return releasePR(RuleHiveSuperseder,
+		"approve "+ref+": hive-authored superseding PR — auto-merging once CI/review are clean (owner rule: a PR the hive creates to supersede another auto-merges; reviewer findings go to the fixer)",
+		"the owner's rule: a PR the hive creates to supersede another auto-merges with no operator decision; only the sentinel or an emergent problem (hold, exhausted fixes, red CI, unresolvable conflict) parks it"), true
+}
+
+// RuleOnePRPerIssue: the merge queue carries one PR per issue; the one it
+// held as a duplicate closes as superseded by the one it kept.
+const RuleOnePRPerIssue = "one-pr-per-issue"
+
+// RuleSameIssueClaimConflict: two open PRs in different merge lanes claim
+// one issue and nobody has decided which lands; the queue admits neither
+// and the hive names the choice without making it (hivecommons/hive#15810).
+const RuleSameIssueClaimConflict = "same-issue-claim-conflict"
+
+// decideClaimConflict is the recommend-only answer for a PR the merge
+// queue holds on an undecided same-issue claim: the hive's own PR and a
+// trusted human's PR for hivecommons/hive#15773 both marched toward merge
+// because each lane saw only its own. The hive does not pick — it names
+// the two PRs and the two ways out; Approve on one row admits that PR,
+// Close as superseded on the other ends the conflict.
+func decideClaimConflict(in Input, ref string) (Decision, bool) {
+	if in.Kind != KindPR || in.ClaimConflictWith <= 0 {
+		return Decision{}, false
+	}
+	other := fmt.Sprintf("#%d", in.ClaimConflictWith)
+	issue := "the same issue"
+	if in.ClaimConflictIssue > 0 {
+		issue = fmt.Sprintf("issue #%d", in.ClaimConflictIssue)
+	}
+	return recommendOnly(RuleSameIssueClaimConflict,
+		fmt.Sprintf("%s and %s both claim %s from different merge lanes; the merge queue admits neither until one is closed or approved, so two implementations of one fix never both land", ref, other, issue),
+		fmt.Sprintf("keep %s, close %s — or keep %s, close %s; the hive will not pick", other, ref, ref, other)), true
+}
+
+// decideTrainDuplicate resolves a same-issue pair the merge queue split
+// (hivecommons/hive#15395). The queue's pick stands: it picks between
+// heads at the merge gate and keeps the pick until the kept PR closes or
+// is blocked for good (hivecommons/hive#17439). Deciding on the held PR
+// closes it as superseded by the kept one, with a comment; deciding on
+// the kept PR releases it and names the duplicate the queue holds. A
+// paused repo only gets the recommendation.
+func decideTrainDuplicate(in Input, ref string) (Decision, bool) {
+	if in.Kind != KindPR {
+		return Decision{}, false
+	}
+	issue := ""
+	if in.TrainDuplicateIssue > 0 {
+		issue = fmt.Sprintf(" for issue #%d", in.TrainDuplicateIssue)
+	}
+	if in.TrainDuplicateOf > 0 {
+		winner := fmt.Sprintf("#%d", in.TrainDuplicateOf)
+		text := fmt.Sprintf("superseded by %s: both PRs fix the same issue%s; the merge queue carries one PR per issue and kept %s (green first, then the earlier-opened)", winner, issue, winner)
+		rationale := fmt.Sprintf("%s and %s declare the same closing issue%s; the merge queue holds one PR per issue and kept %s, so %s closes as superseded with credit", ref, winner, issue, winner, ref)
+		if in.RepoPaused {
+			return recommendOnly(RuleOnePRPerIssue, rationale+"; the repo is paused, so the hive only recommends", "close "+ref+" as superseded by "+winner), true
+		}
+		note := fmt.Sprintf("Thank you for this PR. %s fixes the same issue%s and the merge queue carries one PR per issue; it kept %s (green first, then the earlier-opened), so the hive is closing this one as superseded. Your work is credited on the issue.", winner, issue, winner)
+		return Decision{
+			Verdict: VerdictCloseSuperseded, Rule: RuleOnePRPerIssue, Text: text,
+			Rationale: rationale,
+			Actions:   []Action{{Kind: ActionCloseDuplicate, Target: in.TrainDuplicateOf, Text: note}},
+		}, true
+	}
+	for _, other := range in.Competing {
+		if !other.HeldDuplicate {
+			continue
+		}
+		held := fmt.Sprintf("#%d", other.Number)
+		if in.Conflicting || in.CIRed() || in.DCOMissing {
+			return recommendOnly(RuleOnePRPerIssue,
+				fmt.Sprintf("the merge queue kept %s over %s%s, but %s is not mergeable now (%s); the queue keeps it until it closes or is blocked for good", ref, held, issue, ref, mergeBlockers(in)),
+				"fix "+ref+" ("+mergeBlockers(in)+"), or decide on "+held+" to let it supersede this one"), true
+		}
+		return releasePR(RuleOnePRPerIssue,
+			fmt.Sprintf("approve %s: the merge queue carries one PR per issue%s and kept this one; %s is held as its duplicate and closes as superseded once this merges", ref, issue, held),
+			"one PR per issue in the merge queue; the kept PR merges, the held duplicate closes as superseded"), true
+	}
+	return Decision{}, false
 }
 
 // decideCompeting applies "prefer an adequate contributor PR over a hive
@@ -512,6 +1017,62 @@ func decideCompeting(in Input, ref string) (Decision, bool) {
 	return Decision{}, false
 }
 
+// PersonAuthored: a human or one of this hive's owners pushed the PR
+// themselves. Such a PR is never a "contributor" with an expected connected
+// hive, so the contributor-offline rule and adoption do not apply to it.
+func (in Input) PersonAuthored() bool { return in.HumanAuthor || in.OwnerAuthor }
+
+// RuleReturnToAuthor hands a person's PR back to that person with the exact
+// fix list and the reviewer's question, instead of adopting it.
+const RuleReturnToAuthor = "return-to-author"
+
+// decideReturnToAuthor is the person-authored branch of decidePR: a head that
+// is not mergeable, or a reviewer question still open, goes back to the
+// author by name. A green, mergeable head with no open question falls
+// through to the ordinary approve rules.
+// ReturnToAuthor is decideReturnToAuthor for callers outside the policy
+// (the 090 human-merge decider): the person's PR goes back to them with
+// the fix list and the reviewer's question; ok=false when nothing is owed.
+func ReturnToAuthor(in Input) (Decision, bool) {
+	return decideReturnToAuthor(in, "#"+strconv.Itoa(in.Number))
+}
+
+func decideReturnToAuthor(in Input, ref string) (Decision, bool) {
+	fix := fixList(in)
+	question := strings.TrimSpace(in.Question)
+	if len(fix) == 0 && question == "" {
+		return Decision{}, false
+	}
+	who := "the author"
+	if a := strings.TrimSpace(in.Author); a != "" {
+		who = "@" + strings.TrimPrefix(a, "@")
+	}
+	var parts []string
+	if len(fix) > 0 {
+		parts = append(parts, who+": "+strings.Join(fix, ", ")+" on "+ref+"; then it merges")
+	}
+	if question != "" {
+		parts = append(parts, who+", the reviewer asked: "+question)
+	}
+	text := strings.Join(parts, " — ")
+	return Decision{
+		Verdict: VerdictDirection, Rule: RuleReturnToAuthor, Text: text,
+		Rationale: "a person pushed this PR themselves, so the hive asks that person instead of adopting the work (hivecommons/hive#15202)",
+		Actions:   []Action{decisionComment(text)},
+	}, true
+}
+
+// fixThenMerge is the direction for a head that is not mergeable yet: it
+// names the fix and nothing else.
+func fixThenMerge(fix []string) Decision {
+	text := strings.Join(fix, ", ") + "; keep the smallest reversible change, then it merges"
+	return Decision{
+		Verdict: VerdictDirection, Rule: "fix-then-merge", Text: text,
+		Rationale: "the head is not mergeable yet; the direction names the fix and nothing else",
+		Actions:   []Action{decisionComment(text)},
+	}
+}
+
 func releasePR(rule, text, rationale string) Decision {
 	return Decision{
 		Verdict: VerdictApprove, Rule: rule, Text: text, Rationale: rationale,
@@ -531,7 +1092,14 @@ type Rails struct {
 	Held bool
 	// AllowedActions overrides the allowed set (nil = AllowedActions).
 	AllowedActions []ActionKind
+	// PersonAuthored: a human or owner pushed the PR; adopt-supersede is
+	// refused whatever the rule chose (hivecommons/hive#15202).
+	PersonAuthored bool
 }
+
+// RefusalAdoptPersonAuthored is the refusal ApplyRails records when a rule
+// asked to adopt a person's PR.
+const RefusalAdoptPersonAuthored = "adopt-supersede: a person pushed this PR themselves; the hive asks the author instead of adopting it"
 
 // ApplyRails enforces the safety rails on a decision: a held item is refused
 // outright; actions outside the allowed set are dropped with a refusal; a
@@ -564,9 +1132,16 @@ func ApplyRails(d Decision, r Rails) Decision {
 			out.Refusals = append(out.Refusals, "labels-remove hold: the delegate never lifts a hold")
 			continue
 		}
+		if a.Kind == ActionAdoptSupersede && r.PersonAuthored {
+			out.Refusals = append(out.Refusals, RefusalAdoptPersonAuthored)
+			continue
+		}
 		out.Actions = append(out.Actions, a)
 	}
-	if len(out.Actions) == 0 {
+	if len(out.Actions) == 0 && d.Verdict != VerdictRefused {
+		// A decision that already refuses with no actions (an advisory the
+		// hive is still working) stays a no-write refusal, not a
+		// recommendation comment.
 		out.Verdict = VerdictRecommendOnly
 		out.KeepsPark = true
 		out.Actions = []Action{{Kind: ActionRecommendOnly, Text: "hive recommends: " + d.Text + "; owner to confirm"}}
@@ -576,7 +1151,7 @@ func ApplyRails(d Decision, r Rails) Decision {
 
 // Run is Decide followed by ApplyRails with the hold rail read from the labels.
 func Run(in Input) Decision {
-	return ApplyRails(Decide(in), Rails{Held: hasLabel(in.Labels, LabelHold)})
+	return ApplyRails(Decide(in), Rails{Held: hasLabel(in.Labels, LabelHold), PersonAuthored: in.PersonAuthored()})
 }
 
 // CommentBody renders the comment the delegate posts for a decision: the

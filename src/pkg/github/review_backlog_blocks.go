@@ -18,9 +18,11 @@ import (
 // the block. ReconcileReviewBacklogBlocks resolves parked items in their own
 // destination (GitHub issue, Linear, Jira, GitHub Projects):
 //
-//   - the PR merged: the block is lifted with a one-line note telling the
-//     worker to check the finding still applies and to close the item without
-//     a PR if it is already fixed;
+//   - the PR merged: the hive checks the finding itself first
+//     (reviewBacklogSelfVerify): if its file is gone from the base, or none
+//     of the symbols its title names is in that file any more, the item is
+//     closed as completed with a one-line note; otherwise the block is
+//     lifted with a note that the item is actionable now;
 //   - the PR closed without merging: the block is dropped and a note asks for
 //     re-triage against the current base. The item is never closed or
 //     cancelled automatically: a closed PR is often superseded by one that
@@ -37,6 +39,9 @@ const (
 	reviewBacklogBlockBlocked  = "blocked"
 	reviewBacklogBlockLifted   = "lifted"
 	reviewBacklogBlockRetriage = "retriage"
+	// reviewBacklogBlockClosed: the PR merged and the self-check found the
+	// finding gone from the base, so the item was closed as completed.
+	reviewBacklogBlockClosed = "closed"
 )
 
 // reviewBacklogRetriageMarker tags the note posted when an item is unblocked
@@ -64,25 +69,57 @@ type ReviewBacklogBlockResolver interface {
 func blockedOnReviewedPRNote(repo string, pr int) string {
 	var b strings.Builder
 	b.WriteString(BlockedOnMarker(repo, pr))
-	fmt.Fprintf(&b, "\n**Blocked on PR #%d.** This finding came from reviewing PR #%d and is about code that PR is changing. Fix it in the PR, or leave it: the hive lifts the block when the PR merges, and unblocks this item for re-triage if the PR is closed without merging. Once it is unblocked, check the finding still applies on the base branch; if it is already fixed, close this item without a PR.\n\n", pr, pr)
+	fmt.Fprintf(&b, "\n**Blocked on PR #%d.** This finding came from reviewing PR #%d and is about code that PR is changing. Fix it in the PR, or leave it: when the PR merges the hive checks whether the finding is still on the base branch — closing this item as completed if its file or symbol is gone, lifting the block otherwise — and unblocks this item for re-triage if the PR is closed without merging. Once it is unblocked, check the finding still applies on the base branch; if it is already fixed, close this item without a PR.\n\n", pr, pr)
 	return b.String()
 }
 
-func reviewBacklogLiftNote(repo string, pr int) string {
-	return fmt.Sprintf("%s\nUnblocked: %s#%d merged. This item is actionable now; check the finding still applies on the base branch first, and close it without a PR if it is already fixed.", blockedUnblockedMarker, repo, pr)
+// reviewBacklogLiftNote is the note on an item whose PR merged with the
+// finding's file still on the base. admission is unblockAdmission's
+// sentence ("" when the item is admitted): an un-admitted item is not
+// "actionable now".
+func reviewBacklogLiftNote(repo string, pr int, admission string) string {
+	if admission != "" {
+		return fmt.Sprintf("%s\nUnblocked: %s#%d merged and the finding's file is still on the base branch. Unblocked — waiting for a maintainer to admit it: %s Once it is admitted, check the finding still applies first, and close it without a PR if it is already fixed.", blockedUnblockedMarker, repo, pr, admission)
+	}
+	return fmt.Sprintf("%s\nUnblocked: %s#%d merged and the finding's file is still on the base branch. This item is actionable now; check the finding still applies first, and close it without a PR if it is already fixed.", blockedUnblockedMarker, repo, pr)
 }
 
-func reviewBacklogRetriageNote(repo string, pr int) string {
+func reviewBacklogRetriageNote(repo string, pr int, admission string) string {
+	if admission != "" {
+		return fmt.Sprintf("%s\n%s\nUnblocked: source PR %s#%d closed unmerged. Unblocked — waiting for a maintainer to admit it: %s A superseding PR often lands the same lines, so the finding may still apply; close this item only if it no longer does.", blockedUnblockedMarker, reviewBacklogRetriageMarker, repo, pr, admission)
+	}
 	return fmt.Sprintf("%s\n%s\nUnblocked: source PR %s#%d closed unmerged — re-triage against current base. A superseding PR often lands the same lines, so the finding may still apply; close this item only if it no longer does.", blockedUnblockedMarker, reviewBacklogRetriageMarker, repo, pr)
 }
 
-// LiftBlock removes `blocked` from the GitHub issue and posts note.
+// reviewBacklogAdmission is unblockAdmission for a review-backlog item filed
+// as a GitHub issue; "" for other destinations (no issue filter applies)
+// and when the issue cannot be read.
+func (c *Client) reviewBacklogAdmission(ctx context.Context, sink ReviewBacklogSink, repo string, ref ReviewBacklogRef) string {
+	if _, ok := sink.(githubIssueBacklogSink); !ok || ref.Number <= 0 {
+		return ""
+	}
+	owner, name := c.splitRepo(repo)
+	issue, _, err := c.client.Issues.Get(ctx, owner, name, ref.Number)
+	if err != nil {
+		return ""
+	}
+	return c.unblockAdmission(issueLabelNames(issue.Labels))
+}
+
+// LiftBlock removes `blocked` from the GitHub issue and posts note, unless
+// the blocked sweep already noted the lift for the same PR
+// (unblockAlreadyNoted).
 func (s githubIssueBacklogSink) LiftBlock(ctx context.Context, repo string, ref ReviewBacklogRef, note string) error {
 	if ref.Number <= 0 {
 		return fmt.Errorf("review backlog: GitHub item %q has no issue number", ref.ID)
 	}
 	if err := s.c.unblockIssue(ctx, repo, ref.Number); err != nil {
 		return err
+	}
+	owner, name := s.c.splitRepo(repo)
+	if comments, err := s.c.listIssueComments(ctx, owner, name, ref.Number); err == nil && unblockAlreadyNoted(comments, note) {
+		s.c.noteCommentSuppressed()
+		return nil
 	}
 	return s.c.CreateIssueCommentBudgeted(ctx, repo, ref.Number, note)
 }
@@ -92,7 +129,10 @@ type ReviewBacklogBlockResult struct {
 	Checked   int
 	Lifted    int
 	Retriaged int
-	Errors    int
+	// Closed counts items closed as completed because the self-check found
+	// the finding no longer applies on the base once its PR merged.
+	Closed int
+	Errors int
 }
 
 // reviewBacklogPROutcome is a tracked PR's state: still open, merged, or
@@ -105,13 +145,15 @@ const (
 	reviewBacklogPRClosed
 )
 
-func (c *Client) reviewBacklogPROutcome(ctx context.Context, repo string, number int) (reviewBacklogPROutcome, error) {
+// reviewBacklogPROutcomeBase reads a tracked PR's outcome plus its base
+// branch, which the self-check reads the finding's file from.
+func (c *Client) reviewBacklogPROutcomeBase(ctx context.Context, repo string, number int) (reviewBacklogPROutcome, string, error) {
 	owner, name := c.splitRepo(repo)
 	pr, _, err := c.client.PullRequests.Get(ctx, owner, name, number)
 	if err != nil {
-		return reviewBacklogPROpen, err
+		return reviewBacklogPROpen, "", err
 	}
-	return prOutcome(pr), nil
+	return prOutcome(pr), strings.TrimSpace(pr.GetBase().GetRef()), nil
 }
 
 func prOutcome(pr *gh.PullRequest) reviewBacklogPROutcome {
@@ -154,6 +196,7 @@ func ReconcileReviewBacklogBlocks(ctx context.Context, c *Client, logger *slog.L
 	}
 	sort.Strings(repos)
 	outcomes := map[string]reviewBacklogPROutcome{}
+	bases := map[string]string{}
 	lookups := 0
 	changed := false
 	for _, repo := range repos {
@@ -178,13 +221,14 @@ func ReconcileReviewBacklogBlocks(ctx context.Context, c *Client, logger *slog.L
 					continue
 				}
 				lookups++
-				o, err := c.reviewBacklogPROutcome(ctx, repo, rec.BlockedOnPR)
+				o, base, err := c.reviewBacklogPROutcomeBase(ctx, repo, rec.BlockedOnPR)
 				if err != nil {
 					res.Errors++
 					logger.Warn("review backlog block sweep: PR lookup failed", "pr", prKey, "error", err)
 					continue
 				}
 				outcomes[prKey] = o
+				bases[prKey] = base
 				outcome = o
 			}
 			if outcome == reviewBacklogPROpen {
@@ -200,7 +244,17 @@ func ReconcileReviewBacklogBlocks(ctx context.Context, c *Client, logger *slog.L
 			var actErr error
 			switch outcome {
 			case reviewBacklogPRMerged:
-				note := reviewBacklogLiftNote(repo, rec.BlockedOnPR)
+				var closed bool
+				closed, actErr = c.reviewBacklogSelfVerify(ctx, sink, repo, rec, bases[prKey], logger)
+				if actErr == nil && closed {
+					rec.BlockState = reviewBacklogBlockClosed
+					res.Closed++
+					break
+				}
+				if actErr != nil {
+					break
+				}
+				note := reviewBacklogLiftNote(repo, rec.BlockedOnPR, c.reviewBacklogAdmission(ctx, sink, repo, ref))
 				if canResolve {
 					actErr = resolver.LiftBlock(ctx, repo, ref, note)
 				} else {
@@ -212,11 +266,22 @@ func ReconcileReviewBacklogBlocks(ctx context.Context, c *Client, logger *slog.L
 				}
 			case reviewBacklogPRClosed:
 				if supersededBy, isSuperseded := c.pullRequestSupersededBy(ctx, repo, rec.BlockedOnPR); isSuperseded && supersededBy > 0 && supersededBy != rec.BlockedOnPR {
-					yOutcome, yErr := c.reviewBacklogPROutcome(ctx, repo, supersededBy)
+					yOutcome, yBase, yErr := c.reviewBacklogPROutcomeBase(ctx, repo, supersededBy)
 					if yErr == nil {
 						switch yOutcome {
 						case reviewBacklogPRMerged:
-							note := reviewBacklogLiftNote(repo, supersededBy)
+							rec.BlockedOnPR = supersededBy
+							var closed bool
+							closed, actErr = c.reviewBacklogSelfVerify(ctx, sink, repo, rec, yBase, logger)
+							if actErr == nil && closed {
+								rec.BlockState = reviewBacklogBlockClosed
+								res.Closed++
+								break
+							}
+							if actErr != nil {
+								break
+							}
+							note := reviewBacklogLiftNote(repo, supersededBy, c.reviewBacklogAdmission(ctx, sink, repo, ref))
 							if canResolve {
 								actErr = resolver.LiftBlock(ctx, repo, ref, note)
 							} else {
@@ -224,11 +289,10 @@ func ReconcileReviewBacklogBlocks(ctx context.Context, c *Client, logger *slog.L
 							}
 							if actErr == nil {
 								rec.BlockState = reviewBacklogBlockLifted
-								rec.BlockedOnPR = supersededBy
 								res.Lifted++
 							}
 						case reviewBacklogPRClosed:
-							note := reviewBacklogRetriageNote(repo, supersededBy)
+							note := reviewBacklogRetriageNote(repo, supersededBy, c.reviewBacklogAdmission(ctx, sink, repo, ref))
 							if canResolve {
 								actErr = resolver.LiftBlock(ctx, repo, ref, note)
 							} else {
@@ -259,7 +323,7 @@ func ReconcileReviewBacklogBlocks(ctx context.Context, c *Client, logger *slog.L
 				}
 				// Never auto-close: unblock, comment, and leave the item to
 				// normal triage (maintainer decision on #13849).
-				note := reviewBacklogRetriageNote(repo, rec.BlockedOnPR)
+				note := reviewBacklogRetriageNote(repo, rec.BlockedOnPR, c.reviewBacklogAdmission(ctx, sink, repo, ref))
 				if canResolve {
 					actErr = resolver.LiftBlock(ctx, repo, ref, note)
 				} else {

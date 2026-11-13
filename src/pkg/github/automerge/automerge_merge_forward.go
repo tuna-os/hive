@@ -29,8 +29,8 @@ func (c *Engine) mergeForwardTrustedHumanFor(repo string) bool {
 	return c.mergeForwardTrustedHuman(repo)
 }
 
-// mergeForwardKey namespaces the per-head attempt in heldRunApprovals so it
-// never collides with the rebase-nudge or bot-takeover entries.
+// mergeForwardKey namespaces the per-head attempt in the sweep memory
+// (automerge_sweep_memory.go), which every lane's engine shares.
 func mergeForwardKey(prKey, headSHA string) string {
 	return prKey + "@" + headSHA + "#merge-forward"
 }
@@ -48,22 +48,15 @@ func mergeForwardWorkflowRefusedKey(prKey, headSHA string) string {
 
 func (c *Engine) mergeForwardWorkflowRefused(owner, repo string, number int, headSHA string) bool {
 	key := mergeForwardWorkflowRefusedKey(c.evaluatedHeadKey(owner, repo, number), headSHA)
-	c.heldRunApprovalsMu.Lock()
-	defer c.heldRunApprovalsMu.Unlock()
-	return c.heldRunApprovals[key]
+	return c.memory().hasOnce(key, c.clock())
 }
 
+// markMergeForwardOnce records key in the sweep memory and reports whether
+// this is its first use. The memory outlives the one-shot engine the
+// trusted-author lane runs on each tick, so a head is tried once per
+// process, not once per sweep.
 func (c *Engine) markMergeForwardOnce(key string) bool {
-	c.heldRunApprovalsMu.Lock()
-	defer c.heldRunApprovalsMu.Unlock()
-	if c.heldRunApprovals == nil {
-		c.heldRunApprovals = make(map[string]bool)
-	}
-	if c.heldRunApprovals[key] {
-		return false
-	}
-	c.heldRunApprovals[key] = true
-	return true
+	return c.memory().markOnce(key, c.clock())
 }
 
 // mergeForwardOrConflict handles a trusted-author PR GitHub reports as
@@ -76,13 +69,17 @@ func (c *Engine) markMergeForwardOnce(key string) bool {
 // changed .github/workflows/ and the App lacks the workflows permission) is
 // reported as "workflow-permission" for that head, so a person brings the
 // branch up to date rather than a fix agent being sent to make the same
-// refused push. Every other case keeps the "conflicting" hold. It is
-// attempted once per head SHA.
+// refused push. Every other case — a dependency bot's branch included, which
+// the bot rebases itself — keeps the "conflicting" hold. It is attempted
+// once per head SHA.
 func (c *Engine) mergeForwardOrConflict(ctx context.Context, displayRepo, owner, repo string, pr *gh.PullRequest, number int) (AutoMergeSweepEvent, string, error) {
 	if !c.mergeForwardTrustedHumanFor(owner+"/"+repo) || pr == nil || c.isForkPR(pr) {
 		return AutoMergeSweepEvent{}, "conflicting", nil
 	}
 	if authorkind.FromLabels(labelNames(pr.Labels), c.stagePolicy().AuthorKindLabels) != authorkind.Human {
+		return AutoMergeSweepEvent{}, "conflicting", nil
+	}
+	if c.leaveBaseSyncToDependencyBot(displayRepo, owner, repo, pr, "merge-forward") {
 		return AutoMergeSweepEvent{}, "conflicting", nil
 	}
 	headRef := strings.TrimSpace(pr.GetHead().GetRef())
@@ -94,6 +91,22 @@ func (c *Engine) mergeForwardOrConflict(ctx context.Context, displayRepo, owner,
 	}
 	if headRef == "" || baseRef == "" || headSHA == "" || appLogin == "" {
 		return AutoMergeSweepEvent{}, "conflicting", nil
+	}
+	if c.requireCurrentBaseFor(owner + "/" + repo) {
+		if reason, err := c.admitBasePreparation(ctx, owner, repo, baseRef, number, headSHA, stageLaneTrusted, true); reason != "" || err != nil {
+			if err != nil {
+				return AutoMergeSweepEvent{}, "merge-forward", err
+			}
+			return AutoMergeSweepEvent{}, reason, nil
+		}
+		if err := c.claimBasePreparationUpdate(ctx, owner, repo, number, headSHA); err != nil {
+			// A conflicting outsider belongs to the existing repair path,
+			// not to final preparation or a ready merge-train seat.
+			if wait := preparationWaitReason(err); wait != "" {
+				return AutoMergeSweepEvent{}, wait, nil
+			}
+			return AutoMergeSweepEvent{}, "merge-forward", err
+		}
 	}
 	if !c.markMergeForwardAttempted(owner, repo, number, headSHA) {
 		if c.mergeForwardWorkflowRefused(owner, repo, number, headSHA) {

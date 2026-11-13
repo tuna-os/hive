@@ -45,6 +45,10 @@ const (
 	// required "Gap vs existing" section. The detail names the match so the
 	// refusal is visible to operators, not just in the agent's bead store.
 	AuditActionAgentIssuePriorArtRefused = "agent_issue_prior_art_refused"
+	// AuditActionAgentIssueEmptyAdvisoryRefused: the relay refused an
+	// issue-create whose body is a dedupe checklist with nothing actionable
+	// in it (hivecommons/hive#15381).
+	AuditActionAgentIssueEmptyAdvisoryRefused = "agent_issue_empty_advisory_refused"
 	// AuditActionHiveIssueCreated is the audit action recorded when the hive
 	// itself creates an issue (advisory issue, ACMM-gap issue).
 	AuditActionHiveIssueCreated = "hive_issue_created"
@@ -56,6 +60,10 @@ const (
 	// AuditActionReleaseCreated is the audit action recorded when an eligible
 	// owner approval makes the hub create a GitHub release.
 	AuditActionReleaseCreated = "release_created"
+	// AuditActionWorkflowLabelRemoved records a workflow model's stale
+	// label deleted from a repository on unbind/rebind
+	// (hivecommons/hive#17620).
+	AuditActionWorkflowLabelRemoved = "workflow_label_removed"
 	// AuditActionPRClosed is the audit action recorded when the hive closes a
 	// PR WITHOUT merging it: the issue-request watcher's close relay targeting
 	// a pull request number. It is the "closed without merging" half of the
@@ -111,6 +119,14 @@ const (
 	// (approved|changes_requested|commented). This makes reviews a first-class
 	// audited activity instead of an invisible agent-CLI write.
 	AuditActionPRReviewed = "agent_pr_reviewed"
+	// AuditActionPRReviewObserved records a review someone other than the
+	// hive submitted (a person, or another bot), observed by the merged-PR
+	// settle scan once the PR merged or closed (hivecommons/hive#16116). It is
+	// not a hive write: it feeds the human/other columns of the throughput
+	// card's Reviewed row. Recorded at the review's submitted_at; detail
+	// carries repo=, number=, review_id= (the de-duplication key), actor= and
+	// actor_class= (human|other_automation).
+	AuditActionPRReviewObserved = "pr_review_observed"
 	// AuditActionSentinelBlockedApproval records an approval/LGTM path refused
 	// because the configured sentinel alert label is present.
 	AuditActionSentinelBlockedApproval = "sentinel-blocked-approval"
@@ -147,7 +163,7 @@ const (
 	// counted as relay merges.
 	PRAuditPathForge = "forge"
 	// PRAuditPathDashboard marks a merge an operator asked for from the
-	// dashboard's activity monitor ("Approve & merge as maintainer" on a
+	// dashboard's activity monitor ("Merge now as maintainer" on a
 	// Ready-for-human-merge row, hivecommons/hive#15078): the hive's App
 	// performs it, the audit line names the person.
 	PRAuditPathDashboard = "dashboard"
@@ -346,11 +362,13 @@ func ParseRunTrailers(body string) (runKey, planRef string) {
 }
 
 // AppendTrailer appends the visible trailer to body, blank-line separated.
-// No-op when the trailer is empty or the body already carries one — a request
-// the watcher retries after a partial failure must not stack trailers.
+// No-op when the trailer is empty or the body already has a trailer line
+// (HasAttributionLine) — a request the watcher retries after a partial
+// failure must not stack trailers. A body that only mentions `— hive:` in its
+// text still gets the line.
 func AppendTrailer(body string, m InvocationMeta) string {
 	t := m.Trailer()
-	if t == "" || strings.Contains(body, AttributionTrailerPrefix) {
+	if t == "" || HasAttributionLine(body) {
 		return body
 	}
 	body = strings.TrimRight(body, "\n")
@@ -358,6 +376,23 @@ func AppendTrailer(body string, m InvocationMeta) string {
 		return t
 	}
 	return body + "\n\n" + t
+}
+
+// HasAttributionLine reports whether body has a line that starts with the
+// `— hive:` prefix: the signature line itself, read the way the repos' monthly
+// agent audit reads it (a line whose first characters are `— hive:`). A body
+// that only mentions `— hive:` in its text has none. Danathar/arch-bootc#473
+// and Danathar/atomic-image-builder#640 and #678 described that audit, so
+// their text named the prefix; AppendTrailer, which tested for the prefix
+// anywhere, took that for a signature and opened them unsigned, and the audit
+// then failed on them.
+func HasAttributionLine(body string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSuffix(line, "\r"), AttributionTrailerPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasAttributionTrailer reports whether body carries the visible `— hive:`
@@ -377,6 +412,34 @@ func HasAttributionTrailer(body string) bool {
 // bin/gh-wrapper.sh's _identity_footer, not arbitrary trailing Markdown. The
 // footer may end with the origin marker (`<!-- hive:origin … -->`, #12539).
 var attributionIdentityFooter = regexp.MustCompile("\\n[ \\t]*---[ \\t]*\\n🐝 \\*\\*Hive Agent\\*\\*:(?: `[^`\\n]+`)?(?: \\| \\*\\*Instance:\\*\\* `[^`\\n]+`)? \\| \\*\\*SHA:\\*\\* `[^`\\n]+`[ \\t]*(?:\\n[ \\t]*<!-- " + OriginMarkerName + "[^>]*-->)?[ \\t\\n]*$")
+
+// OriginFooterNote reports whether body is an agent's free-text note whose
+// only machine marker is the identity footer's `<!-- hive:origin … -->`
+// (hivecommons/hive#17067): the footer is present and carries the origin
+// marker, and no other `<!-- hive…` marker (a verification, blocker or
+// status marker) claims the comment for a dedicated path. note is the body
+// with the footer removed and trimmed; a body that is nothing but the
+// footer is not a note.
+func OriginFooterNote(body string) (note string, ok bool) {
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	loc := attributionIdentityFooter.FindStringIndex(body)
+	if loc == nil {
+		return "", false
+	}
+	footer := body[loc[0]:loc[1]]
+	if !strings.Contains(footer, "<!-- "+OriginMarkerName) {
+		return "", false
+	}
+	rest := body[:loc[0]]
+	if strings.Count(body, "<!-- hive") != 1 {
+		return "", false
+	}
+	note = strings.TrimSpace(rest)
+	if note == "" {
+		return "", false
+	}
+	return note, true
+}
 
 // ParseAttributionTrailer extracts the launch metadata from the final visible
 // `— hive:` line in a PR body, optionally followed by Hive's identity footer.

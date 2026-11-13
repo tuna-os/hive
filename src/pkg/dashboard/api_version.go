@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +31,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{
 		"version":     "2.0.0",
-		"go":          "1.25",
+		"go":          strings.TrimPrefix(runtime.Version(), "go"),
 		"hash":        versionHash,
 		"short":       versionShort,
 		"branch":      upstreamBranch(),
@@ -102,8 +103,25 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	if progress := s.upgradeProgress(curStatus, time.Now()); progress != nil {
 		resp["upgradeProgress"] = progress
 	}
+	// Process identity for the roll banner (#15788): startedAt changes on
+	// every restart even when the build does not, so the dashboard can say
+	// "Restarted" rather than "Upgraded"; startupPhase says what a fresh pod
+	// is still booting while its first status is pending.
+	if !s.startedAt.IsZero() {
+		resp["startedAt"] = s.startedAt.UTC().Format(time.RFC3339)
+	}
+	if phase := s.StartupPhase(); phase != "" {
+		resp["startupPhase"] = phase
+		resp["startupPhaseLabel"] = StartupPhaseLabel(phase)
+	}
 	if policy != nil && len(policy.UpgradeHistory) > 0 {
-		resp["upgradeHistory"] = policy.UpgradeHistory
+		var upgradedAt time.Time
+		if upgradeOutcomeRec != nil {
+			upgradedAt = upgradeOutcomeRec.CompletedAt
+		}
+		if history := spoke.UpgradeHistoryForDisplay(policy.UpgradeHistory, upgradedAt); len(history) > 0 {
+			resp["upgradeHistory"] = history
+		}
 	}
 
 	if cacheAge > dashboardVersionTipCacheTTL || cached == "" {

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v72/github"
 )
@@ -132,6 +133,8 @@ func TestCloseIssueOverrideCommentFailureAbortsClose(t *testing.T) {
 }
 
 func TestCloseIssueEditFailure(t *testing.T) {
+	l := swapSharedLedger(t)
+	l.Observe("o/r", 7, workflowsReport, time.Now())
 	issue := closeGateIssue("hive-app[bot]", "Bot", "Bug: bot finding", "automated", []string{"bug"})
 	srv := closeGateMux(t, issue, emptyCommentList, failHandler, failHandler)
 	defer srv.Close()
@@ -140,6 +143,9 @@ func TestCloseIssueEditFailure(t *testing.T) {
 	err := c.CloseIssue(context.Background(), "r", 7, IssueCloseOptions{})
 	if err == nil || !strings.Contains(err.Error(), "closing issue") {
 		t.Fatalf("err = %v, want close-edit failure", err)
+	}
+	if _, blocked := l.Blocking("o/r", 7); !blocked {
+		t.Fatal("failed close cleared the blocker")
 	}
 }
 
@@ -243,5 +249,33 @@ func TestValidatePRRequestClaimsClosingRefGetFailure(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "validating closing reference") {
 		t.Fatalf("err = %v, want closing-reference validation failure", err)
+	}
+}
+
+func TestValidatePRRequestClaimsClosingRefNotFoundIsPolicyError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/repos/o/r/issues/17122":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := testClient(t, srv.URL)
+
+	// A bare cross-repo issue number resolves against the PR's own repo and
+	// 404s there. That can never succeed on retry, so it must surface as a
+	// permanent policy rejection rather than a retry-with-backoff failure.
+	_, _, err := c.validatePRRequestClaims(context.Background(), PRRequest{
+		Repo: "o/r", Head: "scanner/fix", Title: "[scanner] fix: thing", Body: "Closes #17122",
+	})
+	reason, policy := prRequestPolicyReason(err)
+	if !policy {
+		t.Fatalf("err = %v, want prRequestPolicyError", err)
+	}
+	if !strings.Contains(reason, "o/r#17122 does not exist") {
+		t.Fatalf("reason = %q, want missing-issue explanation", reason)
 	}
 }

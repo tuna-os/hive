@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync/atomic"
 
@@ -30,6 +31,68 @@ const (
 	ClaimBlockReasonNeverClaimPrefix = "never-claim label: "
 	ClaimBlockReasonParkedPrefix     = "parked: "
 )
+
+// ClaimBlockReasonFiledForHelpPrefix is the IssueStartBlockReason for an
+// issue the requesting agent itself filed WITHOUT --claim
+// (hivecommons/hive#17299): filing it unclaimed asked for outside help, so
+// the filer does not start it later and race a contributor who took it up.
+// The reason ends with the filing agent's name.
+const ClaimBlockReasonFiledForHelpPrefix = "filed for outside help by "
+
+const filedForHelpMarkerPrefix = "<!-- hive:filed-for-help "
+
+// FiledForHelpMarker is the hidden body marker the issue-request watcher puts
+// on an issue an agent files without --claim, naming that agent.
+func FiledForHelpMarker(agent string) string {
+	return filedForHelpMarkerPrefix + agent + " -->"
+}
+
+// filedForHelpAgentPattern is the agent-name alphabet the marker can carry.
+const filedForHelpAgentPattern = `[A-Za-z0-9_.-]+`
+
+var (
+	filedForHelpMarkerRe = regexp.MustCompile(`<!--\s*hive:filed-for-help\s+(` + filedForHelpAgentPattern + `)\s*-->`)
+	filedForHelpAgentRe  = regexp.MustCompile(`^` + filedForHelpAgentPattern + `$`)
+	filedForHelpBlankRe  = regexp.MustCompile(`\n{3,}`)
+)
+
+// ParseFiledForHelpMarker returns the agent named by body's filed-for-help
+// marker, or "" when it has none.
+func ParseFiledForHelpMarker(body string) string {
+	m := filedForHelpMarkerRe.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// stripFiledForHelpMarker drops any filed-for-help marker from body. The
+// marker is read only from an issue's own body (ParseFiledForHelpMarker), so
+// a finding folded into another issue as a comment carries none: there it
+// would be noise that binds nobody.
+func stripFiledForHelpMarker(body string) string {
+	if filedForHelpMarkerRe.MatchString(body) {
+		body = filedForHelpMarkerRe.ReplaceAllString(body, "")
+		body = filedForHelpBlankRe.ReplaceAllString(body, "\n\n")
+	}
+	return strings.TrimRight(body, "\n")
+}
+
+// withFiledForHelpMarker appends the filed-for-help marker for agent to
+// body. Any marker already in body is dropped first: the body is the
+// filer's own text, so a pre-seeded marker naming someone else would
+// otherwise let the filer dodge the binding its unclaimed create makes.
+func withFiledForHelpMarker(body, agent string) string {
+	agent = strings.TrimSpace(agent)
+	if agent == "" || !filedForHelpAgentRe.MatchString(agent) {
+		return body
+	}
+	body = stripFiledForHelpMarker(body)
+	if body == "" {
+		return FiledForHelpMarker(agent)
+	}
+	return body + "\n\n" + FiledForHelpMarker(agent)
+}
 
 // umbrellaLabels is the never-claim set the pure derivation (IssueStageFor)
 // reads, kept in step with the client by SetNeverClaimLabels. nil → the
@@ -70,13 +133,21 @@ func (c *Client) neverClaimLabelSet() []string {
 }
 
 // issueUmbrellaLabel returns the never-claim label labels carry under the
-// set SetNeverClaimLabels last installed (package default until then), or "".
-func issueUmbrellaLabel(labels []string) string {
+// set SetNeverClaimLabels last installed (package default until then),
+// claims.SpekUmbrellaMarker when spekUmbrella says the body marks a
+// Spek-published RFC, or "".
+func issueUmbrellaLabel(labels []string, spekUmbrella bool) string {
 	var never []string
 	if p := umbrellaLabels.Load(); p != nil {
 		never = *p
 	}
-	return claims.NeverClaimLabel(labels, never)
+	if label := claims.NeverClaimLabel(labels, never); label != "" {
+		return label
+	}
+	if spekUmbrella {
+		return claims.SpekUmbrellaMarker
+	}
+	return ""
 }
 
 // issueClaimParkLabel returns the park label that puts labels out of the
@@ -112,7 +183,9 @@ func (c *Client) issueClaimParkLabel(labels []string) string {
 //     agent escalation labels, the retired decision labels): a maintainer
 //     holds it, so nobody starts on it until the un-park;
 //   - an issue wearing a never-claim label (governor.claims.never_claim_labels,
-//     default `epic`): an umbrella issue is the list of work, not the work.
+//     default `epic`), or whose body carries the Spek publish marker with no
+//     `task=` (a Spek-published RFC, spektacular#114): an umbrella issue is
+//     the list of work, not the work.
 //
 // Lookup errors are returned so callers cannot mistake unknown labels for
 // permission to claim. Human claims do not use this gate. A producer about
@@ -130,6 +203,9 @@ type issueClaimGateResult struct {
 	reason string
 	labels []string
 	closed bool
+	// filedForHelpBy is the agent named by the issue body's filed-for-help
+	// marker, "" when there is none.
+	filedForHelpBy string
 }
 
 // issueClaimGate reads the issue once and applies every label-based refusal.
@@ -146,8 +222,9 @@ func (c *Client) issueClaimGate(ctx context.Context, repo string, number int) (i
 		return issueClaimGateResult{reason: ClaimBlockReasonPullRequest}, nil
 	}
 	res := issueClaimGateResult{
-		labels: extractLabels(issue.Labels),
-		closed: strings.EqualFold(issue.GetState(), "closed"),
+		labels:         extractLabels(issue.Labels),
+		closed:         strings.EqualFold(issue.GetState(), "closed"),
+		filedForHelpBy: ParseFiledForHelpMarker(issue.GetBody()),
 	}
 	labels := res.labels
 	switch {
@@ -163,7 +240,7 @@ func (c *Client) issueClaimGate(ctx context.Context, repo string, number int) (i
 	}
 	if label := c.issueClaimParkLabel(labels); label != "" {
 		res.reason = ClaimBlockReasonParkedPrefix + label
-	} else if label := claims.NeverClaimLabel(labels, c.neverClaimLabelSet()); label != "" {
+	} else if label := claims.NeverClaimReason(labels, c.neverClaimLabelSet(), issue.GetBody()); label != "" {
 		res.reason = ClaimBlockReasonNeverClaimPrefix + label
 	}
 	return res, nil
@@ -181,9 +258,26 @@ func (c *Client) issueClaimGate(ctx context.Context, repo string, number int) (i
 // false; a failed listing fails open with a warning, except a rate-limited
 // one, which refuses with ClaimBlockReasonOpenPRRateLimited until the reset.
 func (c *Client) IssueDispatchBlockReason(ctx context.Context, repo string, number int) (string, error) {
+	return c.issueDispatchBlockReason(ctx, repo, number, "")
+}
+
+// IssueStartBlockReason is IssueDispatchBlockReason for a named agent's own
+// start (the `claim` relay request, the hub's dispatch of a KindAgent claim):
+// it also refuses an issue that same agent
+// filed for outside help (ClaimBlockReasonFiledForHelpPrefix,
+// hivecommons/hive#17299). A maintainer lets the filer take it after all by
+// removing the marker from the issue body.
+func (c *Client) IssueStartBlockReason(ctx context.Context, repo string, number int, agent string) (string, error) {
+	return c.issueDispatchBlockReason(ctx, repo, number, agent)
+}
+
+func (c *Client) issueDispatchBlockReason(ctx context.Context, repo string, number int, agent string) (string, error) {
 	gate, err := c.issueClaimGate(ctx, repo, number)
 	if err != nil || gate.reason != "" {
 		return gate.reason, err
+	}
+	if agent = strings.TrimSpace(agent); agent != "" && strings.EqualFold(gate.filedForHelpBy, agent) {
+		return ClaimBlockReasonFiledForHelpPrefix + gate.filedForHelpBy + "; it was filed without --claim, so it is open for others — leave it to them unless a maintainer removes the filed-for-help marker", nil
 	}
 	// The same read says whether the issue is still open: a closing keyword
 	// on a PR that merged since the snapshot was listed closes it, and a

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/hivecommons/hive/crux/logscrub"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/effects"
+	"github.com/hivecommons/hive/pkg/issueshape"
 )
 
 const (
@@ -24,6 +26,14 @@ const (
 	advisoryLabelDesc = "Pinned advisory report from Hive agents"
 	advisoryLabelClr  = "0e8a16"
 )
+
+// isAdvisoryTitle reports whether title is the advisory issue's, with the
+// leading `[governor]` tag ignored: an advisory issue filed before titles
+// carried the filer is the same standing issue as one filed after, so a
+// hive upgrade never opens a second advisory per repo.
+func isAdvisoryTitle(title string) bool {
+	return issueshape.SameTitle(title, advisoryTitle)
+}
 
 // IssuesDisabledError reports that the advisory issue cannot be created or
 // resolved because the target repo has its Issues feature turned off
@@ -63,10 +73,17 @@ func (c *Client) ProbeIssuesDisabled(ctx context.Context, owner, repo string) (*
 	if err != nil {
 		return nil, err
 	}
-	if ghRepo != nil && !ghRepo.GetHasIssues() {
-		return &IssuesDisabledError{Repo: owner + "/" + repo, Fork: ghRepo.GetFork()}, nil
+	return IssuesDisabledFor(owner, repo, ghRepo), nil
+}
+
+// IssuesDisabledFor classifies metadata already read for owner/repo the way
+// ProbeIssuesDisabled does: a non-nil *IssuesDisabledError when has_issues is
+// false, nil otherwise (including nil metadata).
+func IssuesDisabledFor(owner, repo string, meta *gh.Repository) *IssuesDisabledError {
+	if meta != nil && !meta.GetHasIssues() {
+		return &IssuesDisabledError{Repo: owner + "/" + repo, Fork: meta.GetFork()}
 	}
-	return nil, nil
+	return nil
 }
 
 // writeForbiddenMessage is GitHub's 403 body when an installation token may
@@ -221,7 +238,11 @@ func (c *Client) EnsureAdvisoryIssue(ctx context.Context, repo string) (int, err
 		c.logger.Warn("could not create advisory label, issue will be created without it", slog.String("error", labelErr.Error()))
 	}
 
-	body := "This issue collects advisory findings from Hive agents.\n\n" +
+	replaces := ""
+	if pc, ok := c.takeAdvisoryPersonClose(owner + "/" + repo); ok {
+		replaces = advisoryReplacesNote(pc)
+	}
+	body := replaces + "This issue collects advisory findings from Hive agents.\n\n" +
 		"At lower ACMM levels, some agents work in advisory mode — they analyze code and post findings " +
 		"here but do not create issues or PRs. At higher levels, designated agents (e.g. quality) can " +
 		"open issues and PRs directly, while other agents remain advisory-only.\n\n" +
@@ -238,7 +259,7 @@ func (c *Client) EnsureAdvisoryIssue(ctx context.Context, repo string) (int, err
 	}
 
 	req := &gh.IssueRequest{
-		Title: gh.Ptr(advisoryTitle),
+		Title: gh.Ptr(issueshape.AgentIssueTitle(config.OriginSourceGovernor, advisoryTitle)),
 		Body:  gh.Ptr(body),
 	}
 	var labels []string
@@ -281,6 +302,9 @@ func (c *Client) EnsureAdvisoryIssue(ctx context.Context, repo string) (int, err
 			var apiErr error
 			issue, _, apiErr = c.client.Issues.Create(ctx, owner, repo, req)
 			if apiErr != nil {
+				if isDefiniteIssueRefusal(apiErr) {
+					return effects.Result{}, effects.NotApplied(apiErr)
+				}
 				return effects.Result{}, apiErr
 			}
 			return effects.Result{Provenance: issue.GetHTMLURL()}, nil
@@ -314,6 +338,16 @@ const (
 	advisoryDigestPrefix    = "## 🐝 Advisory Digest"
 	githubCommentCharLimit  = 65536
 	truncationFooterPadding = 200
+	// advisoryDigestMarker opens the HTML comment that anchors the one
+	// upserted digest comment per issue (#17435): "<!-- hive:advisory-digest
+	// updates=N -->". N is read back from the existing comment on every
+	// cycle, so the counter continues across governor restarts without any
+	// local store.
+	advisoryDigestMarker = "<!-- hive:advisory-digest"
+	// advisoryDigestWrapReserve is the room kept under githubCommentCharLimit
+	// for the marker line and the "Updated N times" footer that wrap the
+	// rendered digest.
+	advisoryDigestWrapReserve = 256
 	// advisoryDigestAuditInterval is how often (in digest posts) an
 	// advisory_commented audit entry is emitted, in addition to the very first
 	// post. The digest is refreshed ~once a minute; a value of 50 yields roughly
@@ -366,6 +400,25 @@ func (c *Client) PostAdvisoryDigest(ctx context.Context, repo string, issueNum i
 	}
 	owner, repoName := c.splitRepo(repo)
 
+	// Repo pause (#6203) means NO hive write against the repo, and the digest
+	// is a write: an edit of the pinned comment, or a fresh comment when the
+	// pinned one is out of reach. It is checked before the unchanged-skip
+	// below so a paused repo never reaches the forge at all, and nothing
+	// about the process-memory hash state is touched, so the first cycle
+	// after the pause is lifted posts exactly as the first after boot does.
+	if perr, paused := c.repoPausedError(repo); paused {
+		c.logger.Info("advisory digest skipped: repo paused",
+			slog.String("repo", repo), slog.Int("issue", issueNum),
+			slog.String("by", perr.By), slog.String("reason", perr.Reason))
+		c.recordWriteAudit(AuditActionAdvisoryDigestSuppressed, InvocationMeta{Agent: AttributionAgentGovernor},
+			WriteTarget{Repo: owner + "/" + repoName, Number: issueNum},
+			"reason", "repo-paused",
+			"paused_by", perr.By,
+			"pause_reason", perr.Reason,
+			"flow", "advisory-digest")
+		return perr
+	}
+
 	// Canary-gated like CreateIssue/CreatePR/CreateIssueComment
 	// (kubestellar/hive#4960): the digest aggregates agent-sourced advisory
 	// finding text, so it is a secondary exfiltration channel that must honor
@@ -375,7 +428,7 @@ func (c *Client) PostAdvisoryDigest(ctx context.Context, repo string, issueNum i
 			return fmt.Errorf("ioscan canary leak detected: agent=%s source=%s", leak.Agent, leak.Source)
 		}
 	}
-	digest = truncateDigest(logscrub.ScrubString(digest))
+	digest = truncateDigestTo(logscrub.ScrubString(digest), githubCommentCharLimit-advisoryDigestWrapReserve)
 
 	// Skip-if-unchanged guard (#4818): the digest is re-rendered ~once a
 	// minute, and at steady state the body is byte-identical cycle after
@@ -433,7 +486,19 @@ func (c *Client) PostAdvisoryDigest(ctx context.Context, repo string, issueNum i
 	// longer sees the bot's own digest and every cycle creates a fresh one.
 	// Suppressing on material content stops that at the source regardless of
 	// which branch the write would have taken.
-	sup := evaluateDigestSuppression(digest, existing.body, existing.found(), existing.updatedAt, time.Now())
+	// The changed-content floor (#17435) measures from the later of the
+	// target's updated_at and this process's own last write, so neither a
+	// lagging comment list nor a restart lets a drifting digest through
+	// inside governor.advisory.digest_min_interval.
+	now := time.Now()
+	c.advisoryMu.Lock()
+	minInterval := c.advisoryDigestMinInterval
+	postedAt := existing.updatedAt
+	if last := c.advisoryDigestLastWrite[key]; last.After(postedAt) {
+		postedAt = last
+	}
+	c.advisoryMu.Unlock()
+	sup := evaluateDigestSuppression(digest, existing.body, existing.found(), postedAt, now, minInterval)
 	if sup.suppress && writeThrough {
 		c.logger.Debug("advisory digest suppression overridden by periodic write-through",
 			slog.String("repo", repo), slog.Int("issue", issueNum),
@@ -469,9 +534,35 @@ func (c *Client) PostAdvisoryDigest(ctx context.Context, repo string, issueNum i
 
 	commentID := existing.id
 	var author string
+	updates := parseDigestUpdates(existing.body) + 1
+	if commentID > 0 && !writeThrough {
+		// Per-anchor unchanged guard (#16439). The listed body the #5507
+		// suppression compares against can lag the last PATCH (the comment
+		// list is eventually consistent), so at steady state the digest was
+		// still re-edited with identical material content every cycle.
+		// Compare the pending material fingerprint with the one this process
+		// last WROTE to this exact anchor and skip the PATCH when they match;
+		// the periodic write-through still forces a real write.
+		anchorKey := fmt.Sprintf("%s@%d", key, commentID)
+		pendingFP := materialDigestFingerprint(digest)
+		c.advisoryMu.Lock()
+		unchanged := c.advisoryDigestAnchorHashes[anchorKey] == pendingFP
+		if unchanged {
+			c.advisoryDigestHashes = ensureStringMap(c.advisoryDigestHashes)
+			c.advisoryDigestHashes[key] = digestHash
+			c.advisoryDigestSkips[key]++
+		}
+		c.advisoryMu.Unlock()
+		if unchanged {
+			c.logger.Debug("advisory digest material content unchanged for anchor — skipping edit",
+				slog.String("repo", repo), slog.Int("issue", issueNum), slog.Int("comment_id", commentID))
+			return nil
+		}
+	}
+	action := "edit"
 	if commentID > 0 {
 		edited, _, err := c.client.Issues.EditComment(ctx, owner, repoName, int64(commentID), &gh.IssueComment{
-			Body: gh.Ptr(digest),
+			Body: gh.Ptr(wrapDigestComment(digest, updates, now)),
 		})
 		switch {
 		case err == nil:
@@ -493,13 +584,16 @@ func (c *Client) PostAdvisoryDigest(ctx context.Context, repo string, issueNum i
 		}
 	}
 	if commentID == 0 {
+		action = "create"
+		updates = 1
 		comment, _, err := c.client.Issues.CreateComment(ctx, owner, repoName, issueNum, &gh.IssueComment{
-			Body: gh.Ptr(digest),
+			Body: gh.Ptr(wrapDigestComment(digest, updates, now)),
 		})
 		if err != nil {
 			return fmt.Errorf("posting advisory digest to %s#%d: %w", repo, issueNum, c.classifyDigestWriteError(ctx, owner, repoName, err))
 		}
 		author = comment.GetUser().GetLogin()
+		commentID = int(comment.GetID())
 	}
 
 	// Audit the FIRST post and every advisoryDigestAuditInterval-th one, not the
@@ -519,9 +613,32 @@ func (c *Client) PostAdvisoryDigest(ctx context.Context, repo string, issueNum i
 	// over from any real write.
 	c.advisoryDigestHashes[key] = digestHash
 	c.advisoryDigestSkips[key] = 0
+	if c.advisoryDigestLastWrite == nil {
+		c.advisoryDigestLastWrite = make(map[string]time.Time)
+	}
+	c.advisoryDigestLastWrite[key] = now
+	if commentID > 0 {
+		// Persist the anchor this write landed on and its material
+		// fingerprint (#16439): the next cycle re-pins to it past any
+		// foreign-authored digest comment and skips the PATCH when the
+		// rendered content has not materially changed.
+		if c.advisoryDigestAnchors == nil {
+			c.advisoryDigestAnchors = make(map[string]int)
+		}
+		c.advisoryDigestAnchors[key] = commentID
+		c.advisoryDigestAnchorHashes = ensureStringMap(c.advisoryDigestAnchorHashes)
+		c.advisoryDigestAnchorHashes[fmt.Sprintf("%s@%d", key, commentID)] = materialDigestFingerprint(digest)
+	}
 	c.advisoryDigestPosts[key]++
 	count := c.advisoryDigestPosts[key]
 	c.advisoryMu.Unlock()
+
+	// The caller logs "posted" for every healthy cycle, skipped or not; this
+	// line marks the cycles that actually reached the forge (#17435).
+	c.logger.Info("advisory digest comment written",
+		slog.String("repo", repo), slog.Int("issue", issueNum),
+		slog.Int("comment_id", commentID), slog.String("action", action),
+		slog.Int("updates", updates), slog.Bool("write_through", writeThrough))
 
 	if count == 1 || count%advisoryDigestAuditInterval == 0 {
 		c.recordWriteAudit(AuditActionAdvisoryCommented, InvocationMeta{Agent: AttributionAgentGovernor},
@@ -570,10 +687,17 @@ func (c *Client) ProbeIssueWrite(ctx context.Context, repo string, issueNum int)
 }
 
 func truncateDigest(digest string) string {
-	if len(digest) <= githubCommentCharLimit {
+	return truncateDigestTo(digest, githubCommentCharLimit)
+}
+
+// truncateDigestTo cuts digest to fit within limit bytes (footer included),
+// reporting GitHub's comment limit in the footer so the reader sees the real
+// constraint rather than the wrapper's reserve.
+func truncateDigestTo(digest string, limit int) string {
+	if len(digest) <= limit {
 		return digest
 	}
-	cutoff := githubCommentCharLimit - truncationFooterPadding
+	cutoff := limit - truncationFooterPadding
 	lastNewline := strings.LastIndex(digest[:cutoff], "\n")
 	if lastNewline > 0 {
 		cutoff = lastNewline
@@ -583,6 +707,59 @@ func truncateDigest(digest string) string {
 		cutoff--
 	}
 	return digest[:cutoff] + fmt.Sprintf("\n\n---\n⚠️ *Digest truncated: %d → %d characters (GitHub limit: %d)*\n", len(digest), cutoff, githubCommentCharLimit)
+}
+
+// SetAdvisoryDigestMinInterval sets the floor between two writes of a changed
+// digest to the same target (governor.advisory.digest_min_interval, #17435).
+// The governor calls it every eval cycle from live config; 0 disables the
+// gate. Nil-safe like PostAdvisoryDigest.
+func (c *Client) SetAdvisoryDigestMinInterval(d time.Duration) {
+	if c == nil {
+		return
+	}
+	if d < 0 {
+		d = 0
+	}
+	c.advisoryMu.Lock()
+	c.advisoryDigestMinInterval = d
+	c.advisoryMu.Unlock()
+}
+
+// isAdvisoryDigestBody reports whether a comment body is a hive advisory
+// digest: either the #17435 marker or the legacy bare heading, so digests
+// written before the marker existed are still adopted and edited in place.
+func isAdvisoryDigestBody(body string) bool {
+	return strings.HasPrefix(body, advisoryDigestMarker) || strings.HasPrefix(body, advisoryDigestPrefix)
+}
+
+// digestUpdatesPattern reads the update counter out of the marker.
+var digestUpdatesPattern = regexp.MustCompile(`<!-- hive:advisory-digest updates=(\d+) -->`)
+
+// parseDigestUpdates returns how many times the existing digest comment has
+// been written according to its marker; 0 for a legacy or absent comment.
+func parseDigestUpdates(body string) int {
+	m := digestUpdatesPattern.FindStringSubmatch(body)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// wrapDigestComment frames the rendered digest with the upsert marker and the
+// "Updated N times · last <ts>" footer (#17435). Both are excluded from the
+// material fingerprint (see volatileDigestPatterns), so the bookkeeping never
+// makes an unchanged digest look changed.
+func wrapDigestComment(digest string, updates int, now time.Time) string {
+	times := "times"
+	if updates == 1 {
+		times = "time"
+	}
+	return fmt.Sprintf("%s updates=%d -->\n%s\n\n_Updated %d %s · last %s_\n",
+		advisoryDigestMarker, updates, strings.TrimRight(digest, "\n"), updates, times, now.UTC().Format(time.RFC3339))
 }
 
 func (c *Client) ensureAdvisoryLabel(ctx context.Context, owner, repo string, issueNum int) {
@@ -631,7 +808,7 @@ func (c *Client) findDigestCommentDetail(ctx context.Context, owner, repo string
 			PerPage: advisoryDigestCommentsPerPage,
 		},
 	}
-	var botAuthored digestComment
+	var scan digestScan
 	pages := 0
 	for {
 		comments, resp, err := c.client.Issues.ListComments(ctx, owner, repo, issueNum, opts)
@@ -639,15 +816,15 @@ func (c *Client) findDigestCommentDetail(ctx context.Context, owner, repo string
 			// A partial scan that already found a usable fallback still
 			// beats creating a duplicate, so surface the error but keep
 			// whatever the earlier pages turned up.
-			return botAuthored, err
+			return c.resolveDigestScan(owner, repo, issueNum, scan.botAuthored, &scan), err
 		}
 		pages++
-		found, done := c.scanDigestPage(owner, repo, issueNum, comments, &botAuthored)
+		found, done := c.scanDigestPage(comments, &scan)
 		if done {
-			return found, nil
+			return c.resolveDigestScan(owner, repo, issueNum, found, &scan), nil
 		}
 		if resp == nil || resp.NextPage == 0 {
-			return botAuthored, nil
+			return c.resolveDigestScan(owner, repo, issueNum, scan.botAuthored, &scan), nil
 		}
 		if pages >= advisoryDigestScanMaxPages {
 			c.logger.Warn("advisory digest comment scan hit its page cap — treating the digest as absent, which will CREATE a new one",
@@ -655,21 +832,35 @@ func (c *Client) findDigestCommentDetail(ctx context.Context, owner, repo string
 				slog.Int("issue", issueNum),
 				slog.Int("pages_scanned", pages),
 				slog.Int("comments_scanned", pages*advisoryDigestCommentsPerPage))
-			return botAuthored, nil
+			return c.resolveDigestScan(owner, repo, issueNum, scan.botAuthored, &scan), nil
 		}
 		opts.Page = resp.NextPage
 	}
 }
 
+// digestScan carries state across the pages of one digest-comment scan.
+type digestScan struct {
+	// botAuthored is the newest bot-authored-but-not-provably-ours digest
+	// comment, kept as a fallback when no exact match turns up.
+	botAuthored digestComment
+	// foreign is the newest digest comment this App can never edit (human
+	// authored), recorded so the resolution can report it ONCE per issue
+	// together with the action taken (#16439) instead of warning on every
+	// cycle the comment is seen.
+	foreign       digestComment
+	foreignAuthor string
+}
+
 // scanDigestPage applies the authorship rules to one page of comments. It
 // returns (comment, true) when it has found the definitive digest to edit and
 // the scan can stop, or (_, false) to continue to the next page. A
-// bot-authored-but-not-provably-ours comment is remembered in botAuthored as a
-// fallback rather than ending the scan, so a later page can still yield an
-// exact match.
-func (c *Client) scanDigestPage(owner, repo string, issueNum int, comments []*gh.IssueComment, botAuthored *digestComment) (digestComment, bool) {
+// bot-authored-but-not-provably-ours comment is remembered in scan.botAuthored
+// as a fallback rather than ending the scan, so a later page can still yield
+// an exact match. A foreign-authored digest comment is NEVER selected: it is
+// only noted in scan.foreign so the resolution can log it.
+func (c *Client) scanDigestPage(comments []*gh.IssueComment, scan *digestScan) (digestComment, bool) {
 	for _, comment := range comments {
-		if !strings.HasPrefix(comment.GetBody(), advisoryDigestPrefix) {
+		if !isAdvisoryDigestBody(comment.GetBody()) {
 			continue
 		}
 		if c.appAuth == nil {
@@ -690,8 +881,8 @@ func (c *Client) scanDigestPage(owner, repo string, issueNum int, comments []*gh
 			// a misconfigured slug would create a duplicate every cycle.
 			// "First" is now the NEWEST such comment, since the scan runs
 			// newest-first.
-			if !botAuthored.found() {
-				*botAuthored = digestCommentFrom(comment)
+			if !scan.botAuthored.found() {
+				scan.botAuthored = digestCommentFrom(comment)
 			}
 			continue
 		}
@@ -700,16 +891,54 @@ func (c *Client) scanDigestPage(owner, repo string, issueNum int, comments []*gh
 		// hard-forbids an App from editing a foreign-authored comment (403
 		// "Resource not accessible by integration") no matter what the
 		// installation grants, so adopting it wedges the digest forever
-		// (kalantar-msb/soft-reflective#1). Skip it; if no bot-authored digest
-		// comment exists a fresh App-authored one is created and every later
+		// (kalantar-msb/soft-reflective#1). Never select it; the scan goes on
+		// to re-pin to an App-authored digest further down the issue, and if
+		// there is none a fresh App-authored one is created and every later
 		// cycle edits THAT one, so nothing is duplicated per cycle.
-		c.logger.Warn("skipping advisory digest comment not authored by this App — an installation token can never edit it",
-			slog.String("repo", owner+"/"+repo),
-			slog.Int("issue", issueNum),
-			slog.Int64("comment_id", comment.GetID()),
-			slog.String("author", login))
+		if !scan.foreign.found() {
+			scan.foreign = digestCommentFrom(comment)
+			scan.foreignAuthor = login
+		}
 	}
 	return digestComment{}, false
+}
+
+// resolveDigestScan finalizes one scan: it reports a foreign-authored digest
+// comment ONCE per issue per process at Warn — with the action taken — and
+// at Debug thereafter (#16439). Before the fix the Warn fired on every cycle
+// the human comment was listed (~every 5 minutes on
+// torch-spyre/spyre-inference#406) and never settled, because the comment
+// stays on the issue forever.
+func (c *Client) resolveDigestScan(owner, repo string, issueNum int, chosen digestComment, scan *digestScan) digestComment {
+	if !scan.foreign.found() {
+		return chosen
+	}
+	action := "creating a fresh App-authored digest comment"
+	if chosen.found() {
+		action = fmt.Sprintf("re-pinned to App-authored digest comment %d", chosen.id)
+	}
+	key := fmt.Sprintf("%s/%s#%d", owner, repo, issueNum)
+	c.advisoryMu.Lock()
+	warned := c.advisoryForeignDigestWarned[key]
+	if c.advisoryForeignDigestWarned == nil {
+		c.advisoryForeignDigestWarned = make(map[string]bool)
+	}
+	c.advisoryForeignDigestWarned[key] = true
+	c.advisoryMu.Unlock()
+	attrs := []any{
+		slog.String("repo", owner+"/"+repo),
+		slog.Int("issue", issueNum),
+		slog.Int("comment_id", scan.foreign.id),
+		slog.String("author", scan.foreignAuthor),
+		slog.String("action", action),
+	}
+	const msg = "skipping advisory digest comment not authored by this App — an installation token can never edit it"
+	if warned {
+		c.logger.Debug(msg, attrs...)
+	} else {
+		c.logger.Warn(msg, attrs...)
+	}
+	return chosen
 }
 
 // digestCommentFrom projects the fields the post path needs out of a forge
@@ -760,7 +989,7 @@ func (c *Client) findAdvisoryIssueListed(ctx context.Context, owner, repo string
 	})
 	if err == nil {
 		for _, issue := range result.Issues {
-			if issue.GetTitle() == advisoryTitle {
+			if isAdvisoryTitle(issue.GetTitle()) {
 				return issue.GetNumber(), nil
 			}
 		}
@@ -777,7 +1006,7 @@ func (c *Client) findAdvisoryIssueListed(ctx context.Context, owner, repo string
 	issues, _, listErr := c.client.Issues.ListByRepo(ctx, owner, repo, opts)
 	if listErr == nil {
 		for _, issue := range issues {
-			if issue.GetTitle() == advisoryTitle {
+			if isAdvisoryTitle(issue.GetTitle()) {
 				return issue.GetNumber(), nil
 			}
 		}
@@ -801,7 +1030,7 @@ func (c *Client) findAdvisoryIssueListed(ctx context.Context, owner, repo string
 			if issue.IsPullRequest() {
 				continue
 			}
-			if issue.GetTitle() == advisoryTitle {
+			if isAdvisoryTitle(issue.GetTitle()) {
 				c.logger.Info("found advisory issue via title scan (missing label)", slog.Int("number", issue.GetNumber()))
 				c.ensureAdvisoryLabel(ctx, owner, repo, issue.GetNumber())
 				return issue.GetNumber(), nil
@@ -820,7 +1049,9 @@ func (c *Client) findAdvisoryIssueListed(ctx context.Context, owner, repo string
 	// that never updates again, which reads exactly like a wedged digest. So
 	// reopen the most recent closed one and keep posting to the URL people
 	// already follow. Only after this finds nothing does the caller create.
-	if num, ok := c.findClosedAdvisoryIssue(ctx, owner, repo); ok {
+	// A person's close is a decision, not an accident: that issue stays
+	// closed and the caller files a new one (advisory_person_close.go).
+	if num, ok := c.findClosedAdvisoryIssue(ctx, owner, repo); ok && c.advisoryReusable(ctx, owner, repo, num, nil) {
 		if _, _, err := c.client.Issues.Edit(ctx, owner, repo, num, &gh.IssueRequest{State: gh.Ptr("open")}); err != nil {
 			// Cannot reopen (permissions, locked). Report NOT-FOUND rather than
 			// the closed number: posting a digest to a closed issue would be
@@ -855,7 +1086,7 @@ func (c *Client) findClosedAdvisoryIssue(ctx context.Context, owner, repo string
 		if issue.IsPullRequest() {
 			continue
 		}
-		if issue.GetTitle() == advisoryTitle {
+		if isAdvisoryTitle(issue.GetTitle()) {
 			return issue.GetNumber(), true
 		}
 	}

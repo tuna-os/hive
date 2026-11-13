@@ -154,6 +154,8 @@ func mergeResumeKicks(agentsDue, restartedAgents []string, allow func(string) (b
 				logger.Warn("restarted agent NOT resume-kicked (cadence/budget gate); it idles until its next scheduled slot", "agent", a, "reason", string(reason))
 			case governor.ResumeRefusalBudgetExhausted:
 				logger.Warn("restarted agent NOT resume-kicked (cadence/budget gate); budget exhausted, kicks suspended", "agent", a, "reason", string(reason))
+			case governor.ResumeRefusalContributorCovering:
+				logger.Info("restarted agent NOT resume-kicked; a contributor relay is covering its role (contributor_first)", "agent", a, "reason", string(reason))
 			default:
 				logger.Info("restarted agent NOT resume-kicked (cadence/budget gate); idle by configuration", "agent", a, "reason", string(reason))
 			}
@@ -506,6 +508,9 @@ type kickDispatchDeps struct {
 	// continuous-mode scheduler uses this to exponential-backoff instead of
 	// returning the same due agent on every eval while the CLI is stalled.
 	onFailed func(msg scheduler.KickMessage, err error)
+	// onDeferred optionally records kicks that wait for a busy agent's lane.
+	// It runs in message order, like the delivered and failed effects.
+	onDeferred func(msg scheduler.KickMessage)
 	// markProbeReleased stamps the provider-budget probe. Called at most once
 	// per dispatch, and only after a kick actually goes out.
 	markProbeReleased func(at time.Time)
@@ -633,6 +638,9 @@ func dispatchAgentKicks(msgs []scheduler.KickMessage, releaseProbe bool, deps ki
 		if out.deferred || errors.Is(out.sendErr, crux.ErrAgentBusy) {
 			endSpan(nil)
 			logger.Info("agent busy: deferring kick", "agent", msg.Agent)
+			if deps.onDeferred != nil {
+				deps.onDeferred(msg)
+			}
 			continue
 		}
 		if out.startErr != nil {
@@ -670,7 +678,13 @@ func stoppedAgentStartErrorIsBenign(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "already running") ||
 		strings.Contains(msg, "launch already in progress") ||
-		strings.Contains(msg, "shared session pool is busy")
+		isSharedPoolBusyErr(err)
+}
+
+// isSharedPoolBusyErr reports the shared CLI session pool refusing a slot.
+// crux/agent does not export its busy sentinel, so match the message.
+func isSharedPoolBusyErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "shared session pool is busy")
 }
 
 // advisoryIngestDeps are the side effects of recording an ioscan canary leak

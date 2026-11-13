@@ -51,6 +51,33 @@ type signedHeadMovedError struct{ error }
 
 func (e signedHeadMovedError) Unwrap() error { return e.error }
 
+// signedGraphQLError is a non-2xx answer from the createCommitOnBranch
+// mutation. The follow-up reconciler reads the status to tell a refusal
+// (4xx, which a retry cannot change) from an outage (5xx).
+type signedGraphQLError struct {
+	status int
+	body   string
+}
+
+func (e *signedGraphQLError) Error() string {
+	return fmt.Sprintf("graphql HTTP %d: %s", e.status, e.body)
+}
+
+// signedAPIRefusal reports whether err is a definite 4xx answer from GitHub
+// (REST or GraphQL): the same request will be refused again, so retrying the
+// same head is pointless. A 5xx, a network error, or a context error is not.
+func signedAPIRefusal(err error) bool {
+	var ghErr *gh.ErrorResponse
+	if errors.As(err, &ghErr) && ghErr.Response != nil {
+		return ghErr.Response.StatusCode/100 == 4
+	}
+	var gqlErr *signedGraphQLError
+	if errors.As(err, &gqlErr) {
+		return gqlErr.status/100 == 4
+	}
+	return false
+}
+
 // SetSignedCommits installs the toggle read before every PR-open request. nil
 // (or a func returning false) leaves branches exactly as the agent pushed them.
 func (c *Client) SetSignedCommits(fn func() bool) {
@@ -123,6 +150,7 @@ func (c *Client) signBranch(ctx context.Context, owner, repo, base, head string)
 		return "", 0, err
 	}
 	headline, body := signedCommitMessage(comparison.Commits)
+	body = ensureSignedOffBy(body, c.appBotLogin)
 
 	// Scratch ref at the merge base. Delete a leftover from a crashed run
 	// first: CreateRef 422s on an existing ref.
@@ -357,6 +385,22 @@ func BotSignedOffByTrailer(login string) string {
 	return "Signed-off-by: " + login + " <" + signedTrailerEmail(login+"@"+signedTrailerNoreplyDomain) + ">"
 }
 
+// ensureSignedOffBy appends the App's own DCO trailer to a signed commit's
+// body when none of the folded agent commits carried one. The commit is
+// authored by the App bot, so an unsigned body would publish a hive-authored
+// commit without sign-off (hivecommons/hive#16619); the trailer is the one
+// BotSignedOffByTrailer derives, or nothing when the App login is unknown.
+func ensureSignedOffBy(body, appLogin string) string {
+	if strings.TrimSpace(appLogin) == "" || signedTrailerLineRE.MatchString(body) {
+		return body
+	}
+	trailer := BotSignedOffByTrailer(appLogin)
+	if strings.TrimSpace(body) == "" {
+		return trailer
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + trailer
+}
+
 // signedTrailersBracketFree rewrites every Signed-off-by line in msg through
 // signedTrailerEmail, leaving the rest of the message byte-for-byte intact.
 func signedTrailersBracketFree(msg string) string {
@@ -414,7 +458,7 @@ func (c *Client) createCommitOnBranch(ctx context.Context, nameWithOwner, branch
 		return "", err
 	}
 	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("graphql HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return "", &signedGraphQLError{status: resp.StatusCode, body: strings.TrimSpace(string(respBody))}
 	}
 	var parsed struct {
 		Data struct {

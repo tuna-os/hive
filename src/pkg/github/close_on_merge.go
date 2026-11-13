@@ -15,6 +15,7 @@ import (
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/pkg/claims"
 	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/prstatus"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
@@ -61,10 +62,13 @@ type CloseOnMergeOptions struct {
 	// matched by bare repository name; empty matches any.
 	OnlyPRRepo   string
 	OnlyPRNumber int
-	// LabelDriven reports a repo that opted in to label-driven triage; the
-	// backfill posts no "What to reply" notice there when it reclassifies a
-	// dedupe checklist as needs-decision. nil means no repo opts in.
+	// LabelDriven reports a repo that opted in to label-driven triage. nil
+	// means no repo opts in.
 	LabelDriven func(repo string) bool
+	// AdvisoryAutocloseOff disables the advisory-checklist sweep
+	// (dedupe.advisory_autoclose: false): checklists are then neither
+	// ticked nor closed by the backfill (hivecommons/hive#15754).
+	AdvisoryAutocloseOff bool
 	// RepoOnGitHub reports whether a repo lives on GitHub (its forge.Kind, via
 	// config.RepoOnGitHub). Both sweeps read and close through the GitHub API,
 	// so a claim or repo on GitLab or Gitea is skipped rather than looked up on
@@ -149,6 +153,9 @@ type CloseOnMergeResult struct {
 	Reason      string
 	WrongRefs   bool
 	MergeCommit string
+	// Ticked is how many advisory-checklist items this sweep marked
+	// resolved in the issue body (hivecommons/hive#15754).
+	Ticked int
 }
 
 // closeOnMergeTransientReasons are the result reasons that describe a failed
@@ -160,6 +167,7 @@ var closeOnMergeTransientReasons = map[string]bool{
 	"awaiting_comment_failed": true,
 	"close_comment_failed":    true,
 	"close_failed":            true,
+	"body_edit_failed":        true,
 }
 
 // Settles reports whether the result is a final verdict for its PR/issue
@@ -225,6 +233,7 @@ func (c *Client) CloseOnMergeLedgerSweep(ctx context.Context, ledger *ClaimLedge
 	// in the ledger for settledClaimRetention, so reading every one of them on
 	// every pass exhausts the App quota after a restart empties the caches.
 	openIssues := map[string]map[int]*gh.Issue{}
+	openIssueChildren := map[string]map[int]IssueChildren{}
 	openIssueListFailed := map[string]bool{}
 	eligibleByRepo := map[string]int{}
 	for _, claim := range claims {
@@ -261,7 +270,7 @@ func (c *Client) CloseOnMergeLedgerSweep(ctx context.Context, ledger *ClaimLedge
 		batchOpenIssues := eligibleByRepo[key] >= closeOnMergeOpenIssueBatchThreshold
 		if batchOpenIssues {
 			if _, seen := openIssues[key]; !seen && !openIssueListFailed[key] {
-				open, err := c.closeOnMergeOpenIssues(ctx, claim.Repo)
+				open, children, err := c.closeOnMergeOpenIssues(ctx, claim.Repo)
 				if err != nil {
 					if opts.Logger != nil {
 						opts.Logger.Warn("close-on-merge: listing open issues failed", "repo", claim.Repo, "error", err)
@@ -269,6 +278,7 @@ func (c *Client) CloseOnMergeLedgerSweep(ctx context.Context, ledger *ClaimLedge
 					openIssueListFailed[key] = true
 				} else {
 					openIssues[key] = open
+					openIssueChildren[key] = children
 				}
 			}
 		}
@@ -290,7 +300,7 @@ func (c *Client) CloseOnMergeLedgerSweep(ctx context.Context, ledger *ClaimLedge
 			}
 			continue
 		}
-		res := c.closeIssueForMergedPRClaimWithIssue(ctx, claim.Repo, claim.Issue, pr, true, opts, issue)
+		res := c.closeIssueForMergedPRClaimWithIssue(ctx, claim.Repo, claim.Issue, pr, true, opts, issue, closeOnMergeListedChildren(openIssueChildren[key], claim.Issue))
 		sweep.Results = append(sweep.Results, res)
 		if res.Settles() && ledger.MarkCloseOnMergeSettled(claim.Repo, claim.Issue, claim.PRNumber, now) {
 			sweep.Marked++
@@ -310,32 +320,34 @@ func (c *Client) closeOnMergeRepoKey(repo string) string {
 }
 
 // closeOnMergeOpenIssues lists repo's open issues (pull requests excluded),
-// keyed by number. Any list error is returned so the caller skips the repo
+// keyed by number, together with the sub-issue summary GitHub put on each
+// parent's row. Any list error is returned so the caller skips the repo
 // for this pass instead of falling back to per-claim reads.
-func (c *Client) closeOnMergeOpenIssues(ctx context.Context, repo string) (map[int]*gh.Issue, error) {
+func (c *Client) closeOnMergeOpenIssues(ctx context.Context, repo string) (map[int]*gh.Issue, map[int]IssueChildren, error) {
 	owner, repoName := c.splitRepo(strings.TrimSpace(repo))
 	out := map[int]*gh.Issue{}
-	issueOpts := &gh.IssueListByRepoOptions{
-		State:       "open",
-		ListOptions: gh.ListOptions{PerPage: 100},
-	}
+	children := map[int]IssueChildren{}
+	next := 1
 	for page := 0; page < claimSearchMaxPages; page++ {
-		issues, resp, err := c.client.Issues.ListByRepo(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, issueOpts)
+		issues, summaries, resp, err := c.closeOnMergeListOpenIssuesPage(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, next)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, issue := range issues {
 			if issue == nil || issue.IsPullRequest() || issue.GetNumber() <= 0 || !strings.EqualFold(issue.GetState(), "open") {
 				continue
 			}
 			out[issue.GetNumber()] = issue
+			if summary, ok := summaries[issue.GetNumber()]; ok {
+				children[issue.GetNumber()] = summary
+			}
 		}
 		if resp == nil || resp.NextPage == 0 {
 			break
 		}
-		issueOpts.ListOptions.Page = resp.NextPage
+		next = resp.NextPage
 	}
-	return out, nil
+	return out, children, nil
 }
 
 func (c *Client) CloseOnMergeBackfill(ctx context.Context, opts CloseOnMergeOptions) []CloseOnMergeResult {
@@ -353,12 +365,9 @@ func (c *Client) CloseOnMergeBackfill(ctx context.Context, opts CloseOnMergeOpti
 			continue
 		}
 		owner, repoName := c.splitRepo(repo)
-		issueOpts := &gh.IssueListByRepoOptions{
-			State:       "open",
-			ListOptions: gh.ListOptions{PerPage: 100},
-		}
+		next := 1
 		for page := 0; page < claimSearchMaxPages; page++ {
-			issues, resp, err := c.client.Issues.ListByRepo(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, issueOpts)
+			issues, children, resp, err := c.closeOnMergeListOpenIssuesPage(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, next)
 			if err != nil {
 				if opts.Logger != nil {
 					opts.Logger.Warn("close-on-merge backfill: listing open issues failed", "repo", repo, "error", err)
@@ -413,7 +422,7 @@ func (c *Client) CloseOnMergeBackfill(ctx context.Context, opts CloseOnMergeOpti
 						out = append(out, CloseOnMergeResult{Repo: repo, Issue: issue.GetNumber(), PR: prNum, PRRepo: prRepo, Action: CloseOnMergeSkipped, Reason: "no_closing_or_claim_metadata"})
 						continue
 					}
-					res := c.closeIssueForMergedPRClaimWithIssue(ctx, repo, issue.GetNumber(), pr, true, opts, issue)
+					res := c.closeIssueForMergedPRClaimWithIssue(ctx, repo, issue.GetNumber(), pr, true, opts, issue, closeOnMergeListedChildren(children, issue.GetNumber()))
 					out = append(out, res)
 					if res.Action == CloseOnMergeClosed || res.Action == CloseOnMergeAwaiting || res.Action == CloseOnMergeAlreadyDone {
 						break
@@ -423,7 +432,7 @@ func (c *Client) CloseOnMergeBackfill(ctx context.Context, opts CloseOnMergeOpti
 			if resp == nil || resp.NextPage == 0 {
 				break
 			}
-			issueOpts.ListOptions.Page = resp.NextPage
+			next = resp.NextPage
 		}
 	}
 	return out
@@ -571,6 +580,35 @@ func closeOnMergePRRefsIssue(pr *gh.PullRequest, prRepo, issueRepo string, issue
 	return false
 }
 
+// prLeavesIssueOpen is the closing-keyword decision the issue's coverage
+// comment states ("partial/non-closing work … Hive will not add a closing
+// keyword", EnsureIssueStagePRLink): the PR text names no closing keyword for
+// the issue, and either references it (`Refs #N`, `Part of #N`) or says in
+// words that it stays open. The close path reads the same decision, so a PR
+// the hive called non-closing never closes the issue when it merges.
+func prLeavesIssueOpen(text, prRepo, issueRepo string, issue int) bool {
+	if issue <= 0 {
+		return false
+	}
+	if _, closing := FindClosingKeywordReference(text, prRepo, issueRepo, issue); closing {
+		return false
+	}
+	for _, ref := range ParseReferencedIssues(text, prRepo) {
+		if ref.Issue == issue && strings.EqualFold(ref.Repo, issueRepo) {
+			return true
+		}
+	}
+	return strings.EqualFold(prRepo, issueRepo) && issueStaysOpenPhrase(stripClosingFalsePositiveText(text), issue)
+}
+
+// closeOnMergeIssueMarkedOpen reports whether the issue carries a label that
+// says work remains: hive/verified-open (an agent re-checked it and found it
+// still open) or hive/partially-addressed (an earlier merge covered only part).
+func closeOnMergeIssueMarkedOpen(issue *gh.Issue) bool {
+	labels := issueLabelNames(issue.Labels)
+	return labelPresent(labels, VerifiedOpenLabel) || labelPresent(labels, PartiallyAddressedLabel)
+}
+
 // closeOnMergeIssueNotFound reports whether reading the referenced issue
 // failed because GitHub does not know it (404), as opposed to a transient
 // API error worth retrying on the next sweep.
@@ -580,15 +618,29 @@ func closeOnMergeIssueNotFound(err error) bool {
 }
 
 func (c *Client) closeIssueForMergedPRClaim(ctx context.Context, issueRepo string, issueNumber int, pr *gh.PullRequest, claimMetadata bool, opts CloseOnMergeOptions) CloseOnMergeResult {
-	return c.closeIssueForMergedPRClaimWithIssue(ctx, issueRepo, issueNumber, pr, claimMetadata, opts, nil)
+	return c.closeIssueForMergedPRClaimWithIssue(ctx, issueRepo, issueNumber, pr, claimMetadata, opts, nil, nil)
 }
 
-func (c *Client) closeIssueForMergedPRClaimWithIssue(ctx context.Context, issueRepo string, issueNumber int, pr *gh.PullRequest, claimMetadata bool, opts CloseOnMergeOptions, issue *gh.Issue) CloseOnMergeResult {
+// closeIssueForMergedPRClaimWithIssue applies close-on-merge to one issue
+// for one merged PR. issue is the row a sweep's open-issue listing already
+// holds, with children the sub-issue summary that listing carried for it
+// (nil when it carried none); with a nil issue the function reads both in
+// one GET.
+func (c *Client) closeIssueForMergedPRClaimWithIssue(ctx context.Context, issueRepo string, issueNumber int, pr *gh.PullRequest, claimMetadata bool, opts CloseOnMergeOptions, issue *gh.Issue, children *IssueChildren) CloseOnMergeResult {
 	prRepo := issueRepo
 	if pr != nil && pr.GetBase() != nil && pr.GetBase().GetRepo() != nil && pr.GetBase().GetRepo().GetFullName() != "" {
 		prRepo = pr.GetBase().GetRepo().GetFullName()
 	}
 	res := CloseOnMergeResult{Repo: issueRepo, Issue: issueNumber}
+	// The backfill sweep and webhooks pass the configured repo name, which
+	// may be short ("utah-packages"); references parse as owner/repo, so
+	// every reference check compares against refRepo. Comparing the short
+	// name made `Refs #490` look like no reference at all, and the guard
+	// below closed projectbluefin/utah-packages#490 on a Refs-only PR.
+	refRepo := issueRepo
+	if owner, name := c.splitRepo(issueRepo); owner != "" && name != "" {
+		refRepo = owner + "/" + name
+	}
 	if pr != nil {
 		res.PR = pr.GetNumber()
 		res.MergeCommit = pr.GetMergeCommitSHA()
@@ -613,11 +665,11 @@ func (c *Client) closeIssueForMergedPRClaimWithIssue(ctx context.Context, issueR
 			return res
 		}
 	}
-	if !claimMetadata && !closeOnMergePRClaimsIssue(pr, prRepo, issueRepo, issueNumber) {
+	if !claimMetadata && !closeOnMergePRClaimsIssue(pr, prRepo, refRepo, issueNumber) {
 		res.Action, res.Reason = CloseOnMergeSkipped, "no_closing_or_claim_metadata"
 		return res
 	}
-	if claimMetadata && !closeOnMergePRClaimsIssue(pr, prRepo, issueRepo, issueNumber) && closeOnMergePRRefsIssue(pr, prRepo, issueRepo, issueNumber) {
+	if claimMetadata && !closeOnMergePRClaimsIssue(pr, prRepo, refRepo, issueNumber) && closeOnMergePRRefsIssue(pr, prRepo, refRepo, issueNumber) {
 		res.WrongRefs = true
 		if opts.Logger != nil {
 			// This is PR metadata, not a failed runtime operation. WARN would
@@ -629,7 +681,9 @@ func (c *Client) closeIssueForMergedPRClaimWithIssue(ctx context.Context, issueR
 	owner, repoName := c.splitRepo(issueRepo)
 	if issue == nil {
 		var err error
-		issue, _, err = c.client.Issues.Get(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, issueNumber)
+		// The same GET as before, read with the sub-issue summary go-github
+		// drops, so the open-sub-issue check below costs no call of its own.
+		issue, _, children, err = c.getIssueWithBlockedCount(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, issueNumber)
 		if err != nil {
 			if closeOnMergeIssueNotFound(err) {
 				// The referenced issue does not exist (or is not visible to the
@@ -673,7 +727,7 @@ func (c *Client) closeIssueForMergedPRClaimWithIssue(ctx context.Context, issueR
 		}
 		return res
 	}
-	closedMarker, reopenedMarker := c.closeOnMergeMarkers(ctx, owner, repoName, issueNumber, pr.GetNumber())
+	closedMarker, reopenedMarker, stageNoted := c.closeOnMergeMarkers(ctx, owner, repoName, issueNumber, pr.GetNumber())
 	if closedMarker {
 		res.Action, res.Reason = CloseOnMergeAlreadyDone, "marker_present"
 		return res
@@ -692,19 +746,31 @@ func (c *Client) closeIssueForMergedPRClaimWithIssue(ctx context.Context, issueR
 	}
 	if closeOnMergeReopenedAfter(events, opts.Identity) {
 		res.Action, res.Reason = CloseOnMergeSkipped, "reopened_after_merge"
-		if _, _, err := c.client.Issues.CreateComment(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, issueNumber, &gh.IssueComment{Body: gh.Ptr(closeOnMergeReopenedComment(pr))}); err != nil && opts.Logger != nil {
+		body := closeOnMergeReopenedComment(pr)
+		if _, err := c.PostIssueNote(WithRESTCaller(ctx, "hive:close_on_merge"), issueRepo, issueNumber, prstatus.KeyIssueReopened, body, func(ctx context.Context) error {
+			_, _, err := c.client.Issues.CreateComment(ctx, owner, repoName, issueNumber, &gh.IssueComment{Body: gh.Ptr(body)})
+			return err
+		}); err != nil && opts.Logger != nil {
 			opts.Logger.Warn("close-on-merge: posting reopened-after-merge marker failed", "repo", issueRepo, "issue", issueNumber, "pr", pr.GetNumber(), "error", err)
 		}
 		return res
 	}
 	if c.reporterConfirmationCloseGateReason(issue) != "" || closeOnMergeNeedsConfirmation(issue) {
-		if cov := c.closeOnMergeCoverage(ctx, prRepo, issueRepo, issueNumber, pr, issue, opts); cov.partial() {
+		if cov := c.closeOnMergeCoverage(ctx, prRepo, refRepo, issueNumber, pr, issue, opts); cov.partial() {
 			c.markPartiallyAddressed(ctx, issueRepo, issueNumber, pr.GetNumber(), issue, cov, opts)
 			res.Action, res.Reason = CloseOnMergeSkipped, "partially_addressed"
 			return res
 		}
+		if closeOnMergeHeldForOpenSubIssues(&res, pr.GetNumber(), children, opts) {
+			return res
+		}
 		body := closeOnMergeAwaitingComment(pr)
-		if _, _, err := c.client.Issues.CreateComment(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, issueNumber, &gh.IssueComment{Body: gh.Ptr(body)}); err != nil {
+		// Confirming the fix is an action asked of a person, so under the
+		// attention pilot it is announced once rather than only edited in.
+		if _, err := c.PostIssueAttention(WithRESTCaller(ctx, "hive:close_on_merge"), issueRepo, issueNumber, fmt.Sprintf("close-on-merge-awaiting-%d", pr.GetNumber()), body, func(ctx context.Context) error {
+			_, _, err := c.client.Issues.CreateComment(ctx, owner, repoName, issueNumber, &gh.IssueComment{Body: gh.Ptr(body)})
+			return err
+		}); err != nil {
 			res.Action, res.Reason = CloseOnMergeNoop, "awaiting_comment_failed"
 			return res
 		}
@@ -721,12 +787,34 @@ func (c *Client) closeIssueForMergedPRClaimWithIssue(ctx context.Context, issueR
 		res.Action, res.Reason = CloseOnMergeAwaiting, "needs_confirmation_or_human"
 		return res
 	}
-	if cov := c.closeOnMergeCoverage(ctx, prRepo, issueRepo, issueNumber, pr, issue, opts); cov.partialForDirectClose(closeOnMergePRRefsIssue(pr, prRepo, issueRepo, issueNumber)) {
+	cov := c.closeOnMergeCoverage(ctx, prRepo, refRepo, issueNumber, pr, issue, opts)
+	if cov.partialForDirectClose(prLeavesIssueOpen(pr.GetTitle()+"\n"+pr.GetBody(), prRepo, refRepo, issueNumber)) {
 		c.markPartiallyAddressed(ctx, issueRepo, issueNumber, pr.GetNumber(), issue, cov, opts)
 		res.Action, res.Reason = CloseOnMergeSkipped, "partially_addressed"
 		return res
 	}
-	if _, _, err := c.client.Issues.CreateComment(WithRESTCaller(ctx, "hive:close_on_merge"), owner, repoName, issueNumber, &gh.IssueComment{Body: gh.Ptr(closeOnMergeCloseComment(pr))}); err != nil {
+	if !cov.Closing && closeOnMergeIssueMarkedOpen(issue) {
+		// An agent re-verified the issue as still open, or an earlier merge
+		// left part of it: only a PR whose own text closes the issue may
+		// close it. A branch name, claim or comment link is not enough.
+		res.Action, res.Reason = CloseOnMergeSkipped, "issue_marked_open"
+		if opts.Logger != nil {
+			opts.Logger.Info("close-on-merge: issue is marked open and the PR does not close it; leaving it open", "repo", issueRepo, "issue", issueNumber, "pr", pr.GetNumber())
+		}
+		return res
+	}
+	if closeOnMergeHeldForOpenSubIssues(&res, pr.GetNumber(), children, opts) {
+		return res
+	}
+	// The issue-stage lane may already have said "Fixed by #N" for this
+	// PR (mergedPRClosedStageMarker) and only failed to close; one closing
+	// comment per issue is enough (hivecommons/hive#15727 vs #15843).
+	if stageNoted {
+		c.noteCommentSuppressed()
+	} else if _, err := c.PostIssueNote(WithRESTCaller(ctx, "hive:close_on_merge"), issueRepo, issueNumber, prstatus.KeyIssueClose, closeOnMergeCloseComment(pr), func(ctx context.Context) error {
+		_, _, err := c.client.Issues.CreateComment(ctx, owner, repoName, issueNumber, &gh.IssueComment{Body: gh.Ptr(closeOnMergeCloseComment(pr))})
+		return err
+	}); err != nil {
 		res.Action, res.Reason = CloseOnMergeNoop, "close_comment_failed"
 		return res
 	}
@@ -1003,35 +1091,40 @@ func closeOnMergeShortSHA(sha string) string {
 }
 
 func (c *Client) hasCloseOnMergeMarker(ctx context.Context, owner, repo string, number int) bool {
-	closed, _ := c.closeOnMergeMarkers(ctx, owner, repo, number, 0)
+	closed, _, _ := c.closeOnMergeMarkers(ctx, owner, repo, number, 0)
 	return closed
 }
 
 // closeOnMergeMarkers reports, in one pass over the issue's comments, whether
-// Hive's close-on-merge marker is present and whether the reopened-after-merge
-// marker for pr is present.
-func (c *Client) closeOnMergeMarkers(ctx context.Context, owner, repo string, number, pr int) (closed, reopened bool) {
-	reopenedMarker := ""
+// Hive's close-on-merge marker is present, whether the reopened-after-merge
+// marker for pr is present, and whether the issue-stage lane already left
+// its own "Fixed by #pr" closing note (mergedPRClosedStageMarker).
+func (c *Client) closeOnMergeMarkers(ctx context.Context, owner, repo string, number, pr int) (closed, reopened, stageNoted bool) {
+	reopenedMarker, stageMarker := "", ""
 	if pr > 0 {
 		reopenedMarker = closeOnMergeReopenedMarker(pr)
+		stageMarker = mergedPRClosedStageMarkerFor(pr)
 	}
 	opts := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: closeOnMergeCommentPageSize}}
 	for {
 		comments, resp, err := c.client.Issues.ListComments(ctx, owner, repo, number, opts)
 		if err != nil {
-			return closed, reopened
+			return closed, reopened, stageNoted
 		}
 		for _, comment := range comments {
 			body := comment.GetBody()
 			if strings.Contains(body, CloseOnMergeMarker) {
-				return true, reopened
+				return true, reopened, stageNoted
 			}
 			if reopenedMarker != "" && strings.Contains(body, reopenedMarker) {
 				reopened = true
 			}
+			if stageMarker != "" && strings.Contains(body, stageMarker) {
+				stageNoted = true
+			}
 		}
 		if resp == nil || resp.NextPage == 0 {
-			return closed, reopened
+			return closed, reopened, stageNoted
 		}
 		opts.Page = resp.NextPage
 	}

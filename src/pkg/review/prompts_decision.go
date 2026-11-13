@@ -62,6 +62,7 @@ func BuildDecisionPrompt(pr PullRequest, perspectives []Perspective, agg Aggrega
 	b.WriteString("4. Decide the perspective's verdict from the confirmed findings only: approve when none blocks; changes_requested for agent-fixable in-scope issues; requires_human for ambiguous or high-risk judgement a person must own; reject for a fundamentally unsuitable change. When the heads disagreed on a verdict, resolve it on the evidence and say why.\n")
 	b.WriteString("For Hive-authored PRs, resolve sequencing, naming, config-shape, scope, and land-now-vs-later questions yourself; use requires_human only for risk a human must own: security, data loss, irreversible or public-facing behavior, policy/governance, licensing, spend, or when you could not read the diff.\n")
 	b.WriteString(permissionsTighteningGuidance)
+	b.WriteString(hiveSupersedingGuidance)
 
 	reportPerspectives := append([]Perspective(nil), perspectives...)
 	seen := map[Perspective]bool{}
@@ -93,7 +94,7 @@ func BuildDecisionPrompt(pr PullRequest, perspectives []Perspective, agg Aggrega
 	b.WriteString("Each object: the standard outputschema AgentReport fields plus perspective, verdict, confidence, repo, number, head_sha, body_digest and dispositions (copy head_sha and body_digest verbatim from above, or leave them out; never compute or summarize them).\n")
 	b.WriteString("Required AgentReport fields: lane, kind, findings, prs_opened, beads_filed, summary. Set kind to \"review\" and lane to \"review-swarm\". Use [] for empty arrays.\n")
 	fmt.Fprintf(&b, "Every object must carry the same repo (%s) and number (%d).\n", pr.Repo, pr.Number)
-	b.WriteString("findings: ONLY the confirmed and out-of-scope findings, each once, with its FINAL severity (out-of-scope ones with review_scope \"out-of-scope\"). Not-reproducible findings do not appear here.\n")
+	b.WriteString("findings: ONLY the confirmed and out-of-scope findings, each once, with its FINAL severity (out-of-scope ones with review_scope \"out-of-scope\"). Not-reproducible findings do not appear here. Each UNDERLYING finding appears once even when several heads raised it or an earlier head raised it first: a head's note that merely restates another head's or an earlier head's finding (\"Previous style note still present\") is not a finding of its own and must not be listed; cite the existing backlog issue with `<!-- hive-refers-to: #N -->` in the summary instead.\n")
 	b.WriteString("dispositions: one object per head finding for this perspective: {\"head\": \"<head>\", \"title\": \"<the head's finding title>\", \"file\": \"<path>\", \"line\": <n>, \"disposition\": \"confirmed|not_reproducible|out_of_scope\", \"reason\": \"<what you read>\", \"severity\": \"<final severity for a confirmed finding>\"}.\n")
 	b.WriteString(findingSchemaInstruction)
 	b.WriteString("A perspective you could not meaningfully decide is requires_human, not approve.\n")

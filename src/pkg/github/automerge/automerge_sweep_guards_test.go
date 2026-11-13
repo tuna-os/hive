@@ -84,18 +84,27 @@ func newSelfSweepGuardAPI(t *testing.T, fx selfSweepFixture) *httptest.Server {
 	fetches := 0
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/main":
+			json.NewEncoder(w).Encode(map[string]any{"name": "main", "protected": false, "commit": map[string]string{"sha": "base1"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/branches/main/protection/required_status_checks":
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"message": "Branch not protected"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/rules/branches/main":
+			json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/base1/status":
+			json.NewEncoder(w).Encode(map[string]any{"state": "success", "total_count": 1, "statuses": []map[string]string{{"context": "ci/build", "state": "success"}}})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7":
 			fetches++
 			if fetches == 1 && fx.firstGetStatus != 0 {
 				w.WriteHeader(fx.firstGetStatus)
 				return
 			}
-			if fetches > 1 && fx.recheckGetStatus != 0 {
+			if fetches > 2 && fx.recheckGetStatus != 0 {
 				w.WriteHeader(fx.recheckGetStatus)
 				return
 			}
 			head := *fx.headSHA
-			if fetches > 1 {
+			if fetches > 2 {
 				head = *fx.recheckHeadSHA
 			}
 			var prLabels []map[string]string
@@ -114,6 +123,7 @@ func newSelfSweepGuardAPI(t *testing.T, fx selfSweepFixture) *httptest.Server {
 				"mergeable":       fx.mergeableState == "clean",
 				"user":            map[string]string{"login": fx.author},
 				"head":            map[string]string{"sha": head},
+				"base":            map[string]string{"ref": "main"},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7/files":
 			if fx.filesHTTPCode != 0 {
@@ -125,6 +135,10 @@ func newSelfSweepGuardAPI(t *testing.T, fx selfSweepFixture) *httptest.Server {
 				files = append(files, map[string]any{"filename": name, "status": "modified", "additions": 1, "deletions": 0})
 			}
 			json.NewEncoder(w).Encode(files)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/issues/7/timeline":
+			// The superseded rule looks for a merged PR declaring
+			// `Supersedes #7`; this fixture has none.
+			json.NewEncoder(w).Encode([]map[string]any{})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/7/reviews":
 			reviews := fx.reviews
 			if reviews == nil {
@@ -176,6 +190,10 @@ func newSelfSweepGuardAPI(t *testing.T, fx selfSweepFixture) *httptest.Server {
 			json.NewEncoder(w).Encode(map[string]any{"merged": fx.mergeApplied, "sha": "merge7"})
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/rules/branches/"):
 			json.NewEncoder(w).Encode([]any{}) // no rulesets
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/commits/sha7":
+			// The head commit predates every fixture review, so an approval
+			// on sha7 binds to it (automerge_review_head_binding.go).
+			json.NewEncoder(w).Encode(map[string]any{"sha": "sha7", "parents": []map[string]string{{"sha": "sha6"}}, "commit": map[string]any{"committer": map[string]string{"date": "2026-10-01T00:00:00Z"}}})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}

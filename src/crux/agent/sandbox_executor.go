@@ -7,13 +7,18 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/crux/cline"
+	"github.com/hivecommons/hive/crux/config"
 	"github.com/hivecommons/hive/crux/effects"
+	"github.com/hivecommons/hive/crux/internal/textutil"
+	"github.com/hivecommons/hive/crux/kubejob"
 	"github.com/hivecommons/hive/crux/logscrub"
 	"github.com/hivecommons/hive/crux/outputschema"
 	"github.com/hivecommons/hive/crux/pushbroker"
@@ -24,7 +29,7 @@ const (
 	DefaultSandboxKickTimeout = 45 * time.Minute
 	defaultSandboxNetworkMode = sandbox.NetworkModeRestricted
 	sandboxPromptRelPath      = ".hive/kick-prompt.txt"
-	sandboxTranscriptRelPath  = ".hive/sandbox-transcript.log"
+	sandboxTranscriptRelPath  = sandbox.TranscriptRelPath
 	// The sandboxed agent may leave the PR title and body it wants in the
 	// workspace; the executor (which alone can open the PR) picks them up.
 	sandboxPRTitleRelPath = ".hive/pr-title.txt"
@@ -42,11 +47,12 @@ type sandboxCommandRunner interface {
 
 type sandboxExecRunner struct{}
 
+// Run delegates to pushbroker.ExecRunner so the production broker gets the
+// same stdout-only-on-success contract the package's own runner has: the
+// normaliser commits `git show HEAD:<path>` output as file content, and a
+// CombinedOutput runner would amend exit-0 stderr warnings into the blob.
 func (sandboxExecRunner) Run(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	return cmd.CombinedOutput()
+	return pushbroker.ExecRunner{}.Run(ctx, dir, env, name, args...)
 }
 
 // PRCreator is crux.PRCreator, the host-provided pull-request capability.
@@ -66,13 +72,13 @@ type SandboxKickSpec struct {
 	Generation   uint64
 	MaxWorktrees int
 	Image        string
+	Runtime      string
 	EnvAllowlist []string
 	NetworkMode  string
 	Timeout      time.Duration
 	// PublishVerify are the deterministic preflight commands run in the
 	// sandbox before the run's commits are pushed (config
-	// sandbox.publish.verify or a `<!-- hive:publish.verify -->` block in the
-	// kick template). Any non-zero exit withholds the push and the PR.
+	// sandbox.publish.verify). Any non-zero exit withholds the push and the PR.
 	PublishVerify []string
 	// VerifyTimeout bounds each PublishVerify command; zero uses the default.
 	VerifyTimeout time.Duration
@@ -83,9 +89,10 @@ type SandboxKickSpec struct {
 }
 
 type configSnapshot struct {
-	Backend   string
-	Model     string
-	LaunchCmd string
+	Backend         string
+	Model           string
+	LaunchCmd       string
+	ReasoningEffort string
 }
 
 type SandboxKickResult struct {
@@ -124,8 +131,16 @@ type SandboxVerifyResult struct {
 	TimedOut bool
 }
 
-// Passed reports whether the command ran to completion with exit 0.
-func (v SandboxVerifyResult) Passed() bool { return v.Err == "" && v.ExitCode == 0 && !v.TimedOut }
+// Passed reports whether the command ran to completion with exit 0. A
+// launcher that returned no error but could not read the exit code back
+// (a Complete Job whose pod is already gone) counts as passed too: the
+// Job's own success condition is the fact, the missing code is not a failure.
+func (v SandboxVerifyResult) Passed() bool {
+	if v.Err != "" || v.TimedOut {
+		return false
+	}
+	return v.ExitCode == 0 || v.ExitCode == kubejob.ExitCodeUnknown
+}
 
 type SandboxExecutor struct {
 	Launcher    sandbox.Launcher
@@ -137,6 +152,7 @@ type SandboxExecutor struct {
 	Logger      *slog.Logger
 	Now         func() time.Time
 	Mutation    effects.Boundary
+	onStarted   func()
 }
 
 func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (SandboxKickResult, error) {
@@ -177,10 +193,19 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 		res.Error = err.Error()
 		return res, err
 	}
-	command, err := sandboxCommand(spec.AgentConfig, sandboxPromptRelPath)
+	command, err := sandboxKickCommand(spec, sandboxPromptRelPath)
 	if err != nil {
 		res.Error = err.Error()
 		return res, err
+	}
+	var provider *cline.ProviderFile
+	if spec.AgentConfig.Backend == "cline" && spec.Runtime != config.SandboxRuntimeJob {
+		provider, err = cline.StageProviderFile(os.Getenv("HIVE_CLINE_CONFIG_DIR"), spec.AgentConfig.Model, workspace)
+		if err != nil {
+			res.Error = err.Error()
+			return res, err
+		}
+		defer provider.Close()
 	}
 	// A spool the relay cannot see is a lost review, not a failed kick: the
 	// rest of the run is still worth doing, so log and go on without one.
@@ -195,9 +220,14 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 	}()
 	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
 	defer cancel()
+	var notifyStarted func()
+	if e.onStarted != nil {
+		var once sync.Once
+		notifyStarted = func() { once.Do(e.onStarted) }
+	}
 	sres, runErr := e.launcher().Run(runCtx, sandbox.LaunchSpec{
 		Image:          spec.Image,
-		Name:           "hive-" + sanitizeBranchPart(spec.Agent) + "-sandbox",
+		Name:           sandbox.LaunchName(spec.Agent),
 		Workspace:      workspace,
 		WorkspaceMount: sandbox.DefaultWorkspaceMount,
 		WorkDir:        sandbox.DefaultWorkspaceMount,
@@ -205,7 +235,21 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 		Env:            spool.sandboxEnv(),
 		EnvAllowlist:   spec.EnvAllowlist,
 		NetworkMode:    spec.NetworkMode,
+		ClineProvider:  provider,
+		OnStarted:      notifyStarted,
 	})
+	// Launchers that only report a final successful result still prove the
+	// run was accepted; do not infer acceptance from queueing alone.
+	if runErr == nil && notifyStarted != nil {
+		notifyStarted()
+	}
+	if provider != nil {
+		sres.Stdout = provider.Redact(sres.Stdout)
+		sres.Stderr = provider.Redact(sres.Stderr)
+		if err := provider.Close(); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}
 	if ctx.Err() == nil && !spool.awaitDrain(ctx) && e.Logger != nil {
 		e.Logger.Warn("sandbox review spool: requests still pending after the drain wait", "agent", spec.Agent, "spool", spool.entry.Spool)
 	}
@@ -223,7 +267,12 @@ func (e *SandboxExecutor) Run(ctx context.Context, spec SandboxKickSpec) (Sandbo
 	res.Sandbox = sres
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		res.TimedOut = true
-		runErr = fmt.Errorf("sandbox kick timed out after %s", spec.Timeout)
+		timeoutErr := fmt.Errorf("sandbox kick timed out after %s", spec.Timeout)
+		if provider != nil {
+			runErr = errors.Join(timeoutErr, runErr)
+		} else {
+			runErr = timeoutErr
+		}
 	}
 	res.TranscriptPath = filepath.Join(workspace, sandboxTranscriptRelPath)
 	_ = writeTranscript(res.TranscriptPath, sres)
@@ -348,197 +397,12 @@ func readWorkspaceText(path string, max int) string {
 	return truncateRunes(text, max)
 }
 
-func truncateRunes(s string, max int) string {
-	if max <= 0 {
-		return s
-	}
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max])
-}
-
-// prepareWorkspace clones the target repo and checks out the work branch off
-// the base ref. When spec.BaseRef is empty it is RESOLVED from the clone's own
-// refs/remotes/origin/HEAD and written back into spec, so the caller opens its
-// PR against the same ref it branched from (kubestellar/hive#4928). If that
-// resolution fails, prepareWorkspace fails the kick rather than silently
-// falling back to "main" — a wrong base is worse than a failed kick, and the
-// error surfaces through res.Error into the kick result the operator sees.
-func (e *SandboxExecutor) prepareWorkspace(ctx context.Context, spec *SandboxKickSpec) (string, string, error) {
-	if strings.TrimSpace(spec.Org) == "" || strings.TrimSpace(spec.Repo) == "" {
-		return "", "", errors.New("sandbox workspace prep requires org and repo")
-	}
-	if strings.TrimSpace(spec.WorkspaceDir) == "" {
-		return "", "", errors.New("sandbox workspace root is required")
-	}
-	if err := os.MkdirAll(spec.WorkspaceDir, 0o770); err != nil {
-		return "", "", err
-	}
-	if strings.TrimSpace(spec.Stage) != "" {
-		return e.prepareRunStageWorkspace(ctx, spec)
-	}
-	workspace := filepath.Join(spec.WorkspaceDir, sanitizeBranchPart(spec.Agent)+"-"+fmt.Sprint(e.now().UnixNano()))
-	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", spec.Org, spec.Repo)
-	authArgs, cleanupAuth, err := e.cloneAuthArgs(ctx, spec.Org+"/"+spec.Repo, spec.WorkspaceDir)
-	if err != nil {
-		return "", "", err
-	}
-	defer cleanupAuth()
-	cloneArgs := append(append([]string{}, authArgs...), "clone", "--no-checkout", repoURL, workspace)
-	if out, err := e.runner().Run(ctx, "", pushbroker.PushEnv(os.Environ()), "git", cloneArgs...); err != nil {
-		return "", "", fmt.Errorf("git clone: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	if strings.TrimSpace(spec.BaseRef) == "" {
-		ref, err := e.resolveBaseRef(ctx, workspace)
-		if err != nil {
-			return "", "", fmt.Errorf("sandbox workspace prep: could not resolve %s/%s's default branch and no explicit base ref was given (refusing to guess %q): %w", spec.Org, spec.Repo, FallbackSandboxBaseRef, err)
-		}
-		spec.BaseRef = ref
-	}
-	fetchArgs := append(append([]string{}, authArgs...), "fetch", "origin", spec.BaseRef)
-	if out, err := e.runner().Run(ctx, workspace, pushbroker.PushEnv(os.Environ()), "git", fetchArgs...); err != nil {
-		return "", "", fmt.Errorf("git fetch %s: %w: %s", spec.BaseRef, err, strings.TrimSpace(string(out)))
-	}
-	if out, err := e.runner().Run(ctx, workspace, pushbroker.PushEnv(os.Environ()), "git", "checkout", "-B", spec.Branch, "FETCH_HEAD"); err != nil {
-		return "", "", fmt.Errorf("git checkout: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	base, err := e.runner().Run(ctx, workspace, pushbroker.PushEnv(os.Environ()), "git", "rev-parse", "HEAD")
-	if err != nil {
-		return "", "", fmt.Errorf("git rev-parse HEAD: %w", err)
-	}
-	return workspace, strings.TrimSpace(string(base)), nil
-}
-
-func (e *SandboxExecutor) prepareRunStageWorkspace(ctx context.Context, spec *SandboxKickSpec) (string, string, error) {
-	if strings.TrimSpace(spec.RunKey) == "" || spec.Generation == 0 {
-		return "", "", errors.New("sandbox run-stage workspace prep requires run key and generation")
-	}
-	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", spec.Org, spec.Repo)
-	source := runStageSourceRepo(*spec)
-	authArgs, cleanupAuth, err := e.cloneAuthArgs(ctx, spec.Org+"/"+spec.Repo, spec.WorkspaceDir)
-	if err != nil {
-		return "", "", err
-	}
-
-	defer cleanupAuth()
-	if _, err := os.Stat(filepath.Join(source, ".git")); err != nil {
-		if !os.IsNotExist(err) {
-			return "", "", err
-		}
-		if err := os.MkdirAll(filepath.Dir(source), 0o770); err != nil {
-			return "", "", err
-		}
-		cloneArgs := append(append([]string{}, authArgs...), "clone", "--no-checkout", repoURL, source)
-		if out, err := e.runner().Run(ctx, "", pushbroker.PushEnv(os.Environ()), "git", cloneArgs...); err != nil {
-			return "", "", fmt.Errorf("git clone: %w: %s", err, strings.TrimSpace(string(out)))
-		}
-	}
-	if strings.TrimSpace(spec.BaseRef) == "" {
-		ref, err := e.resolveBaseRef(ctx, source)
-		if err != nil {
-			return "", "", fmt.Errorf("sandbox workspace prep: could not resolve %s/%s's default branch and no explicit base ref was given (refusing to guess %q): %w", spec.Org, spec.Repo, FallbackSandboxBaseRef, err)
-		}
-		spec.BaseRef = ref
-	}
-	fetchArgs := append(append([]string{}, authArgs...), "fetch", "origin", spec.BaseRef)
-	if out, err := e.runner().Run(ctx, source, pushbroker.PushEnv(os.Environ()), "git", fetchArgs...); err != nil {
-		return "", "", fmt.Errorf("git fetch %s: %w: %s", spec.BaseRef, err, strings.TrimSpace(string(out)))
-	}
-	mgr := sandbox.WorktreeManager{Runner: func(ctx context.Context, dir string, name string, args ...string) ([]byte, error) {
-		return e.runner().Run(ctx, dir, pushbroker.PushEnv(os.Environ()), name, args...)
-	}}
-	wt, err := mgr.Add(ctx, sandbox.WorktreeSpec{
-		SourceRepo:   source,
-		WorkspaceDir: spec.WorkspaceDir,
-		RunKey:       spec.RunKey,
-		Stage:        spec.Stage,
-		Generation:   spec.Generation,
-		TargetRef:    "FETCH_HEAD",
-		MaxWorktrees: spec.MaxWorktrees,
-	})
-	if err != nil {
-		return "", "", err
-	}
-	return wt.Path, wt.SHA, nil
-}
-
-func runStageSourceRepo(spec SandboxKickSpec) string {
-	return filepath.Join(spec.WorkspaceDir, "_repos", sanitizeBranchPart(spec.Org), sanitizeBranchPart(spec.Repo))
-}
-
-// FallbackSandboxBaseRef names the branch resolveBaseRef would have used had
-// it not been made an error instead (kubestellar/hive#4928) — kept as a named
-// constant purely so the "refusing to guess" error message above never has a
-// bare string literal to drift out of sync with intent.
-const FallbackSandboxBaseRef = "main"
-
-// resolveBaseRef reports the default branch of the freshly cloned repo. `git
-// clone` records the remote's HEAD in refs/remotes/origin/HEAD, so the answer
-// is already on disk — no API call, no extra token scope. An unreadable or
-// empty answer is returned as an error so the caller can fail the kick rather
-// than silently branching off an assumed "main" (kubestellar/hive#4928).
-func (e *SandboxExecutor) resolveBaseRef(ctx context.Context, workspace string) (string, error) {
-	out, err := e.runner().Run(ctx, workspace, pushbroker.PushEnv(os.Environ()),
-		"git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-	if err != nil {
-		return "", fmt.Errorf("reading refs/remotes/origin/HEAD: %w", err)
-	}
-	ref := strings.TrimSpace(string(out))
-	// symbolic-ref --short renders it as "origin/<branch>".
-	if _, branch, found := strings.Cut(ref, "/"); found {
-		ref = branch
-	}
-	if ref == "" {
-		return "", errors.New("refs/remotes/origin/HEAD resolved to an empty branch name")
-	}
-	return ref, nil
-}
-
-func (e *SandboxExecutor) cloneAuthArgs(ctx context.Context, repo, dir string) ([]string, func(), error) {
-	minter := e.CloneMinter
-	if minter == nil {
-		minter = e.Minter
-	}
-	if minter == nil {
-		return nil, func() {}, nil
-	}
-	token, err := minter.MintPushToken(ctx, repo)
-	if err != nil {
-		return nil, func() {}, fmt.Errorf("minting clone token: %w", err)
-	}
-	if strings.TrimSpace(token) == "" {
-		return nil, func() {}, errors.New("sandbox workspace prep: minter returned empty clone token")
-	}
-	path := filepath.Join(dir, ".hive-git-credentials-"+sanitizeBranchPart(repo)+"-"+fmt.Sprint(e.now().UnixNano()))
-	line := "https://x-access-token:" + token + "@github.com\n"
-	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
-		return nil, func() {}, fmt.Errorf("writing sandbox clone credential helper: %w", err)
-	}
-	cleanup := func() { _ = os.Remove(path) }
-	return []string{"-c", "credential.helper=store --file=" + path}, cleanup, nil
-}
-
-func (e *SandboxExecutor) commitsSince(ctx context.Context, workspace, baseSHA string) (string, int, error) {
-	head, err := e.runner().Run(ctx, workspace, pushbroker.PushEnv(os.Environ()), "git", "rev-parse", "HEAD")
-	if err != nil {
-		return "", 0, err
-	}
-	headSHA := strings.TrimSpace(string(head))
-	if headSHA == baseSHA {
-		return headSHA, 0, nil
-	}
-	countOut, err := e.runner().Run(ctx, workspace, pushbroker.PushEnv(os.Environ()), "git", "rev-list", "--count", baseSHA+"..HEAD")
-	if err != nil {
-		return headSHA, 0, err
-	}
-	var count int
-	_, _ = fmt.Sscanf(strings.TrimSpace(string(countOut)), "%d", &count)
-	return headSHA, count, nil
-}
+func truncateRunes(s string, max int) string { return textutil.Runes(s, max) }
 
 func sandboxCommand(cfg configSnapshot, promptRel string) ([]string, error) {
+	if cfg.Backend == "cline" {
+		return nil, fmt.Errorf("Cline requires scoped provider-file staging or Job Secret references through the canonical sandbox kick path; direct command overrides are unsupported")
+	}
 	if strings.TrimSpace(cfg.LaunchCmd) != "" {
 		return []string{"sh", "-lc", cfg.LaunchCmd + " < " + shellQuote(promptRel)}, nil
 	}
@@ -637,6 +501,11 @@ func writeTranscript(path string, res sandbox.Result) error {
 	b.WriteString(res.Stdout)
 	b.WriteString("\n\nstderr:\n")
 	b.WriteString(res.Stderr)
+	// Trailing status line, read back by the dashboard's job-runtime
+	// terminal pane once the Job pod is gone (hivecommons/hive#14798).
+	b.WriteString("\n\n" + sandbox.TranscriptExitPrefix)
+	b.WriteString(strconv.Itoa(res.ExitCode))
+	b.WriteString("\n")
 	return os.WriteFile(path, []byte(b.String()), 0o660)
 }
 
@@ -775,7 +644,9 @@ func sandboxPublishWithheld(res SandboxKickResult) string {
 		}
 		return reason
 	}
-	if res.Sandbox.ExitCode != 0 {
+	// A completed Job whose pod could not be read has no exit code; that is
+	// not a failure, and the guessed 0 it used to carry was not a fact either.
+	if code := res.Sandbox.ExitCode; code != 0 && code != kubejob.ExitCodeUnknown {
 		return fmt.Sprintf("sandbox exited %d", res.Sandbox.ExitCode)
 	}
 	return ""
@@ -847,28 +718,7 @@ func (e *SandboxExecutor) branchName(agentName string) string {
 	return "hive/" + sanitizeBranchPart(agentName) + "/" + e.now().Format("20060102150405")
 }
 
-func sanitizeBranchPart(s string) string {
-	s = strings.TrimSpace(strings.ToLower(s))
-	var b strings.Builder
-	lastDash := false
-	for _, r := range s {
-		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
-		if ok {
-			b.WriteRune(r)
-			lastDash = false
-			continue
-		}
-		if !lastDash {
-			b.WriteByte('-')
-			lastDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		return "agent"
-	}
-	return out
-}
+func sanitizeBranchPart(s string) string { return sandbox.AgentSlug(s) }
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"

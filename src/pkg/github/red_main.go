@@ -2,7 +2,6 @@ package github
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -30,13 +29,12 @@ import (
 //     NEW PRs in the repo unless they fix main (redMainPRRequestRefusal,
 //     which reads a named issue live when the sweep has not seen it), and
 //     kicks and the repo card name the check and the fix PR.
+//   - When a trigger rule names ci.failed, the same pass reports each check
+//     that concluded failure or timed_out on the tip, required or not, once
+//     per head SHA (observeCIFailed, red_main_ci_failed.go).
 //
 // Every lookup failure leaves the repo's previous observation in place:
 // a read error never trips the breaker and never clears it either.
-
-// redMainMaxIssuePages bounds the open-issue listing used to find the
-// `[shared-ci]` tracking issue (newest first, 100 per page).
-const redMainMaxIssuePages = 3
 
 // redMainMaxLiveIssueLookups bounds the issues a refused PR request names
 // that the refusal path reads live to find a just-filed tracking issue.
@@ -55,6 +53,9 @@ type redMainState struct {
 	// paths caches the annotated files of a failing run by run ID; a run's
 	// annotations never change once it has concluded.
 	paths map[int64][]string
+	// ciFailed is the ci.failed trigger hook and its dedupe state
+	// (red_main_ci_failed.go).
+	ciFailed ciFailedState
 }
 
 // SetRedMainThresholdFunc installs the per-repo threshold resolver
@@ -139,6 +140,9 @@ func (c *Client) SweepRedMain(ctx context.Context, now time.Time) (RedMainSweepR
 		return res, ErrNoGitHubClient
 	}
 	ctx = WithRESTCaller(ctx, "hive:red_main")
+	// nil unless a trigger rule names ci.failed: the sweep then reads and
+	// skips exactly as it always has.
+	ciFailedEmit := c.ciFailedEmitter()
 	for _, repo := range c.activeRepos() {
 		if ctx.Err() != nil {
 			return res, ctx.Err()
@@ -154,7 +158,10 @@ func (c *Client) SweepRedMain(ctx context.Context, now time.Time) (RedMainSweepR
 		}
 		cfgSet, cfgKnown := c.configRequiredChecksForRepo(key)
 		rules := ReadBranchRules(ctx, c.client, owner, name, branch, cfgSet, cfgKnown)
-		if !rules.Known {
+		// ci.failed covers every check on the tip, required or not (a
+		// post-merge build is rarely required), so with a ci.failed rule the
+		// tip's runs are read even where the breaker has nothing to watch.
+		if !rules.Known && ciFailedEmit == nil {
 			c.logger.Debug("red-main: required checks unknown; keeping previous observation", "repo", key, "reason", rules.Reason)
 			res.Skipped++
 			continue
@@ -162,6 +169,12 @@ func (c *Client) SweepRedMain(ctx context.Context, now time.Time) (RedMainSweepR
 		runs, settled, err := c.redCheckRunsForRef(ctx, owner, name, branch)
 		if err != nil {
 			c.logger.Debug("red-main: default branch check runs unavailable; keeping previous observation", "repo", key, "error", err)
+			res.Skipped++
+			continue
+		}
+		c.observeCIFailed(ctx, ciFailedEmit, repo, owner, name, branch, runs)
+		if !rules.Known {
+			c.logger.Debug("red-main: required checks unknown; keeping previous observation", "repo", key, "reason", rules.Reason)
 			res.Skipped++
 			continue
 		}
@@ -286,34 +299,13 @@ func (c *Client) redMainAnnotatedPaths(ctx context.Context, owner, repo string, 
 // `[shared-ci] <check> failing across <owner/repo>` issue tracking it in
 // owner/repo (the lowest number when several are open).
 func (c *Client) openSharedCITrackingIssues(ctx context.Context, owner, repo string) (map[string]int, error) {
-	opts := &gh.IssueListByRepoOptions{
-		State:       "open",
-		Sort:        "created",
-		Direction:   "desc",
-		ListOptions: gh.ListOptions{PerPage: 100},
+	issues, err := c.openSharedCIIncidentIssues(ctx, owner, repo)
+	if err != nil {
+		return nil, err
 	}
-	out := map[string]int{}
-	for page := 0; page < redMainMaxIssuePages; page++ {
-		issues, resp, err := c.client.Issues.ListByRepo(ctx, owner, repo, opts)
-		if err != nil {
-			return nil, fmt.Errorf("listing open shared-CI incidents in %s/%s: %w", owner, repo, err)
-		}
-		for _, issue := range issues {
-			if issue == nil || issue.IsPullRequest() {
-				continue
-			}
-			check, ok := SharedCITrackingCheck(issue.GetTitle(), owner+"/"+repo)
-			if !ok {
-				continue
-			}
-			if n, seen := out[check]; !seen || issue.GetNumber() < n {
-				out[check] = issue.GetNumber()
-			}
-		}
-		if resp == nil || resp.NextPage == 0 {
-			break
-		}
-		opts.ListOptions.Page = resp.NextPage
+	out := make(map[string]int, len(issues))
+	for check, issue := range issues {
+		out[check] = issue.GetNumber()
 	}
 	return out, nil
 }

@@ -21,13 +21,18 @@
 # crux/logscrub: pkg/logscrub moved into the Crux module with the cut (hivecommons/hive#13950).
 # search: GET /api/repos/{owner}/{repo}/health serves the report-only repo health score the search indexer computes (search.Health), wired through a setter so the dashboard never builds or walks the index (hivecommons/hive#14638).
 # search: GET /api/search reads the portfolio search Backend the indexer publishes; pkg/search is a leaf (no dashboard deps) (hivecommons/hive#14637).
+# workflowmodel: /api/workflows handlers compile lifecycle models (Compile, Profile diagnostics) and the tracker emits per-repo workflow columns; the store and bindings already route through Dependencies (hivecommons/hive#17620 P2).
+# egressmark: deployment_upgrade.go dials the in-cluster Kubernetes API for the hive's own rollout; the dial must carry the forced-egress SO_MARK or nodes without xt_owner redirect it into the MITM proxy (hivecommons/hive#17817).
 github.com/hivecommons/hive/crux
 github.com/hivecommons/hive/crux/agent
 github.com/hivecommons/hive/crux/agentparse
 github.com/hivecommons/hive/crux/claude
+github.com/hivecommons/hive/crux/egressmark
+github.com/hivecommons/hive/crux/kubejob
 github.com/hivecommons/hive/crux/logread
 github.com/hivecommons/hive/crux/logscrub
 github.com/hivecommons/hive/crux/paneclass
+github.com/hivecommons/hive/crux/sandbox
 github.com/hivecommons/hive/crux/skillreg
 github.com/hivecommons/hive/crux/taskmcp
 github.com/hivecommons/hive/crux/toolapprove
@@ -38,6 +43,7 @@ github.com/hivecommons/hive/pkg/advisor
 github.com/hivecommons/hive/pkg/advisory
 github.com/hivecommons/hive/pkg/agentaudit
 github.com/hivecommons/hive/pkg/beads
+github.com/hivecommons/hive/pkg/blocker
 github.com/hivecommons/hive/pkg/celtrigger
 github.com/hivecommons/hive/pkg/claims
 github.com/hivecommons/hive/pkg/classify
@@ -61,18 +67,25 @@ github.com/hivecommons/hive/pkg/hivestate
 github.com/hivecommons/hive/pkg/hooks
 github.com/hivecommons/hive/pkg/housestyle
 github.com/hivecommons/hive/pkg/hub
+github.com/hivecommons/hive/pkg/hubactivity
 github.com/hivecommons/hive/pkg/hubbackup
+# pkg/inbox: Inbox triage API (hivecommons/hive#17876) — dashboard routes
+# /api/inbox* wrap the inbox service; no existing seam covers it.
+github.com/hivecommons/hive/pkg/inbox
 github.com/hivecommons/hive/pkg/inferencehealth
 github.com/hivecommons/hive/pkg/ioscan
 github.com/hivecommons/hive/pkg/knowledge
+github.com/hivecommons/hive/pkg/maintainernotes
 github.com/hivecommons/hive/pkg/mention
 github.com/hivecommons/hive/pkg/mergelane
+github.com/hivecommons/hive/pkg/modelfamily
 github.com/hivecommons/hive/pkg/notify
 github.com/hivecommons/hive/pkg/nous
 github.com/hivecommons/hive/pkg/outputschema
 github.com/hivecommons/hive/pkg/planning
 github.com/hivecommons/hive/pkg/policies
 github.com/hivecommons/hive/pkg/promptsrc
+github.com/hivecommons/hive/pkg/rebasemerge
 github.com/hivecommons/hive/pkg/releasenotes
 github.com/hivecommons/hive/pkg/resolve
 github.com/hivecommons/hive/pkg/retro
@@ -90,4 +103,7 @@ github.com/hivecommons/hive/pkg/timeline
 github.com/hivecommons/hive/pkg/tokens
 github.com/hivecommons/hive/pkg/turn
 github.com/hivecommons/hive/pkg/upstreamwatch
+github.com/hivecommons/hive/pkg/webassets
+github.com/hivecommons/hive/pkg/workflowmodel
 github.com/hivecommons/hive/pkg/worksource
+github.com/hivecommons/hive/pkg/writeback

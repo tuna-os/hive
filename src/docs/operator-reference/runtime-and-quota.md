@@ -1,0 +1,1137 @@
+# Hive operator reference
+
+[Contents](../operator-reference.md)
+
+## Fleet breaker
+
+The dashboard top bar includes a fleet breaker: a circular pause/play control plus a status pill. The `GET /api/breaker` state is readable by authenticated viewers, but engaging or releasing the breaker is owner-only (`POST /api/breaker/engage`, `POST /api/breaker/release`).
+
+Engage pauses every agent that is currently running and is not `on_demand`. Agents already paused before engage are skipped and keep their original pause reason. Release resumes only the exact agents the breaker paused and still owns (`PausedTrigger == fleet-breaker`); if an operator manually re-pauses an agent while the breaker is engaged, release leaves it paused. The breaker state is persisted so a crash/restart can still release the same captured set.
+
+Fixes #2953.
+
+## Self-reported issues
+
+When a hive notices an unusual error in itself — a restart storm, repeated
+kick failures, a recovered panic, degraded model discovery, inference
+auth failures or advisory post failures — it files an issue on
+`hivecommons/hive` titled `[selfreport] <class>: <short message>`, or adds
+itself to an open issue that already describes the problem (fingerprint
+match, `hive/selfreport` + class match, or keyword match on a human-filed
+issue). Joining posts one "Also seen on **<hive>**" comment per 24h and
+bumps the `Affected hives (N)` block in the body, where each hive has its own
+line — `- <hive> (instance <id>) — owner(s): @login — seen N, last <time>` —
+naming the GitHub login(s) of the hive owner (`dashboard.authorized_users`
+owner-role entries plus the device-flow operator) so a maintainer can see who
+is affected. Each report also names the repositories the hive watches
+(`project.repos`) and their owners, and the body block keeps an
+`Affected repos (N)` / `Affected repo owners (N)` union across reporting
+hives (hivecommons/hive#12338). Every selfreport carries
+`origin/selfreport` (the provenance axis every hive-created issue records,
+see [labels-and-control-signals.md](../labels-and-control-signals/reference.md#origin-sources))
+next to the deprecated `hive/selfreport`.
+
+```yaml
+governor:
+  fleet_report:
+    enabled: true            # unset = on for hub-managed hives, off (dry-run) for self-hosted
+    repo: hivecommons/hive
+    max_per_day: 5
+    include_repos: true      # false: never name project.repos / repo owners (set this if any watched repo is private)
+    include_owners: true     # false: render "(anonymous)" instead of the hive owner's GitHub login(s)
+```
+
+Rate limits: `max_per_day` new issues per hive per 24h, at least 1h between
+new filings of different classes, no re-filing of a fingerprint closed
+upstream while the hive keeps observing the condition (7-day cooldown from
+the last observation), deferred while the GitHub API budget is not normal. Issues
+are never auto-closed; the hive posts one "cleared" comment when the
+condition stops. Hub-managed hives that cannot write to the report repo relay
+through the hub (`POST /api/selfreport/ingest`, heartbeat bearer). The
+dashboard shows "Self-reports: N open (last: <class> → #NNN)" in the Fleet
+Report panel and the toggle/repo/cap under Settings → Governor →
+"Self-Reported Issues". Full details: [fleet-report.md](../fleet-report.md).
+
+## Agent CLI session recycling
+
+Each agent's CLI (Copilot, Claude, …) is a long-lived Node/V8 process whose
+heap grows with every turn and never shrinks while idle. The health tick
+samples the resident memory of the whole process tree under each agent's
+tmux pane and recycles a session that is over budget — but only while the
+agent is idle at its input prompt with no kick pending, so a turn is never
+interrupted. A recycle is an ordinary restart (`last_restart_reason: session
+recycle`): claims, queues and the kick log are preserved exactly as on any
+other restart, and the governor re-kicks on the next cadence. After a recycle
+the same agent is left alone for ten minutes even if it is over budget again.
+
+```yaml
+agents:
+  session_recycle:        # fleet default; on unless enabled: false
+    max_rss_mb: 1536      # recycle an idle session whose process tree exceeds this (MiB)
+    max_age: 6h           # …or whose CLI session is older than this
+    min_idle: 2m          # pane + transcript must be silent this long first
+  scanner:
+    session_recycle:      # optional per-agent override; absent fields inherit the fleet value
+      max_rss_mb: 2048
+```
+
+The sampled value is shown as **Session RSS** (with the session age and a
+`↻N` recycle count) in the agent detail panel. The log line is
+`agent session recycled` with `rss_mb`, `age` and `reason`.
+
+## Agent CLI memory
+
+Each subscription CLI keeps a private cross-session memory in the agent's
+home (Claude Code `~/.claude/projects/*/memory/`, Codex `$CODEX_HOME/memories*/`,
+Gemini `~/.gemini/GEMINI.md`; Copilot memory is server-side). The
+`agents.cli_memory` block, overridable per agent, decides what happens to it;
+the full table is in
+[agent-configuration.md](../agent-configuration.md#cli-auto-memory-agentscli_memory).
+
+```yaml
+agents:
+  cli_memory:                  # fleet default; each key may be overridden per agent
+    auto_memory: false         # pin the vendor auto-memory switch off (default)
+    clear_on_kick: false       # wipe the agent's memory stores before every non-resume kick
+    drain_to_knowledge: false  # first convert each memory fact into a draft knowledge entry
+    drain_on_write: false      # also drain a Claude memory file as soon as it is written
+  scanner:
+    cli_memory:
+      auto_memory: true        # this agent may take notes…
+      drain_to_knowledge: true # …which become drafts in bead-synth-wiki at the next kick
+      clear_on_kick: true      # …and the private store is then emptied
+```
+
+| Key | Default | Effect |
+|---|---|---|
+| `auto_memory` | `false` | Pins Claude Code (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), Codex (`[features] memories = false`) and Copilot CLI (`"memory": false`) auto-memory off at launch; `true` pins it on. |
+| `clear_on_kick` | `false` | Removes the agent's own memory stores before each non-resume kick; shared homes (`HIVE_SHARED_AGENT_HOME=1`, uid 0) are never touched. |
+| `drain_to_knowledge` | `false` | Before the wipe, writes every memory bullet or paragraph as a `state: draft` entry into the `bead-synth-wiki` vault (`knowledge.bead_synthesizer.vault_path`), tagged `cli-memory`, `agent:<name>`, `cli:<name>` and `repo:<org/repo>` when derivable, deduplicated by content hash; a duplicate only gains the draining agent's `agent:<name>` tag and keeps its state. Drafts are excluded from kicks until approved. |
+| `drain_on_write` | `false` | Needs `drain_to_knowledge`. Also drains a Claude Code memory file as soon as the session writes it, through a `PostToolUse` hook on `Write\|Edit\|MultiEdit`, for long-lived sessions that rarely end. |
+
+For Claude Code, `drain_to_knowledge` also seeds a `SessionEnd` hook, and
+`drain_on_write` a `PostToolUse` hook (matcher `Write|Edit|MultiEdit`), into
+the Claude settings Hive manages: the shared `/data/home/.claude/settings.json`
+for interactive agents and both settings files of inference agents. Each runs
+`hive memory-drain --cli claude --agent "$HIVE_AGENT"`, which asks the hive to
+drain that session's project memory into drafts and empty the files whose
+every fact is stored. The hook always exits 0 and waits at most 10 seconds;
+on a write outside `~/.claude/projects/*/memory/` it exits at once. Your own
+`hooks` entries are kept; turning the keys off removes only Hive's entry.
+Each request is audited as `cli_memory_drain_requested`.
+
+The drain logs one line per kick that found a store:
+`cli-memory: drained N facts from <agent> into bead-synth-wiki (dupes K, spooled S)`
+with `drained`, `dupes`, `skipped` (over the 200-facts-per-drain cap),
+`spooled` and `sources`. A memory file whose facts did not all reach the vault
+(cap hit, vault unwritable) is copied to
+`/data/knowledge/auto-memory-spool/<agent>/` before `clear_on_kick` wipes the
+store, retried first on the agent's next drain, and deleted from the spool
+once every fact in it is stored. Review drafts in the dashboard's
+knowledge view or the vault directory and approve them through the normal
+lifecycle (`PUT /api/knowledge/entry/{id}/state`); nothing promotes them
+automatically.
+
+A drained draft reaches no agent while it is a draft, even for an agent whose
+`knowledge.agent_scopes` entry (or the primer's `include_states`) admits
+drafts: the kick primer, the knowledge advisor and every `?agent=` TOC, entry
+and effective read skip it, and the curator's auto-promotion never selects
+it. Review it under **🧠 Auto-memory drafts** in the dashboard's knowledge
+view, where an owner can **Approve** (primed from the next kick) or
+**Discard** (deprecated, never re-drafted); see
+[Auto-memory drafts](../knowledge-lifecycle.md#auto-memory-drafts).
+
+The shared `/data/home/.claude/projects/*/memory` store that predates
+per-agent CLI homes is not drained at kick time. Drain it once with
+`hivectl knowledge drain-memory --legacy` (owner-only, audited as
+`knowledge_drain_legacy_memory`): its facts become drafts tagged
+`agent:shared`, and the files stay as they are unless `--truncate` is given,
+which empties only files whose every fact is now in the vault. The
+`bead-synth-wiki` vault must be connected (bead stores configured or
+`drain_to_knowledge` on); otherwise the call returns 409.
+
+## GitHub API quota
+
+Agents reach `api.github.com` through the Hive GitHub proxy, which injects the
+agent-scoped App installation token and records charged requests. The App
+installation quota is shared with the daemon's scan, merge, and maintenance
+loops, so the proxy enforces two safeguards:
+
+- `agents.github_api_hourly_cap` (default `300`) limits each agent to that many
+  charged GitHub API responses in a sliding one-hour window. A charged response
+  is any proxied response other than `304 Not Modified`; the proxy's own token
+  minting is not agent-attributed and is not counted. Set the value to `0` to
+  disable the fleet default, or set `agents.<name>.github_api_hourly_cap` to
+  override one agent (`0` disables that agent's cap).
+  The override applies whether or not the fleet key is set. A replica
+  (`reviewer-2`, …) or review head takes its base agent's override unless it
+  has one of its own. The order is the agent's own value, then the base
+  agent's, then `agents.github_api_hourly_cap`, then the default of 300. A
+  config reload reaches the proxy without a restart. Both can also be set
+  from the dashboard and the admin MCP; see
+  [Changing the agent caps](#changing-the-agent-caps).
+- `github.agent_reserve_floor` (default `400`) protects the shared core bucket.
+  When the latest rate-limit reading shows `core.remaining` below the floor,
+  agent read requests receive a proxy `429` even if the agent has not
+  reached its personal cap, with its own wording (below). This keeps daemon merge/scan work from being
+  starved by agent polling. Only readings from the hive's own bucket update
+  that snapshot: responses whose `X-RateLimit-Limit` is 60 (GitHub's per-IP
+  unauthenticated bucket, e.g. an agent's `gh` call without a token) or whose
+  limit differs from the daemon's are ignored, so they cannot trip the floor
+  or the API budget mode. App-JWT responses (installation-token mints and
+  installation discovery) are ignored too, because they describe the App's
+  own bucket. Readings are kept per rate-limit window, the
+  `X-RateLimit-Reset` they carry. When the daemon's responses report two
+  windows at once, the snapshot takes the lower `remaining` of the windows
+  reported in the last five minutes. The dashboard's GitHub API card
+  (`ghRateLimits.core`, including its `observed_at`) and the API budget
+  mode follow that window, not the process's first `GET /rate_limit`
+  reading after a restart.
+
+- `github.etag_cache_max_mb` (default `128`, env `HIVE_GITHUB_ETAG_CACHE_MAX_MB`)
+  and `github.etag_cache_max_entries` (default `8192`) bound the shared
+  conditional-request cache that turns repeat `GET`s into free `304`s. When it
+  is full, every new store evicts a body some poller is about to revalidate,
+  and that poll is charged again. The **ETag cache** row under Debug → GitHub
+  API budget (and `etag_cache.bytes` / `max_bytes` in `/api/gh-rate-limits`)
+  shows the fill level; raising the cap from Settings → Forge App applies at
+  once. Bodies are stored gzip-compressed, so the cap is several times its
+  size in raw JSON.
+
+### Hub bearer validation and exhausted user tokens
+
+The hub validates a `Bearer` token it has not seen before with one
+`GET /user` **using that token**, then caches the login for 5 minutes. A token
+GitHub rejects (401, or 403/429 with `X-RateLimit-Remaining: 0`) is now also
+remembered: for 60 s by default, or until the token's `X-RateLimit-Reset`
+(capped at 15 minutes) when it is rate-limited. Without that negative entry a
+client retrying with an exhausted token made the hub re-probe GitHub on every
+request, charging the token owner's own core bucket while it was already at
+zero. The probe is recorded in `/api/gh-rate-limits` under caller
+`agent:hub-bearer-validate`, so a flood of 401s from one dead token is visible
+on the hub admin page; being a pass-through credential it never updates the
+hub's own core-bucket snapshot.
+
+### Keep personal tokens out of cluster secrets
+
+GitHub's 5,000 req/h core limit is **per user**, shared by every PAT and
+OAuth token (`gho_…`, `ghp_…`, `github_pat_…`) that user owns, from every
+host. A `gh auth token` pasted into a cluster secret therefore shares its
+owner's bucket with their laptop `gh`, the hub's bearer validation of that
+user, and any other service holding a copy. The hub itself authenticates as
+the GitHub App (`HIVE_HUB_GITHUB_APP_ID` / `HIVE_HUB_GITHUB_INSTALLATION_ID` /
+`HIVE_HUB_GITHUB_APP_KEY_FILE`, see [env-vars.md](../env-vars.md)) and uses
+`HIVE_HUB_GITHUB_TOKEN` only as a fallback, logging a startup `WARN` naming the
+identity it ended up with. Audit the rest of the fleet the same way:
+
+1. **Find copies.** For every cluster context, compare the first 8 characters
+   of each GitHub-looking secret value and `/data/gh-user-token` file against
+   the owner's token (`kubectl get secret -A -o json`, decode, never print the
+   full value). Known holders in a hive deployment are the Actions Runner
+   Controller (`gha-runner-scale-set`) `githubConfigSecret`, its generated
+   `*-listener-config` secret, and any sidecar that scrapes GitHub (dibs).
+2. **Move ARC to App auth.** The runner scale-set listener long-polls the
+   Actions broker and acknowledges every message; with a PAT those calls are
+   charged to the PAT owner (~3,000 req/h at 350 ephemeral runners/h). Grant
+   the GitHub App repository **Administration: read & write** (or organization
+   **Self-hosted runners: read & write** for an org-level runner group),
+   then replace the `githubConfigSecret` keys `github_token` with
+   `github_app_id`, `github_app_installation_id` and
+   `github_app_private_key` (the same PEM mounted on the hub as
+   `hive-hub-github-app-key`), and delete the listener pod so the controller
+   regenerates its `*-listener-config` from the new secret. App traffic lands
+   in the installation's own 15,000 req/h bucket.
+3. **Remove the PAT from the hub.** With the three App variables set, unset
+   `HIVE_HUB_GITHUB_TOKEN` on `deploy/hive-hub`; the startup log then reads
+   `hub GitHub API identity selected mode=app` instead of the `WARN`, and
+   `GET /api/gh-rate-limits` reports the App installation's `core.limit`.
+4. **Rotate.** Once no cluster holds it, revoke the leaked user token
+   (`gh auth refresh` mints a new `gho_`), so stale copies fail closed rather
+   than silently sharing the bucket again.
+
+The proxy returns JSON shaped for the GitHub CLI. For the agent's own hourly
+cap:
+
+```json
+{"message":"hive: agent GitHub API hourly cap reached (N/cap); stop polling and continue with local work","documentation_url":"…docs/operator-reference.md#github-api-quota"}
+```
+
+For the reserve floor, the message says the shared budget is low rather than
+that the agent hit its cap, and gives the time the shared bucket resets:
+
+```json
+{"message":"hive: the hive's shared GitHub API budget is low (N left, reserve floor F); this is not this agent's own cap. GitHub API reads are paused until <reset, RFC 3339 UTC> (Retry-After Ss), and git fetch or clone may be too; try again then and continue with local work meanwhile","documentation_url":"…docs/operator-reference.md#github-api-quota"}
+```
+
+Git fetch and clone travel over `github.com`, which the proxy tunnels without
+looking inside by default, so the floor does not reach them. When it
+intercepts `github.com` (`HIVE_PROXY_INJECT_GH_AUTH=true`, or a lane under
+`write_surface.enforce`), it counts `info/refs` and `git-upload-pack` as reads
+and refuses them below the floor too; hence "may be".
+
+It also sets `Retry-After` to when the one-hour window (or observed reset) can
+make progress, logs once at 80% of each agent window, and sends one nudge per
+agent window. The cap nudge tells the agent to stop GitHub reads for the
+session. The reserve nudge tells it to pause GitHub reads until the reset time,
+carry on with local work, and not end the task over it. Both refusals log
+`agent GitHub API hourly cap reached`, told apart by the `reason` field
+(`cap` or `reserve`). Hive-authored write relays are not
+agent-attributed and are not capped by this path.
+
+Open-PR scans use `github.graphql_pr_batch` by default to move mergeability,
+review-decision, linked-issue and CI-rollup reads into GitHub's separate
+GraphQL bucket. `/api/gh-rate-limits` reports these calls as caller
+`hive:pr_batch` on endpoint `/graphql` and exposes `graphql_pr_batch` counters
+for repositories, PRs, pages, REST fallbacks, errors, and the last GraphQL
+query cost. Per-PR REST reads still happen when the batch is disabled, a repo's
+GraphQL query fails, or GitHub returns `mergeable: UNKNOWN` for that PR.
+
+### API budget pacing
+
+`governor.api_budget_pacing` (default `false`) makes the hive spread its own
+GitHub calls over the rate-limit window. Without it the loops run at their
+configured speed until the budget is nearly gone. A polling hive with many
+repositories can spend an hour's calls in the first half of the hour and then
+make no GitHub calls at all until the reset, which stops reviews, merges,
+hand-offs and fix dispatches for that time. The
+[API budget modes](sweeps-and-operations.md#github-api-budget-governor)
+only react once few calls are left (800 by default), which is too late to
+help.
+
+**The rule.** Each time the governor loop recomputes its interval it reads
+three things: the hive's own charged core calls per minute over the last 10
+minutes (the burn rate), the calls left in the core bucket, and the time until
+the window resets.
+
+- If, at that rate, the calls left above the reserve (`github.api_reserve`,
+  default `800`) would last until the reset, nothing changes.
+- If they would run out first, the loop interval is multiplied by
+  `rate × minutes to the reset ÷ (calls left − reserve)`. A hive using 200
+  calls a minute with 7,000 calls and 60 minutes left gets
+  `200 × 60 ÷ 6,200 = 1.94`: a 120-second loop runs every 233 seconds and the
+  budget lasts the hour.
+- The interval never goes past `governor.eval_interval_max_s` (default
+  `1800`), and never past the reset itself: a stretched loop's next cycle
+  lands just after the reset, when the budget is full again.
+
+**It only ever slows the loop down.** The paced interval is compared with the
+interval the loop would use anyway (the API budget mode stretch and the
+webhook interval), and the longer one wins. With the setting off nothing is
+measured and the interval is exactly what it was before.
+
+**It does not flap.** A slowed loop spends less, so the measured rate falls as
+soon as pacing works. The rule therefore works on the rate the loop would have
+at its usual speed: the measured rate multiplied by the stretch in effect
+while it was measured. For 10 minutes after the factor changes the measurement
+still mixes two speeds, so the earlier estimate is kept. A held factor is then
+kept until one of these happens:
+
+- the factor the rule asks for differs from it by more than 25% (it is
+  re-sized);
+- the factor the rule asks for is 0.8 or lower, which means the usual speed
+  would fit with a 20% margin (the stretch is released);
+- a new rate-limit window starts (the factor is sized again for it).
+
+Each change is logged once at INFO as `github api budget pacing changed`, with
+`remaining`, `reset_in_s`, `burn_per_min`, `factor`, `unpaced_interval_s`,
+`effective_interval_s` and `reason`. It is not logged every cycle.
+
+**When there is nothing to go on, it does not pace.** That is: no rate-limit
+reading from the hive's own responses yet, less than 5 minutes of recorded
+calls (a fresh start), or a reset time that has already passed.
+
+**Early wakes still run at once.** A verified webhook delivery, a review
+verdict or a continuous re-kick wakes an eval cycle as before; pacing does not
+delay or drop it. The paced interval only sets when the next *scheduled* cycle
+runs. On a hive whose work is mostly webhook-driven, pacing therefore has
+little to slow down.
+
+**What is paced.**
+
+| Loop                                    | Usual cadence              | Paced                   |
+| --------------------------------------- | -------------------------- | ----------------------- |
+| Governor eval loop and every step in it | `governor.eval_interval_s` | Yes                     |
+| Steps a status publish starts           | once per eval cycle        | Yes, with the eval loop |
+| Periodic sweep workers                  | each sweep's own interval  | Yes, by the same ratio  |
+
+The steps a status publish starts are the closed-item sweep and the
+review-question auto-decide; each also keeps its own minimum gap.
+
+The sweep workers are `automerge`, `supersession`, `duplicate_fix`,
+`shared_ci_rerun`, `red_main`, `shared_ci_issues`, `blocked_issues`,
+`task_list`, `duplicate`, `issue_unpark`, `closed_issue_stage`,
+`clarity_resume`, `prior_art_resume`, `sentinel`, `legacy_fleet_report`,
+`good_first_issue`, `first_timer`, `rfc_existing`, `rfc_notify` and
+`code_scanning`. Each sweep's interval (30 seconds to 1 hour) is multiplied by
+the same ratio as the eval loop, up to `governor.eval_interval_max_s`; a sweep
+that is already slower than that keeps its interval. Their stretch ends the
+moment the window resets, without waiting for the next eval cycle.
+
+**What is not paced.** These run on their own timers and are left alone. Most
+already follow the API budget mode, the reserve floor or the rate-limit pacing
+priority. Their calls still count: they lower the calls left, so the paced
+loops slow down further to make room for them.
+
+| Not paced                                                    | Usual cadence                                         |
+| ------------------------------------------------------------ | ----------------------------------------------------- |
+| ForgeState reconcile                                         | `forgestate.reconcile_interval_s`, default 15 minutes |
+| Automerge lanes (self-authored, trusted author, contributor) | every 5 minutes, plus webhook-triggered passes        |
+| Metrics collector, fleet-stats collector                     | 5 minutes, 30 minutes                                 |
+| Matrix ingest, mention poller, question auto-close           | 2, 5 and 5 minutes, when enabled                      |
+| Rebase-then-merge follow-through                             | 2 minutes                                             |
+| Contribute hub claim loops                                   | 30 seconds and 5 minutes                              |
+| Compliance posture, bead synthesizer                         | 1 hour each, when enabled                             |
+| Nous artifact mirror                                         | 5 minutes, when enabled                               |
+| Finished-PR accounting, request watchers                     | only when work is queued                              |
+| Webhook-driven re-reads and early eval cycles                | per delivery                                          |
+| Agents' own calls through the proxy                          | the per-agent cap and the reserve floor               |
+| Calls a browser causes                                       | per request                                           |
+
+Pacing changes how often a cycle runs, never what a cycle does. It does not
+change the conserve and critical thresholds or the per-agent caps.
+
+**Turning it on.** Settings → General → *Pace GitHub API calls over the
+rate-limit window*, `governor.api_budget_pacing: true` in `hive.yaml`, or the
+admin MCP's [`governor.general_settings`](../admin-mcp.md#registered-operations)
+operation with `{"api_budget_pacing": true}`. Owner only. The loop reads the
+setting every cycle, so it applies from the next eval cycle without a restart.
+
+**Reading the state.** `/api/status` carries an `api_budget_pacing` block next
+to `evalMode` and `evalIntervalS` (which is already the paced interval), and
+`GET /api/config/governor/general-advanced` carries the same block as
+`api_budget_pacing_state` beside the `api_budget_pacing` setting. The General
+tab shows it under the toggle.
+
+| Field                  | Meaning                                         |
+| ---------------------- | ----------------------------------------------- |
+| `enabled`              | The setting, as the loop last read it.          |
+| `active`               | `true` while a stretch is held.                 |
+| `factor`               | The held stretch; `1` when not pacing.          |
+| `effective_interval_s` | The loop interval after pacing, in seconds.     |
+| `burn_per_min`         | The measured burn rate (see below).             |
+| `reason`               | Why it is or is not stretching, in plain words. |
+
+`burn_per_min` is the hive's own charged core calls per minute over the last
+10 minutes, as measured. Agent calls, `304` answers, and search and GraphQL
+calls are not counted. Right after the setting is saved, and until the loop
+next looks, the general-advanced block shows the saved value with the reason
+`saved; applies from the next eval cycle`.
+
+**Finding out who spends the quota.** The dashboard shows it on the GitHub API
+card and under Debug → GitHub API budget. The admin MCP's `github_api_usage`
+tool returns the same reading in one call: the core bucket, the budget mode,
+the calls that cost the most, the last hour summed per caller, and each
+agent's cap and calls. Reading it spends no core API call. See
+[GitHub API usage](../admin-mcp.md#github-api-usage).
+
+`GET /api/gh-rate-limits` takes two optional parameters for this. `?top=N`
+sets how many `top_consumers` rows come back (default 10, at most 50).
+`?usage=1` adds `by_caller`, `window_totals`, `window_seconds`,
+`top_consumers_total`, `core_reset_in_seconds`, `api_budget_thresholds` and
+`agent_caps`. Without them the payload is what it always was.
+
+### Changing the agent caps
+
+Both caps can be changed without editing `hive.yaml`, which matters on a
+hub-managed spoke where the hub owns that file:
+
+- **Fleet default:** Settings → Forge App → *Agent GitHub API hourly cap*,
+  next to the agent reserve floor. A number sets
+  `agents.github_api_hourly_cap`, `0` removes the cap, and a blank field
+  removes the key so the default (`300`) applies again.
+- **One agent:** the agent's Settings → General tab → *GitHub API hourly cap*.
+  A number sets `agents.<name>.github_api_hourly_cap`, `0` removes the cap for
+  that agent, and a blank field goes back to the fleet default.
+- **Admin MCP:** `agent.github_api_hourly_cap` (`agent`, and `cap` as a number
+  or `inherit`) and `github.agent_api_hourly_cap` (`cap` as a number or
+  `default`), through `write_preview` and `write_confirm`. A preview that
+  raises a cap, removes one, or makes an agent inherit a higher fleet value
+  says so in its `widening_disclosure`. Lowering a cap is not widening.
+
+For example, a reviewer that runs out of calls overnight while the rest of the
+fleet stays at the default:
+
+```yaml
+agents:
+  github_api_hourly_cap: 300
+  reviewer:
+    github_api_hourly_cap: 600
+```
+
+**Which cap applies.** The first of these that is set wins, and `0` at any
+step means no cap:
+
+1. the agent's own `agents.<name>.github_api_hourly_cap`;
+2. for a replica or review head, its base agent's value;
+3. `agents.github_api_hourly_cap`;
+4. the default, `300`.
+
+**Replicas and review heads.** `reviewer-2` and a review head are copies of
+their base agent, rebuilt from it whenever the configuration loads. Set the cap
+on the base agent; the save rebuilds the copies at once, so they follow it
+straight away. Their own General tab shows the cap they inherit, read-only,
+and the endpoint refuses an override on them.
+
+**When it applies.** A save changes the running configuration the proxy reads,
+so the agent's next GitHub API request uses the new cap, with no restart or
+reload. Calls already counted in the current hour still count against it. The
+proxy only counts an agent's calls while it has a cap, so a cap switched on
+starts from an empty window.
+
+**Saving and audit.** The value is saved like any dashboard setting: to
+`hive.yaml`, the dashboard overlay and the runtime copy on the PVC, so it
+survives a restart. The audit log records `config_github` for the fleet value
+and `config_agent_general` for one agent, each with the old and new value.
+
+**The reserve floor still applies.** Every agent spends from the one hourly
+bucket of the App installation, which the daemon's scan, merge and review loops
+share. Raising or removing a cap does not lift `github.agent_reserve_floor`:
+once the bucket drops below the floor, agent reads are refused whatever their
+cap.
+
+**Seeing it.** Debug → GitHub API budget lists each agent's cap, where it comes
+from, and its calls in the current hour (`ghRateLimits.agent_caps` in
+`/api/status`). The admin MCP's `config_effective_read` shows both keys' values
+and each agent's effective cap under `agent_github_api_hourly_caps`.
+
+### Webhook-driven PR cache invalidation
+
+See [GitHub webhooks: cadence, patch and reconcile](../webhooks.md) for the
+cadence keys, the fallback to polling when deliveries degrade, and the
+accuracy guarantees of the ForgeState contract.
+
+A spoke accepts GitHub App webhooks on the public `POST /api/webhook/github`,
+either delivered directly by GitHub or relayed by the hub (the hub forwards the
+original signed body to the hive that manages the repository). The receiver
+fails closed: it accepts a delivery only when `X-Hub-Signature-256` verifies
+against `GITHUB_WEBHOOK_SECRET` (exactly as the hub does), or when the hub's
+relay signature verifies against this hive's own relay key (hosted spokes,
+below). With neither configured it rejects every delivery with 503.
+Deliveries for repositories the hive does not manage are ignored.
+
+#### What the operator configures
+
+1. **Secret (self-hosted only).** Set `GITHUB_WEBHOOK_SECRET` in the spoke's
+   environment (a Secret mount on Kubernetes; never in `hive.yaml`) to the
+   App's webhook secret. A hosted spoke needs nothing here: it never holds the
+   App secret and verifies relays with its hub relay key instead (item 3).
+2. **GitHub App webhook.** Point the App's webhook URL at the hub
+   (`POST /api/github/webhook`) for hosted spokes, or at the spoke's own
+   `/api/webhook/github` for a stand-alone hive (a repository or organization
+   webhook with the same secret works too). Subscribe the App to these events:
+   `pull_request`, `pull_request_review`, `pull_request_review_comment`,
+   `issue_comment`, `issues`, `check_suite`, `check_run`, `status`, `push`,
+   optionally `workflow_job` (Actions: read; lets the CI counts on the
+   activity monitor move from the job payload for Apps that do not surface
+   check runs), and, with `governor.work_source.type: github_projects`, `projects_v2_item`
+   (organization-scoped; see [Work sources](../work-sources.md#type-github_projects--github-projects-projects-v2)).
+3. **Hub relay.** The hub verifies the HMAC and relays the body byte-for-byte,
+   with the original signature and `X-GitHub-Delivery`, to the spoke whose
+   reported dashboard URL manages the repository. For a hosted hive it also
+   adds `X-Hive-Relay-Timestamp` and `X-Hive-Relay-Signature-256`
+   (`sha256=` HMAC-SHA256 over `timestamp.delivery-id.body`) keyed with that
+   hive's own relay key, which the hub mints at provisioning and delivers over
+   the heartbeat (persisted on the spoke as `/data/webhook-relay.key`). The
+   spoke rejects a relay whose signature does not verify, whose timestamp is
+   more than 5 minutes off, or whose delivery ID it already accepted.
+   Nothing to configure.
+4. **Pacing (optional).** `governor.eval_interval_webhook_s` (default `900`)
+   is the base tick while webhooks are healthy; `governor.webhook_wake_debounce_s`
+   (default `10`) and `governor.webhook_wake_min_gap_s` (default `30`) pace the
+   early cycles described below. `review.event_driven` additionally lets
+   `pull_request` deliveries dispatch reviews early.
+
+Verify: `/api/status.webhooks.events_1h` climbs after a push or comment,
+`/api/status.evalMode` reads `webhook`, and the spoke log shows
+`github webhook wake: running an early eval cycle` with the delivery's reason.
+
+Through the hub, every enrolled hive that tracks the delivery's repository
+and has a dashboard URL receives the relay, so multiple hives (for example
+v5 and v6 spokes) tracking one repo all stay on webhook mode.
+
+#### What a delivery does
+
+- `pull_request`, `pull_request_review`, `pull_request_review_comment`,
+  `check_suite`, `check_run`, `workflow_job`, `status`, `issue_comment` (on
+  PRs only) and `push` invalidate the cached PR detail and the GraphQL batch
+  check-run/review entries for the affected PR and mark it dirty. Check and
+  status events are matched by PR number and head SHA (fork PRs arrive
+  without a PR list); `push` invalidates every open PR whose base or head
+  branch is the pushed branch. `issues` `opened`/`labeled`/`unlabeled`
+  mark the issue dirty and wake evaluation; `reopened` wakes evaluation too.
+  To select the scanner for newly seen actionable issues, configure a
+  top-level [CEL trigger](../cel-triggers.md#run-the-scanner-for-newly-seen-github-issues)
+  matching `event.kind == "issue.opened"`. Agent Channels is not a webhook
+  installer and only supports the governor `kick` runtime.
+- `pull_request` `opened`/`synchronize`/`reopened` also hands the PR to the
+  [sentinel](sweeps-and-operations.md#suspicious-activity-alerts-sentinel), which evaluates it now
+  instead of waiting for its reconcile cadence
+  ([#13379](https://github.com/hivecommons/hive/issues/13379)).
+- `projects_v2_item` (`created`/`edited`/`deleted`/`reordered`/`archived`/
+  `restored`/`converted`) patches the GitHub Projects work-source cache: the
+  delivery names the item and its project, the hive re-reads that one item
+  (one GraphQL call) and upserts it, or drops it on `deleted`/archived. The
+  payload carries no repository, so the spoke receiver routes it ahead of the
+  repository-keyed events and the response carries `projects_patch`. The hub
+  relay forwards repository-keyed deliveries only, so a hosted spoke using a
+  Projects board needs the organization webhook pointed at its own
+  `/api/webhook/github` for this event.
+- **Every invalidating delivery wakes the governor loop.** The wake is
+  debounced for `governor.webhook_wake_debounce_s` so a push and its check
+  fan-out coalesce into one cycle, and webhook-triggered cycles are at least
+  `governor.webhook_wake_min_gap_s` apart so a delivery storm stretches the
+  batch instead of spinning cycles. **The wake cycle does not re-list
+  repositories.** It plans from the governor's cached actionable snapshot
+  (the one the last cadence tick enumerated, patched by the targeted
+  re-reads described below), so a wake costs the targeted re-read plus the
+  dirty-PR detail refreshes and nothing else: repositories with no dirty PR
+  reuse their previous GraphQL PR batch (`graphql_pr_batch.webhook_skips`),
+  clean PRs are served from the PR detail cache past
+  `github.pr_detail_ttl_s`, and only the dirty PRs are re-read. The log line
+  is `github webhook wake: running an early eval cycle` (`reason`,
+  `deliveries`, `coalesced`, `source=cached`), followed by
+  `eval cycle planning from cached snapshot`.
+- Webhooks are **healthy** while the last delivery for a managed repository is
+  newer than `2 × governor.eval_interval_s`. The first healthy window puts
+  the loop in **webhook mode**: the governor's base eval interval rises to
+  `governor.eval_interval_webhook_s` (default `900`, capped by
+  `governor.eval_interval_max_s`) — safe because the wakes above carry the
+  latency — and `/api/status.evalMode` reads `webhook`,
+  `/api/status.webhooks.mode` reads `webhook`. The API budget stretch still
+  applies; the larger interval wins.
+- **Fallback to polling** ([webhooks.md](../webhooks.md#fallback-when-webhooks-degrade)).
+  Webhook mode degrades when the window lapses *while GitHub was active*
+  (a cadence pass listed an item updated after the newest delivery) or when
+  deliveries reach the receiver but fail verification; a quiet repository
+  with no deliveries and no activity keeps the stretched tick. The loop
+  re-checks as the window closes (not just at the next stretched tick),
+  resets its ticker to `governor.eval_interval_s`, logs one INFO
+  `webhooks degraded; polling cadence restored` (with `reason`), and
+  `evalMode` reads `poll`, `webhooks.mode` reads `polling` with `since` and
+  `mode_reason`. The way back has hysteresis: deliveries must keep arriving
+  for `2` consecutive healthy windows (`webhooks.healthy_windows` counts
+  them) before one INFO `webhooks healthy; webhook cadence engaged` restores
+  the webhook cadence.
+- `pull_request` `opened`, `reopened`, `synchronize`, `ready_for_review` and
+  `review_requested` deliveries also queue an early review dispatch when
+  `review.event_driven` is on; see
+  [Event-driven dispatch](../review-swarm.md#event-driven-dispatch).
+- **A failed check reacts within seconds, not at the next sweep.** A
+  `check_run` (`completed`, conclusion `failure`/`timed_out`), `check_suite`
+  (`failure`/`timed_out`) or `status` (`failure`/`error`) delivery is
+  resolved to the open PR(s) at that head from the PR detail cache — one
+  cached lookup, no extra `GET /pulls` fan-out; a head no cached PR matches
+  is counted under `/api/status.ci_failure_signals.unmatched` and left to
+  the sweep's dirty mark. Each match becomes a **CI failure signal**
+  `{repo, number, head, check, details_url, at}`, deduplicated per head +
+  check and kept for two hours. A **hive-authored** PR is attributed to the
+  agent whose relay opened it (`agent_pr_created` in the audit log; scanner
+  when unattributed) and that agent is kicked at once with its
+  FIX-BEFORE-NEW section naming the check and the log URL — the same
+  section every regular kick carries, into which the signal is also folded
+  until `ci-failing.json` catches up, so nothing is lost if the kick is
+  gated. A **contributor** PR nudges the automerge lanes for a targeted pass
+  over that PR now (the contributor lane / `stage/072` path), with or
+  without the ForgeState cache. Guards, in this order: `governor.ci_failure_webhook_kick`
+  (default `true`; `false` records signals only), the repo pause
+  (`project.paused_repos`), the agent's config/runtime pause (the fleet
+  breaker pauses every agent), governor kick eligibility, and one
+  webhook-triggered kick or nudge per PR head per
+  `governor.ci_failure_kick_cooldown_s` (default `600`). The activity log
+  records `ci_failure_kick` — "CI failed on #N (check) — kicked agent X" /
+  "nudged contributor lane". **Agents never watch or poll CI themselves**:
+  detection is out-of-band via this webhook path, or the sweep as fallback.
+- **Gated workflow runs are approved for trusted heads.** GitHub holds
+  workflow runs for dependabot and first-time/fork contributors behind
+  "Approve and run workflows" (`action_required`); such runs create no check
+  runs, so CI never reports. `EnrichCIStatus` detects them on pending heads
+  and the CI caption reads `CI waiting · N workflow runs need approval on
+  GitHub`. Right after it, the eval cycle runs the workflow-approval sweep,
+  which approves a head's gated `pull_request` runs **at most once per PR
+  head** ([#16603](https://github.com/hivecommons/hive/issues/16603)) when
+  the head is trusted: a person admitted **this head** (a verified owner's
+  or merger's dashboard Approve, recorded on the stage record and dropped
+  by the next push — [#15136](https://github.com/hivecommons/hive/issues/15136);
+  the automerge label on its own never counts, since it is bound to no head
+  and names no approver), or the PR author or the run's triggering actor is
+  this hive's App or is listed in `governor.ci.auto_approve_workflow_actors`
+  (default `['dependabot[bot]', 'renovate[bot]']`; an explicit `[]` trusts
+  only the App and owner admission). A trusted **author** covers every
+  gated run on the head regardless of who pushed it — including commits a
+  fork collaborator pushed to the author's branch — so keep the actor list
+  to bot logins unless that is acceptable for a human login you add.
+  Trusting the App as triggering actor
+  covers heads the App pushed itself (its own PRs, rebases, review-fix
+  commits), and only when the run's head repository is the PR's base
+  repository: a fork head is never trusted on the triggering-actor path,
+  because a public App installed on a contributor's fork pushes with the
+  same `<slug>[bot]` login. Runs
+  of other events (for example
+  `pull_request_target`) are counted in the caption but never approved.
+  Guards: `governor.ci.auto_approve_workflows` (default `true` — unset
+  means on; `false` leaves the gate to a person), the repo pause, hold /
+  exempt / sentinel labels, a fresh `GET /pulls/N` (open, non-draft, same
+  head, author, labels) before any write, a head-repository match on every
+  run, and the write-back gate (`ci_rerun`). Approval starts CI only;
+  review, hold and merge gates are unchanged. **The sweep does not run on
+  every cycle:** it is an optional enrichment step, so it is skipped
+  whenever the API-budget decision sets `SkipOptional` — `conserve` and
+  `critical` budget modes, off-cadence cycles under
+  `governor.optional_sweep_every_n_cycles`, and cached-snapshot (webhook
+  wake) cycles — and a gated head then waits for the next cycle that runs
+  it. `EnrichCIStatus` still runs on those cycles, so the gate stays
+  visible. A `403`/`404` from `POST /actions/runs/{id}/approve` (the App
+  lacks `actions: write`) is recorded once, never retried for that head,
+  logged as `workflow approval refused; needs workflow approval on GitHub`,
+  and the caption becomes `CI waiting · needs workflow approval on GitHub`
+  on every later cycle, including ones that skip the sweep. Any other
+  failure of that POST — a `5xx`, a network error, a cancelled cycle, or a
+  primary/secondary rate-limit `403` — is logged as `failed to approve
+  gated workflow run; retrying next sweep` and gives the head's pass back,
+  so the next sweep re-reads the PR and tries again (denials are not
+  counted twice). That refusal
+  is bound to the head: granting the App **Actions: Read and write**
+  afterwards does not make the hive retry a head it already recorded a
+  refusal for — the operator approves that run on GitHub, or a new push to
+  the PR (a new head) or a hive restart (the ledger is in memory) lets the
+  sweep attempt it again. The sweep uses
+  the App token, so it needs **Actions: Read and write** on the App
+  ([github-app-setup.md](../github-app-setup.md)); it runs alongside the
+  older `/ok-to-test` path, in which the contributor lane posts a comment
+  and the repository's own `hive-ok-to-test` workflow approves with its
+  `GITHUB_TOKEN` — operators who want to stay on Actions: Read and that
+  path alone set `governor.ci.auto_approve_workflows: false`. Each approved
+  run logs one `approved gated workflow run` INFO line; counts since boot
+  are at `/api/status` `workflow_approvals` (`approved`, `denied`,
+  `permission_errors`, `last`). Approved runs execute the head's workflow
+  files on the repository's runners; operators on self-hosted runners who
+  want an explicit opt-in should set `governor.ci.auto_approve_workflows:
+  false`.
+- **A recorded review verdict also wakes the governor loop.** When the
+  relay records a verdict bound to a review dispatch, the head that wrote it
+  is free and the PR may be ready for its next head or its decision kick, so
+  the loop runs a cached-snapshot cycle now instead of waiting for an
+  unrelated delivery or `governor.eval_interval_webhook_s`. Advisory verdicts
+  do not wake it. The first verdict wakes at once; later ones inside
+  `governor.webhook_wake_min_gap_s` fold into one wake at the end of the gap.
+  `governor.webhook_wake_debounce_s` does not apply to this wake (its
+  debounce is fixed at 0, so a verdict is never held back), and the spoke logs `review verdict wake: running an early eval cycle from
+  the cached snapshot`
+  ([#14705](https://github.com/hivecommons/hive/issues/14705)).
+- Every status publish (cadence or wake) invalidates the `/api/stage-tracker`
+  cache and sends a `stage-tracker` event on `/api/events`, so the dashboard's
+  activity monitor refetches at once instead of waiting out
+  `dashboard.stage_tracker.cache_ttl_s` plus its poll. Invalidation only
+  marks the cached body stale: the publish, and every webhook below, returns
+  at once even while a tracker rebuild is running. The next poll starts
+  **one** rebuild outside any lock; polls that land during it get the
+  previous body with `source: stale` and `max-age=0` rather than queueing,
+  so a slow build (one sentinel evidence read per open PR, on NFS in hosted
+  hives) can never back up webhook handlers, the governor's publish, or an
+  unbounded line of dashboard requests (hivecommons/hive#14681).
+- **The activity monitor row moves without waiting for a cycle.** A delivery
+  that names a PR or issue this hive tracks (`pull_request*`,
+  `check_suite`/`check_run`, `status`, `push` to a PR branch, `issue_comment`,
+  `issues` — any action) also drops the `/api/stage-tracker` cache at once
+  and queues a **targeted re-read of just that item**: one `GET` of the PR
+  or issue, debounced by `dashboard.stage_tracker.webhook_refresh_debounce_ms`
+  (default `2000`) and coalesced per item. The re-read patches that row of
+  the status snapshot in place — labels, title, draft flag, last activity;
+  a closed or merged item leaves — then drops the tracker cache again and
+  sends the `stage-tracker` SSE nudge. The same re-read is handed to the
+  governor, which upserts the item into its cached actionable snapshot —
+  a new issue or PR appears, a closed or merged one leaves, a label change
+  moves it between the actionable / held / sidelined buckets — so the wake
+  cycle that follows plans against the patched item. No repository is
+  re-enumerated. The read goes through the paced REST transport and is
+  skipped outright while the API budget is `critical`; it refreshes the PR
+  detail cache, so the following cycle does not pay for it again. The
+  re-read is also remembered for
+  `dashboard.stage_tracker.webhook_refresh_replay_window_s` (default
+  `1800`) and re-applied to every status snapshot published meanwhile: an
+  eval cycle that enumerated the item *before* the close still publishes
+  from that enumeration minutes later, and without the replay its publish
+  put the closed row back until the next full enumeration.
+  `dashboard.stage_tracker.webhook_refresh: false` turns the re-read off
+  (deliveries then still invalidate caches and wake the loop, and wake
+  cycles fall back to a full enumeration because nothing else patches the
+  snapshot). Independently of the re-read, the one payload fact the tracker
+  trusts without a confirming read is a closed or merged `state` on the
+  issue or pull request the delivery embeds: on *any* action (`labeled`,
+  `unlabeled`, `created`, not only `closed`) that row leaves at once, so a
+  refused or failed re-read cannot leave a closed item listed open. As a
+  backstop for deliveries that never arrived, on each status publish it
+  also lists each repo's items closed since its last look every
+  `dashboard.stage_tracker.closed_sweep_interval_s` (default `300`; one
+  list call per repo; negative disables) and evicts any still shown.
+- **CI counts on the activity monitor move from the check payload.** A
+  `check_run`, `workflow_job` or `status` delivery is applied directly into
+  the per-head check set the tracker's CI chevron counts (`CI 7/11`): the
+  named check is upserted by run id (or check name and producing App), a
+  newer run replaces an older one, and the row is pushed over the
+  `stage-tracker` SSE nudge without any GitHub request — a fan-out of
+  twenty `check_run` deliveries costs zero requests. The payload-only
+  `check_run`/`status` delivery no longer queues the PR re-read above.
+  When no check-run listing exists yet for that head (first delivery after
+  a push, or a sidelined PR the eval cycle never enriched) one coalesced
+  listing of the head's check runs is scheduled instead (debounced by the
+  same `webhook_refresh_debounce_ms`), so the required-check set and the
+  `pass/total` denominator are right from the first row. The polling
+  path's `EnrichCIStatus` still refreshes every actionable PR each cycle
+  and is the backstop for spokes without webhooks.
+  `/api/status.webhooks.last_ci_event_at`, `ci_events_1h`,
+  `ci_events_applied_1h` and `ci_refetches_1h` show whether check
+  deliveries actually arrive and how many were served from the payload.
+
+#### Polling cadence vs webhook patch vs reconcile
+
+The full model — the three writers, the accuracy guarantees of #13373, every
+cadence key with its default, and the webhook-outage fallback — is
+[webhooks.md](../webhooks.md). In brief: inbound webhooks cost nothing against
+the GitHub rate limit; outbound API calls do. The governor therefore keeps three distinct paths and never lets a
+delivery trigger a full re-list:
+
+| Path | Trigger | GitHub cost | What it does |
+| --- | --- | --- | --- |
+| **Reconcile** | cadence tick — `governor.eval_interval_webhook_s` (default `900`) while webhooks are healthy, `governor.eval_interval_s` otherwise | full: lists issues and PRs for every tracked repo | Authoritative. Rebuilds the actionable snapshot from scratch and **overwrites** every webhook patch. If the pass fails outright (every repo refused: rate limit, 429, 5xx) the previous snapshot — patches included — stays published, marked stale for every repo (`stale_repos`, repo card `countsStale`), and the next tick retries; a repo refused on its own is served from its last-good enumeration the same way. |
+| **Webhook patch** | one delivery naming an issue/PR | one `GET` per item, debounced and coalesced | Upserts, moves or removes that single item in both the activity-monitor row and the governor's cached snapshot. Counted in `/api/status.webhookPatches`. |
+| **Cached cycle** | webhook wake, review wake, continuous-agent wake | dirty-PR detail refreshes only | Runs the governor's decision pass (kicks, automerge, stage moves) from the patched snapshot without listing. `source=cached` in the wake log; counted in `/api/status.cachedCycles`. Before the first reconcile has produced a snapshot a wake enumerates instead. |
+
+Cadence ticks reconcile; webhooks keep the picture current in between. The
+priority order is accuracy of issue/PR state, then latency, then API thrift,
+which fixes four rules for the patch path:
+
+- **The payload is a hint, never state.** A delivery only names the item;
+  the GET decides what the row says. A `closed` delivery whose re-read finds
+  the item open leaves it open.
+- **Upserts are monotonic.** A re-read whose `updated_at` is older than the
+  copy already held (two deliveries' GETs landing out of order) is dropped.
+  Each applied read is recorded in the snapshot's `item_patches` (fetch time,
+  `updated_at`, head SHA, `X-GitHub-Delivery` id) for audit.
+- **Closed/merged removes at once; reopened re-adds** — both after the
+  confirming GET.
+- **Irreversible actions are freshness-bounded.** Before an issue close or a
+  PR merge planned from the snapshot (stage sync, close-on-merge, automerge
+  sweep), the governor refuses outright while that repo's share is stale and
+  otherwise re-reads the item once if its copy is older than 60 s
+  (`DecisionFreshnessBound`), proceeding only if it is still open. Refused
+  actions log `irreversible action deferred` and retry next pass.
+
+Startup runs a full enumeration before the first decision pass; a cold cache
+whose GitHub share failed is published stale, never as "0 items".
+`/api/status.staleSince` (and per-repo `countsStaleSince`) carries the
+stale-as-of time and the Overview shows a `stale · as of HH:MM` badge.
+Raising `eval_interval_webhook_s` lowers list-call volume further at the cost
+of a longer window before a missed delivery is corrected by reconciliation.
+
+##### Reading from the ForgeState cache (`forgestate.enabled: true`)
+
+With the per-repo state cache on (`forgestate:` block in `hive.yaml`,
+default off; [#13373](https://github.com/hivecommons/hive/issues/13373)) the
+governor work source stops listing GitHub on the cadence tick too
+([#13375](https://github.com/hivecommons/hive/issues/13375)). The cache's own
+reconcile loop (`forgestate.reconcile_interval_s`, default `900`, shortened
+to one minute while a repo is stale or its drift is high) is the **only**
+full list; every governor pass — cadence tick, webhook wake, review wake —
+takes each repo's open issues and PRs from the cached snapshot and classifies
+them exactly as before. What changes:
+
+- **Startup gate.** No decision pass runs before every repo has completed
+  its first successful reconcile. The loop logs `forgestate: waiting for the
+  first reconcile before the first decision pass` once a minute while it
+  waits and `first reconcile complete` when it is released. A repo whose
+  cache is not ready in a later pass is served from its last-good
+  enumeration and marked stale, like a transient GitHub refusal.
+- **Stale is inherited.** A repo whose last reconcile failed keeps its
+  last-good items and appears in `stale_repos` with `stale_since` set to the
+  last good reconcile, so the same close/merge guard applies.
+- **Freshness bound before a kick.** Every GitHub ref in an assembled kick
+  goes through the same 60 s bound as close and merge: a copy younger than
+  the bound is kicked as-is, an older one is confirmed with one targeted
+  `GET` (dropped from the kick if it closed or merged meanwhile), and a ref
+  in a stale repo is withheld (`kick ref withheld: snapshot not fresh enough
+  to act on`). A kick whose refs all fail is not sent.
+- **Single-item reads feed the cache.** The webhook patch `GET` and the
+  freshness confirmation `GET` are observed into the cache (as a webhook
+  patch carrying the `X-GitHub-Delivery` id, or as a read-through), and the
+  hive's own label add/remove, issue close and PR merge are written through
+  immediately, so the next pass sees them without waiting for a webhook.
+- **`item_patches` covers every cached item.** With the cache, the pass's
+  `generated_at` says nothing about an item's age, so the fetch time of
+  every item served from the cache is recorded there; the closed attributed
+  PR history scan is reused for one reconcile interval rather than re-run
+  on every wake.
+- **Automerge lanes read the same cache.** The self-authored, trusted-author
+  and contributor-lane sweeps take their open-PR set from the cached
+  snapshot and run event-driven with a 5-minute floor pass; see
+  `hive-merge.md` → "Event-driven sweeps on the ForgeState cache"
+  ([#13377](https://github.com/hivecommons/hive/issues/13377)).
+
+Repos added to the config after boot list live until the next restart
+rebuilds the store with them. Enabling the cache changes no classification:
+only the two list calls per repo move behind it.
+
+##### Rate-limit pacing priority
+
+After a GitHub rate-limit refusal (a secondary-limit 403 or a primary-limit
+reset) the shared transport enters a slow-start caution window and paces
+requests about 2s apart. The window lasts the limit's back-off plus 10
+minutes. A primary refusal backs off until its `X-RateLimit-Reset`. A
+secondary 403 backs off for its `Retry-After` (seconds or an HTTP date), or
+until `X-RateLimit-Reset` when `X-RateLimit-Remaining` is `0`. Otherwise it
+follows GitHub's rule for secondary limits: wait one minute, doubling on each
+repeat within 30 minutes of the last back-off (1m, 2m, 4m, 8m, capped at
+15m). The rest of the burst refused by the same block does not count as a
+repeat. Before this, a header-less secondary 403 assumed a full hour, so one
+search refusal kept the hive pacing for 70 minutes. Pacing is prioritised so
+periodic housekeeping cannot starve the governor:
+
+- the reconcile pass (`EnumerateActionable`) runs **high** priority and is
+  bounded only by its own deadline;
+- ordinary requests may queue at most 30s ahead;
+- housekeeping (self-authored and queued automerge sweeps, the review-request
+  watcher, advisory digest lookups, the dashboard metrics and fleet-stats
+  collectors) runs **low** priority: a request that would queue more than 5s
+  ahead is refused immediately (`github pacing: request shed`) instead of
+  taking a slot, and a tick whose first slot is already further out than the
+  tick could wait is skipped outright (`low-priority work shed`, logged at
+  most once a minute per caller) and retried on its next tick;
+- the self-authored automerge sweep backs its tick off to at least 60s while
+  the window is engaged and resumes its adaptive interval when it ends;
+- once an automerge lane (queued, self-authored, trusted-author, contributor)
+  reaches a candidate PR, that PR's evaluation and merge (the PR read, its
+  status and check-run reads, the merge call) run at **normal** priority, so
+  a green, approved PR is never skipped with `status-check` because its
+  status read was shed. The lanes evaluate one request at a time, so this adds
+  at most one slot to the queue;
+- GitHub App installation-token mints (and the other App-JWT endpoints) do
+  not go through the pacer at all: they are a separate rate-limit bucket, and
+  a mint that queued behind paced traffic failed every request that needed
+  the token.
+
+##### Event-driven readers (ForgeState phase 2d)
+
+- **The review-request watcher runs on events.** The relay that submits
+  `hive-review` requests (`review_request_watcher.go`) no longer polls its
+  drop box every 10 s. A request file drop wakes it through a directory
+  notification, and `issue_comment`, `pull_request_review`,
+  `pull_request_review_comment` and `issues` `labeled`/`unlabeled`
+  deliveries wake it for a pass (`/api/status.webhooks` deliveries report
+  `woke_review_watcher`). While webhooks are healthy the unprompted scan is a
+  five-minute reconcile (`ReviewRequestWebhookFallbackInterval`); when
+  webhooks go stale, or the drop box cannot be watched, the watcher returns
+  to the legacy 10 s poll. A `--revise` request for a repo outside
+  `review.revise_repos` is a policy denial (`.denied`, one WARN), not a
+  retried failure.
+- **The advisory issue is resolved from the ForgeState cache.** When a
+  `forgestate` store is bound to the GitHub client (`forgestate.enabled`,
+  hivecommons/hive#13373), `EnsureAdvisoryIssue` answers from the cache: the
+  memoized advisory issue is read through the cache within its freshness
+  bound (zero GitHub calls on a healthy cycle), a stale or missing cached
+  copy costs one targeted `GET` of that issue, and a closed advisory issue
+  is reopened in place and written through. The search → label list →
+  title-scan path runs only when the cache cannot answer (repo not yet
+  reconciled, or no labelled advisory issue to confirm).
+
+`/api/status` and `/api/gh-rate-limits` expose
+`webhooks: {healthy, last_event_at, events_1h, invalidations_1h,
+targeted_refreshes_1h, tracker_invalidations_1h, rejected_1h,
+last_rejected_at, mode, since, mode_reason, mode_reason_code,
+healthy_windows, verification}` (the middle two count the single-item re-reads and the
+tracker cache drops webhooks caused; `rejected_1h` and `last_rejected_at`
+count deliveries the receiver turned away; `mode` is `webhook` | `polling`
+and `since` when it began; `mode_reason_code` says why it is polling — see
+[webhooks.md](../webhooks.md); `verification` is `github-signed`,
+`relay (hub-signed)` or `none`);
+`/api/status` adds `evalMode` (`webhook` | `poll`), `evalIntervalS`,
+`lastWakeReason`, `lastWakeAt`, `webhookWakes` and the `api_budget_pacing`
+block ([API budget pacing](#api-budget-pacing));
+`graphql_pr_batch.webhook_skips` counts batch queries skipped because nothing
+changed.
+
+```yaml
+governor:
+  eval_interval_s: 300
+  eval_interval_webhook_s: 900
+  webhook_wake_debounce_s: 10
+  webhook_wake_min_gap_s: 30
+dashboard:
+  stage_tracker:
+    webhook_refresh: true          # re-read the PR/issue a delivery names
+    webhook_refresh_debounce_ms: 2000
+    webhook_refresh_replay_window_s: 1800   # re-apply re-reads to snapshots published meanwhile
+    closed_sweep_interval_s: 300   # list items closed since the last look and evict rows still shown; -1 disables
+    waiting_push_stale_h: 4        # hours without a push on a CI / Review row before the pill's age turns muted-amber
+    ci_activity_stale_m: 10        # minutes a CI snapshot may still claim a check running before the head's check runs are re-listed; -1 disables
+    toast_info_s: 15               # how long the tracker's result / waiting-on-you toasts stay (3-120 s); the merge banner stays twice as long
+    toast_error_s: 30              # how long a failed row action's toast stays (3-120 s); editable from the Activity Monitor's ⚙ → Toasts & timing
+    merged_hold_s: 8               # ceiling on the "Merging · merge landed" bridge; celebration fires on the merged fact (min 3)
+```
+
+## `HIVE_GITHUB_TOKEN` permissions
+
+`github.token: ${HIVE_GITHUB_TOKEN}` creates the main GitHub client when a GitHub
+App is not configured. The code reads issues, PRs, commits, contents, checks,
+commit statuses, contributors, and search results; it can also create/update
+issues and comments, add/remove/create labels, open PRs, approve PRs for the
+merge queue, and squash-merge queued PRs.
+
+Minimum practical PAT permissions for full PAT-authenticated operation:
+
+- **Classic PAT:** `repo` for private repositories (`public_repo` is enough only
+  when every managed repo is public and no private org data is needed).
+- **Fine-grained PAT:** select the managed repositories and grant:
+  - Contents: read/write (branch pushes by agents and content reads)
+  - Pull requests: read/write (list, open, approve, merge)
+  - Issues: read/write (list, comments, labels, advisory issue)
+  - Checks: read-only and Commit statuses: read-only (CI/merge gating)
+  - Administration: read-only (branch-protection verification before merge requests)
+  - Metadata: read-only (required by GitHub)
+
+If you use a GitHub App, configure equivalent repository permissions on the App
+installation instead of broadening the PAT. A `repo-moved` GitHub App verdict
+means the App/key/installation are healthy, but the hive still names the old
+repository owner after an org transfer; update the configured project org rather
+than trying to add the moved repository back to the old installation.
+
+### GitHub App permissions the hive needs, and what each one unblocks
+
+The App's repository permissions decide which steps the hive can take itself.
+A step the App cannot take is not a question for a person to *decide*; it is
+a **capability gap** the hive records as a structured blocker
+(`<!-- hive:blocker kind=capability:… -->`, see
+[labels-and-control-signals.md](../labels-and-control-signals/glossary-and-operations.md#blockers-hiveblocker-marker)),
+parks the item on, and surfaces at ⚙ → Security as *GitHub App permissions:
+missing `<permission>` · N items blocked* ([#15099](https://github.com/hivecommons/hive/issues/15099)).
+
+| Permission | Level | Without it the hive cannot… | Blocker kind |
+|---|---|---|---|
+| Contents | read/write | push branches, read files | `capability:repo-write` |
+| Pull requests | read/write | open, approve, merge PRs | — (nothing starts) |
+| Issues | read/write | comment, label, file issues | — (nothing starts) |
+| Workflows | write | push any change under `.github/workflows/*` (GitHub refuses the push with *refusing to allow a GitHub App to create or update workflow*) | `capability:workflows-permission` |
+| Actions | write | approve workflow runs from forks (the 085 *Awaiting human: approve workflow runs* pill) | — (`hive:unauthorized`) |
+| Checks / Commit statuses | read | gate merges on CI | — |
+| Administration | read | verify branch protection before a merge request | `capability:branch-protection` when a rule the App cannot satisfy stands |
+| Metadata | read | anything (required by GitHub) | — |
+
+Granting a permission on an existing installation needs the installation
+owner to accept the new permission request in the App settings page the
+dashboard links to (`githubAppInstallURL`). The hive re-checks on its own on
+the next stage pass; *Re-check permissions* on a blocked row
+(`POST /api/repos/{owner}/{repo}/items/{number}/blocker/recheck`) probes the
+installation now. A granted non-workflows permission releases its blocked items;
+workflows blockers require a separate hand-off to a capable lane. `GET /api/status` carries the same picture as
+`capabilities: {missing: ["workflows"], blocked_items: N, by_permission: {workflows: N}}`.
+
+#### Onboarding errors point to the Getting Started guide
+
+Every setup problem the dashboard's **🧭 Guide** (top navbar; also *Getting
+Started* in the sidebar) has a step for is classified server-side and rendered
+with a tip — *New hive? Open the 🧭 Guide → step ‘Install the Forge App
+(GitHub App)’ for the install URL and permissions checklist* — whose link opens
+the guide at that step. The classification rides the status payload as
+`onboardingIssues: [{kind, guideStep, message}]`, on system alerts as
+`onboarding: true` + `guideStep`, and on the embedded `deepHealth` checks
+(`github_auth`, `repo_target`) as `onboarding`/`guideStep`. Kinds:
+`github-app-not-installed`, `github-app-wrong-installation`,
+`github-app-permissions`, `github-app-credentials`, `github-base-url`
+(→ step `github-app`), `repo-target`, `no-repos` (→ `repos`), `no-agents`
+(→ `add-agent`), `proxy-token` (→ `welcome`). Error text is unchanged; the tip
+is appended. While any onboarding issue is active the Guide chip stays visible
+even if the checklist was dismissed earlier. The guide's GitHub App step shows
+the concrete install URL for the configured forge host (`githubAppInstallURL`,
+GHES-aware; on an enterprise host with no `github_app_slug` it says what to
+configure instead of linking to github.com). The guide, its entry points and
+the ⚙️ Governor Config gear require a non-`read` role from `GET /api/role` —
+a read-only viewer sees none of them and must be granted access via Manage
+Access.
+
+## Runtime diagnostics (`debug`, `GOMEMLIMIT`, `mem:` log line)
+
+Added for [#14681](https://github.com/hivecommons/hive/issues/14681) (hive
+process RSS growing hundreds of MiB/min with no pprof to name the culprit).
+
+| Name | Source | Default | Purpose |
+|---|---|---|---|
+| `debug.pprof_addr` | `hive.yaml` | `127.0.0.1:6060` | `net/http/pprof` listener. **Loopback only**: a non-loopback host (`0.0.0.0`, pod IP) is rejected at startup with a warning and the default is used instead. `off` disables the listener. Profiles are under `/debug/pprof/`; `/debug/runtime` prints the same counters as the `mem:` log line. |
+| `GOMEMLIMIT` | env | 85% of the cgroup memory limit | Go soft memory limit. When the env var is unset the hive reads `/sys/fs/cgroup/memory.max` (v2) or `memory/memory.limit_in_bytes` (v1) and sets `MemoryLimitPercent` (85%) of it via `debug.SetMemoryLimit`; an unlimited cgroup leaves the runtime default. Set the env var to override. Logged at startup as `runtime: memory limit` with `source=env|cgroup|none`. |
+| `mem: runtime snapshot` | log (INFO, every 60 s) | always on | `heap_inuse`, `heap_live`, `heap_objects`, `total_sys`, `next_gc`, `gc_cycles`, `goroutines`, `threads` (OS threads from `/proc/self/status`), `gomemlimit`. Read from `runtime/metrics`, so no stop-the-world. |
+
+The same snapshot is embedded in `GET /api/health` as `runtime` so the
+dashboard health probe and `kubectl exec … curl` see goroutine count and heap
+without the pprof port. Taking profiles on a pod:
+
+```bash
+kubectl -n <ns> port-forward deploy/hive 6060:6060 &
+go tool pprof -top  http://127.0.0.1:6060/debug/pprof/heap          # inuse_space
+curl -s 'http://127.0.0.1:6060/debug/pprof/goroutine?debug=1' | head  # parked goroutines
+```
+
+## `cmd/hive` flags and environment
+
+### Startup
+
+| Name | Source | Purpose |
+|---|---|---|
+| `--config` | flag | Path to `hive.yaml`; default `/etc/hive/hive.yaml` unless `HIVE_CONFIG` is set. |
+| `HIVE_CONFIG` | env | Sets the **default** of `--config`. An explicit `--config` outranks it — and the image ships one (`CMD ["--config", "/etc/hive/hive.yaml"]`), so `entrypoint.sh` appends `--config "$HIVE_CONFIG"` to the launch argv when the variable is set. Without that append the variable is inert in the container ([#4973](https://github.com/hivecommons/hive/issues/4973)). |
+| `HIVE_MODE=hub` | env | Starts the hub server instead of a spoke dashboard. |
+| `HIVE_HUB_PORT` | env | Hub listen port in hub mode; default `3001`. |
+| `HIVE_SINGLETON_LOCK` | env | Internal/escape hatch for the process singleton lock path; value `off` disables the guard. |
+
+### GitHub and dashboard auth
+
+| Name | Purpose |
+|---|---|
+| `HIVE_GITHUB_TOKEN` | Main PAT fallback when `github.token` is empty; also used for token identity/fleet stats fallback. Wrong-scope tokens fail with generic 403s at request time — see [github-app-setup.md](../github-app-setup.md#personal-access-token-pat-scopes) for the required scopes per ACMM tier. |
+| `GH_APP_KEY_FILE` | GitHub App private-key path fallback when `github.key_file` is empty. |
+| `HIVE_GITHUB_ETAG_CACHE_MAX_MB` / `HIVE_GITHUB_ETAG_CACHE_MAX_ENTRIES` | Size the shared GitHub ETag response cache (defaults `128` MiB compressed / `8192` entries); win over `github.etag_cache_max_mb` / `github.etag_cache_max_entries`. See [GitHub API quota](#github-api-quota). |
+| `HIVE_DASHBOARD_TOKEN` | Shared dashboard/API token fallback for `dashboard.auth_token`. Any non-empty string is accepted with no strength check — generate one with `openssl rand -hex 32`; see [env-vars.md](../env-vars.md#generating-and-rotating-hive_dashboard_token). |
+
+### Hosted-spoke and fleet metadata
+
+| Name | Purpose |
+|---|---|
+| `HIVE_HUB_URL` | Hub URL override for heartbeat/spoke registration. |
+| `HIVE_CLUSTER_ID` | Hosted cluster ID override. |
+| `HIVE_ID` | Hive ID override. |
+| `HIVE_LEVEL` | ACMM level bootstrap/override used by hosted flows. |
+| `HIVE_COVERAGE_BADGE_URL` | Source of the coverage percentage on the ci-maintainer card: an `http(s)` badge URL (shields JSON or SVG) or `repo://<ref>/<path>` read from the primary repo via the App client. See [env-vars.md](../env-vars.md). |
+
+### Dashboard metrics
+
+See [Monitoring a hive with Prometheus and Grafana](../monitoring.md) for setup, metric families and scraping.
+
+| Name | Purpose |
+|---|---|
+| `HIVE_METRICS_ENABLED` | Registers Prometheus `/metrics` when set to `1`, `true`, `yes`, or `on`; off by default (route not registered — scrapes 404) because it exposes estimated cost data. |
+| `HIVE_METRICS_TOKEN` | **Required whenever metrics are enabled** ([#3804](https://github.com/hivecommons/hive/pull/3804)): scrapers must send `Authorization: Bearer <token>` (configure Prometheus `bearer_token`). Enabled-but-tokenless serves 403 with an error naming both variables, and the hive logs a startup warning; the cost/agent series are never served unauthenticated. The Kubernetes manifests read it from the dedicated `hive-metrics-token` Secret, not from `hive-secrets` (see [monitoring.md](../monitoring.md)). See [ServiceMonitor setup](../monitoring.md#adding-the-monitoring-component-to-an-overlay) and [alert runbooks](../monitoring.md#alerts-and-runbooks) for configuring scraper access and on-call alerts. |
+
+> **Note on `tokens_24h`:** despite its name, the per-spoke heartbeat field
+> `tokens_24h` (stored on the hub as `totalTokens24h`) is a **cumulative total**,
+> not a rolling 24-hour window. Read it as lifetime token consumption for the
+> spoke. See [token-tracking.md](../token-tracking.md) for the full heartbeat and
+> `/api/saas/usage` rollup details.
+
+### Knowledge: Context7 content caps
+
+| Name | Default | Purpose |
+|---|---|---|
+| `HIVE_CONTEXT7_MAX_SNIPPETS` | `40` | Snippets kept from one Context7 llms.txt fetch (document import or `context7` connector). |
+| `HIVE_CONTEXT7_MAX_SNIPPET_BYTES` | `4096` | A single snippet larger than this is dropped whole. |
+| `HIVE_CONTEXT7_MAX_TOTAL_BYTES` | `16384` | Total content kept per fetch, marker included; values under `1024` are raised to `1024`. |
+
+Snippets are dropped whole (never clipped) by relevance to the topic, the
+stored content ends with a `… truncated: N snippets / M bytes omitted (size
+cap)` line, and the fetch logs the library. Unparseable or non-positive values
+fall back to the default. The kick primer's own byte cap is the yaml key
+`knowledge.primer.max_bytes` (default `4096`); see
+[knowledge-curator.md](../knowledge-curator.md#kick-primer-size-cap-knowledgeprimermax_bytes).
+
+### Inference endpoint fallbacks
+
+| Name | Default | Purpose |
+|---|---|---|
+| `HIVE_VLLM_ENDPOINT` | unset | Comma-separated vLLM endpoint list; set only to a cluster-reachable endpoint. Unset disables the built-in vLLM gateway route. |
+| `HIVE_LLMD_ENDPOINT` | `http://hive-llm-d-epp.hive-inference.svc.cluster.local:8000` | Comma-separated llm-d endpoint list. |

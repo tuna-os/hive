@@ -242,12 +242,22 @@ func passDecision(verdict stageVerdict, role stagelabels.Role, obs stageObservat
 	if verdict.Reason != "" {
 		obs.Reason = verdict.Reason
 	}
-	if pass.Prior != nil {
-		prev := stagelabels.Record{Stage: pass.Prior.Stage, Reason: pass.Prior.Reason, ActivityHead: pass.Prior.ActivityHead}
-		if replacement, ok := PreserveNormalizedFixingStage(prev, true, obs, verdict); ok {
-			verdict = replacement
-			obs.Reason = replacement.Reason
-		}
+	var prev stagelabels.Record
+	hadPrev := pass.Prior != nil
+	if hadPrev {
+		prev = stagelabels.Record{Stage: pass.Prior.Stage, Reason: pass.Prior.Reason, ActivityHead: pass.Prior.ActivityHead, AdmittedHead: pass.Prior.AdmittedHead}
+	}
+	if replacement, ok := PreserveNormalizedFixingStage(prev, hadPrev, obs, verdict); ok {
+		verdict = replacement
+		obs.Reason = replacement.Reason
+	}
+	if replacement, ok := PreserveStageOnStaleDecisionAnswer(prev, hadPrev, obs, verdict, pass.FixerExcluded); ok {
+		verdict = replacement
+		obs.Reason = replacement.Reason
+	}
+	if replacement, ok := PreserveNeedsDecisionOnSameHead(prev, hadPrev, obs, verdict); ok {
+		verdict = replacement
+		obs.Reason = replacement.Reason
 	}
 	var human *stagelabels.Route
 	if verdict.Human && !verdict.Terminal && verdict.Reason != prstage.ReasonSupersessionPending {
@@ -306,6 +316,39 @@ func passDecision(verdict stageVerdict, role stagelabels.Role, obs stageObservat
 	}
 	if !verdict.Terminal && pass.AdoptionRefusedReason != "" && verdict.Stage == FixingStage(obs) {
 		obs.Reason = pass.AdoptionRefusedReason
+	}
+	if !verdict.Terminal && pass.RebaseFailedTwice && verdict.Stage == FixingStage(obs) {
+		verdict.Stage = stagelabels.NeedsDecision
+		verdict.Rank = stageRankOwned
+		obs.Reason = stagelabels.LaneReasonRebaseFailedTwice
+	}
+	if !verdict.Terminal && pass.BotAuthorFinding != "" && verdict.Stage == FixingStage(obs) {
+		verdict.Stage = stagelabels.NeedsDecision
+		verdict.Rank = stageRankOwned
+		obs.Reason = stagelabels.LaneReasonBotAuthorFinding
+	}
+	if !verdict.Terminal && pass.Reauthoring > 0 && verdict.Stage == FixingStage(obs) {
+		obs.Reason = stagelabels.ReauthoringReason(pass.Reauthoring)
+	}
+	if !verdict.Terminal && pass.FixerExhausted > 0 && pass.Reauthoring == 0 && verdict.Stage == FixingStage(obs) {
+		verdict.Stage = stagelabels.NeedsDecision
+		verdict.Rank = stageRankOwned
+		obs.Reason = stagelabels.FixerExhaustedReason(pass.FixerExhausted)
+	}
+	if !verdict.Terminal && verdict.Stage != stagelabels.None && pass.RecoveryUnauthorized != "" {
+		verdict.Stage = stagelabels.NeedsDecision
+		verdict.Rank = stageRankOwned
+		obs.Reason = prstage.StageReasonUnauthorizedPrefix + pass.RecoveryUnauthorized
+		human = &stagelabels.Route{Stage: stagelabels.NeedsDecision}
+	}
+	// Only re-park when the post-steps would leave 085: an adoption that
+	// cleared it, or a fresher 085 reason, must stand.
+	if verdict.Stage != stagelabels.NeedsDecision && !pass.AdoptionLive {
+		if replacement, ok := PreserveNeedsDecisionOnSameHead(prev, hadPrev, obs, verdict); ok {
+			verdict = replacement
+			obs.Reason = replacement.Reason
+			human = &stagelabels.Route{Stage: stagelabels.NeedsDecision}
+		}
 	}
 	d := Decision{
 		Stage:      verdict.Stage,
@@ -378,7 +421,9 @@ func decisionFrom(v stageVerdict, role stagelabels.Role, obs stageObservation, f
 // the hive (Facts.Adoption live at the PR's head) when no lane observed
 // it: 074 adopted-by-hive, ahead of the 085 park the labels may still
 // carry — adoption is who owns the PR, and the owner answers the question
-// on the superseding PR. A hold label or sentinel alert keeps the park.
+// on the superseding PR. A `needs-human` label keeps the park; a hold
+// label or sentinel alert is a gate, not a stage (hivecommons/hive#17327),
+// so it rides the adoption as a pill and the lane still refuses the merge.
 func adoptedPRDecision(f Facts) (Decision, bool) {
 	a := f.Adoption
 	if !f.Open || !a.Adopted || !a.Live || a.Yielded {
@@ -387,9 +432,9 @@ func adoptedPRDecision(f Facts) (Decision, bool) {
 	if f.PR != nil && a.Head != "" && f.PR.HeadSHA != "" && a.Head != f.PR.HeadSHA {
 		return Decision{}, false
 	}
-	if len(f.Park.Holds) > 0 || f.Park.Sentinel || f.Park.NeedsHuman {
-		// A hold, sentinel or `needs-human` label is an explicit park
-		// (hivecommons/hive#14471); only the lane's own 085 yields.
+	if f.Park.NeedsHuman {
+		// A `needs-human` label is an explicit park (hivecommons/hive#14471);
+		// only the lane's own 085 yields.
 		return Decision{}, false
 	}
 	reason := "adopted by the hive"

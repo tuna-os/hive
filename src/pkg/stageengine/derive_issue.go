@@ -17,15 +17,25 @@ import (
 // mapping is pinned byte-for-byte on both sides of the move.
 
 const (
-	reasonIssueNotIssue   = "stage facts: not an issue"
-	reasonIssueNoBucket   = "stage facts: no enumeration bucket for the issue"
-	reasonIssueClosed     = "closed"
-	reasonIssueLikelyDone = "merged PR awaiting confirmation"
-	reasonIssueActionable = "actionable"
-	reasonIssueOpenPR     = "open PR covers it"
+	reasonIssueNotIssue = "stage facts: not an issue"
+	reasonIssueNoBucket = "stage facts: no enumeration bucket for the issue"
+	// reasonIssueStandingMeta prefixes the bucket of a standing meta issue.
+	reasonIssueStandingMeta = "standing meta issue, not work: "
+	reasonIssueClosed       = "closed"
+	reasonIssueLikelyDone   = "merged PR awaiting confirmation"
+	reasonIssueActionable   = "actionable"
+	reasonIssueOpenPR       = "open PR covers it"
 	// reasonIssueOpenPRPartial is 040 under a PR that references the issue
 	// without closing it (ClaimFact.Partial); ReasonIsPartialCover reads it.
 	reasonIssueOpenPRPartial = "open PR addresses part of it (references it without a closing keyword)"
+	// reasonIssueDecidedHumanWork prefixes the reason of an issue whose
+	// direction a person already gave and whose remainder is held for a
+	// person (hivecommons/hive#16579).
+	reasonIssueDecidedHumanWork = "decided; remaining work held for a person: "
+	// reasonIssueOpenForDiscussion prefixes the reason of an unclaimed
+	// proposal / design issue (018); the triggering label follows
+	// (hivecommons/hive#17150).
+	reasonIssueOpenForDiscussion = "open for discussion: "
 )
 
 // ReasonIsPartialCover reports whether a 040 reason describes a PR that
@@ -33,6 +43,41 @@ const (
 // "addresses part of" rather than "covers".
 func ReasonIsPartialCover(reason string) bool {
 	return strings.HasPrefix(strings.TrimSpace(reason), "open PR addresses part of it")
+}
+
+// ReasonDiscussionLabel reads the proposal / design label an 018
+// open-for-discussion reason names ("open for discussion: proposal"), or ""
+// when the reason is not one, so presentation layers can name the label
+// without re-deriving the stage.
+func ReasonDiscussionLabel(reason string) string {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(reason), reasonIssueOpenForDiscussion)
+	if !ok {
+		return ""
+	}
+	label, _, _ := strings.Cut(rest, ";")
+	return strings.TrimSpace(label)
+}
+
+const reasonOpenChildrenPrefix = "waiting on "
+
+// ReasonOpenChildren reads the "; waiting on N open child issue(s)" suffix
+// deriveIssue appends to a decomposed parent's reason and returns N, or 0
+// when the reason carries no such suffix. Presentation layers use it to say
+// the parent is tracking its children rather than waiting on the scanner.
+func ReasonOpenChildren(reason string) int {
+	for _, part := range strings.Split(reason, ";") {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, reasonOpenChildrenPrefix) || !strings.HasSuffix(part, " open child issue(s)") {
+			continue
+		}
+		digits := strings.TrimSuffix(strings.TrimPrefix(part, reasonOpenChildrenPrefix), " open child issue(s)")
+		n, err := strconv.Atoi(digits)
+		if err != nil || n <= 0 {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 // deriveIssue maps issue Facts to a Decision. Pure: same Facts → same
@@ -68,8 +113,25 @@ func deriveIssue(f Facts) Decision {
 		// label as found and the next sweep re-judges it from the restarted
 		// clock.
 		Stalled: f.Issue.Stalled && stage != stagelabels.None,
-		Clear:   issueTriageClear(f, stage),
+		Clear:   append(issueTriageClear(f, stage), issueParkClear(f, stage)...),
 	}
+}
+
+// issueParkClear reconciles `needs-human` against `approved-direction` on
+// an issue parked at 045 (hivecommons/hive#15099). That happens for a
+// structured blocker — no decision grants the App a permission — and for a
+// park let through because a newer, different `/hive decision` is pending
+// (Park.DecisionSuperseded): either way the ack is the stale one and the
+// writer clears it. A plain `needs-human` next to a standing ack derives
+// out of the pipeline instead and keeps it (hivecommons/hive#16579), so
+// nothing is cleared for it.
+func issueParkClear(f Facts, stage stagelabels.Stage) []string {
+	is := f.Issue
+	label := strings.TrimSpace(is.ApprovedDirectionLabel)
+	if !f.Park.NeedsHuman || label == "" || stage != stagelabels.IssueNeedsDecision {
+		return nil
+	}
+	return []string{label}
 }
 
 // issueTriageClear names the reporter-trust awaiting label the issue still
@@ -94,6 +156,13 @@ func issueTriageClear(f Facts, stage stagelabels.Stage) []string {
 // belongs to the PR, whose stage the reason names).
 func issueStage(f Facts) (stage stagelabels.Stage, covered bool, reason string) {
 	is := f.Issue
+	// A standing meta issue is a control panel or a report, never work:
+	// projectbluefin/gutenprint-printer-app#45, ps-printer-app#50 and
+	// hplip-printer-app#42 (mergeraptor's Dependency Dashboards) wore
+	// stage/045 because a triage bot added `needs-human`.
+	if is.Bucket == BucketDependencyDashboard || is.Bucket == BucketHiveAdvisory {
+		return stagelabels.None, false, reasonIssueStandingMeta + string(is.Bucket)
+	}
 	if is.LikelyDone {
 		return stagelabels.None, false, reasonIssueLikelyDone
 	}
@@ -111,6 +180,35 @@ func issueStage(f Facts) (stage stagelabels.Stage, covered bool, reason string) 
 		return stagelabels.None, false, is.BlockedReason
 	}
 	if f.Park.NeedsHuman {
+		// A structured blocker names what would actually unblock the issue
+		// (a permission the App lacks, a CLA): it is parked on a person for
+		// that, and `approved-direction` next to it is the contradiction
+		// hivecommons/hive#14976 wore — the direction did not take, so the
+		// reason says why and the writer clears the ack (#15099).
+		if is.Blocker != "" {
+			short := strings.TrimSpace(is.BlockerShort)
+			if short == "" {
+				short = is.Blocker
+			}
+			return stagelabels.IssueNeedsDecision, false, "blocked: " + short
+		}
+		// A decision is already recorded (`approved-direction`): a
+		// `needs-human` next to it is the agent standing down on work only
+		// a person can do (a cluster rollout, a backup, an out-of-repo
+		// step) — what the re-park refusal tells agents to do — not a new
+		// question. Re-deriving 045 stripped the ack and re-opened the
+		// decision inbox on every scanner pass, and the un-park sweep
+		// re-applied the same old decision: a bounce loop
+		// (hivecommons/hive#16579, seen on hivecommons/dibs#567). The
+		// issue is held out of the pipeline like a hold and keeps the ack;
+		// a person who wants to decide again removes `approved-direction`
+		// — or posts a new `/hive decision`: the label relay lets an
+		// agent's park through on that newer, different decision
+		// (Park.DecisionSuperseded), the ack is stale again, and the issue
+		// re-parks at 045 with it cleared until the un-park sweep answers.
+		if strings.TrimSpace(is.ApprovedDirectionLabel) != "" && !f.Park.DecisionSuperseded {
+			return stagelabels.None, false, reasonIssueDecidedHumanWork + is.NeedsHumanLabel
+		}
 		return stagelabels.IssueNeedsDecision, false, "held for a person: " + is.NeedsHumanLabel
 	}
 	// The prior-art gate's park is its own stage, 017, not 045: nothing is
@@ -126,16 +224,16 @@ func issueStage(f Facts) (stage stagelabels.Stage, covered bool, reason string) 
 	// `epic`) is the list of work, not the work: a claim or start mark on
 	// it is never staged 020/030 — admission refuses new ones, and one that
 	// exists (recorded before the gate, or by a human) leaves the epic at
-	// its umbrella stage, 010 while open (hivecommons/hive#12999).
+	// its unclaimed stage, 010 while open (hivecommons/hive#12999).
 	if is.UmbrellaLabel != "" && (is.Bucket == BucketClaimed || is.Bucket == BucketInProgress) {
-		stage, reason := actionableIssueStage(is, "umbrella issue ("+is.UmbrellaLabel+"): claim not staged")
+		stage, reason := unclaimedIssueStage(is, "umbrella issue ("+is.UmbrellaLabel+"): claim not staged")
 		return stage, false, reason
 	}
 	claim := is.Claim
 	prStarted := claim != nil && claim.PRStarted
 	switch is.Bucket {
 	case BucketActionable, BucketReporterTriage:
-		stage, reason := actionableIssueStage(is, reasonIssueActionable)
+		stage, reason := unclaimedIssueStage(is, reasonIssueActionable)
 		return stage, false, reason
 	case BucketClaimed:
 		if prStarted {
@@ -168,17 +266,33 @@ func issueStage(f Facts) (stage stagelabels.Stage, covered bool, reason string) 
 	return stagelabels.None, false, "outside the pipeline: " + string(is.Bucket)
 }
 
-// issueProgress reports whether an issue back at an actionable stage got
+// issueProgress reports whether an issue back at an unclaimed stage got
 // there by a PR landing: close-on-merge labels the issue partially-addressed
 // when the merged PR covered only part of it and leaves the remainder at
-// 010. Seen from the stage number alone that is 040 → 010, a fall; seen
-// from the label it is work that merged, so the Store must not book a
-// regression for it.
+// 010 — or at 018 when what remains of a proposal is its discussion
+// (hivecommons/hive#17150). Seen from the stage number alone that is
+// 040 → 010 / 018, a fall; seen from the label it is work that merged, so
+// the Store must not book a regression for it.
 func issueProgress(f Facts, stage stagelabels.Stage) bool {
-	if stage != stagelabels.Actionable && stage != stagelabels.TriageNeeded {
+	if stage != stagelabels.Actionable && stage != stagelabels.TriageNeeded && stage != stagelabels.OpenForDiscussion {
 		return false
 	}
 	return HasLabelFold(f.Labels, stagelabels.PartiallyAddressedLabel)
+}
+
+// unclaimedIssueStage is the stage of an open issue nobody holds a live
+// claim on. A proposal / design issue (IssueFacts.DiscussionLabel) is
+// 018-open-for-discussion, naming the label: what is left on it is a
+// discussion, not agent work, so it must not read as idle agent work at
+// 010 (hivecommons/hive#17150). It is not a gate — admission still lets
+// anyone claim it, and that claim stages 020/030 — and it outranks the
+// untriaged 015 the same way: a person owns the next move either way.
+// Everything else is actionableIssueStage.
+func unclaimedIssueStage(is *IssueFacts, reason string) (stagelabels.Stage, string) {
+	if label := strings.TrimSpace(is.DiscussionLabel); label != "" {
+		return stagelabels.OpenForDiscussion, reasonIssueOpenForDiscussion + label
+	}
+	return actionableIssueStage(is, reason)
 }
 
 // actionableIssueStage is 010-actionable or, for an untriaged issue, 015.

@@ -99,6 +99,7 @@ func TestHeadsDispatchEveryPerspectiveToEveryHead(t *testing.T) {
 	answered := AggregateReports([]PerspectiveReport{
 		{Repo: "acme/hive", Number: 7, HeadSHA: "sha1", Perspective: PerspectiveCorrectness, Verdict: VerdictApprove, Head: "cr-sol"},
 	}, AggregateOptions{Perspectives: headsOpts().Perspectives, ExpectedHeads: []string{"cr-sol", "cr-sonnet"}})
+	answered.ReportReceipts = []ReportReceipt{{Perspective: PerspectiveCorrectness, Agent: "cr-sol-1", Head: "cr-sol", ReceivedAt: headsOpts().Now}}
 	next := PlanDispatch([]PullRequest{dispatchPR("sha1")}, Artifact{Items: []Aggregate{answered}}, plan.State, headsOpts())
 	if len(next.ReviewKicks) != 1 || next.ReviewKicks[0].Agent != "cr-sol-1" || next.ReviewKicks[0].Perspective != PerspectiveSecurity {
 		t.Fatalf("freed sol replica was not given security: %+v", next.ReviewKicks)
@@ -192,6 +193,11 @@ func TestHeadsReaskOnlyTheHeadThatHasNotReported(t *testing.T) {
 		{Repo: "acme/hive", Number: 7, HeadSHA: "sha1", Perspective: PerspectiveCorrectness, Verdict: VerdictApprove, Head: "cr-sol"},
 		{Repo: "acme/hive", Number: 7, HeadSHA: "sha1", Perspective: PerspectiveSecurity, Verdict: VerdictApprove, Head: "cr-sonnet"},
 	}, AggregateOptions{Perspectives: opts.Perspectives, ExpectedHeads: []string{"cr-sol", "cr-sonnet"}})
+	agg.ReportReceipts = []ReportReceipt{
+		{Perspective: PerspectiveCorrectness, Agent: "cr-sonnet-1", Head: "cr-sonnet", ReceivedAt: opts.Now},
+		{Perspective: PerspectiveCorrectness, Agent: "cr-sol-1", Head: "cr-sol", ReceivedAt: opts.Now},
+		{Perspective: PerspectiveSecurity, Agent: "cr-sonnet-1", Head: "cr-sonnet", ReceivedAt: opts.Now},
+	}
 	if agg.Verdict != VerdictIncomplete || !strings.Contains(strings.Join(agg.Reasons, " "), "security/cr-sol") {
 		t.Fatalf("aggregate = %s %v, want incomplete waiting on security/cr-sol", agg.Verdict, agg.Reasons)
 	}
@@ -323,6 +329,9 @@ func TestCombinedHeadsReaskOnlyMissingPerspectives(t *testing.T) {
 		reports = append(reports, PerspectiveReport{Repo: "acme/hive", Number: 7, HeadSHA: "sha1", Perspective: p, Verdict: VerdictApprove, Head: "cr-sonnet"})
 	}
 	agg := AggregateReports(reports, AggregateOptions{Perspectives: opts.Perspectives, ExpectedHeads: []string{"cr-sol", "cr-sonnet"}})
+	for _, report := range reports {
+		agg.ReportReceipts = append(agg.ReportReceipts, ReportReceipt{Perspective: report.Perspective, Agent: report.Head + "-1", Head: report.Head, ReceivedAt: opts.Now})
+	}
 	if agg.Verdict != VerdictIncomplete {
 		t.Fatalf("aggregate = %s, want incomplete while sol owes two perspectives", agg.Verdict)
 	}
@@ -372,6 +381,96 @@ func TestCombinedHeadsDecisionOnceEveryHeadSettled(t *testing.T) {
 	want := PlanDispatch([]PullRequest{dispatchPR("sha1")}, Artifact{Items: []Aggregate{awaitingAgg()}}, DispatchState{}, split)
 	if plan.ReviewKicks[0].Message != want.ReviewKicks[0].Message {
 		t.Fatal("decision prompt differs under combined perspectives")
+	}
+}
+
+// A combined head kick fans the perspectives out to parallel sub-agents
+// (hivecommons/hive#15058): the head reads the PR once, every perspective's
+// focus (overrides included) is in the kick, the head alone records one array
+// and nothing is posted. A single-perspective re-ask has nothing to fan out.
+func TestCombinedHeadPromptFansOutPerPerspective(t *testing.T) {
+	set, err := NewPerspectiveSet(nil, map[string]string{"security": "custom security focus from perspective_prompts"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := set.List()
+	pr := dispatchPR("sha1")
+	pr.BodyDigest = "digest1"
+	fanOut := []string{
+		"FAN OUT: ONE SUB-AGENT PER PERSPECTIVE, IN PARALLEL.",
+		"ONCE, yourself",
+		"IN PARALLEL, not one after another",
+		"must NOT post anything on the PR, must NOT call hive-review",
+		"must NOT fetch the PR or its diff again",
+		"record it ONCE with the --record-verdict command above. Only you call hive-review.",
+		"If sub-agents are unavailable",
+		"cover this whole review, not each sub-agent",
+	}
+	for _, tc := range []struct {
+		name         string
+		perspectives []Perspective
+		opts         PromptOptions
+		wantFanOut   bool
+	}{
+		{name: "head, every perspective", perspectives: all, opts: PromptOptions{HeadRecordOnly: "cr-sol", PostComments: true}, wantFanOut: true},
+		{name: "head, two missing perspectives", perspectives: all[3:], opts: PromptOptions{HeadRecordOnly: "cr-sol", PostComments: true}, wantFanOut: true},
+		{name: "head, single perspective re-ask", perspectives: all[:1], opts: PromptOptions{HeadRecordOnly: "cr-sol", PostComments: true}},
+		{name: "plain combined kick, not a head", perspectives: all, opts: PromptOptions{PostComments: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts
+			opts.Perspectives = set
+			opts.WritingGuideSection = "WRITING GUIDE MARKER"
+			msg := BuildCombinedPrompt(pr, tc.perspectives, opts)
+			want := []string{"WRITING GUIDE MARKER", "Head SHA: sha1", "digest1"}
+			for _, p := range tc.perspectives {
+				want = append(want, "[perspective:"+string(p)+"]", string(p)+" — "+set.Focus(p))
+			}
+			isHead := opts.HeadRecordOnly != ""
+			if isHead {
+				want = append(want, "INDEPENDENT REVIEW HEAD (cr-sol)", "Do NOT post anything on the PR", "--record-verdict --verdict-file <verdict>", "ONE JSON array")
+			}
+			if tc.wantFanOut {
+				want = append(want, fanOut...)
+			}
+			for _, w := range want {
+				if !strings.Contains(msg, w) {
+					t.Errorf("prompt missing %q", w)
+				}
+			}
+			if !tc.wantFanOut && strings.Contains(msg, "FAN OUT") {
+				t.Error("prompt carries a fan-out section it should not")
+			}
+			if isHead {
+				for _, bad := range []string{"--comment --body-file", "ONE COMMENT, EVERY PERSPECTIVE"} {
+					if strings.Contains(msg, bad) {
+						t.Errorf("combined head prompt tells the head to post: %q", bad)
+					}
+				}
+			}
+		})
+	}
+	if !strings.Contains(BuildCombinedPrompt(pr, all, PromptOptions{HeadRecordOnly: "cr-sol", Perspectives: set}), "custom security focus from perspective_prompts") {
+		t.Fatal("perspective_prompts override missing from the combined head prompt")
+	}
+
+	// The fan-out must not break the per-head model guarantee: every
+	// sub-agent runs on the head's model, and replaces (not adds to) the
+	// single pinned sub-agent of the independent-review section.
+	pinned := BuildCombinedPrompt(pr, all, PromptOptions{HeadRecordOnly: "cr-sol", Perspectives: set, ReviewBackend: "codex", ReviewModel: "gpt-6-sol"})
+	for _, w := range []string{
+		"Launch EVERY sub-agent with `model` set to `codex/gpt-6-sol`",
+		"instead of that single sub-agent, not in addition to it",
+		"cannot pin `gpt-6-sol`, review the perspectives yourself",
+		`review_model "gpt-6-sol"`,
+	} {
+		if !strings.Contains(pinned, w) {
+			t.Errorf("fan-out does not pin sub-agents to the head model: missing %q", w)
+		}
+	}
+	unpinned := BuildCombinedPrompt(pr, all, PromptOptions{HeadRecordOnly: "cr-sol", Perspectives: set})
+	if !strings.Contains(unpinned, "Run every sub-agent on the model you are running on now") {
+		t.Error("fan-out without a configured head model must keep sub-agents on the session's own model")
 	}
 }
 

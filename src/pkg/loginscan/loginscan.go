@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/crux/claude"
 	"github.com/hivecommons/hive/crux/paneclass"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/notify"
@@ -30,9 +31,35 @@ func CommandForBackend(backend string) string {
 		return "Run: gemini auth login"
 	case "goose":
 		return "Run: goose auth login"
+	case "codex":
+		return "Run: codex login"
 	default:
 		return "Run the login command for " + backend
 	}
+}
+
+// PauseNotice renders the notification title, body and login hint for an
+// agent paused at a login prompt. A claude agent running on the operator's
+// long-lived token (longLivedToken) is at that prompt because Claude answered
+// 401 to the token itself: `/login` would only start a sign-in the agent does
+// not use, so the hint is claude.TokenRejectedMessage instead.
+func PauseNotice(name, backend string, longLivedToken bool) (title, body, hint string) {
+	if backend == "claude" && longLivedToken {
+		return fmt.Sprintf("\U0001F511 Claude token rejected: %s", name),
+			fmt.Sprintf("Agent '%s' was paused. %s, update the configured secret source "+
+				"(%s, or the file named by %s) with it, and restart the hive. "+
+				"See the backend auth recovery runbook, \"Replace a Claude operator token\".",
+				name, claude.TokenRejectedMessage, claude.OperatorTokenEnvVar, claude.OperatorTokenFileEnvVar),
+			claude.TokenRejectedMessage
+	}
+	hint = CommandForBackend(backend)
+	return fmt.Sprintf("\U0001F511 Login required: %s", name),
+		fmt.Sprintf(
+			"Agent '%s' needs authentication. Open the agent's terminal "+
+				"(tmux attach -t hive-%s) and run the login command for the CLI (%s). %s",
+			name, name, backend, hint,
+		),
+		hint
 }
 
 // Action is what the detector should do about one agent this cycle.
@@ -208,6 +235,24 @@ type AgentManager interface {
 	Pause(name, trigger, reason string) error
 }
 
+// ClaudeAuthModeReporter is the optional AgentManager extension that says
+// whether claude agents run on the operator's long-lived token. The in-process
+// agent.Manager implements it from the token it captured at construction,
+// which is the same snapshot its AgentHasValidCredential verdict uses, so the
+// pause verdict and the notice text in Scan come from one source.
+type ClaudeAuthModeReporter interface {
+	ClaudeLongLivedToken() bool
+}
+
+// claudeLongLivedToken answers the mode from the manager when it can say,
+// falling back to the live claude.AuthMode() read (remote runtimes).
+func claudeLongLivedToken(agentMgr AgentManager) bool {
+	if r, ok := agentMgr.(ClaudeAuthModeReporter); ok {
+		return r.ClaudeLongLivedToken()
+	}
+	return claude.AuthMode() == claude.AuthModeLongLivedToken
+}
+
 type Notifier interface {
 	Send(title, message string, priority notify.Priority)
 }
@@ -300,8 +345,18 @@ func Scan(
 				"sightings", streak, "required", PauseMinSightings)
 			continue
 		case ActionPause:
+			// Determine the login instruction based on the agent's backend
+			title, body, loginCmd := PauseNotice(name, backend, claudeLongLivedToken(agentMgr))
+
+			// This WARN is what the fleet selfreport for class
+			// agent_login_required is built from (hivecommons/hive#16953):
+			// without the backend and the login hint the report cannot say
+			// WHICH provider the operator has to re-authenticate.
 			logger.Warn("login required detected",
 				"agent", name,
+				"backend", backend,
+				"login_hint", loginCmd,
+				"credential_valid", credentialValid,
 				"pattern", re.String(),
 				"sightings", streak,
 			)
@@ -326,18 +381,7 @@ func Scan(
 				dashSrv.AuditLog("system", "pause", "trigger=login-detector", name)
 			}
 
-			// Determine the login instruction based on the agent's backend
-			loginCmd := CommandForBackend(backend)
-
-			notifier.Send(
-				fmt.Sprintf("\U0001F511 Login required: %s", name),
-				fmt.Sprintf(
-					"Agent '%s' needs authentication. Open the agent's terminal "+
-						"(tmux attach -t hive-%s) and run the login command for the CLI (%s). %s",
-					name, name, backend, loginCmd,
-				),
-				notify.PriorityHigh,
-			)
+			notifier.Send(title, body, notify.PriorityHigh)
 		}
 	}
 	// Agents that vanished (removed from config, stopped) must not keep a

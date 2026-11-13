@@ -3,7 +3,10 @@ package automerge
 // Owner approval releases the workflow-path fence (hivecommons/hive#14664).
 //
 // The contributor lane's diff fence refuses any PR that edits
-// `.github/workflows/**` or `.github/actions/**` (contributorLaneDiffReason).
+// `.github/workflows/**` or `.github/actions/**` (contributorLaneDiffReason),
+// or with workflow_fence_scope: human_merge_paths only one whose edited
+// workflow / action file is also a human-merge path
+// (automerge_workflow_fence_scope.go).
 // Until #14664 that refusal was absolute: an owner's approval only moved the
 // PR to stage/090 with a "click Merge" caption and the hive never merged it
 // (hive#14568, hive#14498, rationguard#401). The owner's decision is that an
@@ -21,7 +24,14 @@ package automerge
 //     (headObservedAt — the pinned server-side updated_at, never the
 //     commit's own committer date, which the pusher chooses).
 //
-// Approval on an older head never counts, so a new push re-arms the fence.
+// Approval on an older head never counts, so a new push re-arms the fence —
+// except a head the hive's own base refresh produced: an App-authored merge
+// of the base branch that leaves the PR's three-dot diff file-for-file what
+// the person approved carries that approval forward
+// (reviewReachesHead for a review; workflowFenceCarriedApproval for the
+// hive's own audit marker or a dashboard approval on the earlier head), so
+// a strict up-to-date rule does not cost a re-approval every time the base
+// moves.
 // A released fence is logged once per head and leaves one audit marker per
 // head on the PR; the PR then goes through every other gate (CI, soak,
 // holds, sentinel, verdict) exactly like any other contributor-lane PR.
@@ -37,6 +47,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +55,7 @@ import (
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/pkg/effects"
 	hgithub "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/review"
 	"github.com/hivecommons/hive/pkg/stageengine/prstage"
 )
 
@@ -61,6 +73,21 @@ const (
 	workflowApprovalDecisionCommand = "/hive decision approve"
 	// workflowApprovalRESTCaller tags the audit comment write.
 	workflowApprovalRESTCaller = "hive:workflow_fence_release"
+	// typedDecisionApprovalRESTCaller tags the comment read on a PR no diff
+	// fence tripped (typedDecisionApprovalAnswer).
+	typedDecisionApprovalRESTCaller = "hive:typed_decision_approval"
+	// workflowApprovalDecisionBody is the decision text a typed approval is
+	// recorded with (the un-park sweep and the dashboard record "approve").
+	workflowApprovalDecisionBody = "approve"
+)
+
+// What the fence-release comment says about the reviewer verdict on the
+// head: nothing (it does not ask for a person), that the approval answered
+// it, or which command still does.
+const (
+	workflowApprovalVerdictNone = iota
+	workflowApprovalVerdictAnswered
+	workflowApprovalVerdictOpen
 )
 
 // workflowFenceReleased decides whether the diff fence that tripped with
@@ -68,47 +95,294 @@ const (
 // releasable, only when the policy toggle is on, and only while the lane has
 // not already learnt that the App cannot merge this head (an unauthorized
 // mark for merge-workflow-path, in memory or as a marker comment). It
-// returns the approver and true when released; the caller then skips the
+// returns the approval and true when released; the caller then skips the
 // fence. Read failures release nothing: the fence stays as it was.
-func (c *Engine) workflowFenceReleased(ctx context.Context, displayRepo, owner, repo string, pr *gh.PullRequest, number int, headSHA, reason string, policy ContributorLanePolicy) (string, bool) {
+//
+// verdict is the reviewer verdict on the head and verdictAnswered whether a
+// person already answered it there (an Approve review, a recorded
+// decision, a `/hive approve` release). A typed `/hive decision approve`
+// that releases the fence while the verdict still asks for a person also
+// answers it (recordTypedApprovalDecision): the 085 comment names that
+// command as settling both, and on an owner's own PR GitHub refuses the
+// Approve review that would (Danathar/zfs-aurora-complex#254 sat at
+// contributor-lane:no-verdict for hours after the owner typed it).
+func (c *Engine) workflowFenceReleased(ctx context.Context, displayRepo, owner, repo string, pr *gh.PullRequest, number int, headSHA, reason string, policy ContributorLanePolicy, verdict ContributorLaneVerdict, verdictAnswered bool) (workflowApproval, bool) {
 	if c == nil || c.gh == nil || reason != contributorLaneReasonWorkflowPath || !policy.OwnerApprovalReleasesWorkflowFence || strings.TrimSpace(headSHA) == "" {
-		return "", false
+		return workflowApproval{}, false
 	}
 	if c.unauthorizedStep(owner, repo, number, headSHA) == unauthorizedStepMergeWorkflowPath {
-		return "", false
+		return workflowApproval{}, false
 	}
 	comments, err := c.listIssueComments(hgithub.WithRESTCaller(ctx, workflowApprovalRESTCaller), owner, repo, number)
 	if err != nil {
 		c.warn("workflow-path fence: could not read comments", "repo", displayRepo, "pr", number, "head", headSHA, "error", err)
-		return "", false
+		return workflowApproval{}, false
 	}
-	approver, ok := c.workflowFenceApproval(ctx, owner, repo, pr, number, headSHA, comments)
+	approval, ok := c.workflowFenceApproval(ctx, owner, repo, pr, number, headSHA, comments)
 	if !ok {
-		return "", false
+		return workflowApproval{}, false
 	}
-	if hasCommentWithPrefix(comments, unauthorizedMarker(headSHA, unauthorizedStepMergeWorkflowPath)) {
+	approver := approval.Login
+	verdictState := workflowApprovalVerdictNone
+	if verdictNeedsHuman(stageDetail{Verdict: verdict, VerdictKnown: true}) {
+		verdictState = workflowApprovalVerdictOpen
+		if !verdictAnswered && approval.Typed != nil && c.recordTypedApprovalDecision(displayRepo, owner, repo, number, headSHA, approval) {
+			approval.AnswersVerdict = true
+		}
+		if verdictAnswered || approval.AnswersVerdict {
+			verdictState = workflowApprovalVerdictAnswered
+		}
+	}
+	if unauthorizedCommentCoversHead(comments, unauthorizedStepMergeWorkflowPath, headSHA) {
 		// A previous process already learnt the App cannot merge this head;
 		// re-arm the in-memory mark so the reason flips without another
 		// merge attempt.
 		c.markUnauthorized(ctx, displayRepo, owner, repo, pr, number, headSHA, unauthorizedStepMergeWorkflowPath, unauthorizedPermissionWorkflowsWrite, mergeWorkflowPathHumanAction())
-		return "", false
+		return workflowApproval{}, false
+	}
+	if c.observeOnly {
+		// An observe-only pass on an auto-merge-off repo refuses every write
+		// by design, so the audit comment waits for a pass that may merge;
+		// attempting it logged the refusal at WARN on every re-evaluation
+		// (hivecommons/hive#17668).
+		c.debug("workflow-path fence: observe-only pass skipped audit comment", "repo", displayRepo, "pr", number, "head", headSHA, "login", approver)
+		return approval, true
 	}
 	if !hasCommentWithPrefix(comments, workflowApprovalMarker(headSHA)) {
-		c.info("workflow-path fence released by owner approval", "repo", displayRepo, "pr", number, "login", approver, "head", headSHA)
-		if err := c.commentWorkflowApproval(ctx, owner, repo, number, headSHA, approver); err != nil {
+		if approval.CarriedFrom != "" {
+			c.info("workflow-path fence approval carried over hive base refresh", "repo", displayRepo, "pr", number, "login", approver, "approved_head", approval.CarriedFrom, "head", headSHA)
+		} else {
+			c.info("workflow-path fence released by owner approval", "repo", displayRepo, "pr", number, "login", approver, "head", headSHA)
+		}
+		if err := c.commentWorkflowApproval(ctx, owner, repo, number, headSHA, approval, verdictState); err != nil {
 			c.warn("workflow-path fence: could not post audit comment", "repo", displayRepo, "pr", number, "head", headSHA, "error", err)
 		}
 	}
-	return approver, true
+	return approval, true
+}
+
+// workflowApproval is the explicit approval that released the fence: who
+// gave it and, when they typed `/hive decision approve` themselves, that
+// comment. A GitHub Approve review and the dashboard's approval already
+// answer the reviewer's requires_human question on the head; a typed
+// comment reaches the decision store only through recordTypedApprovalDecision.
+type workflowApproval struct {
+	Login string
+	Typed *gh.IssueComment
+	// AnswersVerdict: the typed comment was recorded as the person's
+	// answer to the reviewer's requires_human question on the head.
+	AnswersVerdict bool
+	// CarriedFrom is the earlier head the approval was given on when the
+	// hive's own base refresh is all that moved the PR to the current head
+	// (the PR's diff unchanged); "" when the approval is bound to the current
+	// head itself.
+	CarriedFrom string
+}
+
+// recordTypedApprovalDecision records a typed `/hive decision approve` as
+// the trusted merger's answer on headSHA, the same record the dashboard's
+// approval and the un-park sweep write (Source decision, Kind approve,
+// SourceID the comment), so the lanes and the stage engine read the
+// reviewer's question as answered (DecisionAnswerFor) on every pass and
+// after a restart. A decision recorded on the head after the comment
+// stands instead: a later instruction is never overwritten by an earlier
+// approval. Reports whether the head now carries this approval.
+func (c *Engine) recordTypedApprovalDecision(displayRepo, owner, repo string, number int, headSHA string, approval workflowApproval) bool {
+	if c == nil || c.humanChangeRequests == nil || approval.Typed == nil || strings.TrimSpace(approval.Login) == "" {
+		return false
+	}
+	full := owner + "/" + repo
+	head := strings.TrimSpace(headSHA)
+	comment := approval.Typed
+	if existing, ok := c.humanChangeRequests.For(full, number, head); ok {
+		if existing.Source == review.HumanChangeRequestSourceDecision && existing.SourceID == comment.GetID() {
+			return existing.IsApproval()
+		}
+		if existing.RecordedAt.After(comment.GetCreatedAt().Time) {
+			return false
+		}
+	}
+	req := review.HumanChangeRequest{
+		Repo: full, Number: number, HeadSHA: head,
+		Source: review.HumanChangeRequestSourceDecision, SourceID: comment.GetID(),
+		Actor: approval.Login, Body: workflowApprovalDecisionBody, URL: comment.GetHTMLURL(),
+		Kind: review.HumanChangeRequestKindApprove, RecordedAt: comment.GetCreatedAt().Time,
+	}
+	if err := c.humanChangeRequests.Record(req); err != nil {
+		c.warn("typed decision approve: could not record the typed approval as the reviewer decision", "repo", displayRepo, "pr", number, "head", headSHA, "by", approval.Login, "error", err)
+		return false
+	}
+	c.info("typed decision approve: typed approval recorded as the answer to the reviewer's requires_human question", "repo", displayRepo, "pr", number, "head", headSHA, "by", approval.Login)
+	return true
+}
+
+// typedDecisionApprovalAnswer is recordTypedApprovalDecision for a PR no
+// diff fence tripped (hivecommons/hive#16121): the newest typed
+// `/hive decision approve` by a trusted merger bound to headSHA — read with
+// latestTrustedCommentApproval, the same rule the fence uses — answers a
+// verdict that still asks for a person. Without it an owner's own PR that
+// touches no workflow file waited on the un-park sweep, which reads only
+// stage-labelled PRs. Returns the approver when the head now carries the
+// approval; a read failure, a dashboard approval (which records its own
+// decision), or a later decision on the head answers nothing.
+func (c *Engine) typedDecisionApprovalAnswer(ctx context.Context, displayRepo, owner, repo string, pr *gh.PullRequest, number int, headSHA string, verdict ContributorLaneVerdict) (string, bool) {
+	if c == nil || c.gh == nil || c.humanChangeRequests == nil || strings.TrimSpace(headSHA) == "" {
+		return "", false
+	}
+	if !verdictNeedsHuman(stageDetail{Verdict: verdict, VerdictKnown: true}) {
+		return "", false
+	}
+	comments, err := c.listIssueComments(hgithub.WithRESTCaller(ctx, typedDecisionApprovalRESTCaller), owner, repo, number)
+	if err != nil {
+		c.warn("typed decision approve: could not read comments", "repo", displayRepo, "pr", number, "head", headSHA, "error", err)
+		return "", false
+	}
+	approval, ok := c.latestTrustedCommentApproval(owner, repo, pr, number, headSHA, comments)
+	if !ok || approval.Typed == nil {
+		return "", false
+	}
+	if !c.recordTypedApprovalDecision(displayRepo, owner, repo, number, headSHA, approval) {
+		return "", false
+	}
+	// The verdict was noted for the stage engine before the record existed;
+	// tell it now so the stage moves on this tick rather than the next.
+	c.noteStageTrustedHumanApproval(owner, repo, number, headSHA, approval.Login)
+	return approval.Login, true
 }
 
 // workflowFenceApproval finds the trusted merger whose explicit approval is
-// bound to headSHA: an APPROVED review on the head first, then an approval
-// comment (dashboard-posted or typed) among comments bound to it.
-func (c *Engine) workflowFenceApproval(ctx context.Context, owner, repo string, pr *gh.PullRequest, number int, headSHA string, comments []*gh.IssueComment) (string, bool) {
-	if login, ok := c.latestTrustedHumanApproval(ctx, owner, repo, number, headSHA); ok {
-		return login, true
+// bound to headSHA: an APPROVED review that reaches the head first (on it,
+// or carried over the hive's base merges), then an approval comment
+// (dashboard-posted or typed) among comments bound to it, and last an
+// approval comment on an earlier head carried over the hive's own base
+// refresh.
+func (c *Engine) workflowFenceApproval(ctx context.Context, owner, repo string, pr *gh.PullRequest, number int, headSHA string, comments []*gh.IssueComment) (workflowApproval, bool) {
+	if login, carriedFrom, ok := c.latestTrustedHumanApprovalReach(ctx, owner, repo, number, headSHA); ok {
+		return workflowApproval{Login: login, CarriedFrom: carriedFrom}, true
 	}
+	approval, ok := c.latestTrustedCommentApproval(owner, repo, pr, number, headSHA, comments)
+	if ok {
+		c.noteStageTrustedHumanApproval(owner, repo, number, headSHA, approval.Login)
+		return approval, true
+	}
+	appLogin := strings.TrimSpace(c.transport.AppBotLogin())
+	return c.workflowFenceCarriedApproval(ctx, owner, repo, pr, number, headSHA, appLogin, c.standingTrustedHumanReviews(ctx, owner, repo, number), comments)
+}
+
+// workflowFenceCarriedApproval carries an approval given on an earlier head
+// to headSHA when the hive's own base refresh is all that moved the PR there
+// (BaseRefreshChecker, hivecommons/hive#15649: GitHub-verified App merges of
+// the base branch whose three-dot diff against the base is file-for-file the
+// approved head's, at most a few hops back). The workflow change is then
+// exactly what the person approved, so under a strict up-to-date branch rule
+// the update-branch the lane itself performs no longer re-arms the fence and
+// waits for a fresh approval every time the base moves (projectbluefin/utah
+// #1111). The approver must still be a trusted merger. Any other head
+// change — a contributor commit, even one leaving the workflow files alone;
+// a rebase; a base merge by anyone but the App; a base merge that changed
+// the PR's own hunks, or changed anything at all in a `.github/` file the PR
+// also changes — carries nothing and the fence stays armed. A base merge
+// that edited another file the PR changes only where the PR's hunks do not
+// reach (the hunks identical, only their line numbers moved) still carries
+// (projectbluefin/utah-packages#924).
+func (c *Engine) workflowFenceCarriedApproval(ctx context.Context, owner, repo string, pr *gh.PullRequest, number int, headSHA, appLogin string, reviews []*gh.PullRequestReview, comments []*gh.IssueComment) (workflowApproval, bool) {
+	baseRef := strings.TrimSpace(pr.GetBase().GetRef())
+	if c.gh == nil || appLogin == "" || baseRef == "" {
+		return workflowApproval{}, false
+	}
+	for _, prior := range workflowFencePriorApprovals(headSHA, appLogin, reviews, comments) {
+		if trusted, configured := c.isTrustedMerger(prior.Login); !configured || !trusted {
+			continue
+		}
+		if !c.baseRefresh.HeadIsBaseRefreshOf(ctx, c.gh.Repositories, owner, repo, number, baseRef, prior.CarriedFrom, headSHA, appLogin) {
+			continue
+		}
+		c.noteStageTrustedHumanApproval(owner, repo, number, headSHA, prior.Login)
+		return prior, true
+	}
+	return workflowApproval{}, false
+}
+
+// workflowFencePriorApprovals lists the explicit approvals bound to heads
+// other than headSHA, one per head, newest first: the hive's own audit
+// marker for a head it released (which also records a typed or unmarked
+// approval the comment itself cannot be bound to later), a dashboard
+// `/approve` marked for a head, then each trusted merger's standing APPROVED
+// review. Only App-authored, unedited comments are read, so nobody else can
+// forge an earlier approval.
+func workflowFencePriorApprovals(headSHA, appLogin string, reviews []*gh.PullRequestReview, comments []*gh.IssueComment) []workflowApproval {
+	var out []workflowApproval
+	seen := map[string]bool{strings.ToLower(strings.TrimSpace(headSHA)): true}
+	add := func(head, login string) {
+		head, login = strings.ToLower(strings.TrimSpace(head)), strings.TrimSpace(login)
+		if head == "" || login == "" || seen[head] {
+			return
+		}
+		seen[head] = true
+		out = append(out, workflowApproval{Login: login, CarriedFrom: head})
+	}
+	for i := len(comments) - 1; i >= 0; i-- {
+		comment := comments[i]
+		if comment == nil || appLogin == "" || !strings.EqualFold(strings.TrimSpace(hgithub.SafeGetLogin(comment.GetUser())), appLogin) {
+			continue
+		}
+		if comment.GetUpdatedAt().Time.After(comment.GetCreatedAt().Time) {
+			continue
+		}
+		body := comment.GetBody()
+		if head, login, ok := parseWorkflowApprovalMarker(body); ok {
+			add(head, login)
+			continue
+		}
+		if command, actor, head, ok := hgithub.ParsePRApprovalCommandComment(body); ok && command == "/approve" {
+			add(head, actor)
+		}
+	}
+	approvals := make([]*gh.PullRequestReview, 0, len(reviews))
+	for _, rv := range reviews {
+		if rv != nil && strings.EqualFold(rv.GetState(), "APPROVED") {
+			approvals = append(approvals, rv)
+		}
+	}
+	sort.SliceStable(approvals, func(i, j int) bool {
+		return approvals[i].GetSubmittedAt().After(approvals[j].GetSubmittedAt().Time)
+	})
+	for _, rv := range approvals {
+		add(rv.GetCommitID(), hgithub.SafeGetLogin(rv.GetUser()))
+	}
+	return out
+}
+
+// parseWorkflowApprovalMarker reads the head and approver off the first line
+// of an audit comment (workflowApprovalComment).
+func parseWorkflowApprovalMarker(body string) (head, approver string, ok bool) {
+	line, _, _ := strings.Cut(body, "\n")
+	rest, found := strings.CutPrefix(strings.TrimSpace(line), workflowApprovalMarkerPrefix+" ")
+	if !found {
+		return "", "", false
+	}
+	rest, _, _ = strings.Cut(rest, "-->")
+	for _, field := range strings.Fields(rest) {
+		if v, isHead := strings.CutPrefix(field, "head="); isHead {
+			head = v
+		} else if v, isBy := strings.CutPrefix(field, "by="); isBy {
+			approver = v
+		}
+	}
+	if head == "" || approver == "" {
+		return "", "", false
+	}
+	return head, approver, true
+}
+
+// latestTrustedCommentApproval walks comments newest-first for the first
+// explicit approval bound to headSHA (workflowApprovalCommentActor) whose
+// actor is a configured trusted merger. Typed is set when the merger posted
+// the comment themselves (`/hive decision approve`) rather than through the
+// dashboard's App-posted `/approve`. The workflow fence and the non-fenced
+// verdict answer share this so the rule binding a comment to the head is
+// written once.
+func (c *Engine) latestTrustedCommentApproval(owner, repo string, pr *gh.PullRequest, number int, headSHA string, comments []*gh.IssueComment) (workflowApproval, bool) {
 	headPushedAt := c.headObservedAt(owner, repo, number, headSHA, pr)
 	appLogin := strings.TrimSpace(c.transport.AppBotLogin())
 	for i := len(comments) - 1; i >= 0; i-- {
@@ -116,12 +390,16 @@ func (c *Engine) workflowFenceApproval(ctx context.Context, owner, repo string, 
 		if !ok {
 			continue
 		}
-		if trusted, configured := c.isTrustedMerger(login); configured && trusted {
-			c.noteStageTrustedHumanApproval(owner, repo, number, headSHA, login)
-			return login, true
+		if trusted, configured := c.isTrustedMerger(login); !configured || !trusted {
+			continue
 		}
+		approval := workflowApproval{Login: login}
+		if strings.EqualFold(strings.TrimSpace(hgithub.SafeGetLogin(comments[i].GetUser())), login) {
+			approval.Typed = comments[i]
+		}
+		return approval, true
 	}
-	return "", false
+	return workflowApproval{}, false
 }
 
 // workflowApprovalCommentActor reads one comment as an explicit approval
@@ -129,9 +407,14 @@ func (c *Engine) workflowFenceApproval(ctx context.Context, owner, repo string, 
 // `/approve` posted by the App counts for the maintainer it names; a
 // person's `/hive decision approve` counts for its author. Either binds to
 // the head through its marker, or — for comments without one — by having
-// been posted after the head (headPushedAt, when known).
+// been posted after the head (headPushedAt, when known). An edited comment
+// never counts: collaborators can edit others' comments, and an edit to an
+// existing comment is not a new instruction.
 func workflowApprovalCommentActor(comment *gh.IssueComment, headSHA string, headPushedAt time.Time, appLogin string) (string, bool) {
 	if comment == nil {
+		return "", false
+	}
+	if created, updated := comment.GetCreatedAt().Time, comment.GetUpdatedAt().Time; !created.IsZero() && updated.After(created) {
 		return "", false
 	}
 	body := comment.GetBody()
@@ -193,17 +476,37 @@ func workflowApprovalMarker(headSHA string) string {
 	return workflowApprovalMarkerPrefix + " head=" + strings.ToLower(headSHA)
 }
 
-// workflowApprovalComment is the audit comment body.
-func workflowApprovalComment(headSHA, approver string) string {
-	return workflowApprovalMarker(headSHA) + " by=" + strings.ToLower(approver) + " -->\n" +
-		"@" + approver + " approved head `" + shortSHA(headSHA) + "`, which edits CI workflow / action files. That explicit owner approval releases the contributor lane's workflow-path fence: the hive merges this PR itself once the usual gates (CI, soak, holds, review verdict) are clear. A new push re-arms the fence until the new head is approved again."
+// workflowApprovalComment is the audit comment body. verdictState says what
+// the approval did about a reviewer verdict that asks for a person: an
+// owner told only "merges once the gates clear" while the verdict still
+// held the PR waited hours for a merge that never came
+// (Danathar/zfs-aurora-complex#254). A carried approval names the head it
+// was given on (from=) and says why it still stands.
+func workflowApprovalComment(headSHA string, approval workflowApproval, verdictState int) string {
+	approver := approval.Login
+	marker := workflowApprovalMarker(headSHA) + " by=" + strings.ToLower(approver)
+	gates := "the hive merges this PR itself once the usual gates (CI, soak, holds, review verdict) are clear."
+	switch verdictState {
+	case workflowApprovalVerdictAnswered:
+		gates = "the same approval answers the review swarm's `requires_human` question on this head, and the hive merges this PR itself once the usual gates (CI, soak, holds) are clear."
+	case workflowApprovalVerdictOpen:
+		gates = "the review swarm's `requires_human` verdict on this head still holds the PR. A trusted merger's `/hive decision approve` reply (or the dashboard's approval) answers it, as does a `/hive approve` reply posted after the verdict; then the hive merges this PR itself once the usual gates (CI, soak, holds) are clear."
+	}
+	if approval.CarriedFrom != "" {
+		// The approval was on an earlier head; head only merges the base in
+		// (the PR's diff is unchanged), so say so rather than claim this head.
+		return marker + " from=" + strings.ToLower(approval.CarriedFrom) + " -->\n" +
+			"@" + approver + " approved head `" + shortSHA(approval.CarriedFrom) + "`, which edits CI workflow / action files. Head `" + shortSHA(headSHA) + "` is only the hive's own merge of the base branch into it — the PR's diff is unchanged — so that approval still releases the contributor lane's workflow-path fence: " + gates + " Any other push re-arms the fence until the new head is approved again."
+	}
+	return marker + " -->\n" +
+		"@" + approver + " approved head `" + shortSHA(headSHA) + "`, which edits CI workflow / action files. That explicit owner approval releases the contributor lane's workflow-path fence: " + gates + " A new push re-arms the fence until the new head is approved again; the hive's own merge of the base branch, which leaves the diff unchanged, does not."
 }
 
 // commentWorkflowApproval posts the audit comment once per head: an existing
 // marker on the PR, or a prior effects claim, suppresses it.
-func (c *Engine) commentWorkflowApproval(ctx context.Context, owner, repo string, number int, headSHA, approver string) error {
+func (c *Engine) commentWorkflowApproval(ctx context.Context, owner, repo string, number int, headSHA string, approval workflowApproval, verdictState int) error {
 	marker := workflowApprovalMarker(headSHA)
-	body := workflowApprovalComment(headSHA, approver)
+	body := workflowApprovalComment(headSHA, approval, verdictState)
 	_, err := effects.Execute(hgithub.WithRESTCaller(ctx, workflowApprovalRESTCaller), c.mutation, effects.Claim{
 		Repo:   owner + "/" + repo,
 		Kind:   effects.KindIssueComment,
@@ -222,17 +525,18 @@ func (c *Engine) commentWorkflowApproval(ctx context.Context, owner, repo string
 }
 
 // workflowFenceMergeUnauthorized handles a merge failure on a PR whose
-// workflow-path fence owner approval released. When GitHub refused the merge
+// workflow-path fence owner approval released, or whose workflow edits
+// workflow_fence_scope left outside the fence. When GitHub refused the merge
 // for want of the App's `workflows` permission, it marks the PR unauthorized
 // for merge-workflow-path and returns the workflow-path reason — the
 // pre-#14664 outcome, which the stage engine routes to 090 "click Merge" for
 // an approved head. Any other failure, or a PR whose fence did not trip,
 // returns "" so the caller's usual handling runs.
 func (c *Engine) workflowFenceMergeUnauthorized(ctx context.Context, displayRepo, owner, repo string, eval contributorLaneEval, err error) string {
-	if eval.workflowApprover == "" || !isWorkflowsPermissionMergeError(err) {
+	if (eval.workflowApprover == "" && !eval.workflowUnfenced) || !isWorkflowsPermissionMergeError(err) {
 		return ""
 	}
-	c.warn("workflow-path merge refused: App lacks workflows permission", "repo", displayRepo, "pr", eval.pr.GetNumber(), "head", eval.headSHA, "approver", eval.workflowApprover, "error", err)
+	c.warn("workflow-path merge refused: App lacks workflows permission", "repo", displayRepo, "pr", eval.pr.GetNumber(), "head", eval.headSHA, "approver", eval.workflowApprover, "outside_fence_scope", eval.workflowUnfenced, "error", err)
 	c.markUnauthorized(ctx, displayRepo, owner, repo, eval.pr, eval.pr.GetNumber(), eval.headSHA, unauthorizedStepMergeWorkflowPath, unauthorizedPermissionWorkflowsWrite, mergeWorkflowPathHumanAction())
 	return contributorLaneReasonWorkflowPath
 }

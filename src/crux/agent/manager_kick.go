@@ -2,17 +2,17 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/hivecommons/hive/crux"
 	"github.com/hivecommons/hive/crux/config"
+	"github.com/hivecommons/hive/crux/logscrub"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -116,8 +116,7 @@ func (m *Manager) SendKickWithSource(name string, message string, source string)
 	// (the default). SendKick has no context parameter, so this span roots at
 	// Background; it still captures the kick leg of the governor→agent
 	// lifecycle. Ended before delivery bookkeeping via defer.
-	_, span := m.startSpan(context.Background(), "agent.send_kick",
-		attribute.String("agent.name", name))
+	_, span := m.startSpan(context.Background(), "agent.send_kick")
 	defer span.End()
 
 	// Kick duration/outcome metrics; role stays kickRoleUnknown until the
@@ -132,7 +131,16 @@ func (m *Manager) SendKickWithSource(name string, message string, source string)
 	if !ok {
 		return fmt.Errorf("agent %s not found", name)
 	}
+	// Preserve the identity across unlocked waits: a removed/replaced agent
+	// must not receive a stale attempt's failure.
+	kickAgent := agent
+	defer func() {
+		if m.agents[name] == kickAgent {
+			recordKickFailureLocked(kickAgent, err)
+		}
+	}()
 	role = name
+	span.SetAttributes(attribute.String("agent.name", role))
 
 	trigger := "send-kick"
 	if strings.TrimSpace(source) != "" {
@@ -183,8 +191,11 @@ func (m *Manager) SendKickWithSource(name string, message string, source string)
 	// passes the marker check, but a kick typed into it is consumed by the
 	// menu — or by bash once the default "No, exit" selection exits the CLI
 	// (observed live: "-bash: NEVER: command not found").
+	// A Claude permission dialog is a blocking prompt too, but a restart
+	// relaunches into the same dialog; the prompt wait below answers it in
+	// place (or names it in the error) instead.
 	pane := m.captureVisiblePaneForAgent(agent)
-	if !paneHasCLIMarker(pane) || paneShowsConsentScreen(pane) {
+	if (!paneHasCLIMarker(pane) || paneShowsConsentScreen(pane)) && !paneShowsClaudePermissionDialog(pane) {
 		consentScreen := paneShowsConsentScreen(pane)
 		m.mu.Unlock()
 		// Answer the bypass consent screen in place: a restart relaunches
@@ -260,35 +271,6 @@ func (m *Manager) SendKickWithSource(name string, message string, source string)
 // must hold m.mu and must already have verified the CLI is ready for input
 // (crash detect + waitForCLIReadyForAgent + waitForInputPromptForAgent) —
 // this function does no readiness checking of its own.
-// kickChunkPauseUnlocked waits out one inter-chunk delay with m.mu released,
-// then re-acquires it and re-validates that the kick still belongs to the
-// session it was pinned to.
-//
-// Returns false if the agent disappeared, was replaced, or restarted while
-// unlocked, meaning the remaining chunks must not be typed — the pane they
-// would land in is a different run's. This mirrors the epoch revalidation
-// SendKick already does around waitForInputPromptForAgent (#7363).
-//
-// The identity check is deliberately pointer-based as well as epoch-based: a
-// replacement AgentProcess for the same name starts its kickEpoch at zero, so
-// an epoch comparison alone could alias a fresh object as "unchanged".
-//
-// Always returns with m.mu held, including on the false path, so callers can
-// keep their `Locked` contract.
-func (m *Manager) kickChunkPauseUnlocked(agent *AgentProcess, epoch int, d time.Duration) bool {
-	name := agent.Name
-
-	m.mu.Unlock()
-	time.Sleep(d)
-	m.mu.Lock()
-
-	current, ok := m.agents[name]
-	if !ok || current != agent {
-		return false
-	}
-	return agent.kickEpoch == epoch
-}
-
 func (m *Manager) deliverKickLocked(agent *AgentProcess, message, trigger string) error {
 	// Consume the one-shot resume flag first, before any early return, so a
 	// skipped delivery cannot leave it armed for an unrelated later kick.
@@ -311,21 +293,8 @@ func (m *Manager) deliverKickLocked(agent *AgentProcess, message, trigger string
 	defer agent.kickDelivering.Store(false)
 
 	visible := m.captureVisiblePaneForAgent(agent)
-	menuFooter := paneTUIMenuFooter(effectiveBackend(agent), visible)
-	if !paneShowsInputPrompt(visible) || paneShowsConsentScreen(visible) || paneShowsAgentWorking(visible) || paneShowsCopilotQuestionForm(visible) || menuFooter != "" {
-		reason := "pane not at a ready input prompt"
-		if menuFooter != "" {
-			reason = tuiMenuNotReadyReason(menuFooter)
-		}
-		m.markKickUndeliverableLocked(agent, time.Now(), reason)
-		m.logger.Warn("kick delivery skipped: CLI is not at a ready prompt; refusing to type kick into shell",
-			"agent", agent.Name, "trigger", trigger, "has_cli_marker", paneHasCLIMarker(visible),
-			"consent_screen", paneShowsConsentScreen(visible), "working", paneShowsAgentWorking(visible),
-			"question_form", paneShowsCopilotQuestionForm(visible), "menu_footer", menuFooter)
-		if menuFooter != "" {
-			return fmt.Errorf("agent %s pane not at a ready input prompt: %s", agent.Name, reason)
-		}
-		return m.kickNotReadyErrorLocked(agent, time.Now(), fmt.Errorf("agent %s pane not at a ready input prompt", agent.Name))
+	if err := m.checkKickPromptReadyLocked(agent, visible, trigger); err != nil {
+		return err
 	}
 
 	// Archive the PREVIOUS kick's scrollback and clear the history before any
@@ -337,6 +306,9 @@ func (m *Manager) deliverKickLocked(agent *AgentProcess, message, trigger string
 	// Ctrl+C at that prompt, leaving the subsequent task to be executed by
 	// bash. Clear its input with Ctrl+U alone. Goose skips clearing entirely.
 	backend := effectiveBackend(agent)
+	if backend == "cline" && agent.Config.LaunchCmd == "" {
+		return m.deliverClineKickLocked(agent, message, trigger)
+	}
 	if agentUsesAgyHeadless(backend, agent) {
 		return m.deliverAgyHeadlessKickLocked(agent, message, trigger)
 	}
@@ -353,6 +325,15 @@ func (m *Manager) deliverKickLocked(agent *AgentProcess, message, trigger string
 		time.Sleep(staleCheckDelay)
 	}
 
+	// Persistent CLI memory is drained into draft knowledge entries
+	// (hivecommons/hive#17033) and then wiped (hivecommons/hive#17032) before
+	// the conversation /clear below, and both are skipped on the same resume
+	// kicks: a resumed session is continuing prior work, not starting a
+	// fresh turn.
+	if !skipClear {
+		m.drainCLIMemoryForKick(agent, backend)
+		m.clearCLIMemoryForKick(agent, backend)
+	}
 	if agent.Config.ClearOnKick && !skipClear {
 		if err := m.tmuxSendLiteralForAgent(agent, "/clear"); err != nil {
 			return m.kickDeliveryFailedLocked(agent, "send text", err)
@@ -471,8 +452,21 @@ func (m *Manager) kickDeliveryFailedLocked(agent *AgentProcess, stage string, er
 	return err
 }
 
+// recordKickFailureLocked counts delivery failures, not busy or restart deferrals.
+// Caller holds m.mu.
+func recordKickFailureLocked(agent *AgentProcess, err error) {
+	if err == nil || errors.Is(err, errKickHeldAfterRestart) ||
+		errors.Is(err, errKickCancelledByRestart) || errors.Is(err, crux.ErrAgentBusy) {
+		return
+	}
+	agent.ConsecutiveKickFailures++
+	agent.LastKickError = logscrub.RedactPaneTokens(logscrub.ScrubString(err.Error()))
+}
+
 func (m *Manager) recordDeliveredKickLocked(agent *AgentProcess, message, trigger string) {
 	now := time.Now()
+	agent.ConsecutiveKickFailures = 0
+	agent.LastKickError = ""
 	m.resetBusyVisibilityLocked(agent)
 	agent.LastKick = &now
 	agent.LastKickMessage = message
@@ -499,12 +493,17 @@ func (m *Manager) recordDeliveredKickLocked(agent *AgentProcess, message, trigge
 	agent.lastTransientNudge = time.Time{}
 	agent.ciPollBaseline = -1
 	agent.ciPollCommandBaseline = nil
+	// The nudge is the recovery: a new kick after one was sent closes the
+	// ci_poll_nudge report as self-recovered instead of leaving it open (#16588).
+	if agent.ciPollNudgeSent {
+		m.clearCondition(crux.ClassCIPollNudge, agent.Name)
+	}
 	agent.ciPollNudgeSent = false
 	agent.AwaitingCI = false
 
-	snippet := message
+	previewBody := kickPreviewBody(message)
 	const maxSnippetLen = 120
-	snippet = truncateStr(snippet, maxSnippetLen)
+	snippet := truncateStr(previewBody, maxSnippetLen)
 	record := KickRecord{Timestamp: now, Agent: agent.Name, Snippet: snippet}
 	if trigger != "send-kick" {
 		record.Source = trigger
@@ -514,15 +513,13 @@ func (m *Manager) recordDeliveredKickLocked(agent *AgentProcess, message, trigge
 	}
 	agent.KickHistory = append(agent.KickHistory, record)
 
-	kickPreview := message
 	const maxKickPreviewLen = 200
-	if len(kickPreview) > maxKickPreviewLen {
-		kickPreview = truncateStr(kickPreview, maxKickPreviewLen)
-	}
+	kickPreview := truncateStr(previewBody, maxKickPreviewLen)
 	m.logger.Info("audit: agent kicked",
 		"name", agent.Name,
 		"message_len", len(message),
 		"preview", kickPreview,
+		"canary", previewBody != message,
 		"trigger", trigger,
 	)
 
@@ -549,12 +546,14 @@ func (m *Manager) deliverStartupKick(agent *AgentProcess, prompt string, gen int
 	if !m.waitForCLIReadyForAgent(agent) {
 		m.logger.Warn("startup kick dropped: CLI never became ready",
 			"name", agent.Name, "session", agent.tmuxSession, "trigger", "startup")
+		m.recordStartupKickFailure(agent, gen, fmt.Errorf("agent %s CLI never became ready for startup kick", agent.Name))
 		m.clearStartupKickInFlight(agent, gen)
 		return
 	}
 	if !m.waitForInputPromptForAgent(agent) {
 		m.logger.Warn("startup kick dropped: CLI never reached input prompt",
 			"name", agent.Name, "session", agent.tmuxSession, "trigger", "startup")
+		m.recordStartupKickFailure(agent, gen, fmt.Errorf("agent %s CLI never reached input prompt for startup kick", agent.Name))
 		m.clearStartupKickInFlight(agent, gen)
 		return
 	}
@@ -609,11 +608,21 @@ func (m *Manager) deliverStartupKick(agent *AgentProcess, prompt string, gen int
 		return
 	}
 	if err := m.deliverKickLocked(agent, prompt, trigger); err != nil {
+		recordKickFailureLocked(agent, err)
 		m.logger.Warn("startup kick delivery failed", "name", agent.Name, "error", err)
 		return
 	}
 	if fromQueue {
 		removeDeferredMentionKickLocked(agent, trigger)
+	}
+}
+
+// recordStartupKickFailure ignores work invalidated by a newer launch.
+func (m *Manager) recordStartupKickFailure(agent *AgentProcess, gen int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.agents[agent.Name] == agent && agent.launchGen == gen && agent.State == StateRunning {
+		recordKickFailureLocked(agent, err)
 	}
 }
 
@@ -796,176 +805,6 @@ const (
 	cliActiveCounterMarker = "s · ↓"
 )
 
-// toolSummaryRe matches Claude Code's collapsed tool-activity summary lines,
-// rendered only when tools actually executed (verified against Claude Code
-// v2.1.204): "Running 1 shell command…" while a Bash call is in flight, and
-// "Ran 1 shell command" / "Read 1 file, ran 2 shell commands" once done.
-// Edit/write variants are included for completeness across versions.
-var toolSummaryRe = regexp.MustCompile(`(?i)\b(?:ran|running) \d+ shell command|\bread \d+ file|\bedited \d+ file|\bwrote \d+ file|\bupdated \d+ file`)
-
-// cliBusyEscapeFooterRe matches stable footer actions the CLIs show only while
-// work is in flight. Callers must still pass the VISIBLE pane only: scrollback
-// can retain a completed turn's footer after the prompt is genuinely idle.
-var cliBusyEscapeFooterRe = regexp.MustCompile(`(?i)\besc (?:to )?(?:interrupt|stop agents|cancel)\b`)
-
-const cliWaitingForBackgroundAgentsMarker = "Waiting for background agents"
-
-func paneShowsBusyFooter(pane string) bool {
-	return pane != "" &&
-		(cliBusyEscapeFooterRe.MatchString(pane) ||
-			strings.Contains(pane, cliWaitingForBackgroundAgentsMarker))
-}
-
-// expandedToolCallMarkers are literal fragments of Claude Code's expanded
-// per-tool rendering. "⎿" is the result elbow drawn under a tool call
-// (verified live on v2.1.204: "⎿  $ sleep 15 && echo probe3"); the
-// "⏺ Name(" forms are the expanded tool-call headers older CLI versions
-// render. A bare "⏺" is NOT a tool marker — v2.1.204 uses it as the bullet
-// for every assistant response block, including pure prose.
-var expandedToolCallMarkers = []string{
-	"⎿",
-	"⏺ Bash(",
-	"⏺ Read(",
-	"⏺ Write(",
-	"⏺ Edit(",
-	"⏺ Update(",
-	"⏺ Search(",
-	"⏺ Fetch(",
-	"⏺ Task(",
-}
-
-// countToolMarkers counts tool-execution markers in captured pane content.
-// The no-action watchdog compares the count after a kick against the count
-// recorded at kick delivery: scrollback keeps markers from work done before
-// the kick, so only an increase proves the model executed tools since.
-//
-// EXPLAIN lines are stripped first (#3887). toolSummaryRe matches ENGLISH
-// PHRASES — "read 3 files", "running 2 shell commands" — because that is how
-// the CLI renders its own collapsed tool summaries. An agent in explain mode is
-// asked to state, in plain English, what it is about to do, so it writes
-// exactly those phrases as narration:
-//
-//	EXPLAIN: reading 3 files under pkg/agent to find the kick handler.
-//
-// That counts as a tool marker, the watchdog concludes "real tool activity
-// since the kick", and the prose-only action nudge never fires — on precisely
-// the agents an operator turned explanation ON to debug, which is the worst
-// possible time to silently lose the check. Narration about a tool is not tool
-// execution, so an explanation line contributes nothing to the count.
-//
-// The whole line is dropped rather than just the prefix: a "⎿" or "⏺ Bash("
-// quoted INSIDE an explanation is the agent describing a tool call, not making
-// one.
-func countToolMarkers(pane string) int {
-	pane = stripExplainLines(pane)
-	n := len(toolSummaryRe.FindAllStringIndex(pane, -1))
-	for _, marker := range expandedToolCallMarkers {
-		n += strings.Count(pane, marker)
-	}
-	return n
-}
-
-// stripExplainLines removes the agent's explanation lines from captured pane
-// content, so pane analysis sees only what the agent actually did.
-//
-// Matching is on the TRIMMED line, mirroring the read-time filter in
-// pkg/dashboard (filterExplainLines): the CLI indents assistant output, so
-// anchoring at column 0 would miss every real line. Returns the input unchanged
-// when nothing matches, which is every pane on a hive with explain mode off.
-func stripExplainLines(pane string) string {
-	if !strings.Contains(pane, config.ExplainLinePrefix) {
-		return pane
-	}
-	lines := strings.Split(pane, "\n")
-	kept := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), config.ExplainLinePrefix) {
-			continue
-		}
-		kept = append(kept, line)
-	}
-	return strings.Join(kept, "\n")
-}
-
-// paneShowsActiveWork reports whether the CLI is mid-response: either a busy
-// footer action (esc interrupt / esc to interrupt / esc stop agents / esc to
-// cancel), the live spinner counter, or an OMP work label is visible. The idle
-// input prompt "❯" alone proves nothing on v2.1.204 — the input box stays
-// rendered while a response streams. Callers must pass the VISIBLE pane only:
-// a completed turn's busy footer can linger in scrollback.
-//
-// OMP renders neither marker (verified live, omp 18.1.16/18.1.17): a tool
-// call shows "⏺ Running… (esc to cancel)" and plain generation shows a
-// spinner glyph plus "Working…", so an in-flight OMP turn read as idle
-// without these two additions. omp 18.2+ then swaps that label for the tool
-// intent a few seconds in, leaving only an activity row and a spinner+elapsed
-// status prefix — see paneShowsOMPMidTurn.
-//
-// Copilot CLI 1.0.88 collapses its footer to "◉ Working - autopilot esc
-// interrupt" mid-turn (no "to", no ellipsis), so that shape is matched too.
-func paneShowsActiveWork(pane string) bool {
-	return paneShowsBusyFooter(pane) ||
-		strings.Contains(pane, cliWorkingMarker) ||
-		strings.Contains(pane, cliActiveCounterMarker) ||
-		strings.Contains(pane, "Working…") ||
-		strings.Contains(pane, "Running…") ||
-		paneShowsOMPMidTurn(pane) ||
-		strings.Contains(pane, copilotWorkingMarker) ||
-		strings.Contains(pane, copilotInterruptHint)
-}
-
-// Copilot CLI 1.0.88 mid-turn footer chrome.
-const (
-	copilotWorkingMarker = "◉ Working"
-	copilotInterruptHint = "esc interrupt"
-)
-
-// paneShowsEmptyInputPrompt reports whether the CLI is sitting at an idle,
-// empty input prompt.
-//
-// Trailing chrome is skipped before the test so that both CLI shapes are
-// handled: Claude Code ends at "❯", while the Copilot CLI draws a rule and a
-// hint footer underneath it. A prompt with typed text ("❯ do the thing") still
-// fails the equality check, which is the point — that is not an idle prompt.
-func paneShowsEmptyInputPrompt(pane string) bool {
-	lines := strings.Split(pane, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if lineIsCLIChrome(line) {
-			continue
-		}
-		return line == cliInputPromptMarker
-	}
-	return false
-}
-
-// paneContentHash returns a short stable hash of pane content, used to detect
-// whether a pane has changed since a kick was delivered.
-func paneContentHash(pane string) string {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(pane))
-	return fmt.Sprintf("%016x", h.Sum64())
-}
-
-func paneAfterKickBaseline(pane, baseline string) string {
-	if baseline == "" {
-		return pane
-	}
-	if idx := strings.LastIndex(pane, baseline); idx >= 0 {
-		return pane[idx+len(baseline):]
-	}
-	paneLines := strings.Split(pane, "\n")
-	baseLines := strings.Split(baseline, "\n")
-	common := 0
-	for common < len(paneLines) && common < len(baseLines) && paneLines[common] == baseLines[common] {
-		common++
-	}
-	if common > 0 {
-		return strings.Join(paneLines[common:], "\n")
-	}
-	return pane
-}
-
 // recordInferenceKick arms the post-kick stall watchdog for an inference
 // agent: remembers when the kick was delivered and what the pane looked like
 // right after delivery. Caller must hold m.mu.
@@ -1047,6 +886,17 @@ func (m *Manager) nudgeIfKickStalled(name, pane string) {
 	sinceKick := now.Sub(agent.lastInferKickAt)
 	if match, ok := classifyProviderError(paneAfterKickBaseline(pane, agent.lastInferKickVisible)); ok {
 		m.creditStallRecoveryLocked(agent, paneContentHash(pane))
+		if match.Class == ModelRejectedClass {
+			// Counted per turn, so the same refusal re-read on every stall
+			// check is one failure, and the Nth parks the agent instead of
+			// cycling backoff → kick → refusal forever.
+			count, _, park := m.recordModelRejectionLocked(agent, match, now)
+			m.mu.Unlock()
+			if park {
+				m.parkForModelRejection(name, match.Model, count)
+			}
+			return
+		}
 		backoff := m.markProviderErrorLocked(agent, match, now)
 		attempt := agent.providerErrorBackoffAttempt
 		m.mu.Unlock()
@@ -1296,178 +1146,6 @@ const (
 	ProviderErrorBackoffMaxEnv      = "HIVE_PROVIDER_ERROR_BACKOFF_MAX"
 )
 
-// MarkStartupLaunchQueued tells SendKick that the named agents are still in the
-// boot stagger. A governor/manual kick that arrives before the agent reaches its
-// pane is then held for delivery by the startup kick path instead of being
-// refused as "stopped" and lost for the whole cadence interval.
-func (m *Manager) MarkStartupLaunchQueued(names []string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, name := range names {
-		if agent, ok := m.agents[name]; ok {
-			agent.startupLaunchQueued = true
-		}
-	}
-}
-
-// GovernorMayStart reports whether the governor's kick path may start the named
-// agent: it must be stopped and not stopped explicitly by an operator.
-func (m *Manager) GovernorMayStart(name string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	agent, ok := m.agents[name]
-	return ok && agent.State == StateStopped && !agent.OperatorStopped
-}
-
-// maxDeferredMentionKicks bounds the per-agent deferred mention FIFO so a
-// burst of mentions against an agent stuck in startup cannot grow unbounded.
-const maxDeferredMentionKicks = 8
-
-type deferredKick struct {
-	message string
-	source  string
-}
-
-// deferStartupKickLocked records a kick that arrives while startup owns
-// delivery. Cadence/governor kicks coalesce: the latest one replaces the
-// normal bootstrap prompt, since one readiness-gated kick should be typed into
-// the fresh pane and the governor's actionable queue message is the fresher,
-// more specific instruction. Mention/action-sourced kicks are different — each
-// already carries a human-visible ack — so they are queued FIFO and never
-// evicted by a later cadence kick (#12982). The startup delivery types the
-// oldest queued mention unless a one-shot (non-cadence) kick is pending; the
-// rest are delivered on later governor cadence kicks. Stop drops them (#13055).
-//
-// Caller holds m.mu.
-func (m *Manager) deferStartupKickLocked(agent *AgentProcess, message, trigger string) bool {
-	if agent.Paused || agent.State == StatePaused || agent.State == StateFailed {
-		return false
-	}
-	startupKickInFlight := agent.startupKickInFlight && agent.startupKickGen == agent.launchGen
-	if agent.startupKickInFlight && !startupKickInFlight {
-		agent.startupKickInFlight = false
-	}
-	if !agent.startupLaunchQueued && !startupKickInFlight {
-		return false
-	}
-	if mentionKickSource(trigger) {
-		m.queueDeferredMentionKickLocked(agent, message, trigger)
-	} else {
-		agent.pendingStartupKick = message
-		agent.pendingStartupSource = trigger
-	}
-	agent.KickRefused = true
-	agent.KickRefusalReason = "deferred until startup completes"
-	m.logger.Info("agent kick deferred until startup completes",
-		"name", agent.Name,
-		"state", agent.State,
-		"trigger", trigger,
-		"queued_mentions", len(agent.deferredMentionKicks),
-		"startup_queued", agent.startupLaunchQueued,
-		"startup_kick_in_flight", startupKickInFlight,
-	)
-	return true
-}
-
-// queueDeferredMentionKickLocked appends a mention/action kick to the agent's
-// deferred FIFO. A re-sent kick for an already-queued source replaces its
-// message in place. When the FIFO is full the oldest entry is genuinely
-// dropped: that is audited and reported to the kick observer so the mention
-// store does not keep a pending entry that will never be delivered.
-//
-// Caller holds m.mu.
-func (m *Manager) queueDeferredMentionKickLocked(agent *AgentProcess, message, source string) {
-	for i := range agent.deferredMentionKicks {
-		if agent.deferredMentionKicks[i].source == source {
-			agent.deferredMentionKicks[i].message = message
-			return
-		}
-	}
-	if len(agent.deferredMentionKicks) >= maxDeferredMentionKicks {
-		dropped := agent.deferredMentionKicks[0]
-		agent.deferredMentionKicks = agent.deferredMentionKicks[1:]
-		m.logger.Warn("audit: deferred mention kick dropped",
-			"name", agent.Name,
-			"source", dropped.source,
-			"reason", "deferred mention queue full",
-			"queue_cap", maxDeferredMentionKicks,
-		)
-		m.notifyKickObserver(agent.Name, "kick-dropped", dropped.source)
-	}
-	agent.deferredMentionKicks = append(agent.deferredMentionKicks, deferredKick{message: message, source: source})
-}
-
-// startupKickTrigger is the trigger of the bootstrap prompt typed when an
-// agent finishes starting.
-const startupKickTrigger = "startup"
-
-// nextDeferredMentionKickLocked substitutes the oldest queued mention kick for
-// a kick that may safely yield to it: the governor cadence kick (re-sent on the
-// next tick) or the startup bootstrap prompt. Every other kick — mentions
-// themselves and one-shot messages from sourceless SendKick callers — is
-// delivered as sent and the mention stays queued for the next cadence kick.
-// fromQueue reports whether the returned kick must be removed from the FIFO
-// once it is delivered.
-//
-// Caller holds m.mu.
-func (m *Manager) nextDeferredMentionKickLocked(agent *AgentProcess, message, trigger string) (string, string, bool) {
-	if len(agent.deferredMentionKicks) == 0 || (trigger != GovernorCadenceKickSource && trigger != startupKickTrigger) {
-		return message, trigger, false
-	}
-	next := agent.deferredMentionKicks[0]
-	if message != "" {
-		m.logger.Info("cadence/startup kick superseded by queued mention kick",
-			"name", agent.Name, "superseded_trigger", trigger, "trigger", next.source)
-	}
-	return next.message, next.source, true
-}
-
-// drainDeferredMentionKicksLocked drops every queued mention kick when the
-// agent is stopped, so each mention's pending store entry and 👀 ack are
-// released via kick-dropped instead of lingering indefinitely (#13055).
-// Restarts keep the queue: the relaunched agent's startup delivery drains it.
-//
-// Caller holds m.mu.
-func (m *Manager) drainDeferredMentionKicksLocked(agent *AgentProcess, reason string) {
-	for _, dropped := range agent.deferredMentionKicks {
-		m.logger.Warn("audit: deferred mention kick dropped",
-			"name", agent.Name,
-			"source", dropped.source,
-			"reason", reason,
-		)
-		m.notifyKickObserver(agent.Name, "kick-dropped", dropped.source)
-	}
-	agent.deferredMentionKicks = nil
-}
-
-// removeDeferredMentionKickLocked removes a delivered kick from the FIFO by
-// source rather than by index: m.mu is released while a kick is typed, so the
-// queue may have changed underneath the delivery.
-//
-// Caller holds m.mu.
-func removeDeferredMentionKickLocked(agent *AgentProcess, source string) {
-	for i := range agent.deferredMentionKicks {
-		if agent.deferredMentionKicks[i].source == source {
-			agent.deferredMentionKicks = append(agent.deferredMentionKicks[:i], agent.deferredMentionKicks[i+1:]...)
-			return
-		}
-	}
-}
-
-func mentionKickSource(source string) bool {
-	source = strings.TrimSpace(source)
-	return source == "mention" || strings.HasPrefix(source, "mention:") ||
-		source == "action" || strings.HasPrefix(source, "action:")
-}
-
-func (m *Manager) clearStartupKickInFlight(agent *AgentProcess, gen int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if current, ok := m.agents[agent.Name]; ok && current == agent && agent.startupKickGen == gen {
-		agent.startupKickInFlight = false
-	}
-}
-
 // cliChromeFooterMarkers are hint-bar fragments that the Copilot CLI renders
 // on a line BELOW the input box (e.g. "/ commands · ? help · tab next tab" and
 // "@ files · # issues", each right-padded with the backend name). Claude Code
@@ -1557,240 +1235,3 @@ var ciPollProhibitionRe = regexp.MustCompile("(?i)\\b(?:no|not|never|don't|avoid
 
 // ciLogReadRe identifies diagnostic log reads, rather than CI-status polls.
 var ciLogReadRe = regexp.MustCompile(`^gh run view\b[^\n;|&]*\s--log(?:-failed)?(?:=true)?(?:\s|$)`)
-
-// ciPollCommands returns each CI-status command in pane as its normalized
-// command line (from the command name to end of line), skipping mentions
-// that are prohibitions quoted from the kick prompt or policy: those landed
-// in the pane right after the kick and read as poll commands issued 0s in.
-func ciPollCommands(pane string) []string {
-	pane = stripExplainLines(pane)
-	var cmds []string
-	for _, loc := range ciPollCommandRe.FindAllStringIndex(pane, -1) {
-		lineStart := strings.LastIndex(pane[:loc[0]], "\n") + 1
-		if ciPollProhibitionRe.MatchString(pane[lineStart:loc[0]]) {
-			continue
-		}
-		line, _, _ := strings.Cut(pane[loc[0]:], "\n")
-		// Failure diagnosis can revisit the same log while comparing jobs or
-		// extracting evidence. It does not wait for a check to finish (#14382).
-		if ciLogReadRe.MatchString(line) {
-			continue
-		}
-		cmds = append(cmds, strings.Join(strings.Fields(strings.TrimRight(line, " \t┃│")), " "))
-	}
-	return cmds
-}
-
-// countCIPollCommands counts CI-status commands in pane.
-func countCIPollCommands(pane string) int {
-	return len(ciPollCommands(pane))
-}
-
-// ciPollCommandsSinceBaseline returns the commands in current that were run
-// after baseline was taken. The pane capture holds only the newest
-// tmuxCaptureLines lines and evicts the oldest first, so baseline is a prefix
-// of the kick's full command sequence and current is a suffix of it. The
-// longest baseline tail that opens current is what is still visible; the rest
-// of current is new. Subtracting per-command counts instead let reads that had
-// scrolled out cancel genuine new ones (#14065).
-func ciPollCommandsSinceBaseline(current, baseline []string) []string {
-	for k := min(len(current), len(baseline)); k > 0; k-- {
-		if slices.Equal(baseline[len(baseline)-k:], current[:k]) {
-			return current[k:]
-		}
-	}
-	return current
-}
-
-// countRepeatedCIPollCommands counts CI-status commands whose command line
-// appears more than once since baseline. Waiting on one PR re-reads the same
-// target; a merge sweep or CI-repair pass reads each of many PRs once, and
-// that is the lane's work, not polling (#14016). Reads already in baseline are
-// dropped BEFORE deciding whether a command repeats: one read in each of two
-// kicks is not repeated polling in either kick (#14061).
-func countRepeatedCIPollCommands(pane string, baseline []string) int {
-	counts := map[string]int{}
-	for _, cmd := range ciPollCommandsSinceBaseline(ciPollCommands(pane), baseline) {
-		counts[cmd]++
-	}
-	n := 0
-	for _, c := range counts {
-		if c > 1 {
-			n += c
-		}
-	}
-	return n
-}
-
-// repeatedCIPollCommandLines lists each command line run more than once since
-// baseline as "<count>× <command>", most-repeated first then by command, so a
-// ci_poll_nudge report shows which reads repeated (#14289).
-func repeatedCIPollCommandLines(pane string, baseline []string) []string {
-	counts := map[string]int{}
-	for _, cmd := range ciPollCommandsSinceBaseline(ciPollCommands(pane), baseline) {
-		counts[cmd]++
-	}
-	var cmds []string
-	for cmd, c := range counts {
-		if c > 1 {
-			cmds = append(cmds, cmd)
-		}
-	}
-	slices.SortFunc(cmds, func(a, b string) int {
-		if counts[a] != counts[b] {
-			return counts[b] - counts[a]
-		}
-		return strings.Compare(a, b)
-	})
-	lines := make([]string, 0, len(cmds))
-	for _, cmd := range cmds {
-		lines = append(lines, fmt.Sprintf("%d× %s", counts[cmd], RedactPaneTokens(cmd)))
-	}
-	return lines
-}
-
-// reviewLaneAgent mirrors the review swarm's own admission rule
-// (review.hasReviewCapability): a name or role carrying "review" is a
-// reviewer. pkg/review is not imported here (cycle risk); the token is tiny.
-func reviewLaneAgent(agent *AgentProcess) bool {
-	for _, f := range []string{agent.Name, agent.Config.Role} {
-		if strings.Contains(strings.ToLower(f), "review") {
-			return true
-		}
-	}
-	return false
-}
-
-// ciPollNudgeExemptAgent identifies lanes whose work inherently reads CI
-// status across repositories. The guard cannot distinguish those operational
-// reads from an agent polling its own PR, so nudging these lanes interrupts the
-// work they were kicked to do.
-func ciPollNudgeExemptAgent(agent *AgentProcess) bool {
-	if reviewLaneAgent(agent) {
-		return true
-	}
-	for _, f := range []string{agent.Name, agent.Config.Role} {
-		if exemptCIPollLane(f) {
-			return true
-		}
-	}
-	return false
-}
-
-// exemptCIPollLane matches a lane name or role exactly, or as a dash/underscore-
-// suffixed variant ("ci-maintainer-2", "quality_full"), so replicas and policy
-// variants of an exempt lane are exempt too.
-func exemptCIPollLane(f string) bool {
-	lane := strings.ToLower(strings.TrimSpace(f))
-	for _, base := range []string{"ci-maintainer", "quality"} {
-		if lane == base || strings.HasPrefix(lane, base+"-") || strings.HasPrefix(lane, base+"_") {
-			return true
-		}
-	}
-	return false
-}
-
-// nudgeIfPollingCI tells an agent that keeps polling CI within one kick to
-// move on. Policy templates already forbid it; this is the harness backstop.
-// Sends at most one nudge per kick, and only at an idle prompt so it never
-// splices into a running response.
-//
-// Two independent triggers count as "polling CI" (#9673's ask, item 2): more
-// than ciPollNudgeThreshold repeated poll commands this kick (the same
-// command line run more than once, #14016), OR at least one poll
-// command with the kick already running longer than ciPollNudgeWallClock — a
-// single `gh run watch` blocks for the whole wait and would otherwise never
-// cross the count threshold. The wall-clock trigger skips a sweep: a scanner
-// reading each of several PRs once late in a long kick is doing its work, not
-// waiting on one PR (#14066).
-
-func (m *Manager) nudgeIfPollingCI(agent *AgentProcess, scrollback, visible string) {
-	if agent.kickDelivering.Load() || agent.LastKick == nil {
-		return
-	}
-	// Reviewers, CI maintainers and quality agents read check status as evidence
-	// for the PRs and repositories they inspect. Those reads are not an own-PR
-	// wait loop, which this guard cannot identify from pane text alone
-	// (#13860, #13898, #14188).
-	if ciPollNudgeExemptAgent(agent) {
-		return
-	}
-	cmds := ciPollCommands(scrollback)
-	m.mu.Lock()
-	if agent.ciPollBaseline < 0 {
-		agent.ciPollBaseline = len(cmds)
-		agent.ciPollCommandBaseline = cmds
-		m.mu.Unlock()
-		return
-	}
-	newPolls := len(ciPollCommandsSinceBaseline(cmds, agent.ciPollCommandBaseline))
-	newRepeats := countRepeatedCIPollCommands(scrollback, agent.ciPollCommandBaseline)
-	overThreshold := newRepeats > ciPollNudgeThreshold ||
-		(newPolls > 0 && !ciPollSweep(newPolls, newRepeats) && time.Since(*agent.LastKick) > ciPollNudgeWallClock)
-	alreadyNudged := agent.ciPollNudgeSent
-	m.mu.Unlock()
-
-	// idlePrompt is the same idle-at-prompt gate the nudge below requires: the
-	// agent stopped producing new output after its polling ran. AwaitingCI
-	// (#9673 item 3) uses it too, so the dashboard's "Waiting on CI" state
-	// self-clears the instant the agent starts doing something else, rather
-	// than sticking until the next kick.
-	idlePrompt := !paneShowsActiveWork(visible) && paneShowsEmptyInputPrompt(visible)
-	m.mu.Lock()
-	agent.AwaitingCI = overThreshold && idlePrompt
-	m.mu.Unlock()
-
-	if alreadyNudged || !overThreshold || !idlePrompt {
-		return
-	}
-	if m.tmuxSessionHasAttachedClientForAgent(agent) {
-		return
-	}
-	m.mu.Lock()
-	agent.ciPollNudgeSent = true
-	agent.CIPollNudges++
-	totalCIPollNudges := agent.CIPollNudges
-	lane := agent.Config.Role
-	var sinceKick time.Duration
-	if agent.LastKick != nil {
-		sinceKick = time.Since(*agent.LastKick).Round(time.Minute)
-	}
-	m.mu.Unlock()
-
-	// Self-report (#13470, was the hive-code-defect "CI-poll nudge" counter):
-	// the harness caps the nudge at one per kick, so every observation is a
-	// distinct kick in which the agent repeated CI-status commands; whether
-	// the target was its own PR cannot be inferred from pane text (#14384).
-	// A lone poll past the wall clock is a normal post-push check, and one
-	// read each of several PRs is a sweep, so only repeated polling of the
-	// same target reaches the fleet; the in-session nudge is unchanged.
-	if ciPollReportWorthy(newRepeats) {
-		m.mu.Lock()
-		repeated := repeatedCIPollCommandLines(scrollback, agent.ciPollCommandBaseline)
-		m.mu.Unlock()
-		m.observeCondition(crux.ClassCIPollNudge, agent.Name,
-			fmt.Sprintf("repeated CI-status commands observed after the kick: stop-polling nudge sent (%d repeated of %d poll command(s) since the kick, %s after it; %d nudge(s) since boot)", newRepeats, newPolls, roundDurationForHumans(sinceKick), totalCIPollNudges),
-			fmt.Sprintf("agent=%s lane=%s polls_total=%d polls_since_kick=%d repeated_since_kick=%d threshold=%d wall_clock=%s report_min_polls=%d\n--- pane tail (%d lines) ---\n%s\n--- repeated poll commands ---\n%s",
-				agent.Name, lane, len(cmds), newPolls, newRepeats, ciPollNudgeThreshold, ciPollNudgeWallClock, ciPollReportMinPolls, stallNudgeTailLines, paneTail(visible, stallNudgeTailLines), strings.Join(repeated, "\n")))
-	}
-
-	m.logger.Warn("agent is polling CI, sending stop-polling nudge", "name", agent.Name, "polls", len(cmds))
-	m.tmuxSendLiteralForAgent(agent, ciPollNudgeMessage)
-	time.Sleep(textToEnterDelay)
-	m.tmuxSendEntersForAgent(agent)
-}
-
-// ciPollSweep reports whether the poll commands since the kick read several
-// targets once each: more than one command and none of them repeated. A lone
-// poll is not a sweep; it may be the blocking `gh run watch` the wall-clock
-// trigger exists for.
-func ciPollSweep(newPolls, newRepeats int) bool {
-	return newPolls > 1 && newRepeats == 0
-}
-
-// ciPollReportWorthy reports whether a CI-poll nudge is repeated polling
-// (at least ciPollReportMinPolls repeated commands since the kick) rather
-// than a single check or a sweep.
-func ciPollReportWorthy(newRepeats int) bool {
-	return newRepeats >= ciPollReportMinPolls
-}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/hivecommons/hive/pkg/github"
@@ -94,10 +95,18 @@ func (s *Scheduler) isHoldGatedPRAgent(agentName string) bool {
 // not to fix it. ci-maintainer-holdgated.md meanwhile promised
 // ".github/workflows/*.yml changes" it could never land.
 //
+// Step 3 names the lane's token as the limit: Danathar/goodreads-mcp#440 said
+// "the hive's token cannot change workflow files" while the App held
+// `workflows: write`, and the delegated decider took it for a missing App
+// permission.
+//
 // Injected at the same post-resolution seam as the held-PR preflight and for
 // the same reason (kubestellar/hive#4744): a customized or remotely sourced
 // policy must not be able to omit it.
 func (s *Scheduler) addWorkflowPushCeiling(agentName, message string) string {
+	if message != "" && s.cfg.AgentPushesWorkflows(agentName) {
+		return insertAfterKickHeader(message, workflowPushReach)
+	}
 	if message == "" || s.agentEffectiveMode(agentName) != "ISSUES_AND_PRS" {
 		return message
 	}
@@ -123,7 +132,11 @@ When a fix belongs in a workflow file:
 2. File the issue with the exact replacement text, so applying it is mechanical.
 3. Say plainly in the issue that the change needs a human or an
    ISSUES_PRS_MERGE agent to land, and why — otherwise "issue, no PR" reads as
-   a judgement call you did not make. Park it in the same request with
+   a judgement call you did not make. Name the limit as this lane's token
+   ("this lane's token cannot push workflow files"), never the hive's or the
+   App's: the installation can grant ` + "`workflows: write`" + ` to other lanes, and a
+   reader takes the broader claim for a permission the owner must grant. Park
+   it in the same request with
    ` + "`hive-open-issue comment --repo <owner/repo> <number> --body-file <file> --needs-decision`" + `
    (or ` + "`--needs-decision`" + ` on the create), since you cannot add the park label yourself.
 4. If part of the fix lives outside ` + "`.github/workflows/`" + `, PR that part and say
@@ -132,7 +145,57 @@ When a fix belongs in a workflow file:
 Everything else is pushable as normal, including composite actions under
 ` + "`.github/actions/`" + ` — GitHub's restriction covers the workflows directory only.
 `
+	// A kick spans the agent's repositories and the lane is chosen per
+	// repository (WorkflowsCapableLane), so the text names an example lane
+	// and says the hand-off happens only where one serves the repo.
+	if lane := s.cfg.WorkflowsLaneFor(agentName, ""); lane != "" {
+		section += `
+This hive runs lanes whose token can push workflow files (for example ` + "`" + lane + "`" + `). A
+park from step 3 whose only remaining change is under ` + "`.github/workflows/`" + ` (and
+that offers the owner no lettered options) is not parked in a repository such
+a lane serves: the hive hands the issue to it (label ` + "`" + github.WorkflowsLaneLabel + "`" + `), and
+your exact replacement is its spec. Write it for that lane to apply, not as a
+step for the owner, and do not pick the issue up again. Where no such lane
+serves the repository, the park stands and the owner applies it.
+`
+	}
 	return insertAfterKickHeader(message, section)
+}
+
+// workflowPushReach is the other side of the ceiling: a trusted/merger-tier
+// token asks for the Workflows permission, so the lane can push
+// .github/workflows/** itself. projectbluefin/testsuite#1059: scanner, at
+// ISSUES_PRS_MERGE, parked "the hive app cannot push .github/workflows/" the
+// same day the App pushed e2e.yml; nothing in its kick said otherwise. The
+// relay refuses such a park when the installation grants the permission.
+const workflowPushReach = `## Workflow files are in reach at this mode
+
+This agent's token is minted at the trusted/merger tier, which asks for the
+Workflows permission, so it can push changes under ` + "`.github/workflows/**`" + `.
+Push a workflow fix like any other; do not park it as "the App cannot push
+workflow files". Only if GitHub rejects the push for the ` + "`workflows`" + `
+permission, park it and quote the rejection.
+`
+
+// routeWorkflowsLane sends an issue the relay handed off for a workflow-only
+// change (github.WorkflowsLaneLabel) to the lane that can push workflow files.
+// Without it the issue keeps its `[lane]` title / `agent/<lane>` routing and
+// goes back to the lane that could not land it — Danathar/exult#374: the
+// owner approved the direction, ci-maintainer was kicked again and re-parked
+// it as an owner step, while scanner was merging workflow fixes in the same
+// hive. With no capable lane configured the issue keeps its classification.
+func (s *Scheduler) routeWorkflowsLane(issues []github.Issue) []github.Issue {
+	for i := range issues {
+		for _, l := range issues[i].Labels {
+			if strings.EqualFold(strings.TrimSpace(l), github.WorkflowsLaneLabel) {
+				if lane := s.cfg.WorkflowsCapableLane(issues[i].Repo); lane != "" {
+					issues[i].Lane = lane
+				}
+				break
+			}
+		}
+	}
+	return issues
 }
 
 // agentEffectiveMode returns the agent's configured mode, preferring the
@@ -141,23 +204,7 @@ Everything else is pushable as normal, including composite actions under
 // both did inline; it is one place now so a new caller cannot get it subtly
 // different.
 func (s *Scheduler) agentEffectiveMode(agentName string) string {
-	if s.cfg == nil {
-		return ""
-	}
-	agentCfg, ok := s.cfg.Agents[agentName]
-	if !ok {
-		agentCfg, ok = s.cfg.Agents[s.cfg.BaseAgentName(agentName)]
-	}
-	if !ok {
-		return ""
-	}
-	mode := agentCfg.Mode
-	if agentCfg.Tools != nil {
-		if effective := agentCfg.Tools.EffectiveMode(); effective != "" {
-			mode = effective
-		}
-	}
-	return mode
+	return s.cfg.AgentEffectiveMode(agentName)
 }
 
 // isPRCapableAgent reports whether the agent's effective mode lets it push
@@ -189,11 +236,7 @@ func (s *Scheduler) addRedPRFixFirst(agentName string, message string) string {
 	if message == "" || !s.isPRCapableAgent(agentName) {
 		return message
 	}
-	data, err := os.ReadFile(ciFailingPath)
-	if err != nil {
-		return message
-	}
-	section := formatRedPRFixData(data, s.cfg.BaseAgentName(agentName))
+	section := s.redPRFixSection(agentName)
 	if section == "" {
 		return message
 	}
@@ -207,6 +250,48 @@ var markAdoptedFixerAttempt = func(repo string, number int, head string) {
 	if head != "" {
 		stagelabels.Shared().MarkFixerAttempted(stagelabels.Key(repo, number), head)
 	}
+}
+
+// redPRFixSection renders the agent's fix-before-new section from
+// ci-failing.json merged with the webhook CI-failure signals attributed to
+// it (github.CIFailureSignals), so a check that went red seconds ago is
+// listed — with its name and log pointer — before the next eval tick
+// rewrites the file. Empty when the agent has nothing to repair.
+func (s *Scheduler) redPRFixSection(agentName string) string {
+	base := s.cfg.BaseAgentName(agentName)
+	data, err := os.ReadFile(ciFailingPath)
+	if err != nil {
+		data = nil
+	}
+	return formatRedPRFixDataWithSignals(data, base, github.CIFailureSignals().ForAgent(base))
+}
+
+// CIFailureKickMessage is the targeted kick a webhook CI-failure signal
+// sends to the owning agent: the same fix-before-new section a regular kick
+// would carry, under a one-line header naming the trigger. Empty when the
+// agent is not PR-capable or has no red PR to repair (e.g. every failing
+// check is red on the base branch too).
+func (s *Scheduler) CIFailureKickMessage(agentName string, sig github.CIFailureSignal) string {
+	if s == nil || !s.isPRCapableAgent(agentName) {
+		return ""
+	}
+	section := s.redPRFixSection(agentName)
+	if section == "" {
+		return ""
+	}
+	header := fmt.Sprintf("CI failed on %s#%d (%s) — repair it now. Detection was out-of-band (webhook); do not watch or poll CI yourself.\n",
+		sig.Repo, sig.Number, sig.Check)
+	if context := sig.Integration; context != nil && context.CandidateID != "" {
+		header = fmt.Sprintf("Integration CI failed on candidate %s, tested commit %s tree %s, base %s, workflow policy %s, producer %s, attempt %d. Ordered PR:head members: %s. Existing ownership routes %s#%d at exact head %s to you first; this is NOT attribution of blame. Inspect the failed job %s (%s), coordinate shared prerequisite repair once, and retain every normal CI/review/trust/hold/current-base gate. Do not copy green statuses, cancel shared jobs, poll CI, or modify other members without their owner.\n",
+			context.CandidateID, context.TestedSHA, context.TestedTree, context.BaseSHA, context.Policy, context.Producer, context.Attempt,
+			strings.Join(context.Members, ", "), sig.Repo, sig.Number, sig.HeadSHA, sig.Check, sig.DetailsURL)
+		if context.RunID > 0 && context.SuiteID > 0 {
+			header += fmt.Sprintf("Evidence source %s; workflow run %d, suite %d.\n", context.Source, context.RunID, context.SuiteID)
+		} else {
+			header += "Workflow run/suite binding unavailable; membership observation is not passing policy proof.\n"
+		}
+	}
+	return header + section
 }
 
 // heldRedPRNote is appended to a held PR's entry in the fix-before-new
@@ -234,6 +319,30 @@ const heldRedPRExemptAgent = "outreach"
 // and when every red PR the agent owns is deferred there is no section — and
 // no banner — at all.
 func formatRedPRFixData(data []byte, agent string) string {
+	return formatRedPRFixDataWithSignals(data, agent, nil)
+}
+
+// ciFailureSignalEvidence is the evidence line a webhook signal contributes:
+// the check name plus the log pointer, so the agent can open the run
+// without listing checks itself.
+func ciFailureSignalEvidence(sig github.CIFailureSignal) string {
+	line := "webhook: " + sig.Check + " failed"
+	if sig.Conclusion != "" && sig.Conclusion != "failure" {
+		line += " (" + sig.Conclusion + ")"
+	}
+	if sig.DetailsURL != "" {
+		line += " — log: " + sig.DetailsURL
+	}
+	return line
+}
+
+// formatRedPRFixDataWithSignals is formatRedPRFixData with the agent's
+// webhook CI-failure signals folded in: a signal for a PR the file already
+// lists adds its check and log pointer to that row; a signal for a PR the
+// file does not know yet (the file is rewritten per eval tick) becomes its
+// own row. A signal whose check the file reports red on the base branch is
+// dropped like any other base-red failure.
+func formatRedPRFixDataWithSignals(data []byte, agent string, signals []github.CIFailureSignal) string {
 	type ciFailingRow struct {
 		Number           int      `json:"number"`
 		Repo             string   `json:"repo"`
@@ -256,12 +365,54 @@ func formatRedPRFixData(data []byte, agent string) string {
 		DeferredExternal bool     `json:"deferred_external"`
 		BaseRedChecks    []string `json:"base_red_checks"`
 		BaseRed          bool     `json:"base_red"`
+		RebaseAttempt    int      `json:"rebase_attempt"`
+		RebaseMax        int      `json:"rebase_attempts_max"`
+		BaseRef          string   `json:"base_ref"`
+		TrustedAuthor    bool     `json:"trusted_author"`
 	}
 	var payload struct {
 		Items []ciFailingRow `json:"ci_failing"`
 	}
-	if json.Unmarshal(data, &payload) != nil {
+	if len(data) > 0 && json.Unmarshal(data, &payload) != nil {
 		return ""
+	}
+	if len(signals) > 0 {
+		known := map[string]int{}
+		for i, r := range payload.Items {
+			known[fmt.Sprintf("%s#%d", strings.ToLower(r.Repo), r.Number)] = i
+		}
+		for _, sig := range signals {
+			key := fmt.Sprintf("%s#%d", strings.ToLower(sig.Repo), sig.Number)
+			if i, ok := known[key]; ok {
+				r := &payload.Items[i]
+				if slices.Contains(r.BaseRedChecks, sig.Check) {
+					continue
+				}
+				if r.BaseRed {
+					// The file says every failing check is base-red; a new
+					// check the file has not seen yet changes that.
+					r.BaseRed = false
+				}
+				if !slices.Contains(r.FailingChecks, sig.Check) {
+					r.FailingChecks = append(r.FailingChecks, sig.Check)
+				}
+				r.Excerpt = strings.TrimSpace(r.Excerpt + "\n" + ciFailureSignalEvidence(sig))
+				continue
+			}
+			row := ciFailingRow{
+				Number:        sig.Number,
+				Repo:          sig.Repo,
+				Title:         sig.Title,
+				Agent:         sig.Agent,
+				FailingChecks: []string{sig.Check},
+				Excerpt:       ciFailureSignalEvidence(sig),
+			}
+			if row.Title == "" {
+				row.Title = "(title pending)"
+			}
+			payload.Items = append(payload.Items, row)
+			known[key] = len(payload.Items) - 1
+		}
 	}
 	var mine, deferred, external, baseRed []ciFailingRow
 	forks := 0
@@ -365,6 +516,7 @@ func formatRedPRFixData(data []byte, agent string) string {
 				state = "dirty"
 			}
 			b.WriteString("    conflict: mergeable_state=" + state + " — merge the base branch or rebase the PR branch\n")
+			b.WriteString("    " + rebaseResolveInstructions(pr.BaseRef, pr.RebaseAttempt, pr.RebaseMax, pr.TrustedAuthor) + "\n")
 			if from := strings.TrimSpace(pr.ReroutedFrom); from != "" {
 				b.WriteString("    rerouted from paused/unavailable lane: " + from + "\n")
 			}
@@ -716,3 +868,32 @@ const adoptedSentinelNote = "sentinel-alert: repair CI / rebase as usual, but do
 // pending `tide` or a missing lgtm is never the hive's blocker below stage
 // 080 (hivecommons/hive#12858).
 const adoptedPRStatusRule = "    ADOPTED BRANCH: when needs-rebase/conflicting, fetch the contributor's actual fork branch and the PR base, rebase onto the base, preserve original authors and Signed-off-by trailers (never --reset-author), and push back to that fork with --force-with-lease against the observed head. Stop if the contributor moved it; never overwrite their new work. Sign only your own new commits.\n    STATUS RULE: green CI is not done on a 074 PR. Read the stage comment/lane reason: an open review-swarm finding (reviewer-verdict:changes_requested) is YOUR blocker — fix it and let the swarm re-review. Never report \"only tide remains\" or \"needs maintainer lgtm/approve\" unless the stage label is already >= stage/080; below that, a pending tide check means the lane has not admitted the head yet, not that a person owes an approval.\n"
+
+// rebaseResolveInstructions is the fixer's rebase-resolve task for a
+// conflicting PR (hivecommons/hive#15103): rebase onto the base branch,
+// resolve, force-with-lease to the PR's own branch, never open a new PR.
+// attempt/max is the loop guard the fixer sees so it knows a second dirty
+// head ends the hive's attempts.
+func rebaseResolveInstructions(baseRef string, attempt, max int, trustedAuthor bool) string {
+	base := strings.TrimSpace(baseRef)
+	if base == "" {
+		base = "the base branch"
+	} else {
+		base = "origin/" + base
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if max < attempt {
+		max = attempt
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "rebase-resolve (attempt %d/%d): `gh pr checkout`, `git rebase %s`, resolve every conflict keeping both sides' intent, re-run the build and tests, then `git push --force-with-lease` to the PR's OWN branch. Do not open a new PR; do not squash away the author's commits.", attempt, max, base)
+	if trustedAuthor {
+		b.WriteString(" This is a trusted author's PR the hive carries on their behalf — keep their authorship and sign-off intact.")
+	}
+	if attempt >= max {
+		b.WriteString(" Last attempt: if the head is still conflicting after this push the hive stops and asks a person.")
+	}
+	return b.String()
+}

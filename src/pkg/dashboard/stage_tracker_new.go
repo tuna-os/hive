@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	stageengineprstage "github.com/hivecommons/hive/pkg/stageengine/prstage"
 )
 
 // StageTrackerNewSlug is the pre-stage slug a brand-new open item wears in
@@ -31,6 +33,9 @@ const (
 	StageTrackerGateDone  = "done"
 	StageTrackerGateNext  = "next"
 	StageTrackerGateLater = "later"
+	// StageTrackerGateHumanMerge names the gate a breaking-titled or
+	// needs-owner-merge PR ends on: the owner's merge click.
+	StageTrackerGateHumanMerge = "human-merge"
 )
 
 // StageTrackerGate is one gate ahead of a 000-new item.
@@ -55,6 +60,11 @@ type StageTrackerNew struct {
 	Gates             []StageTrackerGate `json:"gates"`
 	// Text is the row caption: "New · waiting for <mover> (next pass in Nm)".
 	Text string `json:"text"`
+	// AutoMergeOff marks a pull request on a repo whose auto-merge is off
+	// (the repo's setting, or a hive below ACMM L6): no hive pass will
+	// stage or merge it, so the narration names a person's merge instead
+	// of a stage-label pass that never comes.
+	AutoMergeOff bool `json:"auto_merge_off,omitempty"`
 }
 
 // stageTrackerIsNew reports whether a finished row is a 000-new item: no
@@ -62,7 +72,7 @@ type StageTrackerNew struct {
 // bucket that means "not placed yet" rather than "placed outside the
 // actionable set" (filtered, hive_advisory, claimed, …).
 func stageTrackerIsNew(it StageTrackerItem, hasRec bool) bool {
-	if it.Stage != 0 || hasRec || it.Hold != nil || len(it.BlockedOn) > 0 || it.BlockedOnPR != nil {
+	if it.Stage != 0 || hasRec || it.Hold != nil || len(it.BlockedOn) > 0 || it.BlockedOnPR != nil || it.LinkedPR > 0 || len(it.LinkedPRs) > 0 {
 		return false
 	}
 	for _, m := range it.Modifiers {
@@ -93,7 +103,18 @@ func stageTrackerNewState(it StageTrackerItem, hasRec bool, filter *config.Issue
 	if n.Since == nil {
 		n.Since = it.UpdatedAt
 	}
-	triagePending := it.Kind == "issue" && (it.Bucket == stageengineReporterTriageBucket || slices.Contains(it.Modifiers, modNeedsTriage))
+	triageLabels := []string{config.DefaultUntrustedRequireLabels[0]}
+	if filter != nil {
+		if l := filter.ReporterTrustRequiredLabelsForNotice(); len(l) > 0 {
+			triageLabels = l
+		}
+	}
+	// The labels are the newer fact: once a maintainer's triage label is on
+	// (the row menu's Accept triage, or applied by hand) the reporter-trust
+	// gate admits the issue on its next poll, so the row waits on the hive
+	// even while the bucket still says reporter_triage.
+	triageAccepted := it.Kind == "issue" && stageTrackerHasAnyLabel(it.Labels, triageLabels)
+	triagePending := it.Kind == "issue" && !triageAccepted && (it.Bucket == stageengineReporterTriageBucket || slices.Contains(it.Modifiers, modNeedsTriage))
 	if t, ok := parseGovernorNextKick(governor.NextKickAt); ok {
 		n.NextPassAt = &t
 		if left := t.Sub(now); left > 0 {
@@ -110,12 +131,7 @@ func stageTrackerNewState(it StageTrackerItem, hasRec bool, filter *config.Issue
 	switch {
 	case triagePending:
 		n.NextMover = StageTrackerMoverMaintainer
-		labels := []string{"triage/accepted"}
-		if filter != nil {
-			if l := filter.ReporterTrustRequiredLabelsForNotice(); len(l) > 0 {
-				labels = l
-			}
-		}
+		labels := triageLabels
 		n.NextMoverText = "a maintainer's triage (add `" + strings.Join(labels, "` or `") + "`)"
 		n.Gates = []StageTrackerGate{
 			{Name: "triage", State: StageTrackerGateNext, Text: "a maintainer accepts triage (" + strings.Join(labels, " / ") + ")"},
@@ -127,24 +143,58 @@ func stageTrackerNewState(it StageTrackerItem, hasRec bool, filter *config.Issue
 		n.NextMoverText = "the stage-label pass (→ 050 review pending)"
 		n.Gates = []StageTrackerGate{
 			{Name: "review", State: StageTrackerGateNext, Text: "the stage-label pass places it at 050 review pending"},
-			{Name: "merge-gate", State: StageTrackerGateLater, Text: "reviews and checks admit it to the merge gate"},
+			{Name: "merge-gate", State: StageTrackerGateLater, Text: "reviews and checks admit it to the merge queue"},
+		}
+		// A ⚠️-titled or needs-owner-merge PR ends at 090, not in the
+		// merge queue: the owner merges it (hivecommons/hive#15442). The
+		// row knows the default rule only; the lanes apply the configured one.
+		if ok, _ := (stageengineprstage.HumanMergeRule{}).RequiresHumanMerge(it.Title, it.Labels); ok {
+			n.Gates[1] = StageTrackerGate{Name: "merge-gate", State: StageTrackerGateLater, Text: "reviews and checks park it at 090 Ready for human merge"}
+			n.Gates = append(n.Gates, StageTrackerGate{Name: StageTrackerGateHumanMerge, State: StageTrackerGateLater, Text: stageengineprstage.CauseHumanMergeRequired})
 		}
 	default:
 		n.NextMover = StageTrackerMoverHive
 		n.NextMoverText = "the stage-label pass (→ 010 actionable), then the scanner"
+		triageGate := "reporter admitted; no triage label needed"
+		if triageAccepted {
+			triageGate = "triage accepted (" + strings.Join(stageTrackerLabelsOn(it.Labels, triageLabels), " / ") + ")"
+		}
 		n.Gates = []StageTrackerGate{
-			{Name: "triage", State: StageTrackerGateDone, Text: "reporter admitted; no triage label needed"},
+			{Name: "triage", State: StageTrackerGateDone, Text: triageGate},
 			{Name: "actionable", State: StageTrackerGateNext, Text: "the stage-label pass marks it 010 actionable"},
 			{Name: "claimed", State: StageTrackerGateLater, Text: "the scanner claims it (020)"},
 		}
 	}
 	n.Text = "New · waiting for " + n.NextMoverText
-	if pass != "" && n.NextMover == StageTrackerMoverHive {
+	if triagePending {
+		n.Text = stageTrackerTriageNeededCaption
+	} else if pass != "" && n.NextMover == StageTrackerMoverHive {
 		n.Text += " (" + pass + ")"
 	} else if pass != "" {
 		n.Text += fmt.Sprintf("; the hive's %s", pass)
 	}
 	return n
+}
+
+// stageTrackerHasAnyLabel reports whether labels carries any of want
+// (case-insensitive, trimmed).
+func stageTrackerHasAnyLabel(labels, want []string) bool {
+	return len(stageTrackerLabelsOn(labels, want)) > 0
+}
+
+// stageTrackerLabelsOn returns the members of want that labels carries, in
+// want's order.
+func stageTrackerLabelsOn(labels, want []string) []string {
+	var on []string
+	for _, w := range want {
+		for _, l := range labels {
+			if strings.EqualFold(strings.TrimSpace(l), strings.TrimSpace(w)) {
+				on = append(on, strings.TrimSpace(w))
+				break
+			}
+		}
+	}
+	return on
 }
 
 // parseGovernorNextKick reads FrontendGovernor.NextKickAt (RFC3339).
@@ -172,6 +222,30 @@ func applyStageTrackerNew(it *StageTrackerItem, n *StageTrackerNew) {
 	if n.Since != nil && it.StageSince == nil {
 		it.StageSince = n.Since
 	}
+	// A reporter-trust hold is "Triage needed" whether or not the awaiting
+	// label has landed yet: the gate decided it, the stage-label pass only
+	// writes it down later. The same modifier the `needs-triage` label
+	// yields drives the Open chevron word, the pill and Accept triage.
+	if n.TriagePending() && !slices.Contains(it.Modifiers, modNeedsTriage) {
+		it.Modifiers = append(it.Modifiers, modNeedsTriage)
+		slices.SortFunc(it.Modifiers, func(a, b string) int {
+			return slices.Index(stageTrackerModifierOrder, a) - slices.Index(stageTrackerModifierOrder, b)
+		})
+	}
+}
+
+// TriagePending reports whether the 000-new row waits on a maintainer's
+// triage: the triage gate is the next one.
+func (n *StageTrackerNew) TriagePending() bool {
+	if n == nil || n.NextMover != StageTrackerMoverMaintainer {
+		return false
+	}
+	for _, g := range n.Gates {
+		if g.Name == "triage" && g.State == StageTrackerGateNext {
+			return true
+		}
+	}
+	return false
 }
 
 // issueFilterConfig is the project's issue filter, or nil without deps.
@@ -180,4 +254,65 @@ func (s *Server) issueFilterConfig() *config.IssueFilterConfig {
 		return nil
 	}
 	return &s.deps.Config.Project.IssueFilter
+}
+
+// stageTrackerAutoMergeOffGateText is the merge gate of a 000-new pull
+// request on a repo whose auto-merge is off. Below ACMM L6 every repo
+// reads off (config.RepoAutoMergeEnabled), and the sentence says so.
+const stageTrackerAutoMergeOffGateText = "auto-merge is off for this repo (its auto-merge setting, or the hive is below ACMM L6) — a person merges it"
+
+// stageTrackerAutoMergeOffNew rewrites the 000-new narration of a pull
+// request on a repo whose auto-merge is off. Every merge lane skips such a
+// repo before it records anything, so no stage-label pass ever places the
+// PR: the "waiting for the stage-label pass (next pass due now)" caption
+// and its countdown were never true there (projectbluefin/server#626 read
+// it for four days). The narration drops the countdown, names the person's
+// merge as the last gate and carries the governor's merge verdict.
+//
+// next_mover is the maintainer only when the verdict is a hand merge
+// (outstanding: GitHub would take the merge and only the repo switch, or a
+// hive-side gate on top of it, holds it); the row then carries a decision
+// whose lead is Merge now as maintainer (decisionForAutoMergeOffNew). Any
+// other PR is still in CI / review, and the hive stays the next mover as
+// before, without the false promise of a stage pass.
+func stageTrackerAutoMergeOffNew(n *StageTrackerNew, verdict *github.MergeVerdict) *StageTrackerNew {
+	if n == nil {
+		return nil
+	}
+	out := *n
+	out.AutoMergeOff = true
+	out.NextPassAt, out.NextPassInSeconds = nil, 0
+	reason := ""
+	if verdict != nil {
+		reason = strings.TrimSpace(verdict.Reason)
+	}
+	mergeGate := StageTrackerGate{Name: StageTrackerGateHumanMerge, State: StageTrackerGateLater, Text: stageTrackerAutoMergeOffGateText}
+	for _, g := range n.Gates {
+		// A breaking-titled or needs-owner-merge PR keeps that rule beside
+		// the switch (hivecommons/hive#15442).
+		if g.Name == StageTrackerGateHumanMerge && g.Text != "" {
+			mergeGate.Text = g.Text + "; " + stageTrackerAutoMergeOffGateText
+		}
+	}
+	if verdict != nil && verdict.HandMerge && verdict.State == github.MergeVerdictOutstanding {
+		out.NextMover = StageTrackerMoverMaintainer
+		out.NextMoverText = "a person's merge (" + stageTrackerAutoMergeOffGateText + ")"
+		mergeGate.State = StageTrackerGateNext
+		verdictText := "GitHub would accept the merge"
+		if reason != "" {
+			verdictText += "; hive's merge verdict: " + reason
+		}
+		out.Gates = []StageTrackerGate{{Name: "merge-verdict", State: StageTrackerGateDone, Text: verdictText}, mergeGate}
+		out.Text = "New · auto-merge off — a person merges it"
+		return &out
+	}
+	out.NextMover = StageTrackerMoverHive
+	out.NextMoverText = "CI and review; no hive pass stages or merges it here"
+	reviewText := "CI and review run on the head"
+	if reason != "" {
+		reviewText += "; hive's merge verdict: " + reason
+	}
+	out.Gates = []StageTrackerGate{{Name: "review", State: StageTrackerGateNext, Text: reviewText}, mergeGate}
+	out.Text = "New · not staged (auto-merge off) — waiting for CI and review; a person merges it"
+	return &out
 }

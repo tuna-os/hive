@@ -13,13 +13,19 @@ package stagelabels
 //   - 050 review-pending: no verdict for this head yet (or the head was just
 //     pushed and nothing has reported). Nobody acts; wait.
 //   - 085 needs-decision: a person must decide something other than the
-//     merge — sentinel alert, hold / do-not-merge / needs-decision label, or
-//     a lane rule that is human-only for a non-trust reason.
+//     merge — a needs-decision / needs-human label, a reviewer's
+//     requires_human verdict, or a lane rule that is human-only for a
+//     non-trust reason.
 //   - 060 reviewed: approve verdict, but checks or the soak are still
 //     running. Wait.
 //   - 090 ready-for-human-merge: everything the hive would need is in place
 //     and only trust/tier/role stops it. The maintainer's /lgtm /approve is
 //     the whole remaining job.
+//
+// A sentinel alert and a hold-class label are gates, not stages
+// (hivecommons/hive#17327): the stage stays the head's real progress and
+// the gate rides it as a pill (Route.Gates). The lanes refuse the merge on
+// the label itself, so a gated head at 090 is "held", never "queued".
 //
 // RouteHuman is a pure function of Evidence so every rule is testable.
 
@@ -28,6 +34,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +76,12 @@ type CheckSummary struct {
 	Total, Green, Pending int
 	// Red names every failing gating check, in a stable order.
 	Red []string
+	// Missing names the required checks with nothing reported on the head.
+	// They are not green: GitHub refuses the merge until they report, and a
+	// PR whose workflows never triggered waits on them for good
+	// (projectbluefin/utah#1074 read "4/4 checks green, ready for a human
+	// merge" with `contract` and `build_main` never run).
+	Missing []string
 	// Known is false when the head could not be read (API error): CI is
 	// then a pending gate, never a pass.
 	Known bool
@@ -113,6 +126,11 @@ type Evidence struct {
 	// it (hivecommons/hive#15020); the 085 reason then names them instead
 	// of the bare "the `hold` label is set".
 	Hold *HoldProvenance
+	// Blocked is the gate clause for a `blocked` label on the PR — "blocked
+	// on owner/repo#N" when the blocked sweep read the pull request it waits
+	// on, else "the `blocked` label is set" — and "" without the label. It
+	// rides the route like a hold: every merge lane refuses the PR on it.
+	Blocked string
 	// Cause is why the lane handed off; CauseTrust is the only one that can
 	// end at 090.
 	Cause HumanCause
@@ -122,9 +140,20 @@ type Evidence struct {
 	// DecisionQuestion is the maintainer-facing question from the reviewer
 	// verdict/comment, when the swarm explicitly deferred a product call.
 	DecisionQuestion string
+	// DecisionFinding is what the review found that makes the question a
+	// person's — printed so the comment and tracker say WHY, not just that
+	// a decision is owed (hivecommons/hive, owner rule 2026-10-29).
+	DecisionFinding string
 	// HumanSummaries are reviewer summaries for requires_human verdicts that
 	// did not carry a structured decision question.
 	HumanSummaries []string
+	// ReviewAsks are what the review asked for on Head when Verdict is
+	// VerdictChangesRequested, one rendered line each: the verdict's
+	// in-scope findings, else the blocking reviewers' summaries. They ride
+	// the fixing route (Route.ReviewAsks) so the author's nudge can list
+	// them when the lane stopped before it read the verdict. They never
+	// choose the stage or its reasons.
+	ReviewAsks []string
 	// SelfAuthored selects 070 fixing for the "author must act" outcome;
 	// otherwise AuthorKind picks 072 (clanker) or 071 (human / unknown).
 	SelfAuthored bool
@@ -151,6 +180,15 @@ type Evidence struct {
 	// requires_human verdict and on a manual-merge lane rule: the person
 	// read the reviewer's objection and ruled the head lands as-is.
 	HumanApprover string
+	// HumanChangeRequester is the trusted maintainer whose CHANGES_REQUESTED
+	// review (or `/hive decision <text>`) stands on exactly Head ("" when
+	// none). A person has reviewed this head and asked for a fix: that
+	// answers every "needs a human" park on it — the sentinel alert, a
+	// workflow-path fence, a hold — so the PR is the author's to act on
+	// (071 / 072 / 070), not 085 (hivecommons/hive#15159: a clanker PR
+	// with the owner's changes-requested review kept re-deriving
+	// "Sentinel alert · needs human" over the operator's 072).
+	HumanChangeRequester string
 	// ManualMergeRule is true when CauseReason names a lane rule no
 	// approval can override — the hive never merges the head unattended
 	// (CI workflow / action edits, removed tests, a human-merge path). With
@@ -161,6 +199,77 @@ type Evidence struct {
 	// ("contributor-lane:workflow-path"); the 090 route for an approved
 	// manual-merge rule records it suffixed with the approver.
 	LaneReason string
+	// HiveSuperseder is true for the hive App's own superseding copy of
+	// another PR ("Supersedes #N") under the owner's rule that such a PR
+	// auto-merges with no operator decision: a reviewer's requires_human
+	// is the fixer's, never 085. HiveSupersederHardStop is the one
+	// exception that does park it (a HiveSupersederHardStop* token, ""
+	// when none): the sentinel's unacknowledged finding, or an emergent
+	// problem with the PR itself.
+	HiveSuperseder         bool
+	HiveSupersederHardStop string
+	// BehindBase names the base branch when GitHub reports the head
+	// "behind" it ("" otherwise). GitHub says "behind" only when the base
+	// requires up-to-date branches, so GitHub will not merge this head until
+	// the base is merged in: the 090 comment names it instead of calling trust
+	// the only blocker (projectbluefin/common#1619). It never changes the
+	// stage: the trust decision is still the person's to make.
+	BehindBase string
+	// HeadDirty is true when GitHub reports mergeable_state `dirty` for
+	// exactly Head: the head conflicts with its base, so neither the hive
+	// nor a person's merge click can land it. Conflict is what routes the
+	// PR to its author; HeadDirty only keeps a dirty head from being
+	// called ready (060 / 090) when nothing else sent it back. A decision
+	// still owed is asked first (hivecommons/hive#14607).
+	HeadDirty bool
+}
+
+// Hard-stop tokens for a hive-authored superseding PR: the only reasons
+// such a PR parks at 085 (owner refinement: "the only exception would be if
+// this is sentinel or some other emergent problem with the pr"). Recorded
+// as the 085 lane reason under LaneReasonHiveSupersederHardStopPrefix so
+// the tracker pill and the delegated plan can name the reason.
+const (
+	HiveSupersederHardStopSentinel         = "sentinel-unacknowledged"
+	HiveSupersederHardStopHold             = "hold"
+	HiveSupersederHardStopFixExhausted     = "fix-attempts-exhausted"
+	HiveSupersederHardStopCIRed            = "ci-red-after-fixes"
+	HiveSupersederHardStopConflict         = "base-conflict-unresolved"
+	LaneReasonHiveSupersederHardStopPrefix = "hive-superseder-hard-stop:"
+	// LaneReasonHiveSupersederFix is the fixing-stage reason when the
+	// reviewer's requires_human on a hive superseding PR goes to the fixer.
+	LaneReasonHiveSupersederFix = "hive-superseder:fixer"
+	// HiveSupersederAutoMergeCaption is the tracker / plan wording for a
+	// hive superseding PR that is not parked.
+	HiveSupersederAutoMergeCaption = "hive-authored superseding PR — auto-merging once CI/review are clean"
+)
+
+// HiveSupersederHardStopProse renders a hard-stop token for the 085
+// comment and tracker ("" for an unknown token).
+func HiveSupersederHardStopProse(token string) string {
+	switch strings.TrimSpace(token) {
+	case HiveSupersederHardStopSentinel:
+		return "the sentinel has an open finding on this PR that nobody has acknowledged"
+	case HiveSupersederHardStopHold:
+		return "a hold is set on this PR"
+	case HiveSupersederHardStopFixExhausted:
+		return "the fixer used all its attempts on the reviewer's findings"
+	case HiveSupersederHardStopCIRed:
+		return "CI is still red after the fixer's attempts"
+	case HiveSupersederHardStopConflict:
+		return "the head conflicts with the base and the hive could not resolve it"
+	}
+	return ""
+}
+
+// HiveSupersederHardStopReason splits a 085 lane reason into its hard-stop
+// token ("" when the reason is not one).
+func HiveSupersederHardStopReason(reason string) string {
+	token, ok := strings.CutPrefix(strings.TrimSpace(reason), LaneReasonHiveSupersederHardStopPrefix)
+	if !ok {
+		return ""
+	}
+	return token
 }
 
 // HumanApprovedReasonSuffix joins a lane reason to the trusted merger who
@@ -178,8 +287,10 @@ func HumanApprovedReason(reason string) (base, approver string) {
 	return reason[:i], strings.TrimSpace(reason[i+len(HumanApprovedReasonSuffix):])
 }
 
-// HoldLabels are the modifier labels that turn a human hand-off into a
-// decision (085). `do-not-merge/*` (prow's family) matches by prefix.
+// HoldLabels are the modifier labels that gate a human hand-off: the hive
+// never merges while one is set, and the route carries it as a pill on the
+// head's real stage (hivecommons/hive#17327). `do-not-merge/*` (prow's
+// family) matches by prefix.
 // `needs-decision` is retired (hivecommons/hive#12683; nothing writes it)
 // and stays here only so a PR still carrying it keeps its decision routing
 // until the label is gone.
@@ -204,6 +315,14 @@ func Holds(labels []string) []string {
 // Route is RouteHuman's answer.
 type Route struct {
 	Stage Stage
+	// Actions names the actual release steps supplied by the merge lane
+	// (hivecommons/hive#13087).
+	Actions []string
+	// ManualMerge means this lane has no unattended way past its rule.
+	ManualMerge bool
+	// ActionsHeading replaces the "How to release it" heading over Actions
+	// when the list is a choice between outcomes, not release steps.
+	ActionsHeading string
 	// Reasons explains the stage: what the author must fix (072/070), what
 	// a person must decide (085), what is still running (060). Empty for a
 	// trust-blocked 090; an approved manual-merge 090 names the rule and
@@ -224,7 +343,6 @@ type Route struct {
 	Verdict      VerdictState
 	Holds        []string
 	Sentinel     bool
-	ManualMerge  bool
 	// ApprovalReleasesFence is Evidence.ApprovalReleasesFence: the
 	// manual-merge reason is a workflow-path fence an approval releases.
 	ApprovalReleasesFence bool
@@ -234,24 +352,193 @@ type Route struct {
 	// Hold carries the `hold` provenance into the 085 comment so it can
 	// name who set the hold and offer release / keep (hivecommons/hive#15020).
 	Hold *HoldProvenance
+	// BehindBase is Evidence.BehindBase on a trust-blocked 090: the 090
+	// comment then says the branch must be brought up to date as well.
+	BehindBase string
+	// Gates names the hard merge stops that ride the route as pills
+	// without choosing its stage: an open sentinel alert, a hold-class
+	// label (owner rule, hivecommons/hive#17327). The stage is the head's
+	// real progress; the hive never merges the head while a gate stands,
+	// and the dashboard's Merge queue cell reads "Held · …" for it.
+	Gates []string
+	// ReviewAsks is Evidence.ReviewAsks on a fixing route decided on a
+	// changes_requested verdict: what the review asked for, for the
+	// author's nudge. Empty on every other route.
+	ReviewAsks []string
 }
 
 // Lane-vocabulary reasons RouteHuman emits for the fixing stages.
 const (
-	LaneReasonChangesRequested       = "reviewer-verdict:changes_requested"
+	LaneReasonChangesRequested = "reviewer-verdict:changes_requested"
+	// LaneReasonHumanChangesRequested is a trusted maintainer's standing
+	// change request on the head (prstage.AutoMergeReasonHumanChangesRequested
+	// aliases this constant; prstage imports this package).
+	LaneReasonHumanChangesRequested  = "human-changes-requested"
 	LaneReasonDCOMissing             = "dco-missing"
 	LaneReasonHiveSignoffAttribution = "hive-signoff-attribution"
 	LaneReasonConflicting            = "conflicting"
-	laneReasonCheckFailing           = "check-failing:"
+	// mergeConflictReason is the route reason for a conflicting head; the
+	// contributor nudge matches its "merge conflict" prefix.
+	mergeConflictReason = "merge conflict with the base branch"
+	// LaneReasonReviewerQuestion is the 071 reason when the reviewer's
+	// requires_human verdict lands on a PR a person pushed themselves
+	// (hivecommons/hive#15202): the human the reviewer wants is the author,
+	// so the question goes to them — not to a decision queue, and never to
+	// adoption.
+	LaneReasonReviewerQuestion = "reviewer-verdict:requires_human"
+	laneReasonCheckFailing     = "check-failing:"
+	// LaneReasonSupersededByMerge is the ledger reason when the hive closes
+	// its own PR because a merged PR superseded it (the issue it was for is
+	// closed, or the merged PR declares it) instead of parking it at 085 on
+	// a reviewer's requires_human (hivecommons/hive#15208).
+	LaneReasonSupersededByMerge = "superseded-by-merge"
+	// LaneReasonAlreadyLanded is the ledger reason when the hive closes its
+	// own PR because the reviewer's verdict on the head says the change is
+	// already on the base and the closer proved it (hivecommons/hive#15647);
+	// AlreadyLandedReason appends the landing PR (":#N") when known.
+	LaneReasonAlreadyLanded = "self-authored:already-landed"
 	// LaneReasonAdoptionStalledPrefix opens the 085 reason for an adopted
 	// PR (074) whose head sat past the stage dwell with nothing the hive
 	// could push; the suffix is the lane reason it was stuck on
 	// ("adoption-stalled:reviewer-verdict:changes_requested").
 	LaneReasonAdoptionStalledPrefix = "adoption-stalled:"
+	// LaneReasonRebaseFailedTwice is the 085 reason for the hive's copy of
+	// an adopted PR (hive/adopt-<n>) that opened conflicting and stayed
+	// dirty after the fixer's rebase-resolve episode used both attempts
+	// (hivecommons/hive#15104 guard); the same suffix under
+	// LaneReasonAdoptionStalledPrefix parks a still-open original.
+	LaneReasonRebaseFailedTwice = "rebase-failed-twice"
+	// LaneReasonFixerExhaustedPrefix opens the 085 reason for a hive-authored
+	// PR whose fix dispatcher refused to kick another fix because the
+	// re-engagement cap is spent ("fixer-exhausted:6"); the suffix is the
+	// attempt count (hivecommons/hive#15744). Before this the PR sat at 070
+	// reading "Fixing" with nobody on it (#15308, 13h).
+	LaneReasonFixerExhaustedPrefix = "fixer-exhausted:"
+	// LaneReasonBotAuthorFinding is the 085 reason for a PR another bot
+	// opened and regenerates (a workflow's promotion or release PR, a
+	// dependency bump) when the reviewer asked for changes on its head.
+	// Nobody can make the change on that branch: the hive does not push to
+	// it and the bot rewrites it, so the finding goes to a maintainer
+	// instead of back to the "author" (071).
+	LaneReasonBotAuthorFinding = "bot-author:finding"
+	// LaneReasonReauthoringPrefix opens the 070 reason for a hive-authored
+	// PR whose fixer gave up and which the hive is re-authoring itself
+	// ("re-authoring:16265"): the suffix is the issue a fresh PR is being
+	// opened for; this PR is closed as superseded. The hive re-authors
+	// once per issue; a second exhaustion parks at 085 without the option.
+	LaneReasonReauthoringPrefix = "re-authoring:"
+	// LabelReauthored is the durable once-per-issue marker the automatic
+	// re-author leaves on the ISSUE: a later hive PR for the same issue
+	// whose fixer is exhausted again is parked for a person instead of
+	// being re-authored a second time.
+	LabelReauthored = "hive/re-authored"
 )
+
+// ReauthoringReason renders the 070 reason for a hive PR being re-authored
+// for issue.
+func ReauthoringReason(issue int) string {
+	return LaneReasonReauthoringPrefix + strconv.Itoa(issue)
+}
+
+// ParseReauthoring reads the issue number out of a re-authoring reason;
+// ok is false for any other reason.
+func ParseReauthoring(reason string) (issue int, ok bool) {
+	reason = strings.TrimSpace(reason)
+	if !strings.HasPrefix(reason, LaneReasonReauthoringPrefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(reason, LaneReasonReauthoringPrefix))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// FixerExhaustedReason renders the 085 reason for a PR whose fixer gave up
+// after attempts tries.
+func FixerExhaustedReason(attempts int) string {
+	return LaneReasonFixerExhaustedPrefix + strconv.Itoa(attempts)
+}
+
+// ParseFixerExhausted reads the attempt count out of a fixer-exhausted
+// reason; ok is false for any other reason.
+func ParseFixerExhausted(reason string) (attempts int, ok bool) {
+	reason = strings.TrimSpace(reason)
+	if !strings.HasPrefix(reason, LaneReasonFixerExhaustedPrefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(reason, LaneReasonFixerExhaustedPrefix))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// decisionConsequenceReason is the 085 bullet for a lane rule that names no
+// specific cause; EntryCause leaves it out of the dedup digest.
+const decisionConsequenceReason = "the automerge lane will not merge this unattended"
 
 // RouteHuman decides which stage a lane's "a human must act" resolves to.
 func RouteHuman(e Evidence) Route {
+	return withGates(e, routeProgress(e))
+}
+
+// GateReasons names the hard merge stops on the head that are gates, not
+// stages (hivecommons/hive#17327): an open sentinel alert and each
+// hold-class label, then the `blocked` label (Evidence.Blocked). A hive
+// superseding PR whose sentinel finding a person acknowledged (no hard stop)
+// carries no sentinel gate.
+func GateReasons(e Evidence) []string {
+	var gates []string
+	if e.Sentinel && !(e.HiveSuperseder && strings.TrimSpace(e.HiveSupersederHardStop) == "") {
+		gates = append(gates, "a sentinel alert is open on this PR")
+	}
+	for _, h := range e.Holds {
+		if h == "hold" && e.Hold.Clause() != "" {
+			gates = append(gates, e.Hold.Clause())
+			continue
+		}
+		gates = append(gates, "the `"+h+"` label is set")
+	}
+	if b := strings.TrimSpace(e.Blocked); b != "" {
+		gates = append(gates, b)
+	}
+	return gates
+}
+
+// withGates rides the sentinel / hold gates on the progress route: they
+// are appended to Reasons so the entry comment and the decision popover
+// still say why the hive will not merge, recorded in Gates so the
+// dashboard can draw the held pill, and never change the Stage. A hive
+// superseding PR's own hard stop already names them in its 085 route.
+func withGates(e Evidence, r Route) Route {
+	if e.HiveSuperseder && strings.TrimSpace(e.HiveSupersederHardStop) != "" {
+		return r
+	}
+	gates := GateReasons(e)
+	if len(gates) == 0 {
+		return r
+	}
+	r.Gates = gates
+	if r.Hold == nil {
+		r.Hold = e.Hold
+	}
+	if r.Stage == NeedsAuthor || r.Stage == ReturnedToContributor || r.Stage == Fixing {
+		// The author's instruction is the whole 07x reason; the gate is a
+		// person's to lift and rides the route as Gates alone.
+		return r
+	}
+	for _, g := range gates {
+		if !slices.Contains(r.Reasons, g) {
+			r.Reasons = append(r.Reasons, g)
+		}
+	}
+	return r
+}
+
+// routeProgress is RouteHuman without the gates: the stage the head's own
+// evidence supports (verdict, checks, DCO, conflict, lane rule, trust).
+func routeProgress(e Evidence) Route {
 	fixing := FixingStageFor(e.SelfAuthored, e.AuthorKind)
 	summary := summarize(e)
 	var fix []string
@@ -260,6 +547,37 @@ func RouteHuman(e Evidence) Route {
 		fix = append(fix, reason)
 		if laneReason == "" {
 			laneReason = lane
+		}
+	}
+	if requester := strings.TrimPrefix(strings.TrimSpace(e.HumanChangeRequester), "@"); requester != "" {
+		// A person reviewed this head and asked for changes: the sentinel's
+		// or the lane rule's "needs a human" is answered for it, and the
+		// author acts next (hivecommons/hive#15159). A new head re-asks.
+		note("@"+requester+" requested changes @"+ShortSHA(e.Head), LaneReasonHumanChangesRequested)
+	} else if e.HiveSuperseder {
+		if token := strings.TrimSpace(e.HiveSupersederHardStop); token != "" {
+			// The one exception to the superseder rule: an emergent
+			// problem with the PR itself parks it, and the caption names it.
+			reasons := []string{"hive-authored superseding PR parked: " + HiveSupersederHardStopProse(token)}
+			if e.Verdict == VerdictRequiresHuman {
+				reasons = append(reasons, "the reviewer swarm returned `requires_human` @"+ShortSHA(e.Head))
+				if f := strings.TrimSpace(e.DecisionFinding); f != "" {
+					reasons = append(reasons, "the review found: "+f)
+				}
+			}
+			return Route{Stage: NeedsDecision, Reasons: reasons, LaneReason: LaneReasonHiveSupersederHardStopPrefix + token, Summary: summary, Head: e.Head, SelfAuthored: e.SelfAuthored, Verdict: e.Verdict, HumanApprover: strings.TrimSpace(e.HumanApprover), Hold: e.Hold}
+		}
+		if e.Verdict == VerdictRequiresHuman && strings.TrimSpace(e.HumanApprover) == "" && strings.TrimSpace(e.DecisionQuestion) == "" {
+			// Owner rule: the reviewer's finding — security-sensitive
+			// included — is the fixer's to address, not a person's to rule
+			// on. The aggregate routes it as changes_requested; the stage
+			// says so rather than "needs your decision". A verdict that
+			// still carries its decision question is the one case the
+			// aggregate left for a person (a pure approver sign-off with
+			// nothing to fix, hivecommons/hive#16607): no fixer is
+			// dispatched for it, so captioning it "goes to the fixer"
+			// parked it on 070 with nobody on it; it falls through to 085.
+			note(HiveSupersederAutoMergeCaption+": the reviewer's finding @"+ShortSHA(e.Head)+" goes to the fixer", LaneReasonHiveSupersederFix)
 		}
 	}
 	if e.Verdict == VerdictChangesRequested {
@@ -280,10 +598,33 @@ func RouteHuman(e Evidence) Route {
 		note("DCO sign-off missing", LaneReasonDCOMissing)
 	}
 	if e.Conflict {
-		note("merge conflict with the base branch", LaneReasonConflicting)
+		note(mergeConflictReason, LaneReasonConflicting)
 	}
 	if len(fix) > 0 {
-		return Route{Stage: fixing, Reasons: fix, LaneReason: laneReason, Summary: summary}
+		r := Route{Stage: fixing, Reasons: fix, LaneReason: laneReason, Summary: summary}
+		if e.Verdict == VerdictChangesRequested {
+			r.ReviewAsks = append([]string(nil), e.ReviewAsks...)
+		}
+		return r
+	}
+	// A person's own PR with a requires_human verdict and nothing else
+	// outstanding: the reviewer's question is the author's to answer. It
+	// routes to 071 Needs author with the question, like a change request
+	// (hivecommons/hive#15202). A hold, sentinel or lane rule still makes it
+	// a decision below; a hive-authored or clanker PR has no human author
+	// to ask, so it keeps the 085 route.
+	if HumanAuthorOwesAnswer(e) {
+		reasons := []string{"the reviewer asked the author a question @" + ShortSHA(e.Head)}
+		if q := strings.TrimSpace(e.DecisionQuestion); q != "" {
+			reasons = append(reasons, "reviewer question: "+q)
+		} else {
+			for _, summary := range e.HumanSummaries {
+				if s := strings.TrimSpace(summary); s != "" {
+					reasons = append(reasons, "reviewer summary: "+s)
+				}
+			}
+		}
+		return Route{Stage: fixing, Reasons: reasons, LaneReason: LaneReasonReviewerQuestion, Summary: summary, Head: e.Head, Verdict: e.Verdict}
 	}
 	// A fresh head waits for its verdict — unless the reviewer has already
 	// answered requires_human for this very head, in which case the person
@@ -293,11 +634,22 @@ func RouteHuman(e Evidence) Route {
 	}
 	var decide []string
 	if len(e.ForkGuard) > 0 {
-		subject, verb, it := "check", "refuses", "it"
+		subject, verb, it, runs, whose := "check", "refuses", "it", "the check runs", "The check's"
 		if len(e.ForkGuard) > 1 {
-			subject, verb, it = "checks", "refuse", "them"
+			subject, verb, it, runs, whose = "checks", "refuse", "them", "the checks run", "Each check's"
 		}
-		decide = append(decide, subject+" `"+strings.Join(e.ForkGuard, "`, `")+"` "+verb+" pull requests from a fork, so neither the author nor the hive can turn "+it+" green: a maintainer must push this branch to the repository (or approve the run as the repository requires)")
+		// The run a maintainer dispatches proves one exact head
+		// (projectbluefin/utah-packages#862), so the ask names it.
+		run, stale := "approve the run", ""
+		if h := ShortSHA(e.Head); h != "" {
+			run = "run or approve " + it + " for head `" + h + "`"
+			// A rebase with a byte-identical patch still sits on a newer
+			// base, so the code the check runs differs. Whether an earlier
+			// run carries over is the repository's call, and a check still
+			// red on this head has said no (projectbluefin/utah-packages#917).
+			stale = ". A run that passed on an earlier head does not cover `" + h + "`, even when the change itself is the same: a rebase or a merge of the base changes the code " + runs + ". " + whose + " own failure message on this head says what to run"
+		}
+		decide = append(decide, subject+" `"+strings.Join(e.ForkGuard, "`, `")+"` "+verb+" pull requests from a fork, so neither the author nor the hive can turn "+it+" green: a maintainer must push this branch to the repository (or "+run+" as the repository requires)"+stale)
 	}
 	approver := strings.TrimSpace(e.HumanApprover)
 	switch e.Verdict {
@@ -310,6 +662,9 @@ func RouteHuman(e Evidence) Route {
 			break
 		}
 		decide = append(decide, "the reviewer swarm returned `requires_human` @"+ShortSHA(e.Head))
+		if f := strings.TrimSpace(e.DecisionFinding); f != "" {
+			decide = append(decide, "the review found: "+f)
+		}
 		if q := strings.TrimSpace(e.DecisionQuestion); q != "" {
 			if decisionQuestionPlaceholderMention(q) {
 				q += " _(the reviewer named no specific person; repository approvers/owners, this is yours)_"
@@ -323,25 +678,24 @@ func RouteHuman(e Evidence) Route {
 			}
 		}
 	}
-	if e.Sentinel {
-		decide = append(decide, "a sentinel alert is open on this PR")
-	}
-	for _, h := range e.Holds {
-		if h == "hold" && e.Hold.Clause() != "" {
-			decide = append(decide, e.Hold.Clause())
-			continue
-		}
-		decide = append(decide, "the `"+h+"` label is set")
-	}
+	// A sentinel alert or a hold-class label is a gate, not a stage
+	// (hivecommons/hive#17327): withGates rides it on whatever stage the
+	// head's progress earns, and the lanes refuse the merge on the label.
 	manualMergeApproved := e.Cause == CauseDecision && e.ManualMergeRule && approver != "" && strings.TrimSpace(e.CauseReason) != "" && len(decide) == 0
 	if e.Cause == CauseDecision && strings.TrimSpace(e.CauseReason) != "" && !manualMergeApproved {
 		decide = append(decide, e.CauseReason)
 	} else if e.Cause == CauseDecision && len(e.ForkGuard) == 0 && !manualMergeApproved {
-		decide = append(decide, "the automerge lane will not merge this unattended")
+		decide = append(decide, decisionConsequenceReason)
 	}
 	if len(decide) > 0 {
 		return Route{Stage: NeedsDecision, Reasons: decide, Summary: summary, Head: e.Head, SelfAuthored: e.SelfAuthored, Verdict: e.Verdict,
 			Holds: append([]string(nil), e.Holds...), Sentinel: e.Sentinel, ManualMerge: e.ManualMerge, ApprovalReleasesFence: e.ManualMerge && e.ApprovalReleasesFence, HumanApprover: approver, Hold: e.Hold}
+	}
+	if e.HeadDirty {
+		// GitHub reports this very head `dirty`: it cannot merge, by the
+		// hive or by a person's click, until the conflict is resolved, so
+		// it is never 060 or 090. The author resolves it.
+		return Route{Stage: fixing, Reasons: []string{mergeConflictReason}, LaneReason: LaneReasonConflicting, Summary: summary}
 	}
 	var wait []string
 	switch {
@@ -349,6 +703,9 @@ func RouteHuman(e Evidence) Route {
 		wait = append(wait, "checks could not be read")
 	case e.Checks.Pending > 0:
 		wait = append(wait, fmt.Sprintf("%d check(s) still running", e.Checks.Pending))
+	}
+	if e.Checks.Known && len(e.Checks.Missing) > 0 {
+		wait = append(wait, "required check(s) `"+strings.Join(e.Checks.Missing, "`, `")+"` not reported on this head (a PR opened with GITHUB_TOKEN triggers no workflow): GitHub will not merge it until they run")
 	}
 	if e.Soak > 0 && e.SoakElapsed < e.Soak {
 		// A head the lane has NOT admitted (trust blocks it) is still
@@ -371,7 +728,19 @@ func RouteHuman(e Evidence) Route {
 		}
 		return route
 	}
-	return Route{Stage: ReadyForHumanMerge, Summary: summary, HumanApprover: approver}
+	if e.Cause == CauseTrust && e.ManualMergeRule && strings.TrimSpace(e.CauseReason) != "" {
+		// A manual-merge rule that owes no decision — the breaking-change
+		// title or the needs-owner-merge label (hivecommons/hive#15442):
+		// the head is green and reviewed, and the hive still never merges
+		// it; the owner's merge click is the one step left.
+		route := Route{Stage: ReadyForHumanMerge, ManualMerge: true, Summary: summary, Head: e.Head, SelfAuthored: e.SelfAuthored, Verdict: e.Verdict, HumanApprover: approver,
+			Reasons: []string{e.CauseReason}, LaneReason: strings.TrimSpace(e.LaneReason)}
+		if approver != "" && route.LaneReason != "" {
+			route.LaneReason += HumanApprovedReasonSuffix + approver
+		}
+		return route
+	}
+	return Route{Stage: ReadyForHumanMerge, Summary: summary, HumanApprover: approver, BehindBase: strings.TrimSpace(e.BehindBase)}
 }
 
 // decisionQuestionPlaceholderMentionRE matches the policy example's
@@ -412,6 +781,9 @@ func summarize(e Evidence) string {
 	if approver := strings.TrimSpace(e.HumanApprover); approver != "" {
 		parts = append(parts, "approved by @"+approver)
 	}
+	if requester := strings.TrimPrefix(strings.TrimSpace(e.HumanChangeRequester), "@"); requester != "" {
+		parts = append(parts, "changes requested by @"+requester)
+	}
 	switch {
 	case !e.Checks.Known:
 		parts = append(parts, "checks unknown")
@@ -421,6 +793,9 @@ func summarize(e Evidence) string {
 		parts = append(parts, fmt.Sprintf("%d/%d checks green, %d pending", e.Checks.Green, e.Checks.Total, e.Checks.Pending))
 	default:
 		parts = append(parts, fmt.Sprintf("%d/%d checks green", e.Checks.Green, e.Checks.Total))
+	}
+	if e.Checks.Known && len(e.Checks.Missing) > 0 {
+		parts = append(parts, "required not reported: "+strings.Join(e.Checks.Missing, ", "))
 	}
 	switch e.DCO {
 	case DCOYes:
@@ -433,6 +808,9 @@ func summarize(e Evidence) string {
 	}
 	if e.Conflict {
 		parts = append(parts, "merge conflict")
+	}
+	if base := strings.TrimSpace(e.BehindBase); base != "" {
+		parts = append(parts, "behind `"+base+"`")
 	}
 	if e.Soak > 0 {
 		if e.SoakElapsed >= e.Soak {
@@ -469,13 +847,35 @@ const (
 	DecisionCommentMarker = "<!-- hive:stage-needs-decision -->"
 )
 
+// EntryCommentMarker is the marker the entry comment for stage carries, or
+// "" for a stage with no entry comment.
+func EntryCommentMarker(stage Stage) string {
+	switch stage {
+	case ReadyForHumanMerge:
+		return ReadyCommentMarker
+	case NeedsDecision:
+		return DecisionCommentMarker
+	}
+	return ""
+}
+
+// EntryCommentUpdated is body — a fresh ReadyComment or DecisionComment —
+// as it is written over the PR's existing entry comment: the same text with
+// one line saying when it was last rewritten, so a reader who saw the
+// earlier wording knows it changed (hivecommons/hive#16433).
+func EntryCommentUpdated(body string, at time.Time) string {
+	return strings.TrimRight(body, "\n") + "\n\n<sub>Updated " + at.UTC().Format("2006-01-02 15:04 UTC") + ".</sub>"
+}
+
 // ReadyComment renders the 090 entry comment:
 //
 //	Ready for a human merge: verdict approved @abc1234, 55/55 checks green,
 //	DCO yes, soak 2h elapsed. Blocked only by `role/newcomer` (below
 //	require_tiers).
 //
-// blockedBy is the prose for the trust cause ("" when unknown).
+// blockedBy is the prose for the trust cause ("" when unknown). A head
+// behind a base that requires up-to-date branches (r.BehindBase) reads
+// "Blocked by …" and names the base merge as well (readyCommentBehindTail).
 //
 // An approved manual-merge route (r.ManualMerge) names the lane rule and
 // the approver instead of a trust cause, and tells the person the one step
@@ -492,24 +892,63 @@ func ReadyComment(r Route, blockedBy string) string {
 	b.WriteString("\nReady for a human merge: ")
 	b.WriteString(r.Summary)
 	b.WriteString(".")
+	held := func() {
+		// A gated head (hivecommons/hive#17327): the stage is its real
+		// progress, but the hive never merges it while the gate stands.
+		b.WriteString(" Held: ")
+		b.WriteString(strings.Join(r.Gates, "; "))
+		b.WriteString(". The hive never merges this head while the gate stands.")
+	}
 	if r.ManualMerge {
 		for _, reason := range r.Reasons {
-			if reason = strings.TrimSpace(reason); reason != "" {
+			if reason = strings.TrimSpace(reason); reason != "" && !slices.Contains(r.Gates, reason) {
 				b.WriteString(" ")
 				b.WriteString(strings.ToUpper(reason[:1]) + reason[1:])
 				b.WriteString(".")
 			}
 		}
+		if len(r.Gates) > 0 {
+			held()
+		}
 		b.WriteString("\n\n<sub>The hive never merges this lane's changes itself: click **Merge** (or `/lgtm` + `/approve` for tide) to land it.</sub>")
 		return b.String()
 	}
+	if len(r.Gates) > 0 {
+		held()
+		b.WriteString("\n\n<sub>Confirm the intent (resolve the sentinel alert or lift the hold), then `/lgtm` `/approve` (or merge) if you accept it.</sub>")
+		return b.String()
+	}
 	if blockedBy = strings.TrimSpace(blockedBy); blockedBy != "" {
-		b.WriteString(" Blocked only by ")
+		b.WriteString(readyCommentBlockedLead(r))
 		b.WriteString(blockedBy)
 		b.WriteString(".")
 	}
-	b.WriteString("\n\n<sub>The hive never approves on your behalf: `/lgtm` `/approve` (or merge) if you accept it.</sub>")
+	b.WriteString(readyCommentBehindTail(r))
 	return b.String()
+}
+
+// readyCommentBlockedLead opens the trust clause of the 090 comment. Trust
+// is the only blocker unless the head is behind a base that requires
+// up-to-date branches (projectbluefin/common#1619).
+func readyCommentBlockedLead(r Route) string {
+	if strings.TrimSpace(r.BehindBase) != "" {
+		return " Blocked by "
+	}
+	return " Blocked only by "
+}
+
+// readyCommentBehindTail ends the trust-blocked 090 comment. A head behind
+// a base that requires up-to-date branches is one GitHub will not merge
+// until the base is merged in, so the comment says so and no longer offers
+// "(or merge)" (projectbluefin/utah#1072 read "Blocked only by
+// `role/untrusted`" while BEHIND).
+func readyCommentBehindTail(r Route) string {
+	base := strings.TrimSpace(r.BehindBase)
+	if base == "" {
+		return "\n\n<sub>The hive never approves on your behalf: `/lgtm` `/approve` (or merge) if you accept it.</sub>"
+	}
+	return " The branch is also behind `" + base + "`, which requires up-to-date branches: GitHub will not merge this head until `" + base + "` is merged into it." +
+		"\n\n<sub>The hive never approves on your behalf: `/lgtm` `/approve` if you accept it; the branch still has to be brought up to date before it can merge.</sub>"
 }
 
 // DecisionComment renders the 085 entry comment naming what is owed.
@@ -542,8 +981,79 @@ func DecisionComment(r Route) string {
 		b.WriteString("\n\n")
 		b.WriteString(actions)
 	}
-	b.WriteString("\n\n<sub>Clear the cause and the hive re-evaluates on its next pass; the stage moves to `" + ReadyForHumanMerge.Label() + "`, `" + PreMergeSoak.Label() + "` or the merge queue on its own. An approval does not bypass CI, hold labels or other merge gates.</sub>")
+	if len(r.Actions) > 0 {
+		heading := r.ActionsHeading
+		if heading == "" {
+			heading = "How to release it:"
+		}
+		b.WriteString("\n\n**" + heading + "**\n\n")
+		for _, action := range r.Actions {
+			b.WriteString("- " + action + "\n")
+		}
+	}
+	b.WriteString("\n\n<sub>Clear the cause and the hive re-evaluates on its next pass; the stage moves to `" + ReadyForHumanMerge.Label() + "`, `" + PreMergeSoak.Label() + "` or the merge queue on its own. Approval does not bypass CI, hold labels or other merge gates.</sub>")
 	return b.String()
+}
+
+// FixerExhaustedRoute is the 085 route for a hive-authored PR whose fix
+// dispatcher refused another fix because the re-engagement cap is spent
+// (hivecommons/hive#15744). summary is the reviewer's one-line finding the
+// fixer never cleared ("" when unknown). The hive re-authors its own PR
+// automatically on the first exhaustion (ReauthoringReason), so this
+// route is reached only when it cannot (no issue, or the issue was
+// already re-authored once: reauthoredFrom names that earlier PR) and
+// lists the answers left: give direction, hand it to a person, or close
+// it as not planned. Re-authoring is never offered as a human choice.
+func FixerExhaustedRoute(head string, attempts int, summary string, reauthoredFrom int) Route {
+	reasons := []string{"the hive's fixer gave up after " + strconv.Itoa(attempts) + " attempts on `" + ShortSHA(head) + "`; no fix job is running"}
+	if summary = strings.TrimSpace(summary); summary != "" {
+		reasons = append(reasons, "last reviewer finding: "+summary)
+	}
+	if reauthoredFrom > 0 {
+		reasons = append(reasons, "this PR is already the hive's re-author of #"+strconv.Itoa(reauthoredFrom)+"; the hive re-authors an issue once and does not try a third time on its own")
+	}
+	return Route{
+		Stage:          NeedsDecision,
+		Reasons:        reasons,
+		Head:           head,
+		SelfAuthored:   true,
+		ActionsHeading: "Your options:",
+		Actions: []string{
+			"**Give direction** — reply `/hive decision <what to change>` (or *Give direction* in the tracker); the hive's fixer gets one more run with your note.",
+			"**Hand it to a person** — push to the branch yourself or say who takes it; the hive steps back while a human owns it.",
+			"**Close as not planned** — close the PR (or *Close as not planned* under Decide… in the tracker) when the change is no longer wanted.",
+		},
+	}
+}
+
+// BotAuthorFindingRoute is the 085 route for a PR another bot opened when
+// the reviewer asked for changes on head (LaneReasonBotAuthorFinding). bot
+// is the PR's author login, base the branch it targets ("" when unknown),
+// and summary the reviewer's one-line finding ("" when unknown). The hive
+// pushes nothing to the bot's branch and the bot cannot act on a review,
+// so the comment hands the finding to a maintainer with the places it can
+// land.
+func BotAuthorFindingRoute(head, bot, base, summary string) Route {
+	bot = strings.TrimSpace(bot)
+	reasons := []string{"the reviewer asked for changes @" + ShortSHA(head) + " on a PR that " + bot + " opened and regenerates: the hive does not push to this branch, and a bot cannot act on a review"}
+	if summary = strings.TrimSpace(summary); summary != "" {
+		reasons = append(reasons, "the review found: "+summary)
+	}
+	where := "the base branch"
+	if base = strings.TrimSpace(base); base != "" {
+		where = "`" + base + "`"
+	}
+	return Route{
+		Stage:          NeedsDecision,
+		Reasons:        reasons,
+		Head:           head,
+		ActionsHeading: "Your options:",
+		Actions: []string{
+			"**Fix it on " + where + "** — when the finding is about code this PR carries over, land the fix there (or open an issue for it); " + bot + "'s next run brings it into this PR, and the new head is reviewed again.",
+			"**Merge it as is** — merge this PR yourself when the finding should not hold it back.",
+			"**Close it** — close the PR when this run should not land.",
+		},
+	}
 }
 
 // DecisionActions names what clears an 085 park, per lane
@@ -575,14 +1085,24 @@ func DecisionActions(r Route) string {
 	}
 	var steps []string
 	head := "`" + ShortSHA(r.Head) + "`"
-	if r.ManualMerge {
-		// Only `/hive decision approve` and an Approve review release the
-		// fence; `/hive approve` never does (hivecommons/hive#14672).
+	if approver := strings.TrimPrefix(strings.TrimSpace(r.HumanApprover), "@"); approver != "" && (r.ManualMerge || r.Verdict == VerdictRequiresHuman) {
+		// The approval this step would ask for is already recorded on the
+		// head: it released the fence and answered requires_human, so the
+		// park is for another reason (projectbluefin/utah#1078 kept asking
+		// "a trusted merger approves this head" next to "approved by
+		// @Danathar"). Say it is done; the reasons name what is left.
+		steps = append(steps, "nothing more to approve: @"+approver+" approved this head ("+head+"); resolve the other reasons listed above")
+	} else if r.ManualMerge {
+		// Only `/hive decision approve` (typed or from the dashboard) and
+		// an Approve review release the fence; `/hive approve` never does
+		// (hivecommons/hive#14672). The first two also answer a
+		// requires_human verdict on the head, so the owner of their own PR,
+		// whom GitHub refuses as a reviewer, has one command for both.
 		settles := ""
 		if r.Verdict == VerdictRequiresHuman {
 			settles = " and settles the reviewer's `requires_human` verdict"
 		}
-		steps = append(steps, "a trusted merger approves this head ("+head+") with a GitHub **Approve** review (or a dashboard `/hive decision approve`), which releases the CI workflow-file fence"+settles+", and the hive merges the PR once the other gates clear; approval on an earlier head does not count, and a `/hive approve` reply does not release the fence")
+		steps = append(steps, "a trusted merger approves this head ("+head+") with a GitHub **Approve** review (or a `/hive decision approve` reply, typed here or from the dashboard), which releases the CI workflow-file fence"+settles+", and the hive merges the PR once the other gates clear; approval on an earlier head carries over only the hive's own merge of the base branch (diff unchanged), and a `/hive approve` reply does not release the fence")
 	} else if r.Verdict == VerdictRequiresHuman {
 		if r.SelfAuthored {
 			steps = append(steps, "approve this head ("+head+") to merge as-is — a GitHub **Approve** review, or a `/hive approve` reply posted after the verdict — or leave a *changes requested* review (or reply `/hive decision <what to change>`) and the hive will push the fix")
@@ -591,15 +1111,11 @@ func DecisionActions(r Route) string {
 		}
 	}
 	if r.Sentinel {
-		steps = append(steps, "resolve the sentinel alert and have a maintainer clear its label")
+		steps = append(steps, oneApproveSentinelStep(r))
 	}
 	for _, h := range r.Holds {
 		if h == "hold" && r.Hold.SelfImposed() {
-			reason := strings.TrimSpace(r.Hold.Reason)
-			if reason == "" {
-				reason = "its own gate"
-			}
-			steps = append(steps, "The hive set `hold` itself for "+reason+". **Release** it (dashboard row menu → Release hold, or remove the `hold` label) and the lane merges on its next pass once the other gates are clear, or **keep** it until a maintainer has reviewed the issue's reporter; `/hive approve` does not remove it")
+			steps = append(steps, selfImposedHoldStep(r.Hold))
 			continue
 		}
 		steps = append(steps, "resolve the reason for `"+h+"` and have a maintainer remove that label (`/hive approve` does not remove it)")
@@ -616,4 +1132,85 @@ func DecisionActions(r Route) string {
 		b.WriteString("\n- " + s + ".")
 	}
 	return b.String()
+}
+
+// selfImposedHoldStep is the release step for a `hold` the hive set itself,
+// worded for the gate that set it. Only the reporter-trust gate's hold is
+// released into an unattended merge; a human-merge-path hold stays a
+// person's merge whatever the label says (projectbluefin/utah#1097,
+// projectbluefin/finpilot#627 were told the lane would merge them); a hold
+// the hive can attribute only to its label event names no gate it cannot see.
+func selfImposedHoldStep(h *HoldProvenance) string {
+	reason := strings.TrimSpace(h.Reason)
+	switch {
+	case h.ReporterTrust():
+		if reason == "" {
+			reason = "its own gate"
+		}
+		return "The hive set `hold` itself for " + reason + ". **Release** it (dashboard row menu → Release hold, or remove the `hold` label) and the lane merges on its next pass once the other gates are clear, or **keep** it until a maintainer has reviewed the issue's reporter; `/hive approve` does not remove it"
+	case h.HumanMergePath():
+		return "The hive set `hold` because this PR changes " + HumanMergePathReason + ": the hive never merges it, so a maintainer reviews it and merges it by hand; removing `hold` does not hand it back to the lane"
+	}
+	if reason == "" {
+		return "The hive set `hold` itself; its notice on this PR names the gate. Resolve that, then remove the `hold` label; `/hive approve` does not remove it"
+	}
+	return "The hive set `hold` itself for " + reason + ". Resolve that, then remove the `hold` label; `/hive approve` does not remove it"
+}
+
+// HumanAuthorOwesAnswer reports whether a requires_human verdict on a PR a
+// person pushed themselves routes to the author (071) rather than to a
+// decision (085): the author is human and not this hive, no trusted merger
+// has approved the head, and nothing else — a fork guard, a human-only
+// lane rule — asks a maintainer for a decision. A sentinel alert or a hold
+// label is a gate riding the route, not a decision (hivecommons/hive#17327).
+func HumanAuthorOwesAnswer(e Evidence) bool {
+	if e.SelfAuthored || e.AuthorKind != authorkind.Human || e.Verdict != VerdictRequiresHuman {
+		return false
+	}
+	if strings.TrimSpace(e.HumanApprover) != "" || len(e.ForkGuard) > 0 {
+		return false
+	}
+	return e.Cause != CauseDecision || strings.TrimSpace(e.CauseReason) == "" || IsDecisionRequestedReason(e.CauseReason)
+}
+
+// IsDecisionRequestedReason matches the lane reason the reviewer's
+// decision-request verdict is recorded under; it names no lane rule of
+// its own, so it never turns a human author's question into a decision.
+func IsDecisionRequestedReason(reason string) bool {
+	return strings.EqualFold(strings.TrimSpace(reason), "contributor-lane:decision-requested")
+}
+
+// AlreadyLandedReason is LaneReasonAlreadyLanded with the PR that landed
+// the change (":#N"), or bare when none was named.
+func AlreadyLandedReason(landed int) string {
+	if landed <= 0 {
+		return LaneReasonAlreadyLanded
+	}
+	return LaneReasonAlreadyLanded + ":#" + strconv.Itoa(landed)
+}
+
+// AlreadyLandedCaption is the tracker caption for an AlreadyLandedReason
+// ("already landed via #N — closing as superseded"); ok is false for any
+// other reason.
+func AlreadyLandedCaption(reason string) (caption string, ok bool) {
+	r := strings.TrimSpace(reason)
+	if r != LaneReasonAlreadyLanded && !strings.HasPrefix(r, LaneReasonAlreadyLanded+":#") {
+		return "", false
+	}
+	if n, err := strconv.Atoi(strings.TrimPrefix(r, LaneReasonAlreadyLanded+":#")); err == nil && n > 0 {
+		return "already landed via #" + strconv.Itoa(n) + " — closing as superseded", true
+	}
+	return "already landed on the base — closing as superseded", true
+}
+
+// AlreadyLandedAuthorReason is the log reason for an already-landed close
+// of any author's PR (hivecommons/hive#15732): "already-landed:<kind>",
+// so a contributor's or trusted author's close reads apart from the
+// hive's own (LaneReasonAlreadyLanded). An unknown kind reads "unknown".
+func AlreadyLandedAuthorReason(kind authorkind.Kind) string {
+	k := strings.TrimSpace(string(kind))
+	if k == "" {
+		k = "unknown"
+	}
+	return "already-landed:" + k
 }

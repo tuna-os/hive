@@ -21,7 +21,9 @@ import (
 	"github.com/hivecommons/hive/pkg/decisionpolicy"
 	"github.com/hivecommons/hive/pkg/effects"
 	"github.com/hivecommons/hive/pkg/issueshape"
+	"github.com/hivecommons/hive/pkg/prstatus"
 	"github.com/hivecommons/hive/pkg/stagelabels"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // IssueRequestDir is where agents drop issue-create and comment requests. An
@@ -126,9 +128,12 @@ type IssueRequest struct {
 	// this one is ready. On an "issue" request the watcher records each as a
 	// GitHub "blocked by" dependency of the new issue after creating it
 	// (hivecommons/hive#9839), so a split's order lives where enumeration can
-	// read it instead of only in prose. A failed link does not fail the
-	// create; linked and failed blockers are both reported in the result.
-	BlockedBy []int `json:"blocked_by,omitempty"` // issue only
+	// read it instead of only in prose. On a "comment" request it records
+	// them on the existing issue: a park that defers to another issue's
+	// decision names it, and the dashboard then counts one owner ask, not
+	// two. A failed link does not fail the request; linked and failed
+	// blockers are both reported in the result.
+	BlockedBy []int `json:"blocked_by,omitempty"` // issue and comment
 	// NeedsDecision parks the issue on a maintainer decision
 	// (hivecommons/hive#11215). On an "issue" request the watcher adds the
 	// hive's configured needs-decision label (hard_suppress_labels.
@@ -144,6 +149,11 @@ type IssueRequest struct {
 	NeedsDecision bool `json:"needs_decision,omitempty"` // issue and comment
 	// OwnerStep records a typed proposal; it does not authorize execution.
 	OwnerStep *IssueOwnerStep `json:"owner_step,omitempty"` // requires NeedsDecision
+	// WithdrawDecision takes back a decision park the requesting agent
+	// placed itself (issue_park_withdraw.go): the comment says why, and the
+	// watcher lifts the park and removes the "What to reply" notice. Like a
+	// park it needs the label op in the lane's allowlist.
+	WithdrawDecision bool `json:"withdraw_decision,omitempty"` // comment only
 	// NoConsolidateReason is the caller's escape hatch from open-issue
 	// consolidation (#14360): when set, the watcher files a new issue instead
 	// of folding the request into an existing one, and records the reason.
@@ -155,6 +165,16 @@ type IssueRequest struct {
 	// label and removes `help wanted`. The blocked sweep lifts the label when
 	// the PR merges or closes.
 	BlockedOnPR int `json:"blocked_on_pr,omitempty"` // comment only
+	// BlockedOnPRRepo names the repository of BlockedOnPR when it is not
+	// Repo (`--blocked-on-pr owner/repo#n`); empty means Repo.
+	BlockedOnPRRepo string `json:"blocked_on_pr_repo,omitempty"` // comment only
+	// Claim makes an "issue" request file AND claim the new issue for Agent
+	// in one request (hivecommons/hive#17299): right after the create the
+	// watcher performs the same claim a "claim" request does and takes
+	// `help wanted` off, so an agent's own next step is never open to
+	// others in between. Without it, the created issue carries a
+	// filed-for-help marker and a later claim of it by Agent is refused.
+	Claim bool `json:"claim,omitempty"` // issue only
 }
 
 // IssueResponse is written next to a consumed request as <name>.result.json.
@@ -172,8 +192,13 @@ type IssueResponse struct {
 	// "subject", "file_set", or "component:<path>" (#14360), so the agent can
 	// tell a true twin from a weak shared-path fold.
 	ConsolidatedReason string `json:"consolidated_reason,omitempty"`
-	// ConsolidationSkippedReason echoes the request's no_consolidate_reason
-	// when the watcher skipped consolidation because the caller asked.
+	// ConsolidationSkippedReason names why the watcher filed a new issue
+	// instead of folding: the request's no_consolidate_reason when the caller
+	// asked (#14360), or the watcher-derived "parent" / "blocked_by" when the
+	// request declared DAG placement and the file-set, component and
+	// canonical-subject folds were skipped (#16065). The DAG-derived values
+	// are reported only on a genuine create, never alongside Consolidated or
+	// AlreadyExisted.
 	ConsolidationSkippedReason string `json:"consolidation_skipped_reason,omitempty"`
 	// RejectedDuplicate reports that no issue was created because a maintainer
 	// recently closed an agent-filed issue covering the same file set as
@@ -191,6 +216,11 @@ type IssueResponse struct {
 	// "request_review" request asked, after normalization.
 	ReviewersRequested     []string `json:"reviewers_requested,omitempty"`
 	TeamReviewersRequested []string `json:"team_reviewers_requested,omitempty"`
+	// ReviewersAlreadyPending and TeamReviewersAlreadyPending report who was
+	// skipped because their review request on the PR is still pending, so
+	// asking again would only re-ping them for the same ask.
+	ReviewersAlreadyPending     []string `json:"reviewers_already_pending,omitempty"`
+	TeamReviewersAlreadyPending []string `json:"team_reviewers_already_pending,omitempty"`
 	// ParentLinked reports that the created issue was linked as a GitHub
 	// sub-issue of req.Parent. ParentLinkError carries the (non-fatal) reason
 	// when a requested link did not succeed; the issue is still created OK.
@@ -201,6 +231,12 @@ type IssueResponse struct {
 	// names each one that could not be, with the reason (#9839).
 	BlockedByLinked []int    `json:"blocked_by_linked,omitempty"`
 	BlockedByErrors []string `json:"blocked_by_errors,omitempty"`
+	// Claimed reports that an "issue" request with Claim set also claimed
+	// the issue it created (#17299). ClaimError names why it did not; the
+	// issue is still created and the request is still OK, so the agent
+	// reads it here instead of assuming the claim landed.
+	Claimed    bool   `json:"claimed,omitempty"`
+	ClaimError string `json:"claim_error,omitempty"`
 }
 
 // IssueRequestAuthorizer mirrors PRRequestAuthorizer: it receives the claimed
@@ -270,7 +306,7 @@ func (c *Client) StartIssueRequestWatcher(ctx context.Context, authz IssueReques
 				if ctx.Err() != nil {
 					return
 				}
-				c.processIssueRequestsInDir(ctx, nowFn, dir)
+				c.processIssueRequestsInDir(WithRESTCaller(ctx, "hive:issue_request_watcher"), nowFn, dir)
 			}
 		}
 	}()
@@ -472,6 +508,9 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 	if shapeErr == "" {
 		shapeErr = issueOwnerStepShapeError(req, kind)
 	}
+	if shapeErr == "" && req.WithdrawDecision && (kind != "comment" || req.NeedsDecision) {
+		shapeErr = "withdraw_decision applies to a comment only and cannot be combined with needs_decision"
+	}
 	if shapeErr != "" {
 		c.writeIssueResult(path, IssueResponse{OK: false, Error: shapeErr, At: nowFn().UTC().Format(time.RFC3339)})
 		_ = os.Rename(path, path+".bad")
@@ -508,7 +547,7 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 	// A comment that parks the item applies a hive-controlled label, so the
 	// lane must hold the label op too: commenting on an issue and taking it
 	// out of the actionable queue are different privileges (#12334).
-	if kind == "comment" && req.NeedsDecision {
+	if kind == "comment" && (req.NeedsDecision || req.WithdrawDecision) {
 		if reason, refused := c.refuseWrite(req.Agent, WriteOpLabel, req.Repo, req.Number); refused {
 			c.denyIssueRequest(path, req, reason, nowFn)
 			return
@@ -542,6 +581,9 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 	originalAddLabels := append([]string(nil), addLabels...)
 	removeLabels := normalizeLabelList(req.RemoveLabels)
 	var issueDecisionDowngrade issueDecisionDowngrade
+	// askFoldedInto is the earlier decision park this park was linked
+	// "blocked by" because it asks the same decision (issue_ask_fold.go).
+	var askFoldedInto int
 	if kind == "label" && containsConfiguredDecisionParkLabel(addLabels, c.needsDecisionLabel()) {
 		var dErr error
 		issueDecisionDowngrade, dErr = c.issueDecisionDowngradeForLabel(ctx, req, addLabels)
@@ -573,6 +615,23 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		body = withParentMarker(body, req.Parent)
 	}
 	if kind == "issue" {
+		// An empty dedupe checklist is not an issue (hivecommons/hive#15381):
+		// a pass that found nothing to act on goes to the hive's own log,
+		// not to the maintainers' queue. Terminal, like a prior-art refusal.
+		if f, isChecklist := ParseDedupeChecklistFindings(body); isChecklist && !f.Actionable() {
+			refusal := "not filed: dedupe checklist has no actionable findings (" + f.Summary() + "); merge-order reminders, cross-links and checked-not-duplicates are notes, not work — report them in your kick output instead"
+			c.recordWriteAudit(AuditActionAgentIssueEmptyAdvisoryRefused, meta,
+				WriteTarget{Repo: req.Repo}, "findings", f.Summary())
+			if c.priorArtFilingRecord != nil {
+				c.priorArtFilingRecord("dedupe pass found nothing to act on: "+strings.TrimSpace(req.Title), f.Summary(), req.Agent, req.Repo)
+			}
+			c.logger.Info("issue-request watcher: refused empty dedupe advisory",
+				slog.String("repo", req.Repo), slog.String("agent", req.Agent), slog.String("findings", f.Summary()))
+			c.writeIssueResult(path, IssueResponse{OK: false, Error: refusal, At: nowFn().UTC().Format(time.RFC3339)})
+			_ = os.Remove(path)
+			c.issueClearRetry(path)
+			return
+		}
 		// Prior-art filing verdict (hivecommons/hive#13879). A refusal is
 		// terminal: retrying the same request cannot change the match.
 		var refusal string
@@ -587,16 +646,45 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 			return
 		}
 	}
+	if kind == "issue" && !req.Claim && req.Parent == 0 {
+		// Filed unclaimed = filed for outside help (#17299): the filer's
+		// later claim is refused by IssueStartBlockReason. --parent children
+		// are the hive's own decomposition backlog, so they stay unmarked.
+		body = withFiledForHelpMarker(body, req.Agent)
+	}
 	if c.attributionTrailerOn() {
 		body = AppendTrailer(body, meta)
 	}
 
 	resp := IssueResponse{At: nowFn().UTC().Format(time.RFC3339)}
+	// #17298: a request that starts work on an issue (a claim, or a comment
+	// announcing a start — the kick path for epic-driven work) is checked
+	// against the same claim-target gate as hive-open-pr before any write,
+	// and before notifyAgentStart books the start. An issue another principal
+	// has claimed, or covered with an open PR, is refused with a policy
+	// reason; a target that is a pull request is never refused (a start
+	// comment on a PR starts no issue); a failed lookup fails closed and is
+	// retried.
+	startSignal := issueRequestStartSignal(kind, req.Body)
+	if startSignal != "" {
+		refusal, blocked, gateErr := c.issueRequestStartTargetBlock(ctx, req, nowFn())
+		if gateErr != nil {
+			resp.OK = false
+			resp.Error = gateErr.Error()
+			c.failIssueRequest(path, req, kind, resp, gateErr, nowFn)
+			return
+		}
+		if blocked {
+			c.noticePRRequestTargetRefusal(ctx, issueRequestStartTargetAction(kind), refusal)
+			c.denyIssueRequest(path, req, issueRequestStartRefusedReason(kind, refusal), nowFn)
+			return
+		}
+	}
 	closedPR := false
 	switch kind {
 	case "claim":
 		var reason string
-		reason, err = c.IssueDispatchBlockReason(ctx, req.Repo, req.Number)
+		reason, err = c.IssueStartBlockReason(ctx, req.Repo, req.Number, req.Agent)
 		if err != nil {
 			break // Retry a failed lookup; never claim on unknown labels.
 		}
@@ -615,20 +703,10 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 				verificationClaimCooldown.String()+" ago and nothing has changed since; do not re-verify it, and open a PR without a claim if you intend to fix it", nowFn)
 			return
 		}
-		// Apply a namespaced ownership label (App bots can't be assignees),
-		// journaled against a fresh read so a second claim on an issue whose
-		// earlier label lapsed is written, not replayed (hivecommons/hive#12512).
-		// The stage — stage/020-claimed when the in-progress mark is on;
-		// 030 needs PR evidence — is a fact for the stage engine (see
-		// issue_inprogress.go).
-		err = c.AddLabelsFresh(ctx, req.Repo, req.Number, claimOwnershipLabel(req.Agent))
-		if err == nil {
-			err = c.submitInProgressFact(ctx, req.Repo, req.Number, req.Agent, nowFn())
-		}
+		err = c.claimIssueForAgent(ctx, req.Repo, req.Number, req.Agent, nowFn)
 		if err == nil {
 			resp.OK = true
 			resp.Number = req.Number
-			c.markInProgressStarted(ctx, req.Repo, req.Number, req.Agent, nowFn())
 		}
 	case "comment":
 		// A verification marker already on the issue means this comment was
@@ -646,19 +724,36 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 				break
 			}
 		}
+		var withdraw *parkWithdrawal
+		if req.WithdrawDecision {
+			var refusal string
+			refusal, withdraw, err = c.decisionParkWithdrawal(ctx, req)
+			if err != nil {
+				break
+			}
+			if refusal != "" {
+				c.denyIssueRequest(path, req, refusal, nowFn)
+				return
+			}
+			body = strings.TrimRight(body, "\n") + "\n\n" + parkWithdrawnMarker(req.Agent)
+		}
 		var parkBlocked bool
 		if req.BlockedOnPR > 0 {
-			settled, merged, pErr := c.pullRequestSettledDetails(ctx, req.Repo, req.BlockedOnPR)
+			prRepo := req.Repo
+			if r := strings.TrimSpace(req.BlockedOnPRRepo); r != "" {
+				prRepo = r
+			}
+			settled, merged, pErr := c.pullRequestSettledDetails(ctx, prRepo, req.BlockedOnPR)
 			if pErr != nil {
 				if !githubStatusError(pErr, http.StatusNotFound) {
 					err = pErr
 					break
 				}
-				body = blockedTargetNotFoundNote(req.Repo, req.BlockedOnPR, body)
+				body = blockedTargetNotFoundNote(prRepo, req.BlockedOnPR, body)
 			} else if settled {
-				body = blockedTargetSettledNote(req.Repo, req.BlockedOnPR, merged, body)
+				body = blockedTargetSettledNote(prRepo, req.BlockedOnPR, merged, body)
 			} else {
-				body = blockedNoteBody(req.Repo, req.BlockedOnPR, body)
+				body = blockedNoteBody(prRepo, req.BlockedOnPR, body)
 				parkBlocked = true
 			}
 		}
@@ -682,41 +777,100 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 			// `resolve` a non-risk Hive engineering question is not parked,
 			// the comment records the decision and the owner-step marker is
 			// withheld so the unpark menu does not offer `/hive done`.
-			issueDecisionDowngrade = c.issueDecisionDowngradeForComment(req, body)
-			if !issueDecisionDowngrade.Active {
+			issueDecisionDowngrade = c.issueDecisionDowngradeForComment(ctx, req, body)
+			if !issueDecisionDowngrade.Active && len(req.BlockedBy) == 0 {
+				if n := c.askFoldTarget(ctx, req.Repo, req.Number, body); n > 0 {
+					req.BlockedBy, askFoldedInto = []int{n}, n
+					body = appendAskFoldNote(body, n)
+				}
+			}
+			// The one plain label this path adds: an operator-renamed
+			// decision label for a park (not a stage spelling the engine
+			// writes, so it goes on first, as the create path puts it in
+			// the create's labels, #12329: the hard-suppress filter reads
+			// it), or, for a workflow-only change handed to the lane that
+			// can push it, the label that routes the issue there
+			// (scheduler routeWorkflowsLane) while nothing parks it.
+			_, parkLabel, _ := c.partitionStageRequestLabels([]string{c.needsDecisionLabel()})
+			plainLabel := ""
+			switch {
+			case !issueDecisionDowngrade.Active && !stagelabels.IsStageLabel(strings.ToLower(parkLabel)):
+				plainLabel = parkLabel
+			case issueDecisionDowngrade.Lane != "":
+				plainLabel = WorkflowsLaneLabel
+			}
+			if plainLabel != "" {
+				err = c.AddLabels(ctx, req.Repo, req.Number, []string{plainLabel})
+			}
+			if err == nil && !issueDecisionDowngrade.Active {
 				// The park is a Parked fact for the stage engine, the same
 				// path a `label` request takes: the engine derives and
-				// writes the stage. An operator-renamed decision label is
-				// not a stage spelling the engine writes, so it goes on
-				// first, as the create path puts it in the create's labels
-				// (#12329): the hard-suppress filter reads that label.
-				_, parkLabel, _ := c.partitionStageRequestLabels([]string{c.needsDecisionLabel()})
-				if !stagelabels.IsStageLabel(strings.ToLower(parkLabel)) {
-					err = c.AddLabels(ctx, req.Repo, req.Number, []string{parkLabel})
-				}
-				if err == nil {
-					err = c.StageFacts().Parked(ctx, c.IssueStageRef(req.Repo, req.Number), parkLabel)
-				}
+				// writes the stage.
+				err = c.StageFacts().Parked(ctx, c.IssueStageRef(req.Repo, req.Number), parkLabel)
 				if err == nil {
 					err = c.verifyIssueParkLanded(ctx, req.Repo, req.Number, parkLabel)
 				}
 			}
 		}
-		if err == nil {
+		if err == nil && (withdraw == nil || !withdraw.posted) {
 			commentBody := issueOwnerStepBody(body, req.NeedsDecision && !issueDecisionDowngrade.Active, req.OwnerStep)
-			if issueDecisionDowngrade.Active {
+			if issueDecisionDowngrade.workflows() {
+				commentBody = appendWorkflowsHandoff(commentBody, issueDecisionDowngrade)
+			} else if issueDecisionDowngrade.Active {
 				commentBody = appendHiveDecisionTaken(commentBody, issueDecisionDowngrade.Question)
 			}
-			err = c.CreateIssueCommentBudgeted(ctx, req.Repo, req.Number, commentBody)
+			commentBody = c.adoptedAwaitingCINote(ctx, req.Repo, req.Number, commentBody)
+			if key := relayStatusNoteKey(commentBody); key != "" && (c.notificationsQuiet() || c.attentionPilot()) {
+				// A one-line state note (awaiting-ci, parking, already fixed)
+				// is a section of the item's status comment in quiet mode or
+				// under the attention pilot.
+				var created bool
+				created, err = c.UpsertPRStatusSection(ctx, req.Repo, req.Number, key, commentBody)
+				if err == nil && !created {
+					c.noteCommentSuppressed()
+				}
+			} else if note, ok := OriginFooterNote(commentBody); ok && req.BlockedOnPR == 0 {
+				// Free text whose only marker is the identity footer is an
+				// agent note: one upserted comment per item, or a status
+				// section in quiet mode (hivecommons/hive#17067).
+				var created bool
+				created, err = c.postOriginNote(ctx, req.Repo, req.Number, req.Agent, note, nowFn())
+				if err == nil && !created {
+					c.noteCommentSuppressed()
+				}
+			} else {
+				err = c.CreateIssueCommentBudgeted(ctx, req.Repo, req.Number, commentBody)
+			}
+
 			if errors.Is(err, ErrIssueCommentBudget) {
 				c.denyIssueRequest(path, req, "comment refused: "+err.Error()+"; this issue already received its daily quota of hive comments, nothing more is needed on it today", nowFn)
 				return
 			}
 		}
+		if err == nil && withdraw != nil {
+			// After the comment, so the reason is on the issue before the
+			// park lifts; a retry after a failed lift finds the comment up
+			// (withdraw.posted) and only lifts.
+			if label := c.renamedParkLabel(withdraw); label != "" {
+				err = c.RemoveLabel(ctx, req.Repo, req.Number, label)
+			}
+			if err == nil {
+				err = c.withdrawDecisionPark(ctx, req, withdraw)
+			}
+		}
 		if err == nil && parkBlocked {
 			err = c.AddLabels(ctx, req.Repo, req.Number, []string{BlockedLabel})
 			if err == nil {
-				err = c.RemoveLabel(ctx, req.Repo, req.Number, helpWantedLabel)
+				err = stripHelpWanted(ctx, c, req.Repo, req.Number)
+			}
+		}
+		// Best-effort "blocked by" links on the existing issue, the
+		// create's contract (#9839): never a failure of the comment.
+		if err == nil && len(req.BlockedBy) > 0 {
+			resp.BlockedByLinked, resp.BlockedByErrors = c.linkBlockedBy(ctx, req.Repo, req.Number, req.BlockedBy)
+			for _, e := range resp.BlockedByErrors {
+				c.logger.Warn("issue-request watcher: blocked-by link failed, comment still posted",
+					slog.String("repo", req.Repo), slog.Int("number", req.Number), slog.String("blocker", e))
 			}
 		}
 		if err == nil {
@@ -725,10 +879,12 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		}
 	case "label":
 		// A re-park on a decision a maintainer already gave is refused; a
-		// failed lookup takes the retry path like the claim gate.
+		// failed lookup takes the retry path like the claim gate. One let
+		// through on a newer, different decision is submitted as such so
+		// the stale `approved-direction` does not read as a standing one.
 		var reason string
-		var refused bool
-		reason, refused, err = c.reparkDecisionRefusal(ctx, req.Repo, req.Number, addLabels)
+		var refused, superseded bool
+		reason, refused, superseded, err = c.reparkDecisionRefusal(ctx, req.Repo, req.Number, addLabels)
 		if err != nil {
 			break
 		}
@@ -759,11 +915,26 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		if err == nil && len(plainLabels) > 0 {
 			err = c.AddLabels(ctx, req.Repo, req.Number, plainLabels)
 		}
+		if err == nil && issueHasLabel(plainLabels, VerifiedOpenLabel) {
+			// The agent's verdict that the work is not finished supersedes
+			// the done labels: projectbluefin/testsuite#1023 wore
+			// hive/already-done next to a later hive/verified-open and the
+			// inbox offered to close it. Best-effort: the verdict landed, and
+			// the stage sweep settles a pair left behind
+			// (reconcileDoneVerdictLabels).
+			if rerr := c.RemoveLabelsFresh(ctx, req.Repo, req.Number, AlreadyDoneLabel, LikelyDoneLabel); rerr != nil && c.logger != nil { // writeback:solicited the agent's verified-open verdict
+				c.logger.Warn("issue-request watcher: removing done labels after verified-open failed; the stage sweep retries", "repo", req.Repo, "number", req.Number, "error", rerr)
+			}
+		}
 		if err == nil && unpark {
 			err = c.StageFacts().Unparked(ctx, c.IssueStageRef(req.Repo, req.Number), req.Agent)
 		}
 		if err == nil && parkLabel != "" {
-			err = c.StageFacts().Parked(ctx, c.IssueStageRef(req.Repo, req.Number), parkLabel)
+			if superseded {
+				err = c.StageFacts().ReparkedOnNewDecision(ctx, c.IssueStageRef(req.Repo, req.Number), parkLabel)
+			} else {
+				err = c.StageFacts().Parked(ctx, c.IssueStageRef(req.Repo, req.Number), parkLabel)
+			}
 			if err == nil {
 				err = c.verifyIssueParkLanded(ctx, req.Repo, req.Number, parkLabel)
 			}
@@ -778,7 +949,17 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 			}
 		}
 		if err == nil && issueDecisionDowngrade.Active {
-			err = c.CreateIssueCommentBudgeted(ctx, req.Repo, req.Number, issueDecisionDowngrade.Note)
+			// Pilot only: quiet mode leaves issue notes as standalone
+			// comments (docs/notifications.md), so it keeps the raw note.
+			if c.attentionPilot() {
+				var created bool
+				created, err = c.UpsertPRStatusSection(ctx, req.Repo, req.Number, prstatus.KeyIssueDecisionDowngrade, issueDecisionDowngrade.Note)
+				if err == nil && !created {
+					c.noteCommentSuppressed()
+				}
+			} else {
+				err = c.CreateIssueCommentBudgeted(ctx, req.Repo, req.Number, issueDecisionDowngrade.Note)
+			}
 		}
 		if err == nil {
 			resp.OK = true
@@ -787,14 +968,31 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 	case "request_review":
 		reviewers := normalizeReviewers(req.Reviewers)
 		teams := normalizeTeamReviewers(req.TeamReviewers)
+		var pendingUsers, pendingTeams []string
+		reviewers, teams, pendingUsers, pendingTeams = c.dropPendingReviewers(ctx, req.Repo, req.Number, reviewers, teams)
 		err = c.RequestReviewers(ctx, req.Repo, req.Number, reviewers, teams)
 		if err == nil {
 			resp.OK = true
 			resp.Number = req.Number
 			resp.ReviewersRequested = reviewers
 			resp.TeamReviewersRequested = teams
+			resp.ReviewersAlreadyPending = pendingUsers
+			resp.TeamReviewersAlreadyPending = pendingTeams
 		}
 	case "close":
+		// An issue with an open sub-issue is not finished, so an agent may
+		// not close it, with or without an override reason
+		// (automated_close_open_subissues.go). A pull request is not
+		// affected.
+		var refusal string
+		refusal, err = c.issueCloseRequestOpenSubIssuesRefusal(ctx, req.Repo, req.Number)
+		if err != nil {
+			break // Retry a failed read; never close on unknown sub-issues.
+		}
+		if refusal != "" {
+			c.denyIssueRequest(path, req, refusal, nowFn)
+			return
+		}
 		closedPR, err = c.closeIssue(ctx, req.Repo, req.Number, IssueCloseOptions{OverrideReason: req.OverrideReason})
 		if err == nil {
 			resp.OK = true
@@ -802,15 +1000,36 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		}
 	default: // "issue"
 		var res CreateIssueResult
-		createLabels, createBody, d := c.issueCreateLabels(req, body)
+		createLabels, createBody, d := c.issueCreateLabels(ctx, req, body)
 		if d.Active {
 			issueDecisionDowngrade = d
 		}
-		res, err = c.createIssue(ctx, CreateIssueRequest{Repo: req.Repo, Title: req.Title, Body: issueOwnerStepBody(createBody, req.NeedsDecision && !issueDecisionDowngrade.Active, req.OwnerStep), Labels: createLabels, Origin: req.Agent, ConsolidateOpen: req.NoConsolidateReason == ""})
+		if req.NeedsDecision && !issueDecisionDowngrade.Active && len(req.BlockedBy) == 0 {
+			if n := c.askFoldTarget(ctx, req.Repo, 0, req.Title+"\n"+createBody); n > 0 {
+				req.BlockedBy, askFoldedInto = []int{n}, n
+				createBody = appendAskFoldNote(createBody, n)
+			}
+		}
+		// A declared parent/blocked-by makes the request a distinct DAG node;
+		// never fold it into a sibling that merely cites the same path (#16065).
+		dagSkipReason := ""
+		if req.Parent > 0 {
+			dagSkipReason = "parent"
+		} else if len(req.BlockedBy) > 0 {
+			dagSkipReason = "blocked_by"
+		}
+		res, err = c.createIssue(ctx, CreateIssueRequest{Repo: req.Repo, Title: req.Title, Body: issueOwnerStepBody(createBody, req.NeedsDecision && !issueDecisionDowngrade.Active, req.OwnerStep), Labels: createLabels, Origin: req.Agent, ConsolidateOpen: req.NoConsolidateReason == "", SkipSharedPathFold: dagSkipReason != ""})
 		if req.NoConsolidateReason != "" {
 			resp.ConsolidationSkippedReason = req.NoConsolidateReason
 			c.logger.Info("issue-request watcher: consolidation skipped at the caller's request",
 				slog.String("repo", req.Repo), slog.String("reason", req.NoConsolidateReason), slog.String("agent", req.Agent))
+		} else if dagSkipReason != "" && err == nil && !res.Consolidated && !res.AlreadyExisted && !res.RejectedTwin {
+			// Only a genuine create reports the skip: an exact-title reuse or
+			// a rejected twin still applies, and the result must not claim
+			// both a fold and a skipped fold.
+			resp.ConsolidationSkippedReason = dagSkipReason
+			c.logger.Info("issue-request watcher: file-set and component folds skipped, request declares DAG placement",
+				slog.String("repo", req.Repo), slog.String("reason", dagSkipReason), slog.String("agent", req.Agent))
 		}
 		if err == nil && res.RejectedTwin {
 			// Terminal, not retried: a maintainer already rejected this
@@ -874,29 +1093,21 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 						slog.String("repo", req.Repo), slog.Int("number", res.Number), slog.String("blocker", e))
 				}
 			}
+			if req.Claim {
+				resp.Claimed, resp.ClaimError = c.claimCreatedIssue(ctx, req, fileUID, res, meta, nowFn)
+			}
 		}
 	}
 
 	if err != nil {
 		resp.OK = false
 		resp.Error = err.Error()
-		if issueRequestFailureIsPermanent(err) {
-			c.quarantineFailedIssueRequest(path, req, kind, "permanent failure", resp, nowFn)
-			return
-		}
-		c.writeIssueResult(path, resp)
-		if why := c.issueNoteFailure(path, kind, nowFn, err); why != "" {
-			c.quarantineFailedIssueRequest(path, req, kind, why, resp, nowFn)
-			return
-		}
-		c.logger.Warn("issue-request watcher: request failed, will retry with backoff",
-			slog.String("repo", req.Repo), slog.String("kind", kind), slog.String("error", err.Error()))
-		c.observeIssueRequestStuck(path, req.Repo, kind, err, nowFn())
+		c.failIssueRequest(path, req, kind, resp, err, nowFn)
 		return
 	}
 
-	if signal := issueRequestStartSignal(kind, req.Body); signal != "" {
-		c.notifyAgentStart(req.Agent, req.Repo, req.Number, signal)
+	if startSignal != "" {
+		c.notifyAgentStart(req.Agent, req.Repo, req.Number, startSignal)
 	}
 
 	action := AuditActionAgentIssueCreated
@@ -921,6 +1132,12 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 	if kind == "comment" && req.NeedsDecision && !issueDecisionDowngrade.Active {
 		extra = append(extra, "parked", c.needsDecisionLabel())
 	}
+	if kind == "comment" && req.WithdrawDecision {
+		extra = append(extra, "withdrew_park", c.needsDecisionLabel())
+	}
+	if askFoldedInto > 0 {
+		extra = append(extra, "folded_into", strconv.Itoa(askFoldedInto))
+	}
 	if kind == "label" {
 		extra = []string{
 			"added", strings.Join(resp.LabelsAdded, " "),
@@ -931,6 +1148,7 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		extra = []string{
 			"reviewers", strings.Join(resp.ReviewersRequested, " "),
 			"team_reviewers", strings.Join(resp.TeamReviewersRequested, " "),
+			"already_pending", strings.Join(append(append([]string{}, resp.ReviewersAlreadyPending...), resp.TeamReviewersAlreadyPending...), " "),
 		}
 	}
 	if closedPR {
@@ -940,13 +1158,24 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		extra = append(extra, "path", PRAuditPathRelay)
 	}
 	c.recordWriteAudit(action, meta, WriteTarget{Repo: req.Repo, Number: resp.Number}, extra...)
-	if issueDecisionDowngrade.Active {
+	if issueDecisionDowngrade.Lane != "" {
+		c.recordWriteAudit(AuditActionAgentIssueDecisionResolved, meta, WriteTarget{Repo: req.Repo, Number: resp.Number},
+			"policy", "workflows-handoff", "lane", issueDecisionDowngrade.Lane)
+	} else if issueDecisionDowngrade.SelfPush {
+		c.recordWriteAudit(AuditActionAgentIssueDecisionResolved, meta, WriteTarget{Repo: req.Repo, Number: resp.Number},
+			"policy", "workflows-self-push", "lane", req.Agent)
+	} else if issueDecisionDowngrade.Active {
 		c.recordWriteAudit(AuditActionAgentIssueDecisionResolved, meta, WriteTarget{Repo: req.Repo, Number: resp.Number},
 			"policy", decisionpolicy.PolicyResolve, "question", issueDecisionDowngrade.Question)
 	}
 	c.writeIssueResult(path, resp)
 	_ = os.Remove(path)
 	c.issueClearRetry(path)
+	if kind == "comment" && !resp.AlreadyExisted {
+		// A deferral on a PR is a decision the activity monitor shows
+		// ("Deferred · waiting on #N"), not an absence of pickup (#17347).
+		c.recordPRDeferral(ctx, req, meta, resp.URL)
+	}
 	c.logger.Info("issue-request watcher: request completed",
 		slog.String("repo", req.Repo), slog.String("kind", kind),
 		slog.Int("number", resp.Number), slog.Bool("reused", resp.AlreadyExisted),
@@ -954,18 +1183,105 @@ func (c *Client) handleOneIssueRequest(ctx context.Context, path string, nowFn f
 		slog.String("agent", req.Agent))
 }
 
+// claimIssueForAgent is the write half of a claim, shared by the "claim"
+// request and an "issue" request with Claim set. It applies a namespaced
+// ownership label (App bots can't be assignees), journaled against a fresh
+// read so a second claim on an issue whose earlier label lapsed is written,
+// not replayed (hivecommons/hive#12512). The stage — stage/020-claimed when
+// the in-progress mark is on; 030 needs PR evidence — is a fact for the
+// stage engine (see issue_inprogress.go).
+func (c *Client) claimIssueForAgent(ctx context.Context, repo string, number int, agent string, nowFn func() time.Time) error {
+	if err := c.AddLabelsFresh(ctx, repo, number, claimOwnershipLabel(agent)); err != nil {
+		return err
+	}
+	if err := c.submitInProgressFact(ctx, repo, number, agent, nowFn()); err != nil {
+		return err
+	}
+	c.markInProgressStarted(ctx, repo, number, agent, nowFn())
+	return nil
+}
+
+// claimCreatedIssue claims the issue an "issue" request with Claim set just
+// created (hivecommons/hive#17299), under the same authorization, allowlist
+// and start gate as a "claim" request, then takes `help wanted` off: an
+// issue its filer is working is not open for outside help. The create has
+// already happened, so a failure never fails or retries the request; it is
+// returned as the result's claim_error.
+func (c *Client) claimCreatedIssue(ctx context.Context, req IssueRequest, fileUID int, res CreateIssueResult, meta InvocationMeta, nowFn func() time.Time) (bool, string) {
+	fail := func(why string) (bool, string) {
+		c.logger.Warn("issue-request watcher: issue created but not claimed",
+			slog.String("repo", req.Repo), slog.Int("number", res.Number),
+			slog.String("agent", req.Agent), slog.String("reason", why))
+		return false, "issue created but not claimed: " + why
+	}
+	if res.Consolidated {
+		return fail(fmt.Sprintf("the request was folded into existing issue #%d as a comment; claim that issue with `hive-open-issue claim` if it is yours to work", res.Number))
+	}
+	if res.Number <= 0 {
+		return fail("the create returned no issue number")
+	}
+	if strings.TrimSpace(req.Agent) == "" {
+		return fail("the request names no agent")
+	}
+	if c.issueAuthz == nil {
+		return fail("no authorizer configured (fail closed)")
+	}
+	if err := c.issueAuthz(req.Agent, fileUID, "claim"); err != nil {
+		return fail(err.Error())
+	}
+	if reason, refused := c.refuseWrite(req.Agent, WriteOpClaim, req.Repo, res.Number); refused {
+		return fail(reason)
+	}
+	reason, err := c.IssueStartBlockReason(ctx, req.Repo, res.Number, req.Agent)
+	if err != nil {
+		return fail(err.Error())
+	}
+	if reason != "" {
+		return fail("issue claim refused: " + reason)
+	}
+	if err := c.claimIssueForAgent(ctx, req.Repo, res.Number, req.Agent, nowFn); err != nil {
+		return fail(err.Error())
+	}
+	// The hub's ledger records the claim from this signal (SetAgentStartHook),
+	// not only the labels. It is not the plain `claim` signal: the hub only
+	// ledgers a start on an issue a kick listed to the agent, and nothing
+	// listed an issue the agent itself just filed, so this signal says
+	// "treat the filing as the listing".
+	c.notifyAgentStart(req.Agent, req.Repo, res.Number, AgentStartSignalFiledClaim)
+	if err := stripHelpWanted(ctx, c, req.Repo, res.Number); err != nil {
+		c.logger.Warn("issue-request watcher: claimed new issue but removing help wanted failed",
+			slog.String("repo", req.Repo), slog.Int("number", res.Number), slog.String("error", err.Error()))
+	}
+	c.recordWriteAudit(AuditActionIssueClaimed, meta, WriteTarget{Repo: req.Repo, Number: res.Number}, "url", res.URL)
+	return true, ""
+}
+
 type issueDecisionDowngrade struct {
 	Active   bool
 	Question string
 	Note     string
+	// Lane is set when the park is a workflow-only change handed to the
+	// lane that can push it (workflowsHandoff), not a decision the hive took.
+	Lane string
+	// SelfPush is set when the parking lane's own token can push the
+	// workflow change and the installation grants it (workflowsHandoff):
+	// the park is refused and the issue stays with that lane.
+	SelfPush bool
 }
+
+// workflows reports a workflow-only park the relay did not park: handed to
+// another lane, or refused because the lane can push it itself.
+func (d issueDecisionDowngrade) workflows() bool { return d.Lane != "" || d.SelfPush }
 
 // A typed owner step (e.g. a release) proposes an action only a person
 // with owner credentials can take, so it is owner-only by construction and
 // never downgraded to a hive-taken decision, whatever the policy.
-func (c *Client) issueDecisionDowngradeForCreate(req IssueRequest, body string) issueDecisionDowngrade {
+func (c *Client) issueDecisionDowngradeForCreate(ctx context.Context, req IssueRequest, body string) issueDecisionDowngrade {
 	if !req.NeedsDecision || req.OwnerStep != nil || !hiveIssueRequestActor(req.Agent, req.Labels) {
 		return issueDecisionDowngrade{}
+	}
+	if d := c.workflowsHandoff(ctx, req.Agent, req.Repo, req.Title, body); d.Active {
+		return d
 	}
 	return c.issueDecisionDowngrade(req.Title, body)
 }
@@ -973,9 +1289,12 @@ func (c *Client) issueDecisionDowngradeForCreate(req IssueRequest, body string) 
 // issueDecisionDowngradeForComment classifies a `comment --needs-decision`
 // park on an existing issue. A comment always carries its own text, so the
 // classification reads the comment body rather than the issue.
-func (c *Client) issueDecisionDowngradeForComment(req IssueRequest, body string) issueDecisionDowngrade {
+func (c *Client) issueDecisionDowngradeForComment(ctx context.Context, req IssueRequest, body string) issueDecisionDowngrade {
 	if !req.NeedsDecision || req.OwnerStep != nil || !hiveIssueRequestActor(req.Agent, req.Labels) {
 		return issueDecisionDowngrade{}
+	}
+	if d := c.workflowsHandoff(ctx, req.Agent, req.Repo, "", body); d.Active {
+		return d
 	}
 	return c.issueDecisionDowngrade("", body)
 }
@@ -1065,15 +1384,22 @@ func hiveDecisionDowngradeNote(question string) string {
 // the hive takes the engineering decision itself — stage/010-actionable in
 // its place and the decision recorded in the body. The labels travel in
 // the create call; the stage engine owns them from the first sweep on.
-func (c *Client) issueCreateLabels(req IssueRequest, body string) (labels []string, createBody string, d issueDecisionDowngrade) {
+func (c *Client) issueCreateLabels(ctx context.Context, req IssueRequest, body string) (labels []string, createBody string, d issueDecisionDowngrade) {
 	labels, createBody = req.Labels, body
 	if !req.NeedsDecision {
 		return labels, createBody, d
 	}
-	if d = c.issueDecisionDowngradeForCreate(req, createBody); d.Active {
+	if d = c.issueDecisionDowngradeForCreate(ctx, req, createBody); d.Active {
 		labels = removeDecisionParkLabels(labels, c.needsDecisionLabel())
 		labels = appendLabelIfMissing(labels, stagelabels.Actionable.Label())
-		createBody = appendHiveDecisionTaken(createBody, d.Question)
+		if d.workflows() {
+			if d.Lane != "" {
+				labels = appendLabelIfMissing(labels, WorkflowsLaneLabel)
+			}
+			createBody = appendWorkflowsHandoff(createBody, d)
+		} else {
+			createBody = appendHiveDecisionTaken(createBody, d.Question)
+		}
 		return labels, createBody, d
 	}
 	return appendLabelIfMissing(labels, c.needsDecisionLabel()), createBody, d
@@ -1187,6 +1513,25 @@ func issueBodyHasMisEscapedNewlines(body string) bool {
 	return issueshape.BodyHasMisEscapedNewlines(body)
 }
 
+// failIssueRequest is the retry path for a request whose GitHub call or
+// lookup failed: a permanent failure is quarantined, anything else writes
+// the result and leaves the file for the next tick with backoff until the
+// stuck budget runs out.
+func (c *Client) failIssueRequest(path string, req IssueRequest, kind string, resp IssueResponse, err error, nowFn func() time.Time) {
+	if issueRequestFailureIsPermanent(err) {
+		c.quarantineFailedIssueRequest(path, req, kind, "permanent failure", resp, nowFn)
+		return
+	}
+	c.writeIssueResult(path, resp)
+	if why := c.issueNoteFailure(path, kind, nowFn, err); why != "" {
+		c.quarantineFailedIssueRequest(path, req, kind, why, resp, nowFn)
+		return
+	}
+	c.logger.Warn("issue-request watcher: request failed, will retry with backoff",
+		slog.String("repo", req.Repo), slog.String("kind", kind), slog.String("error", err.Error()))
+	c.observeIssueRequestStuck(path, req.Repo, kind, err, nowFn())
+}
+
 func (c *Client) denyIssueRequest(path string, req IssueRequest, reason string, nowFn func() time.Time) {
 	c.writeIssueResult(path, IssueResponse{OK: false, Error: "authorization denied: " + reason, At: nowFn().UTC().Format(time.RFC3339)})
 	_ = os.Rename(path, path+".denied")
@@ -1252,6 +1597,10 @@ type CreateIssueResult struct {
 	// fold into: it cites the same files but not the same finding, so a new
 	// issue was created instead (#13906). 0 otherwise.
 	SameFileAs int
+	// SameFilePath is the path SameFileAs shares with this request when the
+	// match was on one component path; "" for an equal file set, where every
+	// cited path is shared.
+	SameFilePath string
 }
 
 // CreateIssueRequest is what every hive issue-create path hands the central
@@ -1271,6 +1620,13 @@ type CreateIssueRequest struct {
 	// ConsolidateOpen turns on open-twin consolidation: a finding over the
 	// same files as an open hive-filed issue is folded into it (#9376).
 	ConsolidateOpen bool
+	// SkipSharedPathFold suppresses the file-set, same-component and
+	// canonical-subject folds (#16065) for a request that declares DAG
+	// placement (--parent or --blocked-by): sibling children routinely share
+	// a path and a title stem. createIssue sets it for a dedupe checklist too. The create's idempotency claim keys on the
+	// exact title rather than the canonical stem for the same reason. The
+	// exact-title and rejected-twin gates still apply.
+	SkipSharedPathFold bool
 	// FoldMatch, when set, narrows ConsolidateOpen: a file-set or
 	// same-component twin is folded into only when FoldMatch accepts its
 	// title and body. Sharing a file is not sharing a problem; a refused twin
@@ -1298,6 +1654,36 @@ func (r CreateIssueRequest) OriginLabel() string {
 	return config.OriginLabelForAgent(r.Origin)
 }
 
+// TitleFiler returns the agent or subsystem name the issue title is tagged
+// with (`[<filer>] …`): the Origin's agent lane (`reviewer-2` → `reviewer`),
+// else a non-lane origin/* label the caller chose (the convergence publisher
+// filing through the forge seam), else the Origin source as written
+// (`governor`, `selfreport`, `dashboard`), else the source of the resolved
+// provenance label.
+func (r CreateIssueRequest) TitleFiler() string {
+	lane := config.OriginLaneFromAgent(r.Origin)
+	if lane != "" && config.IsKnownOriginLane(lane) {
+		return lane
+	}
+	for _, l := range r.Labels {
+		if source := config.OriginSourceOf(l); source != "" && !config.IsKnownOriginLane(source) {
+			return source
+		}
+	}
+	if lane != "" {
+		return lane
+	}
+	if source := config.OriginSourceOf(r.OriginLabel()); source != "" {
+		return source
+	}
+	for _, l := range r.Labels {
+		if source := config.OriginSourceOf(l); source != "" {
+			return source
+		}
+	}
+	return ""
+}
+
 // ErrOriginRequired is returned when a create carries no provenance label and
 // names no Origin source.
 var ErrOriginRequired = errors.New("CreateIssue: provenance is required (set Origin or pass an origin/* label)")
@@ -1317,6 +1703,14 @@ func (c *Client) CreateIssue(ctx context.Context, req CreateIssueRequest) (Creat
 // dashboard's ACMM gap issues) also turn it on.
 func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (CreateIssueResult, error) {
 	repo, title, body, consolidateOpen := req.Repo, req.Title, req.Body, req.ConsolidateOpen
+	// A dedupe checklist cites every path its pairs touch, so a path fold
+	// would bury the whole repo checklist in whichever finding shares one:
+	// projectbluefin/actions#543, a data-loss bug, received the repo's
+	// checklist as a "Folded finding" (10-24). It is filed on its own, like a
+	// declared DAG node; an exact-title twin is still reused.
+	if strings.Contains(body, dedupeChecklistMarkerPrefix) {
+		req.SkipSharedPathFold = true
+	}
 	originLabel := req.OriginLabel()
 	if originLabel == "" {
 		return CreateIssueResult{}, ErrOriginRequired
@@ -1337,6 +1731,11 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 	if title == "" {
 		return CreateIssueResult{}, fmt.Errorf("CreateIssue: title is required")
 	}
+	// Every issue the hive files names its filer in the title (`[reviewer]
+	// Review backlog (security): …`). Hive-internal filers and the watcher
+	// both land here, so a caller cannot forget it; AgentIssueTitle is idempotent
+	// for a title an agent already tagged.
+	title = issueshape.AgentIssueTitle(req.TitleFiler(), title)
 	// Same posture and same placement as validateRepoRef above: a request that
 	// is still carrying its template cannot become a useful issue, and unlike a
 	// bad repo ref it would SUCCEED, leaving a human to triage an empty report
@@ -1384,8 +1783,15 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 	// twin (#13906). An exact-title match is the same finding and stays
 	// unguarded.
 	if err == nil && scan.subject != nil && req.FoldMatch != nil &&
-		strings.TrimSpace(scan.subject.GetTitle()) != title &&
+		!issueshape.SameTitle(scan.subject.GetTitle(), title) &&
 		!req.FoldMatch(scan.subject.GetTitle(), scan.subject.GetBody()) {
+		scan.subject = nil
+	}
+	// A declared DAG node keeps only the exact-title match: sibling children
+	// of one decomposition share a title stem ("<RFC>: child A/B") as readily
+	// as they share a path (#16065).
+	if err == nil && scan.subject != nil && req.SkipSharedPathFold &&
+		!exactIssueTitleMatch(scan.subject.GetTitle(), title) {
 		scan.subject = nil
 	}
 	if err != nil {
@@ -1412,6 +1818,9 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 		fileSetTwin = scan.fileSet
 		componentTwin, componentPath, componentCount = scan.component, scan.componentPath, scan.componentCount
 		openComponent, openComponentOldest = scan.componentCounts, scan.componentOldest
+		if req.SkipSharedPathFold {
+			fileSetTwin, componentTwin, openComponent = nil, nil, nil
+		}
 	}
 
 	// Rejected-finding gate (#6463): a maintainer who recently closed an
@@ -1439,6 +1848,7 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 	// whichever merges first forces the other to rebase. Fold the finding into
 	// the existing issue so one PR handles both.
 	var sameFileAs int
+	var sameFilePath string
 	if fileSetTwin != nil && req.FoldMatch != nil && !req.FoldMatch(fileSetTwin.GetTitle(), fileSetTwin.GetBody()) {
 		sameFileAs, fileSetTwin = fileSetTwin.GetNumber(), nil
 	}
@@ -1448,8 +1858,14 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 			if err := c.commentOnHumanFiledTwin(ctx, owner, repoName, fileSetTwin, comment); err != nil {
 				return CreateIssueResult{}, err
 			}
-		} else if err := c.CreateIssueComment(ctx, owner+"/"+repoName, fileSetTwin.GetNumber(), comment); err != nil {
-			return CreateIssueResult{}, fmt.Errorf("CreateIssue: consolidating into open issue #%d in %s/%s: %w", fileSetTwin.GetNumber(), owner, repoName, err)
+		} else {
+			item := c.WritebackItemForIssue(Issue{Number: fileSetTwin.GetNumber(), Author: safeGetLogin(fileSetTwin.GetUser()), Labels: issueLabelNames(fileSetTwin.Labels), CreatedAt: fileSetTwin.GetCreatedAt().Time})
+			if d := c.WritebackAllowed(owner+"/"+repoName, item, writeback.KindGateComment, comment); !d.Allowed {
+				return CreateIssueResult{}, fmt.Errorf("%w: %s", writeback.ErrSuppressed, d.Detail)
+			}
+			if err := c.CreateIssueComment(ctx, owner+"/"+repoName, fileSetTwin.GetNumber(), comment); err != nil { // writeback:gated
+				return CreateIssueResult{}, fmt.Errorf("CreateIssue: consolidating into open issue #%d in %s/%s: %w", fileSetTwin.GetNumber(), owner, repoName, err)
+			}
 		}
 		c.logger.Info("CreateIssue: consolidated finding into open issue over the same file set",
 			slog.String("repo", repoName), slog.Int("number", fileSetTwin.GetNumber()),
@@ -1484,7 +1900,7 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 	}
 	if componentTwin != nil && req.FoldMatch != nil && !req.FoldMatch(componentTwin.GetTitle(), componentTwin.GetBody()) {
 		if sameFileAs == 0 {
-			sameFileAs = componentTwin.GetNumber()
+			sameFileAs, sameFilePath = componentTwin.GetNumber(), componentPath
 		}
 		componentTwin = nil
 	}
@@ -1532,7 +1948,7 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 		ghReq.Labels = &usable
 	}
 	var issue *gh.Issue
-	claim := issueCreateClaim(owner+"/"+repoName, title, body, issueCreateNow())
+	claim := issueCreateClaimFor(owner+"/"+repoName, title, body, issueCreateNow(), req.SkipSharedPathFold)
 	res, found := c.priorBucketIssueCreate(ctx, claim)
 	if !found {
 		create := func(ctx context.Context) (effects.Result, error) {
@@ -1555,7 +1971,7 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 		var err error
 		res, err = effects.Execute(ctx, boundary, claim, create)
 		if errors.Is(err, effects.ErrNeedsReconciliation) {
-			res, err = c.reconcileIssueCreate(ctx, boundary, claim, owner, repoName, title, body, create, err)
+			res, err = c.reconcileIssueCreate(ctx, boundary, claim, owner, repoName, title, body, req.SkipSharedPathFold, create, err)
 		}
 		if err != nil {
 			return CreateIssueResult{}, fmt.Errorf("creating issue in %s/%s: %w", owner, repoName, err)
@@ -1564,7 +1980,8 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 	if issue == nil {
 		// The mutation boundary replayed this create as already applied
 		// (#11579): another filing of the same finding — same canonical
-		// subject and file set, however the title was reworded — landed
+		// subject and file set, however the title was reworded (or, for a
+		// declared DAG node, the same exact title, #16065) — landed
 		// inside the idempotency window (this bucket or the previous one),
 		// so the effect never ran and there is no API response. Hand back
 		// the journaled issue rather than a zero number with a nil error; an
@@ -1575,11 +1992,11 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 		}
 		c.logger.Info("CreateIssue: create replayed as already applied, reusing the journaled issue",
 			slog.String("repo", repoName), slog.Int("number", number))
-		return CreateIssueResult{Number: number, URL: res.Provenance, AlreadyExisted: true, SameFileAs: sameFileAs}, nil
+		return CreateIssueResult{Number: number, URL: res.Provenance, AlreadyExisted: true, SameFileAs: sameFileAs, SameFilePath: sameFilePath}, nil
 	}
 	c.logger.Info("CreateIssue: issue created as the App bot",
 		slog.String("repo", repoName), slog.Int("number", issue.GetNumber()))
-	return CreateIssueResult{Number: issue.GetNumber(), URL: issue.GetHTMLURL(), ID: issue.GetID(), SameFileAs: sameFileAs}, nil
+	return CreateIssueResult{Number: issue.GetNumber(), URL: issue.GetHTMLURL(), ID: issue.GetID(), SameFileAs: sameFileAs, SameFilePath: sameFilePath}, nil
 }
 
 // issueCreateUnknownTTL bounds how long an issue-create operation may sit
@@ -1590,6 +2007,12 @@ func (c *Client) createIssue(ctx context.Context, req CreateIssueRequest) (Creat
 // single GitHub incident while bounding how long identical requests can be
 // fenced behind one ambiguous failure.
 const issueCreateUnknownTTL = time.Hour
+
+// exactIssueTitleMatch reports whether candidate is the same finding title as
+// title, so the scan's exact-match gate and the DAG guard cannot drift.
+func exactIssueTitleMatch(candidate, title string) bool {
+	return candidate == title || issueshape.SameTitle(candidate, title) || reviewBacklogTitlesEqual(candidate, title)
+}
 
 // reconcileIssueCreate resolves an issue create the mutation journal holds as
 // unresolved — an earlier attempt at the SAME logical operation errored
@@ -1605,13 +2028,20 @@ const issueCreateUnknownTTL = time.Hour
 // needs-reconciliation refusal (still wrapping effects.ErrNeedsReconciliation
 // so the watcher counts the attempt and gives up after
 // issueReconcileMaxAttempts).
-func (c *Client) reconcileIssueCreate(ctx context.Context, boundary effects.Boundary, claim effects.Claim, owner, repoName, title, body string, create func(context.Context) (effects.Result, error), journalErr error) (effects.Result, error) {
+//
+// exactTitle mirrors CreateIssueRequest.SkipSharedPathFold (#16065): a
+// declared DAG node counts only an exact-title twin as evidence that the
+// earlier attempt applied, since a canonical-stem sibling is a different
+// node, not this create.
+func (c *Client) reconcileIssueCreate(ctx context.Context, boundary effects.Boundary, claim effects.Claim, owner, repoName, title, body string, exactTitle bool, create func(context.Context) (effects.Result, error), journalErr error) (effects.Result, error) {
 	found, lookupErr := c.scanOpenIssues(WithRESTCaller(ctx, "hive:reconcile_issue_create"), owner, repoName, title, body, nil, "")
 	if lookupErr != nil {
 		expired, expErr := effects.ExpireUnresolved(ctx, boundary, claim, issueCreateUnknownTTL)
 		if expErr != nil {
 			return effects.Result{}, fmt.Errorf("%w (reconciliation lookup failed: %v; expiry failed: %v)", journalErr, lookupErr, expErr)
 		}
+		// The boundary may already have expired the entry while refusing.
+		expired = expired || errors.Is(journalErr, effects.ErrUnresolvedExpired)
 		if !expired {
 			return effects.Result{}, fmt.Errorf("%w (reconciliation lookup failed: %v)", journalErr, lookupErr)
 		}
@@ -1620,7 +2050,7 @@ func (c *Client) reconcileIssueCreate(ctx context.Context, boundary effects.Boun
 		return effects.Execute(ctx, boundary, claim, create)
 	}
 	state := effects.ExternalState{}
-	if existing := found.subject; existing != nil {
+	if existing := found.subject; existing != nil && (!exactTitle || exactIssueTitleMatch(existing.GetTitle(), title)) {
 		state = effects.ExternalState{Applied: true, Provenance: existing.GetHTMLURL()}
 	}
 	if recErr := effects.Reconcile(ctx, boundary, claim, state); recErr != nil {
@@ -1671,7 +2101,25 @@ const scanOpenIssuesMaxPages = 3
 // trustworthy canonical subject (see canonicalIssueSubject) and no file
 // references falls back to the exact title, which is the pre-#11579 key.
 func issueCreateClaim(repo, title, body string, now time.Time) effects.Claim {
-	subject := canonicalIssueSubject(title)
+	return issueCreateClaimFor(repo, title, body, now, false)
+}
+
+// issueCreateClaimFor is issueCreateClaim with the key selectable. With
+// exactTitle set — a request that declares DAG placement
+// (CreateIssueRequest.SkipSharedPathFold, #16065) — the subject is the exact
+// title minus its `[<agent>]` tag, the same key the scan's exact-title gate
+// compares on, rather than the canonical stem: sibling children "<RFC>:
+// child A" and "<RFC>: child B" canonicalise alike and routinely cite the
+// same file, so the canonical key would replay the second child's create as
+// the first and hand back its sibling's number. The file set stays in the
+// key so a retried create of one child is still a replay of itself.
+func issueCreateClaimFor(repo, title, body string, now time.Time, exactTitle bool) effects.Claim {
+	var subject string
+	if exactTitle {
+		subject = issueshape.StripAgentPrefix(title)
+	} else {
+		subject = canonicalIssueSubject(title)
+	}
 	if subject == "" {
 		subject = strings.TrimSpace(title)
 	}
@@ -1860,7 +2308,10 @@ func (c *Client) scanOpenIssues(ctx context.Context, owner, repo, title, body st
 				continue
 			}
 			candidate := strings.TrimSpace(is.GetTitle())
-			if candidate == title {
+			// Exact match ignores the leading `[<agent>]` tag so an issue
+			// filed before titles carried the filer still dedupes its
+			// prefixed re-filing instead of gaining a twin.
+			if exactIssueTitleMatch(candidate, title) {
 				return openIssueMatches{subject: is}, nil
 			}
 			// Pages arrive newest-first, so overwriting leaves the oldest
@@ -1985,7 +2436,7 @@ func (c *Client) countClosedSiblingsBy(ctx context.Context, owner, repo, botLogi
 		Creator:     botLogin,
 		Sort:        "updated",
 		Direction:   "desc",
-		Since:       cutoff,
+		Since:       cacheableSince(cutoff), // the closed_at filter below keeps the exact cutoff
 		ListOptions: gh.ListOptions{PerPage: 100},
 	}
 	for page := 1; page <= sameComponentClosedMaxPages; page++ {
@@ -2033,7 +2484,11 @@ func (c *Client) commentOnHumanFiledTwin(ctx context.Context, owner, repo string
 			slog.String("repo", repo), slog.Int("number", twin.GetNumber()))
 		return nil
 	}
-	if err := c.CreateIssueComment(ctx, owner+"/"+repo, twin.GetNumber(), comment); err != nil {
+	item := c.WritebackItemForIssue(Issue{Number: twin.GetNumber(), Author: safeGetLogin(twin.GetUser()), Labels: issueLabelNames(twin.Labels), CreatedAt: twin.GetCreatedAt().Time})
+	if d := c.WritebackAllowed(owner+"/"+repo, item, writeback.KindGateComment, comment); !d.Allowed {
+		return fmt.Errorf("%w: %s", writeback.ErrSuppressed, d.Detail)
+	}
+	if err := c.CreateIssueComment(ctx, owner+"/"+repo, twin.GetNumber(), comment); err != nil { // writeback:gated
 		return fmt.Errorf("CreateIssue: commenting on human-filed issue #%d in %s/%s: %w", twin.GetNumber(), owner, repo, err)
 	}
 	return nil
@@ -2048,7 +2503,7 @@ func subjectMatchFindingComment(title, body string) string {
 	b.WriteString("**Consolidated finding.** This was filed as a separate issue; it has the same subject as this one, so it was folded in here instead. Address it together with this issue.\n\n### ")
 	b.WriteString(title)
 	b.WriteString("\n\n")
-	b.WriteString(body)
+	b.WriteString(stripFiledForHelpMarker(body))
 	return b.String()
 }
 
@@ -2068,7 +2523,7 @@ func consolidatedFindingComment(title, body string, files map[string]bool) strin
 	b.WriteString("), so it was folded in here instead. Address it in the same PR as this issue — two PRs editing the same files would conflict.\n\n### ")
 	b.WriteString(title)
 	b.WriteString("\n\n")
-	b.WriteString(body)
+	b.WriteString(stripFiledForHelpMarker(body))
 	return b.String()
 }
 
@@ -2097,7 +2552,7 @@ func foldedComponentFindingComment(title, body, path string, openSiblings, close
 	b.WriteString("`, so it was folded into the oldest of them instead of opening another. Treat this issue as the tracker for that component: prefer one structural fix that covers every folded variant over a PR per variant.\n\n### ")
 	b.WriteString(title)
 	b.WriteString("\n\n")
-	b.WriteString(body)
+	b.WriteString(stripFiledForHelpMarker(body))
 	return b.String()
 }
 
@@ -2208,7 +2663,7 @@ func (c *Client) ensureCreateIssueLabel(ctx context.Context, owner, repo, name s
 	_, _, err := c.client.Issues.CreateLabel(ctx, owner, repo, &gh.Label{
 		Name:        gh.Ptr(name),
 		Color:       gh.Ptr(color),
-		Description: gh.Ptr(description),
+		Description: gh.Ptr(clampLabelDescription(description)),
 	})
 	if ghErr, ok := err.(*gh.ErrorResponse); ok && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusUnprocessableEntity {
 		if _, _, getErr := c.client.Issues.GetLabel(ctx, owner, repo, name); getErr == nil {

@@ -3,19 +3,24 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	cruxconfig "github.com/hivecommons/hive/crux/config"
 
 	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/pkg/attention"
+	"github.com/hivecommons/hive/pkg/authorkind"
 	"github.com/hivecommons/hive/pkg/beads"
+	itemblocker "github.com/hivecommons/hive/pkg/blocker"
 	"github.com/hivecommons/hive/pkg/claims"
 	"github.com/hivecommons/hive/pkg/dashboard"
 	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/ioscan"
 	"github.com/hivecommons/hive/pkg/mergelane"
 	"github.com/hivecommons/hive/pkg/upstreamwatch"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // configureGitHubClient installs EVERY hook, policy gate and setting the hive
@@ -93,6 +98,9 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	if client == nil || b.cfg == nil {
 		return
 	}
+	// Use the same live author-kind names as the PR stage reconciler, also
+	// after an App client rebuild or config reload.
+	client.SetAuthorKindLabels(func() authorkind.Names { return b.cfg.Governor.Labels.Author.Names() })
 	client.SetLinearScopeTeams(b.cfg.Governor.WorkSource.Linear.Teams)
 	client.SetHoldLabels(b.githubHoldLabels())
 	// Umbrella issues no automated claim may take and no claim stages
@@ -102,8 +110,20 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	// scanner.skip_issues_with_open_pr, default on).
 	client.SetSkipIssuesWithOpenPR(b.cfg.Scanner.IsSkipIssuesWithOpenPR())
 	client.SetAdditionalBotLogins(b.cfg.GitHub.AdditionalBotLogins)
+	// Every unsolicited comment/label/review the client writes consults the
+	// one process-wide write-back gate (pkg/writeback); a rebuilt client
+	// must inherit it or the sweeps regress to ungated.
+	client.SetWritebackGate(b.writebackGate())
+	client.SetAttention(b.cfg.HiveID, func() attention.Config { return b.cfg.GitHub.Attention })
 	client.SetSentinelAlertLabel(b.cfg.Sentinel.LabelOrDefault())
+	// Evaluated heads persist so a restart or rebuild neither re-diffs every
+	// open PR nor blanks the Matrix feed until the next sweep (#16276).
+	client.SetSentinelHeadsPath(sentinelHeadsStatePath)
 	client.SetAPIBudgetThresholds(b.cfg.GitHub.APIReserve, b.cfg.GitHub.APICritical)
+	// The conditional-request cache is process-wide, not per client; size it
+	// from github.etag_cache_max_mb / _max_entries so a hive that evicts
+	// within hours can be given more room without a rebuild.
+	github.SetETagCacheLimits(b.cfg.GitHub.EffectiveETagCacheMaxBytes(), b.cfg.GitHub.EffectiveETagCacheMaxEntries())
 	// Per-repo pause (#6203). A live predicate over the shared config, so a
 	// pause taken in the dashboard narrows the very next enumeration and
 	// automerge sweep without a restart.
@@ -112,6 +132,10 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	client.SetRedMainThresholdFunc(b.cfg.RepoRedMainThreshold)
 	// Open-held-PR cap (#13645), live per repo.
 	client.SetMaxOpenHeldPRsFunc(b.cfg.RepoMaxOpenHeldPRs)
+	// Changed-digest rewrite floor (#17435); the eval cycle re-applies it
+	// from live config so a dashboard edit takes effect without a rebuild.
+	client.SetAdvisoryDigestMinInterval(b.cfg.Governor.Advisory.EffectiveDigestMinInterval())
+	client.SetScheduledBaseRefresh(func(repo string) bool { return b.cfg.AutoMerge.RequireCurrentBaseFor(repo) })
 	// Per-repo custom agents (#6204). A live predicate over the shared
 	// config, so the hive-open-pr / hive-merge / hive-open-issue relays
 	// refuse an out-of-scope request without a restart.
@@ -137,9 +161,25 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	client.SetIssueFilter(b.cfg.Project.IssueFilter)
 	b.applyPriorArtFilingGate(client)
 	client.SetAgentIssueDecisionPolicy(b.cfg.Project.EffectiveAgentIssueDecisionPolicy())
+	// A lane that cannot push .github/workflows/** hands a workflow-only park
+	// to the lane that can, instead of the owner (issue_workflows_handoff.go).
+	// Live predicate over the shared config, like the scope funcs above.
+	client.SetWorkflowsLaneFunc(b.cfg.WorkflowsLaneFor)
+	// A lane whose own token asks for the Workflows permission is refused a
+	// workflow-only park when the installation grants it, and the blocker
+	// ledger records "App lacks workflows" only when the hive cannot push
+	// them (projectbluefin/testsuite#1059). The ledger is process-wide, so a
+	// rebuilt client re-installs its check.
+	client.SetWorkflowsSelfPushFunc(b.cfg.AgentPushesWorkflows)
+	itemblocker.Shared().SetCapabilityCheck(client.CapabilityAvailable)
+	itemblocker.Shared().SetProofCheck(client.WorkflowsRejectionProves)
 	client.SetReporterConfirmationEnabledFunc(func() bool {
 		return b.cfg.Issues.ReporterConfirmationEnabled()
 	})
+	// ci.failed CEL trigger source: the red-main sweep reports default-branch
+	// CI failures only while a trigger rule names ci.failed. Both hooks read
+	// b.cfg / b.agentMgr / b.gov when called, so boot order does not matter.
+	client.SetCIFailedHook(b.ciFailedTriggerWanted, b.emitCIFailedTrigger)
 	// Hive-authored superseded PR auto-close (hivecommons/hive#14965):
 	// governor.auto_close_superseded gates it, the repo's ACMM level must
 	// allow own-PR closes.
@@ -150,6 +190,13 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	// ledger is read per call because the client can be configured before
 	// it is built.
 	client.SetRelayContributor(b.relayContributor)
+	// Park-text provenance for the park re-check (#16697): the live claim
+	// above expires with the relay task lease, but the re-check reads park
+	// comments days later, so it keys on the durable registry-backed
+	// predicate instead — tier-aware, since the registry admits
+	// self-registered newcomers (api_contribute.go register) and keeps
+	// revoked profiles.
+	client.SetParkTextContributor(b.parkTextContributor)
 	// Ledger fallback for the enumeration-time claim read and the
 	// in-progress sweep: a ledger claim whose 🔒 comment was budget-suppressed
 	// must still read as a claim (claimswire.go, ledgerClaimLookup).
@@ -170,6 +217,10 @@ func (b *boot) applyGitHubClientConfigHooks(client *github.Client) {
 	})
 	installReviewBots(client, b.cfg, b.logger)
 	installReviewRelaySettings(client, b.cfg, b.logger)
+	// The duplicate-fix sweep tells a registered relay's PR from a
+	// person's by the same registry the stage engine uses
+	// (hivecommons/hive#15469).
+	client.SetRelayKnownFunc(contributorRelayKnown)
 	syncAutoMergePolicyToGitHubClient(b.cfg, client)
 	// Merge strategy (#10889): the self-merge sweep, the lgtm queue sweep and
 	// the hive-merge relay read the live per-repo strategy from config alone;
@@ -254,6 +305,41 @@ func (b *boot) reporterTrusted(login, association string) bool {
 // clanker-requested.
 func (b *boot) relayContributor(login string) bool {
 	return ledgerHasContributor(b.issueClaims, login)
+}
+
+// parkTextContributor is the park re-check's contributor-provenance
+// predicate (github.Client.SetParkTextContributor): a live relay claim, or a
+// contributor-registry profile at a tier an operator or auto-promotion
+// granted. It is narrower than firstTimerKnownContributor on purpose — POST
+// /api/contribute/register creates a newcomer profile from a self-asserted
+// username without authentication, and a revoked profile stays in the
+// registry — so neither tier may let a commenter or reporter steer which
+// cross-repo patches the park re-check reads with the App token (#16697).
+func (b *boot) parkTextContributor(login string) bool {
+	return parkTextContributorKnown(b.relayContributor, dashboard.ContributorTrustTierByLogin, login)
+}
+
+// parkTextContributorTierAdmits reports whether a registry tier is
+// provenance for park text: any tier the registry stores except the
+// self-registration default (newcomer) and revoked. An empty tier is a
+// legacy profile written before tiers existed and is not admitted either.
+func parkTextContributorTierAdmits(tier string) bool {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "", "newcomer", "revoked":
+		return false
+	}
+	return true
+}
+
+func parkTextContributorKnown(relay func(string) bool, registryTier func(string) (string, bool), login string) bool {
+	if relay != nil && relay(login) {
+		return true
+	}
+	if registryTier == nil {
+		return false
+	}
+	tier, ok := registryTier(login)
+	return ok && parkTextContributorTierAdmits(tier)
 }
 
 func ledgerHasContributor(ledger *claims.Ledger, login string) bool {
@@ -430,37 +516,32 @@ func (b *boot) applyGitHubClientDashboardHooks(client *github.Client) {
 		evictHiveClosedPR(b.dashSrv, rec, time.Now())
 	})
 	client.SetPRTerminalObservedHook(func(obs github.PRTerminalObservation) {
-		ts := obs.ObservedAt.UTC().Format(time.RFC3339)
-		switch obs.State {
-		case github.PRStateMerged:
-			path := obs.Attribution
-			if path == "" {
-				path = "unknown"
-			}
-			b.dashSrv.AuditLogRecordAt(ts, "system", github.AuditActionPRMerged,
-				fmt.Sprintf("repo=%s, number=%d, path=%s, actor=%s", obs.Repo, obs.Number, path, obs.Actor),
-				github.AttributionAgentGovernor, obs.Repo, obs.Number)
-			// #12007: link the PR's Fixes issues first (real created_at /
-			// merged_at), so issues started before issue-side recording
-			// existed close instead of lingering as stale in-progress.
-			backfillMergedPROnIssues(b.dashSrv, b.cfg.Project.Org, obs)
-			reworkCommits, reworkObserved := 0, false
-			// Only PRs the hive already journeys are measured, which keeps
-			// the extra GitHub reads off merges the hive never worked.
-			if store := b.dashSrv.LifecycleTimeline(); store != nil && hasJourney(store, timelineRef(b.cfg.Project.Org, obs.Repo, obs.Number)) {
-				reworkCommits, reworkObserved = client.MergedPRReworkCommits(b.ctx, obs.Repo, obs.Number, obs.ObservedAt)
-			}
-			recordObservedMerge(b.dashSrv, b.cfg.Project.Org, obs.Repo, obs.Number, obs.ObservedAt, obs.Actor, path, reworkCommits, reworkObserved)
-		case github.PRStateClosed:
-			path := obs.Attribution
-			if path == "" {
-				path = "unknown"
-			}
-			b.dashSrv.AuditLogRecordAt(ts, "system", github.AuditActionPRClosed,
-				fmt.Sprintf("repo=%s, number=%d, path=%s, reason=observed_closed, actor=%s", obs.Repo, obs.Number, path, obs.Actor),
-				github.AttributionAgentGovernor, obs.Repo, obs.Number)
+		recordPRTerminalObservedAudit(b.dashSrv, b.cfg.Project.Org, obs)
+		if obs.State != github.PRStateMerged {
+			return
 		}
+		path := obs.Attribution
+		if path == "" {
+			path = "unknown"
+		}
+		// #12007: link the PR's Fixes issues first (real created_at /
+		// merged_at), so issues started before issue-side recording
+		// existed close instead of lingering as stale in-progress.
+		backfillMergedPROnIssues(b.dashSrv, b.cfg.Project.Org, obs)
+		reworkCommits, reworkObserved := 0, false
+		// Only PRs the hive already journeys are measured, which keeps
+		// the extra GitHub reads off merges the hive never worked.
+		if store := b.dashSrv.LifecycleTimeline(); store != nil && hasJourney(store, timelineRef(b.cfg.Project.Org, obs.Repo, obs.Number)) {
+			reworkCommits, reworkObserved = client.MergedPRReworkCommits(b.ctx, obs.Repo, obs.Number, obs.ObservedAt)
+		}
+		recordObservedMerge(b.dashSrv, b.cfg.Project.Org, obs.Repo, obs.Number, obs.ObservedAt, obs.Actor, path, reworkCommits, reworkObserved)
 	})
+	// #16116: the reviews people and other bots submitted on the PRs the same
+	// settle scan saw merge or close feed the throughput card's Reviewed row.
+	client.SetPRReviewObservedHook(func(obs github.PRReviewObservation) {
+		recordObservedReview(b.dashSrv, obs)
+	})
+	client.StartPRTerminalEnrichment(b.ctx)
 	client.SetPROpenedHook(func(agentName, repo string, number int, url string) {
 		b.dashSrv.LinearAgentPROpened(agentName, repo, number, url)
 		// Same typed hook feeds the lifecycle timeline: the watcher fires
@@ -540,6 +621,35 @@ func holdMigrationFailedAlertMessage(hiveID, reportPath string) string {
 	return msg
 }
 
+// prTerminalAuditRecorder is the dashboard audit write the PR poller's
+// terminal observations go through.
+type prTerminalAuditRecorder interface {
+	AuditLogRecordAt(timestamp, user, action, detail, agent, repo string, target int)
+}
+
+// recordPRTerminalObservedAudit records a merge or close the PR poller saw.
+// The repo is qualified with the org, the form the hive's own merge paths
+// record (RecordPRMergedAudit), so the PR throughput card counts a merge the
+// hive made and then observed as one PR, not two.
+func recordPRTerminalObservedAudit(audit prTerminalAuditRecorder, org string, obs github.PRTerminalObservation) {
+	ts := obs.ObservedAt.UTC().Format(time.RFC3339)
+	repo := cruxconfig.QualifyRepo(org, obs.Repo)
+	path := obs.Attribution
+	if path == "" {
+		path = "unknown"
+	}
+	switch obs.State {
+	case github.PRStateMerged:
+		audit.AuditLogRecordAt(ts, "system", github.AuditActionPRMerged,
+			fmt.Sprintf("repo=%s, number=%d, path=%s, actor=%s", repo, obs.Number, path, obs.Actor),
+			github.AttributionAgentGovernor, repo, obs.Number)
+	case github.PRStateClosed:
+		audit.AuditLogRecordAt(ts, "system", github.AuditActionPRClosed,
+			fmt.Sprintf("repo=%s, number=%d, path=%s, reason=observed_closed, actor=%s", repo, obs.Number, path, obs.Actor),
+			github.AttributionAgentGovernor, repo, obs.Number)
+	}
+}
+
 // evictHiveClosedPR removes a pull request from the tracker and the cached
 // actionable snapshot the moment the hive records having merged or closed it
 // (AuditActionPRMerged / AuditActionPRClosed). The audit record is the one
@@ -554,5 +664,42 @@ func evictHiveClosedPR(srv *dashboard.Server, rec github.AuditRecord, now time.T
 		srv.EvictHiveClosedItem(rec.Repo, rec.Target, true, true, rec.Action, now)
 	case github.AuditActionPRClosed:
 		srv.EvictHiveClosedItem(rec.Repo, rec.Target, true, false, rec.Action, now)
+	}
+}
+
+// writebackGate returns the process-wide unsolicited write-back gate,
+// building it on first use. The gate reads the live config on every
+// decision, so dashboard edits of the writeback block apply without a
+// rebuild; its first_seen ledger persists under /data so a repo that gains
+// write mid-life never back-fills onto PRs that predate the install.
+func (b *boot) writebackGate() *writeback.Gate {
+	b.writebackOnce.Do(func() {
+		deps := b.cfg.WritebackGateDeps()
+		deps.Config = func() writeback.Config { return b.cfg.Writeback }
+		deps.Logger = b.logger
+		b.writeback = writeback.New(b.cfg.Writeback, deps, writebackStatePath())
+		for _, repo := range b.cfg.Project.Repos {
+			b.writeback.ObserveRepo(repo)
+		}
+	})
+	return b.writeback
+}
+
+// writebackStatePath is the gate's persisted first_seen ledger, beside the
+// hold-guard ledger so a PVC restore brings both back together.
+func writebackStatePath() string {
+	if v := strings.TrimSpace(os.Getenv("HIVE_WRITEBACK_STATE_PATH")); v != "" {
+		return v
+	}
+	return "/data/metrics/writeback.json"
+}
+
+// observeWritebackRepos records first_seen for every repo now in
+// project.repos, so a repo added at runtime starts its backfill clock the
+// moment the hive learns of it, not when it first tries to write.
+func (b *boot) observeWritebackRepos() {
+	g := b.writebackGate()
+	for _, repo := range b.cfg.Project.Repos {
+		g.ObserveRepo(repo)
 	}
 }

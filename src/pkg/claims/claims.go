@@ -114,6 +114,11 @@ type Claim struct {
 	// stage/020-claimed whatever its Kind (hivecommons/hive#13069). Once set
 	// it stays for the claim's life — a renewal never clears it.
 	PRStarted bool `json:"pr_started,omitempty"`
+	// PRRepo / PRNumber name the open pull request a claim is held for once
+	// its holder's lease ended with that PR covering the issue
+	// (hivecommons/hive#17300, HoldForPR). Zero for every other claim.
+	PRRepo   string `json:"pr_repo,omitempty"`
+	PRNumber int    `json:"pr_number,omitempty"`
 	// ClaimedAt is when the current holder took the claim.
 	ClaimedAt time.Time `json:"claimed_at"`
 	// ExpiresAt is when the claim lapses unless renewed.
@@ -370,13 +375,14 @@ type Ledger struct {
 	// on it, so one run is escalated once however often it is observed.
 	escalated map[string]time.Time
 	// listed holds the kick listings (#10527) by issue key.
-	listed map[string]Listing
-	path   string
-	policy Policy
-	hooks  Hooks
-	now    func() time.Time
-	hive   string
-	admit  func(Request) (string, error)
+	listed      map[string]Listing
+	path        string
+	policy      Policy
+	hooks       Hooks
+	now         func() time.Time
+	hive        string
+	admit       func(Request) (string, error)
+	commitCheck func(Claim) (string, error)
 }
 
 // ErrInvalid is returned for requests missing a repo, issue, holder or kind.
@@ -443,6 +449,15 @@ func (l *Ledger) SetAdmissionCheck(check func(Request) (string, error)) {
 	l.mu.Unlock()
 }
 
+// SetCommitCheck installs a local-only, atomic admission reservation. It runs
+// under the claim mutex for a new automated holder, after all remote admission
+// reads. It must not call this ledger or perform remote I/O.
+func (l *Ledger) SetCommitCheck(check func(Claim) (string, error)) {
+	l.mu.Lock()
+	l.commitCheck = check
+	l.mu.Unlock()
+}
+
 // SetNow overrides the clock. Intended for tests.
 func (l *Ledger) SetNow(fn func() time.Time) {
 	l.mu.Lock()
@@ -483,6 +498,22 @@ func (l *Ledger) Claim(req Request) (Result, error) {
 		ClaimedAt: now, ExpiresAt: now.Add(ttl),
 	}
 	prev, held := l.claims[key]
+	newHolder := !held || (!sameHolder(prev, req) &&
+		(req.Kind.Outranks(prev.Kind) || req.Kind.rank() == prev.Kind.rank() && req.Force))
+	if newHolder && req.Kind != KindHuman && l.commitCheck != nil {
+		reason, err := l.commitCheck(next)
+		if err != nil || reason != "" {
+			if len(expired) > 0 {
+				if saveErr := l.saveLocked(); saveErr != nil && err == nil {
+					err = saveErr
+				}
+			}
+			hooks := l.hooks
+			l.mu.Unlock()
+			fireExpired(hooks, expired)
+			return Result{Outcome: OutcomeRefused, Reason: reason}, err
+		}
+	}
 	var res Result
 	switch {
 	case !held:
@@ -694,6 +725,48 @@ func (l *Ledger) ReleaseByHolderID(holderID, reason string, onlyKey ...string) [
 	}
 	return out
 }
+
+// HoldForPR keeps holderID's live claim on key as a PR-held claim instead of
+// letting it go with the lease that carried it (hivecommons/hive#17300): it
+// records the covering pull request (PRStarted, PRRepo, PRNumber) and pushes
+// the expiry out to the policy's longest hold, so every ledger reader keeps
+// seeing the issue as taken by the same principal while the PR is open. The
+// caller re-confirms the PR and calls it again to renew, or releases the
+// claim once the PR merges or closes. OnClaimed fires only when the PR
+// evidence changed, so a periodic renewal does not touch GitHub. Reports
+// false when holderID holds no live claim on key.
+func (l *Ledger) HoldForPR(holderID, key, prRepo string, prNumber int) (Claim, bool) {
+	prRepo = strings.TrimSpace(prRepo)
+	if l == nil || holderID == "" || key == "" || prNumber <= 0 {
+		return Claim{}, false
+	}
+	l.mu.Lock()
+	now := l.now()
+	c, ok := l.claims[key]
+	if !ok || c.Expired(now) || c.HolderID != holderID {
+		l.mu.Unlock()
+		return Claim{}, false
+	}
+	changed := !c.PRStarted || c.PRRepo != prRepo || c.PRNumber != prNumber
+	c.PRStarted, c.PRRepo, c.PRNumber = true, prRepo, prNumber
+	hold := l.policy.MaxTTL
+	if hold <= 0 {
+		hold = DefaultMaxTTL
+	}
+	c.ExpiresAt = now.Add(hold)
+	l.claims[key] = c
+	_ = l.saveLocked()
+	hooks := l.hooks
+	l.mu.Unlock()
+	if changed && hooks.OnClaimed != nil {
+		hooks.OnClaimed(c, OutcomeRenewed)
+	}
+	return c, true
+}
+
+// ReasonCoveringPRDone is the release reason for a PR-held claim (HoldForPR)
+// whose covering pull request merged, closed, or stopped covering the issue.
+const ReasonCoveringPRDone = "covering PR merged or closed"
 
 // ReasonHolderRelaunched is the release reason recorded when a hive agent's
 // CLI was relaunched (hive boot, operator or self-heal restart): the context

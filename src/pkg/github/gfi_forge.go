@@ -17,6 +17,19 @@ func HardSuppressIssueLabels() []string {
 	return append([]string(nil), hardSuppressIssueLabels...)
 }
 
+// ArchivedWrite shares the stage sweeps' process-lifetime archive cache.
+func (c *Client) ArchivedWrite(repo string, err error) bool {
+	if c == nil {
+		return false
+	}
+	owner, name := c.splitRepo(repo)
+	key := strings.ToLower(owner + "/" + name)
+	if err != nil {
+		return c.noteArchivedWrite(key, err)
+	}
+	return c.stageArchived.has(key)
+}
+
 // UpsertIssueMarkerComment implements gfi.Forge: it finds the first comment
 // on repo#number containing marker, edits it to body when body is non-empty
 // and differs, and — only when create is set — posts body when none exists.
@@ -41,6 +54,7 @@ func (c *Client) UpsertIssueMarkerComment(ctx context.Context, repo string, numb
 		if _, _, err := c.client.Issues.EditComment(ctx, owner, repoName, cm.GetID(), &gh.IssueComment{Body: gh.Ptr(body)}); err != nil {
 			return res, fmt.Errorf("editing marker comment on %s/%s#%d: %w", owner, repoName, number, err)
 		}
+		c.noteCommentEdited()
 		return res, nil
 	}
 	if !create || body == "" {

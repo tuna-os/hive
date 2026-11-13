@@ -314,11 +314,10 @@
       font-size: clamp(1.8rem, 3vw, 2.8rem);
       line-height: 1;
     }
-    /* ── Works-with-your-stack band: three integration groups (source
-       control / work sources / sign-in) rendered as pill badges. Cards reuse
+    /* ── Works-with-your-stack integration groups rendered as pill badges. Cards reuse
        the proof-card gradient/border treatment for visual consistency. ── */
     .stack-groups {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: var(--sp-6);
       display: grid;
     }
@@ -627,6 +626,7 @@
       <a href="/reading">Reading</a>
       <a href="/get-started">Get Started</a>
       <a href="https://hivecommons.dev/discord" target="_blank" rel="noopener">Join our Discord</a>
+      <a href="https://www.twitch.tv/hivecommons" target="_blank" rel="noopener">Live stream (Twitch)</a>
       <a href="/dashboard" id="nav-dashboard" style="display:none">My Hives</a>
       <span id="nav-user" style="display:none"></span>
     </nav>
@@ -809,6 +809,13 @@
             <span class="stack-badge">Google</span>
           </div>
           <p class="stack-note">Plus any other OIDC provider on request &mdash; bring the identity your org already trusts.</p>
+        </div>
+        <div class="stack-group">
+          <p class="stack-group-label">Local AI inference</p>
+          <div class="stack-badges">
+            <a class="stack-badge" href="/contribute#apple-mlx">Apple MLX</a>
+          </div>
+          <p class="stack-note">Optional ClankeR inference on Apple Silicon Macs (macOS 14+), using MLX-LM and the Pi coding agent. You choose the tool-capable model and RAM budget; no automatic weight downloads or cloud fallback. <a href="/contribute#apple-mlx">Install and use with just</a>. Not Apple sign-in or an Apple endorsement.</p>
         </div>
       </div>
     </section>
@@ -1364,6 +1371,7 @@
   <footer class="footer">
     <div class="footer-links">
       <a href="https://hivecommons.dev/discord" target="_blank" rel="noopener">Join our Discord</a>
+      <a href="https://www.twitch.tv/hivecommons" target="_blank" rel="noopener">Live stream (Twitch)</a>
       <a href="https://github.com/hivecommons/hive">Source Code</a>
       <a href="https://arxiv.org/abs/2604.09388">ACMM Paper</a>
       <a href="https://hivecommons.dev">Hive Commons</a>
