@@ -6,6 +6,11 @@
 #   HIVE_LITE_GATEWAYS  YAML gateway list (see src/cmd/hive-lite/main.go);
 #                       reference keys by api_key_env, never inline them.
 #   CLOUDFLARE_API_TOKEN  (or whatever api_key_env names) — Workers AI read.
+#
+# With checkpoint=true the session and router ledger persist on the orphan
+# branch hive-lite-state (pkg/coordstate, Contents API sha CAS): a run that
+# exits for capacity resumes where it stopped, and daily caps hold across
+# runs. That is why contents is write; the binary only writes that branch.
 name: hive-lite triage
 
 on:
@@ -20,9 +25,14 @@ on:
         required: false
         type: boolean
         default: false
+      checkpoint:
+        description: Persist/resume the session on the hive-lite-state branch
+        required: false
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 concurrency:
@@ -51,6 +61,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           ISSUE: ${{ inputs.issue }}
           POST: ${{ inputs.post }}
+          CHECKPOINT: ${{ inputs.checkpoint }}
         run: |
           set -euo pipefail
           if [ -z "${HIVE_LITE_GATEWAYS:-}" ]; then
@@ -59,12 +70,13 @@ jobs:
           printf '%s\n' "$HIVE_LITE_GATEWAYS" > "$RUNNER_TEMP/gateways.yaml"
           args=(-repo "$GITHUB_REPOSITORY" -issue "$ISSUE" -gateways "$RUNNER_TEMP/gateways.yaml" -checkout "$GITHUB_WORKSPACE" -v)
           if [ "$POST" = "true" ]; then args+=(-post); fi
+          if [ "$CHECKPOINT" = "true" ]; then args+=(-state github); fi
           set +e
           "$RUNNER_TEMP/hive-lite" "${args[@]}" | tee "$RUNNER_TEMP/result.txt"
           rc=${PIPESTATUS[0]}
           set -e
           { echo '```json'; sed -n '1,/^}/p' "$RUNNER_TEMP/result.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           if [ "$rc" = 75 ]; then
-            echo "::warning::No free-tier capacity now (all gateways rate limited or capped); retry later"; exit 0
+            echo "::warning::No free-tier capacity now (all gateways rate limited or capped); re-run later to resume"; exit 0
           fi
           exit "$rc"

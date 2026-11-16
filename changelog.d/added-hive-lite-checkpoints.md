@@ -1,0 +1,1 @@
+- `pkg/coordstate` adds a compare-and-swap state store for stateless coordinators (memory and GitHub Contents API drivers, a merge-on-flush router ledger), and hive-lite `-state github` checkpoints sessions on an orphan `hive-lite-state` branch so a run paused for capacity resumes with its evidence intact, and gateway entries accept `max_tokens`.

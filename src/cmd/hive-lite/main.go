@@ -19,6 +19,7 @@
 //     api_key_env: CLOUDFLARE_API_TOKEN
 //     default_model: "@cf/zai-org/glm-4.7-flash"
 //     daily_cap: 150
+//     max_tokens: 4096   # optional; some free endpoints default low
 package main
 
 import (
@@ -38,6 +39,7 @@ import (
 
 	cruxconfig "github.com/hivecommons/hive/crux/config"
 	"github.com/hivecommons/hive/pkg/codeindex"
+	"github.com/hivecommons/hive/pkg/coordstate"
 	"github.com/hivecommons/hive/pkg/hivelite"
 	"github.com/hivecommons/hive/pkg/hivetool"
 	"github.com/hivecommons/hive/pkg/turn"
@@ -48,6 +50,7 @@ type gatewayEntry struct {
 	cruxconfig.GatewayConfig `yaml:",inline"`
 	Model                    string `yaml:"model"`
 	DailyCap                 int    `yaml:"daily_cap"`
+	MaxTokens                int    `yaml:"max_tokens"`
 }
 
 func main() {
@@ -63,8 +66,9 @@ func main() {
 	finishAfter := flag.Int("finish-after", 8, "turn at which only task.complete/task.abort are offered")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	verbose := flag.Bool("v", false, "log each step to stderr")
+	state := flag.String("state", "", "checkpoint store: \"github\" (branch hive-lite-state in -repo) or \"github:owner/name@branch\"; a run paused for capacity resumes from it, and the router ledger persists there (token needs contents write on that repo)")
 	flag.Parse()
-	if err := run(*repo, *issue, *ref, *gatewaysPath, *checkout, *post, *fix, *verify, *maxTurns, *finishAfter, *timeout, *verbose); err != nil {
+	if err := run(*repo, *issue, *ref, *gatewaysPath, *checkout, *post, *fix, *verify, *state, *maxTurns, *finishAfter, *timeout, *verbose); err != nil {
 		fmt.Fprintln(os.Stderr, "hive-lite:", err)
 		var ce *llmrouter.CapacityError
 		if errors.As(err, &ce) {
@@ -83,7 +87,7 @@ func githubToken() string {
 	return ""
 }
 
-func run(repo string, issue int, ref, gatewaysPath, checkout string, post, fix bool, verifyCmd string, maxTurns, finishAfter int, timeout time.Duration, verbose bool) error {
+func run(repo string, issue int, ref, gatewaysPath, checkout string, post, fix bool, verifyCmd, stateSpec string, maxTurns, finishAfter int, timeout time.Duration, verbose bool) error {
 	if repo == "" || issue <= 0 || gatewaysPath == "" {
 		return errors.New("-repo, -issue and -gateways are required")
 	}
@@ -111,8 +115,28 @@ func run(repo string, issue int, ref, gatewaysPath, checkout string, post, fix b
 			fmt.Fprintf(os.Stderr, "  provider %s: %s %d %s\n", a.Provider, a.Outcome, a.Status, clip(a.Detail, 100))
 		}
 	}
-	// One ledger for both routers so cooldowns and caps are shared.
-	ledger := llmrouter.NewMemoryLedger()
+	// One ledger for both routers so cooldowns and caps are shared. With a
+	// state store it is loaded from and flushed back to the store, so daily
+	// caps and cooldowns hold across passes.
+	var ledger llmrouter.Ledger = llmrouter.NewMemoryLedger()
+	store, err := openState(stateSpec, repo, tok)
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		sl, err := coordstate.LoadLedger(ctx, store)
+		if err != nil {
+			return fmt.Errorf("load ledger: %w", err)
+		}
+		defer func() {
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if err := sl.Flush(fctx); err != nil {
+				fmt.Fprintln(os.Stderr, "hive-lite: flush ledger:", err)
+			}
+		}()
+		ledger = sl
+	}
 	explore, err := llmrouter.New(providers, llmrouter.WithLedger(ledger), llmrouter.WithAttemptHook(hook))
 	if err != nil {
 		return err
@@ -134,6 +158,7 @@ func run(repo string, issue int, ref, gatewaysPath, checkout string, post, fix b
 		Reader:   &hivetool.RESTReader{Token: func(context.Context) (string, error) { return tok, nil }},
 		Searcher: searcher,
 		MaxTurns: maxTurns, FinishAfter: finishAfter,
+		State: store,
 	}
 	if fix {
 		if tok == "" {
@@ -212,6 +237,7 @@ func loadProviders(path string) ([]llmrouter.Provider, error) {
 		if err != nil {
 			return nil, err
 		}
+		p.MaxTokens = e.MaxTokens
 		out = append(out, p)
 	}
 	return out, nil
@@ -313,4 +339,32 @@ func (g *githubClient) upsertComment(ctx context.Context, repo string, issue int
 	}
 	err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repo, issue), map[string]string{"body": body}, &res)
 	return res.HTMLURL, err
+}
+
+// openState parses -state. "github" keeps checkpoints on the hive-lite-state
+// branch of repo; "github:owner/name@branch" names another repository or
+// branch (a private repo keeps a public repo's transcripts out of view).
+func openState(spec, repo, tok string) (coordstate.Store, error) {
+	if spec == "" {
+		return nil, nil
+	}
+	target, branch := repo, "hive-lite-state"
+	switch {
+	case spec == "github":
+	case strings.HasPrefix(spec, "github:"):
+		rest := strings.TrimPrefix(spec, "github:")
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			rest, branch = rest[:at], rest[at+1:]
+		}
+		target = rest
+	default:
+		return nil, fmt.Errorf("-state %q: want \"github\" or \"github:owner/name@branch\"", spec)
+	}
+	if strings.Count(target, "/") != 1 || branch == "" {
+		return nil, fmt.Errorf("-state %q: bad repository or branch", spec)
+	}
+	if tok == "" {
+		return nil, errors.New("-state needs GH_TOKEN or GITHUB_TOKEN with contents write")
+	}
+	return &coordstate.ContentsStore{Repo: target, Branch: branch, Token: func(context.Context) (string, error) { return tok, nil }}, nil
 }
