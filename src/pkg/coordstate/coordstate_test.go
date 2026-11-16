@@ -217,6 +217,7 @@ type fakeGitHub struct {
 	shas     map[string]string
 	n        int
 	puts     int
+	busy     int // answer this many PUTs 409 as if the branch head moved
 }
 
 func newFakeGitHub() *fakeGitHub {
@@ -256,6 +257,12 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, contents):
 		f.puts++
 		p := strings.TrimPrefix(r.URL.Path, contents)
+		if f.busy > 0 && f.branches[body["branch"].(string)] {
+			f.busy--
+			w.WriteHeader(409)
+			fmt.Fprint(w, `{"message":"is at abc but expected def"}`)
+			return
+		}
 		if !f.branches[body["branch"].(string)] {
 			w.WriteHeader(404)
 			fmt.Fprint(w, `{"message":"Branch not found"}`)
@@ -404,5 +411,45 @@ func TestContentsStoreErrors(t *testing.T) {
 	}
 	if e := apiError("op", 500, []byte(strings.Repeat("z", 400))); len(e.Error()) > 340 {
 		t.Fatal("apiError not bounded")
+	}
+}
+
+// A 409 from a concurrent write to another file on the branch is retried;
+// a changed version of the same key is still a conflict.
+func TestContentsStoreRetriesBranchBusy(t *testing.T) {
+	gh := newFakeGitHub()
+	gh.branches["b"] = true
+	srv := httptest.NewServer(gh)
+	defer srv.Close()
+	ctx := context.Background()
+	s := &ContentsStore{Repo: "o/r", Branch: "b", BaseURL: srv.URL, Backoff: time.Millisecond, Token: func(context.Context) (string, error) { return "tok", nil }}
+	gh.busy = 2
+	v1, err := s.Put(ctx, "mcp/a.json", []byte("a"), "")
+	if err != nil || gh.files["mcp/a.json"] != "a" {
+		t.Fatalf("create through a busy branch = %v", err)
+	}
+	gh.busy = 1
+	if _, err := s.Put(ctx, "mcp/a.json", []byte("b"), v1); err != nil {
+		t.Fatalf("update through a busy branch = %v", err)
+	}
+	// Someone else really changed the key: busy 409, re-read shows a new
+	// version, so this is a conflict.
+	gh.busy = 1
+	if _, err := s.Put(ctx, "mcp/a.json", []byte("c"), v1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale version through busy branch = %v", err)
+	}
+	// Retries are bounded.
+	gh.busy = 100
+	s.BranchRetries = 2
+	if _, err := s.Put(ctx, "mcp/new.json", []byte("x"), ""); !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "branch busy") {
+		t.Fatalf("unbounded retry: %v", err)
+	}
+	// A cancelled context stops the backoff.
+	gh.busy = 100
+	s.Backoff = time.Hour
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err := s.Put(cctx, "mcp/new2.json", []byte("x"), ""); err == nil {
+		t.Fatal("backoff ignored cancellation")
 	}
 }

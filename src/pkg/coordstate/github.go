@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -30,6 +31,34 @@ type ContentsStore struct {
 	HTTP    *http.Client
 	// Author is the commit message prefix; defaults to "hive-lite state".
 	Author string
+	// BranchRetries bounds retries after a 409 caused by a concurrent write
+	// to another file on the branch (default 5); Backoff is the base delay
+	// (default 150ms, linear with jitter).
+	BranchRetries int
+	Backoff       time.Duration
+}
+
+func (s *ContentsStore) conflictRetries() int {
+	if s.BranchRetries > 0 {
+		return s.BranchRetries
+	}
+	return 5
+}
+
+func (s *ContentsStore) backoff(ctx context.Context, attempt int) error {
+	base := s.Backoff
+	if base <= 0 {
+		base = 150 * time.Millisecond
+	}
+	d := base*time.Duration(attempt+1) + time.Duration(rand.Int64N(int64(base)))
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 var _ Store = (*ContentsStore)(nil)
@@ -150,6 +179,7 @@ func (s *ContentsStore) Put(ctx context.Context, key string, value []byte, expec
 	if expect != "" {
 		body["sha"] = string(expect)
 	}
+	bootstrapped := false
 	for attempt := 0; ; attempt++ {
 		code, data, err := s.do(ctx, http.MethodPut, s.contentsPath(key), body)
 		if err != nil {
@@ -167,16 +197,34 @@ func (s *ContentsStore) Put(ctx context.Context, key string, value []byte, expec
 			}
 			return Version(out.Content.SHA), nil
 		case code == http.StatusConflict:
-			return "", fmt.Errorf("%w: %s", ErrConflict, key)
+			// The Contents API serialises commits per branch: a concurrent
+			// write to a DIFFERENT file also answers 409 (measured live,
+			// two hive-mcp sessions opening at once). Only a changed
+			// version of this key is a real conflict; otherwise retry.
+			if attempt >= s.conflictRetries() {
+				return "", fmt.Errorf("%w: %s (branch busy)", ErrConflict, key)
+			}
+			_, cur, gerr := s.Get(ctx, key)
+			if gerr != nil && !errors.Is(gerr, ErrNotFound) {
+				return "", gerr
+			}
+			if cur != expect {
+				return "", fmt.Errorf("%w: %s", ErrConflict, key)
+			}
+			if err := s.backoff(ctx, attempt); err != nil {
+				return "", err
+			}
+			continue
 		case code == http.StatusUnprocessableEntity && expect == "" && bytes.Contains(data, []byte("sha")):
 			// Create-only write, but the file exists: someone else created
 			// it. GitHub answers `"sha" wasn't supplied` (JSON-escaped).
 			return "", fmt.Errorf("%w: %s already exists", ErrConflict, key)
-		case code == http.StatusNotFound && attempt == 0:
+		case code == http.StatusNotFound && !bootstrapped:
 			// The state branch does not exist yet.
 			if err := s.EnsureBranch(ctx); err != nil {
 				return "", err
 			}
+			bootstrapped = true
 			continue
 		default:
 			return "", apiError("put "+key, code, data)
