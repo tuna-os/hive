@@ -1,0 +1,70 @@
+# hive-lite: CLI-less, report-only triage of one issue on free-tier inference
+# (RFC hivecommons/hive#18464, Family C). Runs on a free GitHub-hosted runner:
+# no tmux, no agent CLI, no privileged container, no persistent volume.
+#
+# Secrets:
+#   HIVE_LITE_GATEWAYS  YAML gateway list (see src/cmd/hive-lite/main.go);
+#                       reference keys by api_key_env, never inline them.
+#   CLOUDFLARE_API_TOKEN  (or whatever api_key_env names) — Workers AI read.
+name: hive-lite triage
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number in this repository
+        required: true
+        type: number
+      post:
+        description: Upsert the advisory comment on the issue
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: hive-lite-${{ inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          cache: false
+          go-version-file: src/go.mod
+      - name: Build hive-lite
+        working-directory: src
+        run: go build -o "$RUNNER_TEMP/hive-lite" ./cmd/hive-lite
+      - name: Triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HIVE_LITE_GATEWAYS: ${{ secrets.HIVE_LITE_GATEWAYS }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ISSUE: ${{ inputs.issue }}
+          POST: ${{ inputs.post }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HIVE_LITE_GATEWAYS:-}" ]; then
+            echo "::error::HIVE_LITE_GATEWAYS secret is not set"; exit 1
+          fi
+          printf '%s\n' "$HIVE_LITE_GATEWAYS" > "$RUNNER_TEMP/gateways.yaml"
+          args=(-repo "$GITHUB_REPOSITORY" -issue "$ISSUE" -gateways "$RUNNER_TEMP/gateways.yaml" -checkout "$GITHUB_WORKSPACE" -v)
+          if [ "$POST" = "true" ]; then args+=(-post); fi
+          set +e
+          "$RUNNER_TEMP/hive-lite" "${args[@]}" | tee "$RUNNER_TEMP/result.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          { echo '```json'; sed -n '1,/^}/p' "$RUNNER_TEMP/result.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" = 75 ]; then
+            echo "::warning::No free-tier capacity now (all gateways rate limited or capped); retry later"; exit 0
+          fi
+          exit "$rc"
