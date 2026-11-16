@@ -213,7 +213,12 @@ func TestTerminalOutcome(t *testing.T) {
 
 func TestUnknownAndWriteToolsAreRefused(t *testing.T) {
 	x, _ := newExec()
-	for _, name := range []string{"pr.create", "repo.patch_files", "issue.comment", "search", "Bash"} {
+	for _, name := range []string{"pr.create", "repo.patch_files"} {
+		if _, err := run(t, x, call(name, name, `{}`)); err == nil || !strings.Contains(err.Error(), "writes are not enabled") {
+			t.Errorf("%s without a Writer: err = %v", name, err)
+		}
+	}
+	for _, name := range []string{"issue.comment", "search", "Bash"} {
 		_, err := run(t, x, call(name, name, `{}`))
 		if !errors.Is(err, ErrUnknownTool) || !strings.Contains(err.Error(), ToolRepoRead) {
 			t.Errorf("%s: err = %v", name, err)
