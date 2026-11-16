@@ -57,7 +57,7 @@ var (
 	ErrUncertain          = errors.New("extwork: native state uncertain; not starting")
 )
 
-// New builds a Binding. mode must be one of ModeOff, ModeShadow, ModeReportOnly;
+// New builds a Binding. mode must be a ValidMode;
 // any other value resolves to off, so a setting this build cannot honour never
 // selects a posture the operator did not ask for.
 func New(adapter Adapter, store AdmissionStore, receipts ReceiptStore, sink ProgressSink, mode string, opts ...Option) *Binding {
@@ -96,6 +96,10 @@ type Gate interface {
 // gate applies the adapter's Gate, if any, and records a refusal as an
 // offer decline so the audit shows why nothing was offered.
 func (b *Binding) gate(adm Admission) error {
+	if err := checkPosture(b.adapter, adm); err != nil {
+		b.record(EventOfferDeclined, adm, "", map[string]any{"reason": err.Error(), "gate": true})
+		return err
+	}
 	g, ok := b.adapter.(Gate)
 	if !ok {
 		return nil

@@ -1,0 +1,1 @@
+- `pkg/extwork` adds the `tool-hosted` and `github-mediated` admission modes (RFC #18464): an adapter must declare a mode before the binding admits it, `ClampMode` caps the agent mode at the posture's ceiling (never merge), `VetMediatedPR` applies the outside-contributor bar to vendor-written PRs, and hive-lite fix mode now runs as a `tool-hosted` admission.

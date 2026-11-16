@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hivecommons/hive/crux/toolapprove"
+	"github.com/hivecommons/hive/pkg/extwork"
 	"github.com/hivecommons/hive/pkg/hivetool"
 	"github.com/hivecommons/hive/pkg/turn"
 )
@@ -170,6 +171,38 @@ func TestRenderComment(t *testing.T) {
 func TestConfigValidation(t *testing.T) {
 	if _, err := RunTriage(context.Background(), Config{}); err == nil {
 		t.Fatal("empty config must error")
+	}
+}
+
+func TestAdmissionPostureGatesFixMode(t *testing.T) {
+	base := Config{Repo: "o/r", Ref: "main", Issue: 1, LLM: &scripted{}, Reader: reader{}}
+	for _, c := range []struct {
+		admission string
+		fix       bool
+		want      string
+	}{
+		{"", false, extwork.ModeReportOnly},
+		{"", true, extwork.ModeToolHosted},
+		{extwork.ModeReportOnly, true, "needs a tool-hosted admission"},
+		{extwork.ModeGitHubMediated, true, "needs a tool-hosted admission"},
+		{extwork.ModeShadow, false, "cannot run a session"},
+		{"enforce", false, "cannot run a session"},
+	} {
+		cfg := base
+		cfg.Admission, cfg.Fix = c.admission, c.fix
+		if c.fix {
+			cfg.Writer = &memWriter{refs: map[string]string{}}
+		}
+		err := cfg.defaults()
+		if strings.HasPrefix(c.want, "needs") || strings.HasPrefix(c.want, "cannot") {
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("%q fix=%v: err = %v, want %q", c.admission, c.fix, err, c.want)
+			}
+			continue
+		}
+		if err != nil || cfg.Admission != c.want {
+			t.Errorf("%q fix=%v: admission = %q, err %v", c.admission, c.fix, cfg.Admission, err)
+		}
 	}
 }
 

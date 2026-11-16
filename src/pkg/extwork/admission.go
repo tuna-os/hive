@@ -20,14 +20,11 @@ const (
 	ModeReportOnly = "report-only"
 )
 
-// ValidMode reports whether mode is one of the three operating modes.
+// ValidMode reports whether mode is a known operating mode: the three base
+// modes plus the non-CLI postures in posture.go.
 func ValidMode(mode string) bool {
-	switch mode {
-	case ModeOff, ModeShadow, ModeReportOnly:
-		return true
-	default:
-		return false
-	}
+	_, ok := PostureFor(mode)
+	return ok
 }
 
 // AuthorityBinding is the Hive-side authority under which an external run is
@@ -94,7 +91,7 @@ func (a Admission) Validate() error {
 		return fmt.Errorf("%w: generation must be greater than zero", ErrInvalidAdmission)
 	}
 	if !ValidMode(a.Authority.Mode) {
-		return fmt.Errorf("%w: authority.mode %q is not one of off, shadow, report-only", ErrInvalidAdmission, a.Authority.Mode)
+		return fmt.Errorf("%w: authority.mode %q is not one of off, shadow, report-only, tool-hosted, github-mediated", ErrInvalidAdmission, a.Authority.Mode)
 	}
 	return nil
 }
