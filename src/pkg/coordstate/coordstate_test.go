@@ -200,7 +200,7 @@ func TestLoadLedgerErrors(t *testing.T) {
 		t.Fatal("store error swallowed")
 	}
 	l, _ := LoadLedger(ctx, NewMemoryStore())
-	_, _ = l.Acquire("p", 0, time.Now())
+	_, _, _ = l.Acquire("p", 0, time.Now())
 	bad := NewMemoryStore()
 	_, _ = bad.Put(ctx, LedgerKey, []byte("[]"), "")
 	l.store = bad
