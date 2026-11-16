@@ -37,7 +37,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8765", "listen address")
 	checkout := flag.String("checkout", "", "local checkout for repo_search_code (pkg/codeindex)")
 	write := flag.Bool("write", false, "let ISSUES_AND_PRS principals patch a Hive-owned branch and open draft PRs")
-	state := flag.String("state", "", "\"github:owner/name@branch\" keeps sessions on a state branch (stateless hosting); empty keeps them in memory")
+	state := flag.String("state", "", "session store for stateless hosting: \"github\", \"github:owner/name@branch\" or \"d1:<account-id>/<database-id>\" (CLOUDFLARE_API_TOKEN); empty keeps sessions in memory")
 	hash := flag.String("hash-token", "", "print the sha256 for a token and exit")
 	flag.Parse()
 	if *hash != "" {
@@ -98,12 +98,12 @@ func run(repo, ref, label, tokensPath, addr, checkout, stateSpec string, write b
 		}
 		cfg.Writer = &hivetool.RESTWriter{Token: tokFn}
 	}
-	if stateSpec != "" {
-		target, branch, ok := strings.Cut(strings.TrimPrefix(stateSpec, "github:"), "@")
-		if !strings.HasPrefix(stateSpec, "github:") || !ok || strings.Count(target, "/") != 1 || branch == "" {
-			return fmt.Errorf("-state %q: want github:owner/name@branch", stateSpec)
-		}
-		cfg.Store = &coordstate.ContentsStore{Repo: target, Branch: branch, Token: tokFn, Author: "hive-mcp state"}
+	store, err := coordstate.Open(stateSpec, repo, tok, cfToken(), "hive-mcp state")
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		cfg.Store = store
 	}
 	srv, err := hivemcp.New(cfg)
 	if err != nil {
@@ -134,4 +134,14 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// cfToken is the Cloudflare token for a d1: state store.
+func cfToken() string {
+	for _, k := range []string{"HIVE_STATE_CF_TOKEN", "CLOUDFLARE_API_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
 }

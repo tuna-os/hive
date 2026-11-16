@@ -66,7 +66,7 @@ func main() {
 	finishAfter := flag.Int("finish-after", 8, "turn at which only task.complete/task.abort are offered")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	verbose := flag.Bool("v", false, "log each step to stderr")
-	state := flag.String("state", "", "checkpoint store: \"github\" (branch hive-lite-state in -repo) or \"github:owner/name@branch\"; a run paused for capacity resumes from it, and the router ledger persists there (token needs contents write on that repo)")
+	state := flag.String("state", "", "checkpoint store: \"github\" (branch hive-lite-state in -repo), \"github:owner/name@branch\", or \"d1:<account-id>/<database-id>\" (CLOUDFLARE_API_TOKEN with D1 write); a run paused for capacity resumes from it, and the router ledger persists there")
 	flag.Parse()
 	if err := run(*repo, *issue, *ref, *gatewaysPath, *checkout, *post, *fix, *verify, *state, *maxTurns, *finishAfter, *timeout, *verbose); err != nil {
 		fmt.Fprintln(os.Stderr, "hive-lite:", err)
@@ -119,7 +119,7 @@ func run(repo string, issue int, ref, gatewaysPath, checkout string, post, fix b
 	// state store it is loaded from and flushed back to the store, so daily
 	// caps and cooldowns hold across passes.
 	var ledger llmrouter.Ledger = llmrouter.NewMemoryLedger()
-	store, err := openState(stateSpec, repo, tok)
+	store, err := coordstate.Open(stateSpec, repo, tok, cfToken(), "hive-lite state")
 	if err != nil {
 		return err
 	}
@@ -341,30 +341,12 @@ func (g *githubClient) upsertComment(ctx context.Context, repo string, issue int
 	return res.HTMLURL, err
 }
 
-// openState parses -state. "github" keeps checkpoints on the hive-lite-state
-// branch of repo; "github:owner/name@branch" names another repository or
-// branch (a private repo keeps a public repo's transcripts out of view).
-func openState(spec, repo, tok string) (coordstate.Store, error) {
-	if spec == "" {
-		return nil, nil
-	}
-	target, branch := repo, "hive-lite-state"
-	switch {
-	case spec == "github":
-	case strings.HasPrefix(spec, "github:"):
-		rest := strings.TrimPrefix(spec, "github:")
-		if at := strings.LastIndex(rest, "@"); at >= 0 {
-			rest, branch = rest[:at], rest[at+1:]
+// cfToken is the Cloudflare token for a d1: state store.
+func cfToken() string {
+	for _, k := range []string{"HIVE_STATE_CF_TOKEN", "CLOUDFLARE_API_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
 		}
-		target = rest
-	default:
-		return nil, fmt.Errorf("-state %q: want \"github\" or \"github:owner/name@branch\"", spec)
 	}
-	if strings.Count(target, "/") != 1 || branch == "" {
-		return nil, fmt.Errorf("-state %q: bad repository or branch", spec)
-	}
-	if tok == "" {
-		return nil, errors.New("-state needs GH_TOKEN or GITHUB_TOKEN with contents write")
-	}
-	return &coordstate.ContentsStore{Repo: target, Branch: branch, Token: func(context.Context) (string, error) { return tok, nil }}, nil
+	return ""
 }
