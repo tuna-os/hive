@@ -38,6 +38,9 @@ func RenderComment(r Result, model string) string {
 			body = r.Outcome.Summary
 		}
 	}
+	if r.Outcome.PRNumber > 0 {
+		fmt.Fprintf(&b, "**Draft PR:** #%d (tool-hosted: patches were applied by Hive, not by the model)\n\n", r.Outcome.PRNumber)
+	}
 	b.WriteString(strings.TrimSpace(body))
 	b.WriteString("\n")
 	var unverified []string

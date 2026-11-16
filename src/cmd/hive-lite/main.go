@@ -57,12 +57,14 @@ func main() {
 	gatewaysPath := flag.String("gateways", "", "YAML list of gateways (failover order)")
 	checkout := flag.String("checkout", "", "local checkout of -repo for code search (pkg/codeindex); empty disables search")
 	post := flag.Bool("post", false, "upsert the advisory comment on the issue")
+	verify := flag.String("verify", "", "with -fix and -checkout: shell command run in a scratch copy of the checkout before each commit (e.g. 'go test ./...'); executes model-authored code, so use an ephemeral runner")
+	fix := flag.Bool("fix", false, "allow the session to commit to a hive-lite/issue-N branch and open one DRAFT PR (token needs contents+pull_requests write)")
 	maxTurns := flag.Int("max-turns", 14, "session turn budget")
 	finishAfter := flag.Int("finish-after", 8, "turn at which only task.complete/task.abort are offered")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	verbose := flag.Bool("v", false, "log each step to stderr")
 	flag.Parse()
-	if err := run(*repo, *issue, *ref, *gatewaysPath, *checkout, *post, *maxTurns, *finishAfter, *timeout, *verbose); err != nil {
+	if err := run(*repo, *issue, *ref, *gatewaysPath, *checkout, *post, *fix, *verify, *maxTurns, *finishAfter, *timeout, *verbose); err != nil {
 		fmt.Fprintln(os.Stderr, "hive-lite:", err)
 		var ce *llmrouter.CapacityError
 		if errors.As(err, &ce) {
@@ -81,7 +83,7 @@ func githubToken() string {
 	return ""
 }
 
-func run(repo string, issue int, ref, gatewaysPath, checkout string, post bool, maxTurns, finishAfter int, timeout time.Duration, verbose bool) error {
+func run(repo string, issue int, ref, gatewaysPath, checkout string, post, fix bool, verifyCmd string, maxTurns, finishAfter int, timeout time.Duration, verbose bool) error {
 	if repo == "" || issue <= 0 || gatewaysPath == "" {
 		return errors.New("-repo, -issue and -gateways are required")
 	}
@@ -132,6 +134,25 @@ func run(repo string, issue int, ref, gatewaysPath, checkout string, post bool, 
 		Reader:   &hivetool.RESTReader{Token: func(context.Context) (string, error) { return tok, nil }},
 		Searcher: searcher,
 		MaxTurns: maxTurns, FinishAfter: finishAfter,
+	}
+	if fix {
+		if tok == "" {
+			return errors.New("-fix needs GH_TOKEN or GITHUB_TOKEN with contents and pull_requests write")
+		}
+		branch := fmt.Sprintf("hive-lite/issue-%d", issue)
+		if n, err := gh.openPRFrom(ctx, repo, branch); err != nil {
+			return err
+		} else if n > 0 {
+			return fmt.Errorf("a hive-lite draft is already open for this issue (#%d); review or close it before another fix session", n)
+		}
+		cfg.Fix, cfg.WorkBranch = true, branch
+		cfg.Writer = &hivetool.RESTWriter{Token: func(context.Context) (string, error) { return tok, nil }}
+		if verifyCmd != "" {
+			if checkout == "" {
+				return errors.New("-verify needs -checkout")
+			}
+			cfg.Verifier = &localVerifier{checkout: checkout, cmd: verifyCmd, timeout: 5 * time.Minute}
+		}
 	}
 	if verbose {
 		cfg.Log = func(s string) { fmt.Fprintln(os.Stderr, " ", s) }
@@ -246,6 +267,20 @@ func (g *githubClient) do(ctx context.Context, method, path string, body any, v 
 		return json.Unmarshal(b, v)
 	}
 	return nil
+}
+
+func (g *githubClient) openPRFrom(ctx context.Context, repo, branch string) (int, error) {
+	owner, _, _ := strings.Cut(repo, "/")
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls?state=open&head=%s:%s", repo, owner, branch), nil, &prs); err != nil {
+		return 0, err
+	}
+	if len(prs) == 0 {
+		return 0, nil
+	}
+	return prs[0].Number, nil
 }
 
 func (g *githubClient) defaultBranch(ctx context.Context, repo string) (string, error) {

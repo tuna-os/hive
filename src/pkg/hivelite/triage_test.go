@@ -172,3 +172,91 @@ func TestConfigValidation(t *testing.T) {
 		t.Fatal("empty config must error")
 	}
 }
+
+type memWriter struct {
+	refs map[string]string
+	pr   int
+}
+
+func (w *memWriter) RefSHA(_ context.Context, _, b string) (string, error) {
+	if s, ok := w.refs[b]; ok {
+		return s, nil
+	}
+	return "", hivetool.ErrRefNotFound
+}
+func (w *memWriter) CreateCommit(context.Context, string, string, string, map[string]string) (string, error) {
+	return "c1", nil
+}
+func (w *memWriter) SetBranch(_ context.Context, _, b, sha string, _ bool) error {
+	w.refs[b] = sha
+	return nil
+}
+func (w *memWriter) OpenPR(context.Context, string, string, string, string, string) (int, string, error) {
+	w.pr = 77
+	return 77, "u", nil
+}
+
+func TestFixModeOpensDraftPRThroughHive(t *testing.T) {
+	llm := &scripted{steps: []turn.LLMResponse{
+		tc(hivetool.ToolRepoRead, readA),
+		tc(hivetool.ToolRepoPatch, `{"commit_message":"fix","patches":[{"path":"src/a.go","search":"func Rebase() {}","replace":"func Rebase() { recreate() }"}]}`),
+		tc(hivetool.ToolPRCreate, `{"title":"fix: recreate","body":"Use recreate."}`),
+		tc(hivetool.ToolTaskComplete, `{"summary":"Changed src/a.go:3"}`),
+	}}
+	w := &memWriter{refs: map[string]string{"main": "c0"}}
+	c := cfg(llm)
+	c.Fix, c.Writer = true, w
+	res, err := RunTriage(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome.PRNumber != 77 || w.refs["hive-lite/issue-7"] != "c1" || w.refs["main"] != "c0" {
+		t.Fatalf("res=%+v refs=%v", res, w.refs)
+	}
+	var offered []string
+	for _, d := range llm.tools[0] {
+		offered = append(offered, d.Tool)
+	}
+	if !strings.Contains(strings.Join(offered, ","), hivetool.ToolRepoPatch) {
+		t.Fatalf("fix mode did not offer write tools: %v", offered)
+	}
+	if !strings.Contains(RenderComment(res, "m"), "Draft PR:** #77") {
+		t.Fatal("comment does not link the draft PR")
+	}
+}
+
+func TestReportModeOffersNoWriteTools(t *testing.T) {
+	llm := &scripted{steps: []turn.LLMResponse{tc(hivetool.ToolRepoPatch, `{"commit_message":"x","patches":[{"path":"src/a.go","content":"x"}]}`)}}
+	_, _ = RunTriage(context.Background(), cfg(llm))
+	for _, d := range llm.tools[0] {
+		if d.Tool == hivetool.ToolRepoPatch || d.Tool == hivetool.ToolPRCreate {
+			t.Fatalf("report mode offered %s", d.Tool)
+		}
+	}
+}
+
+type cmpWriter struct{ memWriter }
+
+func (cmpWriter) Compare(context.Context, string, string, string) (string, error) {
+	return "-\treturn total / perPage\n+\treturn (total + perPage - 1) / perPage", nil
+}
+
+func TestResumedFixSessionSeesPriorDiff(t *testing.T) {
+	llm := &scripted{steps: []turn.LLMResponse{tc(hivetool.ToolTaskAbort, `{"reason":"already fixed"}`)}}
+	w := &cmpWriter{memWriter{refs: map[string]string{"main": "c0", "hive-lite/issue-7": "c5"}}}
+	c := cfg(llm)
+	c.Fix, c.Writer = true, w
+	_, _ = RunTriage(context.Background(), c)
+	task := llm.seen[0][1].Content
+	if !strings.Contains(task, "already holds changes") || !strings.Contains(task, "(total + perPage - 1)") {
+		t.Fatalf("task = %q", task)
+	}
+	// A fresh branch gets no note.
+	llm2 := &scripted{steps: []turn.LLMResponse{tc(hivetool.ToolTaskAbort, `{"reason":"x"}`)}}
+	c2 := cfg(llm2)
+	c2.Fix, c2.Writer = true, &cmpWriter{memWriter{refs: map[string]string{"main": "c0"}}}
+	_, _ = RunTriage(context.Background(), c2)
+	if strings.Contains(llm2.seen[0][1].Content, "already holds") {
+		t.Fatal("fresh branch must not get a resume note")
+	}
+}
