@@ -2,15 +2,25 @@
 # (RFC hivecommons/hive#18464, Family C). Runs on a free GitHub-hosted runner:
 # no tmux, no agent CLI, no privileged container, no persistent volume.
 #
+# Scope per the maintainer decision on #18464 (phase 1): default-off (manual
+# dispatch only), report-only, shadow. The advisory goes to the job's step
+# summary and nowhere else. The job token is read-only and hive-lite makes
+# GET requests only: no comments, labels, branches, commits or pull
+# requests. Any GitHub write belongs to the Hive App.
+#
 # Secrets:
 #   HIVE_LITE_GATEWAYS  YAML gateway list (see src/cmd/hive-lite/main.go);
 #                       reference keys by api_key_env, never inline them.
+#                       Mark free tiers that train on inputs with
+#                       trains_on_inputs: true; they are skipped for a
+#                       private repository.
 #   CLOUDFLARE_API_TOKEN  (or whatever api_key_env names) — Workers AI read.
-#
-# With checkpoint=true the session and router ledger persist on the orphan
-# branch hive-lite-state (pkg/coordstate, Contents API sha CAS): a run that
-# exits for capacity resumes where it stopped, and daily caps hold across
-# runs. That is why contents is write; the binary only writes that branch.
+#   HIVE_LITE_STATE     optional d1:<account-id>/<database-id>. When set, the
+#                       session and router ledger persist in Cloudflare D1
+#                       (HIVE_STATE_CF_TOKEN with D1 write), so a run that
+#                       exits for capacity resumes. Unset keeps state in
+#                       memory for the run. A GitHub-branch store is not
+#                       offered: it would be a GitHub write.
 name: hive-lite triage
 
 on:
@@ -20,20 +30,10 @@ on:
         description: Issue number in this repository
         required: true
         type: number
-      post:
-        description: Upsert the advisory comment on the issue
-        required: false
-        type: boolean
-        default: false
-      checkpoint:
-        description: Persist/resume the session on the hive-lite-state branch
-        required: false
-        type: boolean
-        default: true
 
 permissions:
-  contents: write
-  issues: write
+  contents: read
+  issues: read
 
 concurrency:
   group: hive-lite-${{ inputs.issue }}
@@ -59,9 +59,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HIVE_LITE_GATEWAYS: ${{ secrets.HIVE_LITE_GATEWAYS }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HIVE_STATE_CF_TOKEN: ${{ secrets.HIVE_STATE_CF_TOKEN }}
+          HIVE_LITE_STATE: ${{ secrets.HIVE_LITE_STATE }}
           ISSUE: ${{ inputs.issue }}
-          POST: ${{ inputs.post }}
-          CHECKPOINT: ${{ inputs.checkpoint }}
         run: |
           set -euo pipefail
           if [ -z "${HIVE_LITE_GATEWAYS:-}" ]; then
@@ -69,13 +69,19 @@ jobs:
           fi
           printf '%s\n' "$HIVE_LITE_GATEWAYS" > "$RUNNER_TEMP/gateways.yaml"
           args=(-repo "$GITHUB_REPOSITORY" -issue "$ISSUE" -gateways "$RUNNER_TEMP/gateways.yaml" -checkout "$GITHUB_WORKSPACE" -v)
-          if [ "$POST" = "true" ]; then args+=(-post); fi
-          if [ "$CHECKPOINT" = "true" ]; then args+=(-state github); fi
+          case "${HIVE_LITE_STATE:-}" in
+            "") ;;
+            d1:*) args+=(-state "$HIVE_LITE_STATE") ;;
+            *) echo "::error::HIVE_LITE_STATE must be d1:<account-id>/<database-id>"; exit 1 ;;
+          esac
           set +e
           "$RUNNER_TEMP/hive-lite" "${args[@]}" | tee "$RUNNER_TEMP/result.txt"
           rc=${PIPESTATUS[0]}
           set -e
-          { echo '```json'; sed -n '1,/^}/p' "$RUNNER_TEMP/result.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```json'; sed -n '1,/^}/p' "$RUNNER_TEMP/result.txt"; echo '```'
+            sed '1,/^}/d' "$RUNNER_TEMP/result.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
           if [ "$rc" = 75 ]; then
             echo "::warning::No free-tier capacity now (all gateways rate limited or capped); re-run later to resume"; exit 0
           fi

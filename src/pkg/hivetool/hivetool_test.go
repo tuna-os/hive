@@ -213,12 +213,7 @@ func TestTerminalOutcome(t *testing.T) {
 
 func TestUnknownAndWriteToolsAreRefused(t *testing.T) {
 	x, _ := newExec()
-	for _, name := range []string{"pr.create", "repo.patch_files"} {
-		if _, err := run(t, x, call(name, name, `{}`)); err == nil || !strings.Contains(err.Error(), "writes are not enabled") {
-			t.Errorf("%s without a Writer: err = %v", name, err)
-		}
-	}
-	for _, name := range []string{"issue.comment", "search", "Bash"} {
+	for _, name := range []string{"pr.create", "repo.patch_files", "issue.comment", "search", "Bash"} {
 		_, err := run(t, x, call(name, name, `{}`))
 		if !errors.Is(err, ErrUnknownTool) || !strings.Contains(err.Error(), ToolRepoRead) {
 			t.Errorf("%s: err = %v", name, err)
@@ -404,5 +399,27 @@ func TestEvidenceOptional(t *testing.T) {
 	}
 	if got := x.Citations("x ../etc/passwd:1 and src/a.go:0"); len(got) != 0 {
 		t.Fatalf("escaping or zero-line citations must be ignored: %+v", got)
+	}
+}
+
+// TestDefinitionsAreReadOnlyAtEveryMode pins the RFC #18464 phase-1 scope:
+// no agent mode, including merge-capable ones, is offered a tool that writes
+// to GitHub. Writes stay with the Hive App.
+func TestDefinitionsAreReadOnlyAtEveryMode(t *testing.T) {
+	allowed := map[string]bool{ToolTaskComplete: true, ToolTaskAbort: true}
+	for _, n := range ReadToolNames() {
+		allowed[n] = true
+	}
+	for m := agentmode.ModeAdvisory; m <= agentmode.ModeIssuesPRsMerge; m++ {
+		for _, d := range Definitions(m) {
+			if !allowed[d.Tool] {
+				t.Errorf("mode %v offers non-read tool %q", m, d.Tool)
+			}
+			for _, w := range []string{"patch", "pr.", "branch", "comment", "label", "write", "merge"} {
+				if strings.Contains(d.Tool, w) {
+					t.Errorf("mode %v offers write-shaped tool %q", m, d.Tool)
+				}
+			}
+		}
 	}
 }

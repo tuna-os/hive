@@ -198,29 +198,29 @@ func TestD1StoreErrors(t *testing.T) {
 }
 
 func TestOpen(t *testing.T) {
-	if s, err := Open("", "o/r", "", "", "x"); s != nil || err != nil {
-		t.Fatal("empty spec")
+	for _, spec := range []string{"", "memory"} {
+		if s, err := Open(spec, "cf"); s != nil || err != nil {
+			t.Fatalf("%q = %v %v", spec, s, err)
+		}
 	}
-	s, err := Open("github", "o/r", "gh", "", "x")
-	if c, ok := s.(*ContentsStore); err != nil || !ok || c.Repo != "o/r" || c.Branch != "hive-lite-state" || c.Author != "x" {
-		t.Fatalf("github = %+v %v", s, err)
-	}
-	s, err = Open("github:a/b@state", "o/r", "gh", "", "x")
-	if c, ok := s.(*ContentsStore); err != nil || !ok || c.Repo != "a/b" || c.Branch != "state" {
-		t.Fatalf("github:a/b@state = %+v %v", s, err)
-	}
-	s, err = Open("d1:acct/db", "o/r", "", "cf", "x")
+	s, err := Open("d1:acct/db", "cf")
 	if d, ok := s.(*D1Store); err != nil || !ok || d.AccountID != "acct" || d.DatabaseID != "db" {
 		t.Fatalf("d1 = %+v %v", s, err)
 	}
 	if tok, _ := s.(*D1Store).Token(context.Background()); tok != "cf" {
 		t.Fatal("d1 token")
 	}
-	for _, bad := range []struct{ spec, gh, cf string }{
-		{"github", "", ""}, {"github:nope@b", "gh", ""}, {"github:a/b@", "gh", ""},
-		{"d1:acct", "", "cf"}, {"d1:acct/db/x", "", "cf"}, {"d1:acct/db", "", ""}, {"s3:bucket", "gh", "cf"},
+	// The GitHub Contents driver is a GitHub write and never selectable.
+	for _, spec := range []string{"github", "github:a/b@state"} {
+		s, err := Open(spec, "cf")
+		if s != nil || err == nil || !strings.Contains(err.Error(), "GitHub write") {
+			t.Errorf("%q = %v %v; want a GitHub-write refusal", spec, s, err)
+		}
+	}
+	for _, bad := range []struct{ spec, cf string }{
+		{"d1:acct", "cf"}, {"d1:acct/db/x", "cf"}, {"d1:acct/db", ""}, {"s3:bucket", "cf"},
 	} {
-		if _, err := Open(bad.spec, "o/r", bad.gh, bad.cf, "x"); err == nil {
+		if _, err := Open(bad.spec, bad.cf); err == nil {
 			t.Errorf("%q accepted", bad.spec)
 		}
 	}

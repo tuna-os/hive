@@ -125,20 +125,6 @@ type Executor struct {
 	// reading any code.
 	RequireEvidence bool
 
-	// Write side (write.go). Writes stay disabled unless Writer and
-	// WorkBranch are set and Mode is push-capable.
-	Writer         Writer
-	WorkBranch     string              // Hive-owned branch the model's patches land on
-	Mode           agentmode.AgentMode // independent of toolapprove: defence in depth
-	ProtectedPaths []string            // default pushbroker.DefaultProtectedPaths
-	Canary         string              // session canary; write arguments carrying it are refused
-	IssueRef       int                 // referenced (never "Fixes") in PR bodies
-	Verifier       Verifier            // optional pre-commit check (build/test)
-
-	headSHA  string
-	prNumber int
-	verified []verifyRecord
-
 	mu       sync.Mutex
 	seen     map[string]string // call fingerprint -> first call id
 	evidence map[string][]span // path -> served line spans
@@ -187,10 +173,6 @@ func (x *Executor) Execute(ctx context.Context, call turn.ToolCall) (turn.ToolRe
 		out, err = x.checksRead(ctx, args)
 	case ToolTaskComplete, ToolTaskAbort:
 		out, err = x.terminal(call.Name, args)
-	case ToolRepoPatch:
-		out, err = x.repoPatch(ctx, call.Arguments)
-	case ToolPRCreate:
-		out, err = x.prCreate(ctx, call.Arguments)
 	default:
 		err = fmt.Errorf("%w %q; available: %s", ErrUnknownTool, call.Name, strings.Join(ReadToolNames(), ", "))
 	}
@@ -310,7 +292,7 @@ func (x *Executor) repoList(ctx context.Context, a map[string]any) (string, erro
 	if err != nil {
 		return "", err
 	}
-	entries, err := x.Reader.List(ctx, x.Repo, x.readRef(ctx), dir)
+	entries, err := x.Reader.List(ctx, x.Repo, x.Ref, dir)
 	if err != nil {
 		return "", err
 	}
@@ -337,8 +319,7 @@ func (x *Executor) repoRead(ctx context.Context, a map[string]any) (string, erro
 	if file == "" {
 		return "", errors.New("path is required")
 	}
-	ref := x.readRef(ctx)
-	raw, err := x.Reader.File(ctx, x.Repo, ref, file)
+	raw, err := x.Reader.File(ctx, x.Repo, x.Ref, file)
 	if err != nil {
 		return "", err
 	}
@@ -361,11 +342,7 @@ func (x *Executor) repoRead(ctx context.Context, a map[string]any) (string, erro
 	x.recordEvidence(file, start, end)
 	x.mu.Unlock()
 	var b strings.Builder
-	shown := x.Ref
-	if ref != x.Ref {
-		shown = x.WorkBranch + "@" + short(ref)
-	}
-	fmt.Fprintf(&b, "%s lines %d-%d of %d (ref %s)\n", file, start, end, len(lines), shown)
+	fmt.Fprintf(&b, "%s lines %d-%d of %d (ref %s)\n", file, start, end, len(lines), x.Ref)
 	for i := start; i <= end; i++ {
 		fmt.Fprintf(&b, "%d\t%s\n", i, lines[i-1])
 	}
@@ -456,9 +433,6 @@ func (x *Executor) terminal(tool string, a map[string]any) (string, error) {
 	if x.outcome != nil {
 		return "", fmt.Errorf("session already ended with %s", x.outcome.Tool)
 	}
-	if o.PRNumber == 0 {
-		o.PRNumber = x.prNumber
-	}
 	o.Citations = x.citationsLocked(o.Summary)
 	verified := 0
 	for _, c := range o.Citations {
@@ -507,32 +481,15 @@ func ReadToolNames() []string {
 	return out
 }
 
-var writeDefs = []def{
-	{ToolRepoPatch, "Commit changes to the session's work branch. Each patch is {path, search, replace} where search must match the current file text exactly once (copy it from repo.read_file without line numbers), or {path, content} to write a whole file. Protected paths (.github/workflows/, OWNERS, policies/) are refused.",
-		map[string]map[string]any{
-			"commit_message": {"type": "string"},
-			"patches": {"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{
-				"path": map[string]any{"type": "string"}, "search": map[string]any{"type": "string"},
-				"replace": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"},
-			}, "required": []string{"path"}}},
-		}, []string{"commit_message", "patches"}},
-	{ToolPRCreate, "Open a DRAFT pull request from the work branch after repo.patch_files. Body: what changed, why, and how it was verified.",
-		map[string]map[string]any{"title": {"type": "string"}, "body": {"type": "string"}}, []string{"title", "body"}},
-}
-
 // Definitions returns the tool definitions for turn.WithAvailableTools, in
 // the router's convention (Tool=name, Content=description,
 // Arguments=JSON-Schema parameters). Only tools the agent mode may use are
 // offered: fewer tools mean fewer tokens per turn and fewer wrong calls.
-// Read tools are available from ADVISORY up; repo.patch_files and pr.create
-// only to push-capable modes (ISSUES_AND_PRS and above).
+// All read tools are available from ADVISORY up.
 func Definitions(mode agentmode.AgentMode) []toolapprove.ToolRequest {
-	all := defs
-	if mode.CanPush() {
-		all = append(append([]def(nil), defs[:len(defs)-2]...), append(writeDefs, defs[len(defs)-2:]...)...)
-	}
-	out := make([]toolapprove.ToolRequest, 0, len(all))
-	for _, d := range all {
+	_ = mode // write tools (mode-gated) are not implemented in this package yet
+	out := make([]toolapprove.ToolRequest, 0, len(defs))
+	for _, d := range defs {
 		props := map[string]any{}
 		for k, v := range d.props {
 			props[k] = v

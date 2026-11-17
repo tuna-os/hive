@@ -1,14 +1,18 @@
 // Command hive-mcp serves Hive work to MCP-capable agents (RFC
 // hivecommons/hive#18464 §3a, Family E, agent-driven mode). A connected
-// agent spends its own inference; Hive executes every tool call under a
-// tool-hosted admission and holds no model credential.
+// agent spends its own inference; Hive executes every tool call and holds
+// no model credential.
 //
 //	hive-mcp -repo owner/name -label hive-lite -tokens tokens.json -checkout ./repo
 //
+// Scope per the maintainer decision on #18464 (phase 2): a read-only MCP
+// server at ADVISORY. It offers read tools and the terminal markers only,
+// every principal runs at ADVISORY, and it never writes to GitHub.
+//
 // tokens.json is a list of {"sha256": "<hex of the bearer token>", "login":
-// "<contributor>", "mode": "ADVISORY|ISSUES_ONLY|ISSUES_AND_PRS"}. Print a
-// hash with `hive-mcp -hash-token <token>`. GH_TOKEN/GITHUB_TOKEN is Hive's
-// own credential for reads (and, with -write, the draft-PR writes).
+// "<contributor>", "mode": "ADVISORY"}; any other mode is refused at load.
+// Print a hash with `hive-mcp -hash-token <token>`. GH_TOKEN/GITHUB_TOKEN is
+// Hive's own credential, used for reads only; give it read scopes.
 package main
 
 import (
@@ -36,15 +40,14 @@ func main() {
 	tokens := flag.String("tokens", "", "JSON file of hashed bearer tokens")
 	addr := flag.String("addr", "127.0.0.1:8765", "listen address")
 	checkout := flag.String("checkout", "", "local checkout for repo_search_code (pkg/codeindex)")
-	write := flag.Bool("write", false, "let ISSUES_AND_PRS principals patch a Hive-owned branch and open draft PRs")
-	state := flag.String("state", "", "session store for stateless hosting: \"github\", \"github:owner/name@branch\" or \"d1:<account-id>/<database-id>\" (CLOUDFLARE_API_TOKEN); empty keeps sessions in memory")
+	state := flag.String("state", "", "session store for stateless hosting: \"d1:<account-id>/<database-id>\" (CLOUDFLARE_API_TOKEN); empty or \"memory\" keeps sessions in memory. A GitHub-branch store is not selectable: it would be a GitHub write")
 	hash := flag.String("hash-token", "", "print the sha256 for a token and exit")
 	flag.Parse()
 	if *hash != "" {
 		fmt.Println(hivemcp.HashToken(*hash))
 		return
 	}
-	if err := run(*repo, *ref, *label, *tokens, *addr, *checkout, *state, *write); err != nil {
+	if err := run(*repo, *ref, *label, *tokens, *addr, *checkout, *state); err != nil {
 		log.Fatal("hive-mcp: ", err)
 	}
 }
@@ -58,7 +61,7 @@ func githubToken() string {
 	return ""
 }
 
-func run(repo, ref, label, tokensPath, addr, checkout, stateSpec string, write bool) error {
+func run(repo, ref, label, tokensPath, addr, checkout, stateSpec string) error {
 	if repo == "" || tokensPath == "" {
 		return errors.New("-repo and -tokens are required")
 	}
@@ -92,13 +95,7 @@ func run(repo, ref, label, tokensPath, addr, checkout, stateSpec string, write b
 		}
 		cfg.Searcher = hivetool.CodeIndexSearcher{Index: func() *codeindex.Index { return idx }}
 	}
-	if write {
-		if tok == "" {
-			return errors.New("-write needs GH_TOKEN with contents and pull_requests write")
-		}
-		cfg.Writer = &hivetool.RESTWriter{Token: tokFn}
-	}
-	store, err := coordstate.Open(stateSpec, repo, tok, cfToken(), "hive-mcp state")
+	store, err := coordstate.Open(stateSpec, cfToken())
 	if err != nil {
 		return err
 	}

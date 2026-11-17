@@ -16,8 +16,15 @@ import (
 )
 
 // ContentsStore keeps each key as one file on a dedicated state branch,
-// using the GitHub Contents API. The blob sha is the Version: PUT with a
-// stale sha fails with 409, which is the per-file CAS the RFC requires.
+// using the GitHub Contents API.
+//
+// Unused by any binary, deferred per hivecommons/hive#18464: every Put is a
+// commit, which is a GitHub write, and GitHub writes go through the Hive App.
+// Open refuses to select it; it is kept only for a future Hive App-mediated
+// deployment.
+//
+// Each key is one file on the branch. The blob sha is the Version: PUT with
+// a stale sha fails with 409, which is the per-file CAS the RFC requires.
 //
 // The branch inherits the repository's visibility. On a public repository
 // every value is public, so callers must only store what may be published

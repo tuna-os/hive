@@ -7,23 +7,14 @@ package hivetool
 type State struct {
 	Seen     map[string]string   `json:"seen,omitempty"`     // call fingerprint -> first call id
 	Evidence map[string][][2]int `json:"evidence,omitempty"` // path -> served [from, to] spans
-	HeadSHA  string              `json:"head_sha,omitempty"`
-	PRNumber int                 `json:"pr_number,omitempty"`
-	Verified []VerifyRecord      `json:"verified,omitempty"`
 	Outcome  *Outcome            `json:"outcome,omitempty"`
-}
-
-// VerifyRecord is one Verifier report and the commit it was taken for.
-type VerifyRecord struct {
-	SHA    string `json:"sha,omitempty"`
-	Report string `json:"report"`
 }
 
 // Snapshot captures the executor's session memory.
 func (x *Executor) Snapshot() State {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	s := State{HeadSHA: x.headSHA, PRNumber: x.prNumber}
+	s := State{}
 	if len(x.seen) > 0 {
 		s.Seen = make(map[string]string, len(x.seen))
 		for k, v := range x.seen {
@@ -37,9 +28,6 @@ func (x *Executor) Snapshot() State {
 				s.Evidence[p] = append(s.Evidence[p], [2]int{sp.from, sp.to})
 			}
 		}
-	}
-	for _, v := range x.verified {
-		s.Verified = append(s.Verified, VerifyRecord{SHA: v.sha, Report: v.report})
 	}
 	if x.outcome != nil {
 		o := *x.outcome
@@ -62,11 +50,6 @@ func (x *Executor) Restore(s State) {
 		for _, sp := range spans {
 			x.evidence[p] = append(x.evidence[p], span{sp[0], sp[1]})
 		}
-	}
-	x.headSHA, x.prNumber = s.HeadSHA, s.PRNumber
-	x.verified = nil
-	for _, v := range s.Verified {
-		x.verified = append(x.verified, verifyRecord{sha: v.SHA, report: v.Report})
 	}
 	x.outcome = nil
 	if s.Outcome != nil {

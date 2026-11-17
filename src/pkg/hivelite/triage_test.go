@@ -174,122 +174,57 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestAdmissionPostureGatesFixMode(t *testing.T) {
+func TestAdmissionIsReportOnly(t *testing.T) {
 	base := Config{Repo: "o/r", Ref: "main", Issue: 1, LLM: &scripted{}, Reader: reader{}}
 	for _, c := range []struct {
 		admission string
-		fix       bool
 		want      string
 	}{
-		{"", false, extwork.ModeReportOnly},
-		{"", true, extwork.ModeToolHosted},
-		{extwork.ModeReportOnly, true, "needs a tool-hosted admission"},
-		{extwork.ModeGitHubMediated, true, "needs a tool-hosted admission"},
-		{extwork.ModeShadow, false, "cannot run a session"},
-		{"enforce", false, "cannot run a session"},
+		{"", extwork.ModeReportOnly},
+		{extwork.ModeReportOnly, extwork.ModeReportOnly},
+		{extwork.ModeToolHosted, "grants more than ADVISORY"},
+		{"github-mediated", "cannot run a session"},
+		{extwork.ModeShadow, "cannot run a session"},
+		{"enforce", "cannot run a session"},
 	} {
 		cfg := base
-		cfg.Admission, cfg.Fix = c.admission, c.fix
-		if c.fix {
-			cfg.Writer = &memWriter{refs: map[string]string{}}
-		}
+		cfg.Admission = c.admission
 		err := cfg.defaults()
-		if strings.HasPrefix(c.want, "needs") || strings.HasPrefix(c.want, "cannot") {
+		if c.want != extwork.ModeReportOnly {
 			if err == nil || !strings.Contains(err.Error(), c.want) {
-				t.Errorf("%q fix=%v: err = %v, want %q", c.admission, c.fix, err, c.want)
+				t.Errorf("%q: err = %v, want %q", c.admission, err, c.want)
 			}
 			continue
 		}
 		if err != nil || cfg.Admission != c.want {
-			t.Errorf("%q fix=%v: admission = %q, err %v", c.admission, c.fix, cfg.Admission, err)
+			t.Errorf("%q: admission = %q, err %v", c.admission, cfg.Admission, err)
 		}
 	}
 }
 
-type memWriter struct {
-	refs map[string]string
-	pr   int
-}
-
-func (w *memWriter) RefSHA(_ context.Context, _, b string) (string, error) {
-	if s, ok := w.refs[b]; ok {
-		return s, nil
-	}
-	return "", hivetool.ErrRefNotFound
-}
-func (w *memWriter) CreateCommit(context.Context, string, string, string, map[string]string) (string, error) {
-	return "c1", nil
-}
-func (w *memWriter) SetBranch(_ context.Context, _, b, sha string, _ bool) error {
-	w.refs[b] = sha
-	return nil
-}
-func (w *memWriter) OpenPR(context.Context, string, string, string, string, string) (int, string, error) {
-	w.pr = 77
-	return 77, "u", nil
-}
-
-func TestFixModeOpensDraftPRThroughHive(t *testing.T) {
+// TestSessionOffersReadToolsOnly: a model that asks for a write tool gets
+// an unknown-tool refusal, and nothing but read and terminal tools is ever
+// offered (hivecommons/hive#18464 phase 1: no GitHub writes).
+func TestSessionOffersReadToolsOnly(t *testing.T) {
 	llm := &scripted{steps: []turn.LLMResponse{
-		tc(hivetool.ToolRepoRead, readA),
-		tc(hivetool.ToolRepoPatch, `{"commit_message":"fix","patches":[{"path":"src/a.go","search":"func Rebase() {}","replace":"func Rebase() { recreate() }"}]}`),
-		tc(hivetool.ToolPRCreate, `{"title":"fix: recreate","body":"Use recreate."}`),
-		tc(hivetool.ToolTaskComplete, `{"summary":"Changed src/a.go:3"}`),
+		tc("repo.patch_files", `{"commit_message":"x","patches":[{"path":"src/a.go","content":"x"}]}`),
+		tc("pr.create", `{"title":"x","body":"y"}`),
+		tc("issue.comment", `{"body":"y"}`),
 	}}
-	w := &memWriter{refs: map[string]string{"main": "c0"}}
-	c := cfg(llm)
-	c.Fix, c.Writer = true, w
-	res, err := RunTriage(context.Background(), c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Outcome.PRNumber != 77 || w.refs["hive-lite/issue-7"] != "c1" || w.refs["main"] != "c0" {
-		t.Fatalf("res=%+v refs=%v", res, w.refs)
-	}
-	var offered []string
-	for _, d := range llm.tools[0] {
-		offered = append(offered, d.Tool)
-	}
-	if !strings.Contains(strings.Join(offered, ","), hivetool.ToolRepoPatch) {
-		t.Fatalf("fix mode did not offer write tools: %v", offered)
-	}
-	if !strings.Contains(RenderComment(res, "m"), "Draft PR:** #77") {
-		t.Fatal("comment does not link the draft PR")
-	}
-}
-
-func TestReportModeOffersNoWriteTools(t *testing.T) {
-	llm := &scripted{steps: []turn.LLMResponse{tc(hivetool.ToolRepoPatch, `{"commit_message":"x","patches":[{"path":"src/a.go","content":"x"}]}`)}}
 	_, _ = RunTriage(context.Background(), cfg(llm))
-	for _, d := range llm.tools[0] {
-		if d.Tool == hivetool.ToolRepoPatch || d.Tool == hivetool.ToolPRCreate {
-			t.Fatalf("report mode offered %s", d.Tool)
+	allowed := map[string]bool{}
+	for _, n := range hivetool.ReadToolNames() {
+		allowed[n] = true
+	}
+	allowed[hivetool.ToolTaskComplete], allowed[hivetool.ToolTaskAbort] = true, true
+	if len(llm.tools) == 0 {
+		t.Fatal("no turns ran")
+	}
+	for i, offered := range llm.tools {
+		for _, d := range offered {
+			if !allowed[d.Tool] {
+				t.Fatalf("turn %d offered %s", i, d.Tool)
+			}
 		}
-	}
-}
-
-type cmpWriter struct{ memWriter }
-
-func (cmpWriter) Compare(context.Context, string, string, string) (string, error) {
-	return "-\treturn total / perPage\n+\treturn (total + perPage - 1) / perPage", nil
-}
-
-func TestResumedFixSessionSeesPriorDiff(t *testing.T) {
-	llm := &scripted{steps: []turn.LLMResponse{tc(hivetool.ToolTaskAbort, `{"reason":"already fixed"}`)}}
-	w := &cmpWriter{memWriter{refs: map[string]string{"main": "c0", "hive-lite/issue-7": "c5"}}}
-	c := cfg(llm)
-	c.Fix, c.Writer = true, w
-	_, _ = RunTriage(context.Background(), c)
-	task := llm.seen[0][1].Content
-	if !strings.Contains(task, "already holds changes") || !strings.Contains(task, "(total + perPage - 1)") {
-		t.Fatalf("task = %q", task)
-	}
-	// A fresh branch gets no note.
-	llm2 := &scripted{steps: []turn.LLMResponse{tc(hivetool.ToolTaskAbort, `{"reason":"x"}`)}}
-	c2 := cfg(llm2)
-	c2.Fix, c2.Writer = true, &cmpWriter{memWriter{refs: map[string]string{"main": "c0"}}}
-	_, _ = RunTriage(context.Background(), c2)
-	if strings.Contains(llm2.seen[0][1].Content, "already holds") {
-		t.Fatal("fresh branch must not get a resume note")
 	}
 }

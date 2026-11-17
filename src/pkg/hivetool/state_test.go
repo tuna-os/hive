@@ -12,8 +12,6 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 	if _, err := run(t, x, call("1", ToolRepoRead, `{"path":"src/pkg/a.go"}`)); err != nil {
 		t.Fatal(err)
 	}
-	x.headSHA, x.prNumber = "abc", 12
-	x.verified = []verifyRecord{{sha: "abc", report: "ok"}}
 
 	raw, err := json.Marshal(x.Snapshot())
 	if err != nil {
@@ -36,7 +34,7 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 		t.Fatalf("restored evidence rejected: %v", err)
 	}
 	s2 := y.Snapshot()
-	if s2.HeadSHA != "abc" || s2.PRNumber != 12 || len(s2.Verified) != 1 || s2.Verified[0].Report != "ok" || s2.Outcome == nil {
+	if s2.Outcome == nil || len(s2.Evidence["src/pkg/a.go"]) == 0 {
 		t.Fatalf("snapshot = %+v", s2)
 	}
 	// Restoring an outcome-bearing state, then an empty one, clears it.

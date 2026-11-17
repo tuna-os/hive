@@ -14,8 +14,10 @@ import (
 )
 
 // checkpointVersion is bumped when the checkpoint shape changes; an older
-// checkpoint is discarded rather than misread.
-const checkpointVersion = 1
+// checkpoint is discarded rather than misread. Version 2 dropped fix-mode
+// checkpoints (hivecommons/hive#18464 scope cut): a v1 fix session, whose
+// history carries write tools, never resumes.
+const checkpointVersion = 2
 
 // canaryPlaceholder replaces the session canary wherever it appears before a
 // checkpoint is written: a state branch on a public repository is public.
@@ -25,7 +27,6 @@ const canaryPlaceholder = "[hive-canary]"
 type Checkpoint struct {
 	Version     int                  `json:"version"`
 	Admission   string               `json:"admission"`
-	Fix         bool                 `json:"fix,omitempty"`
 	Done        bool                 `json:"done"`
 	Finishing   bool                 `json:"finishing,omitempty"`
 	FinishAfter int                  `json:"finish_after"`
@@ -39,7 +40,6 @@ type checkpointer struct {
 	key       string
 	canary    string
 	admission string
-	fix       bool
 	version   coordstate.Version
 }
 
@@ -47,12 +47,11 @@ func newCheckpointer(cfg Config, sessionID, canary string) *checkpointer {
 	if cfg.State == nil {
 		return nil
 	}
-	return &checkpointer{store: cfg.State, key: coordstate.SessionKey(sessionID), canary: canary, admission: cfg.Admission, fix: cfg.Fix}
+	return &checkpointer{store: cfg.State, key: coordstate.SessionKey(sessionID), canary: canary, admission: cfg.Admission}
 }
 
 // load returns the stored checkpoint and whether it should be resumed: it
-// must be unfinished, current-version, and for the same admission and mode
-// (a report-only checkpoint never resumes as a fix session or vice versa).
+// must be unfinished, current-version, and for the same admission mode.
 func (c *checkpointer) load(ctx context.Context) (Checkpoint, bool, error) {
 	if c == nil {
 		return Checkpoint{}, false, nil
@@ -69,7 +68,7 @@ func (c *checkpointer) load(ctx context.Context) (Checkpoint, bool, error) {
 	if err := json.Unmarshal(raw, &ck); err != nil || ck.Version != checkpointVersion {
 		return Checkpoint{}, false, nil // unreadable or stale shape: start fresh, overwrite
 	}
-	ok := !ck.Done && ck.Admission == c.admission && ck.Fix == c.fix && len(ck.Envelope.Messages) > 0
+	ok := !ck.Done && ck.Admission == c.admission && len(ck.Envelope.Messages) > 0
 	return ck, ok, nil
 }
 
@@ -81,7 +80,7 @@ func (c *checkpointer) save(ctx context.Context, env turn.SessionEnvelope, ex *h
 		return nil
 	}
 	ck := Checkpoint{
-		Version: checkpointVersion, Admission: c.admission, Fix: c.fix, Done: done,
+		Version: checkpointVersion, Admission: c.admission, Done: done,
 		Finishing: finishing, FinishAfter: finishAfter,
 		Envelope: blankSystem(env), Executor: ex.Snapshot(), UpdatedAt: time.Now().UTC(),
 	}

@@ -53,19 +53,6 @@ func (t tasks) Next(_ context.Context, _ Principal, skip []int) (Task, bool, err
 	return Task{}, false, nil
 }
 
-type nopWriter struct{}
-
-func (nopWriter) RefSHA(context.Context, string, string) (string, error) {
-	return "", hivetool.ErrRefNotFound
-}
-func (nopWriter) CreateCommit(context.Context, string, string, string, map[string]string) (string, error) {
-	return "c", nil
-}
-func (nopWriter) SetBranch(context.Context, string, string, string, bool) error { return nil }
-func (nopWriter) OpenPR(context.Context, string, string, string, string, string) (int, string, error) {
-	return 1, "u", nil
-}
-
 var principals = map[string]Principal{
 	"tok-alice": {Login: "alice", Mode: agentmode.ModeAdvisory},
 	"tok-bob":   {Login: "bob", Mode: agentmode.ModeIssuesPRsMerge},
@@ -209,19 +196,68 @@ func TestProtocolEdges(t *testing.T) {
 	}
 }
 
-func TestToolListFollowsClampedMode(t *testing.T) {
-	ro := newHarness(t, nil)
-	if got := strings.Join(ro.tools("tok-bob", ro.open("tok-bob")), ","); strings.Contains(got, "repo_patch_files") {
-		t.Fatalf("no Writer, yet write tools offered: %s", got)
+// TestNoWriteToolOffered pins the RFC #18464 phase-2 scope: whatever mode a
+// principal claims (bob claims merge), the server lists and resolves read
+// tools and the terminal markers only, and every write-shaped call is an
+// unknown tool.
+func TestNoWriteToolOffered(t *testing.T) {
+	h := newHarness(t, nil)
+	allowed := map[string]bool{ToolNextTask: true, ToolAcceptTask: true, ToolDeclineTask: true}
+	for _, n := range hivetool.ReadToolNames() {
+		allowed[mcpName(n)] = true
 	}
-	rw := newHarness(t, func(c *Config) { c.Writer = nopWriter{} })
-	bob := strings.Join(rw.tools("tok-bob", rw.open("tok-bob")), ",")
-	if !strings.Contains(bob, "repo_patch_files") || !strings.Contains(bob, "pr_create") || strings.Contains(bob, "merge") {
-		t.Fatalf("bob (merge tier, clamped to ISSUES_AND_PRS) = %s", bob)
+	allowed[mcpName(hivetool.ToolTaskComplete)], allowed[mcpName(hivetool.ToolTaskAbort)] = true, true
+	for _, tok := range []string{"tok-alice", "tok-bob"} {
+		sid := h.open(tok)
+		names := h.tools(tok, sid)
+		if len(names) == 0 || names[0] != ToolNextTask {
+			t.Fatalf("%s: tools = %v", tok, names)
+		}
+		for _, n := range names {
+			if !allowed[n] {
+				t.Errorf("%s: offered non-read tool %q", tok, n)
+			}
+			for _, w := range []string{"patch", "pr_", "branch", "comment", "label", "write", "merge"} {
+				if strings.Contains(n, w) {
+					t.Errorf("%s: offered write-shaped tool %q", tok, n)
+				}
+			}
+		}
+		for _, w := range []string{"repo_patch_files", "pr_create", "pr_merge", "branch_create", "repo_write_file", "issue_comment"} {
+			r := h.post(tok, sid, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"`+w+`","arguments":{}}}`)
+			if r.body["error"] == nil {
+				t.Errorf("%s: %s callable", tok, w)
+			}
+		}
 	}
-	alice := strings.Join(rw.tools("tok-alice", rw.open("tok-alice")), ",")
-	if strings.Contains(alice, "repo_patch_files") || !strings.HasPrefix(alice, ToolNextTask) || !strings.Contains(alice, "repo_read_file") {
-		t.Fatalf("alice = %s", alice)
+	for m := agentmode.ModeAdvisory; m <= agentmode.ModeIssuesPRsMerge; m++ {
+		if got := effectiveMode(Principal{Login: "x", Mode: m}); got != agentmode.ModeAdvisory {
+			t.Errorf("effectiveMode(%v) = %v, want ADVISORY", m, got)
+		}
+	}
+}
+
+// TestStoredSessionIsClampedOnLoad: a session persisted with a higher mode
+// (an older build, or a tampered store) is served at ADVISORY.
+func TestStoredSessionIsClampedOnLoad(t *testing.T) {
+	h := newHarness(t, nil)
+	sid := h.open("tok-bob")
+	key := sessionKey(sid)
+	raw, ver, err := h.store.Get(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sess session
+	_ = json.Unmarshal(raw, &sess)
+	sess.Mode = int(agentmode.ModeIssuesAndPRs)
+	raw, _ = json.Marshal(sess)
+	if _, err := h.store.Put(context.Background(), key, raw, ver); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range h.tools("tok-bob", sid) {
+		if strings.Contains(n, "patch") || strings.Contains(n, "pr_") {
+			t.Fatalf("stored ISSUES_AND_PRS session offered %s", n)
+		}
 	}
 }
 
@@ -333,11 +369,11 @@ func TestNewValidates(t *testing.T) {
 }
 
 func TestTokenAuth(t *testing.T) {
-	auth, err := TokenAuth([]TokenEntry{{SHA256: HashToken("s3cret"), Login: "carol", Mode: "ISSUES_AND_PRS"}, {SHA256: HashToken("ro"), Login: "dan"}})
+	auth, err := TokenAuth([]TokenEntry{{SHA256: HashToken("s3cret"), Login: "carol", Mode: "ADVISORY"}, {SHA256: HashToken("ro"), Login: "dan"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for tok, want := range map[string]Principal{"s3cret": {"carol", agentmode.ModeIssuesAndPRs}, "ro": {"dan", agentmode.ModeAdvisory}} {
+	for tok, want := range map[string]Principal{"s3cret": {"carol", agentmode.ModeAdvisory}, "ro": {"dan", agentmode.ModeAdvisory}} {
 		r := httptest.NewRequest("POST", "/", nil)
 		r.Header.Set("Authorization", "Bearer "+tok)
 		if p, ok := auth(r); !ok || p != want {
@@ -351,7 +387,13 @@ func TestTokenAuth(t *testing.T) {
 			t.Errorf("%q authenticated", h)
 		}
 	}
-	for _, bad := range [][]TokenEntry{{{SHA256: "zz", Login: "x"}}, {{SHA256: HashToken("a")}}, {{SHA256: HashToken("a"), Login: "x", Mode: "GOD"}}} {
+	for _, bad := range [][]TokenEntry{
+		{{SHA256: "zz", Login: "x"}}, {{SHA256: HashToken("a")}}, {{SHA256: HashToken("a"), Login: "x", Mode: "GOD"}},
+		// The server is read-only: any mode above ADVISORY is refused.
+		{{SHA256: HashToken("a"), Login: "x", Mode: "ISSUES_ONLY"}},
+		{{SHA256: HashToken("a"), Login: "x", Mode: "ISSUES_AND_PRS"}},
+		{{SHA256: HashToken("a"), Login: "x", Mode: "ISSUES_PRS_MERGE"}},
+	} {
 		if _, err := TokenAuth(bad); err == nil {
 			t.Errorf("%+v accepted", bad)
 		}
@@ -388,10 +430,7 @@ func TestLabelTasks(t *testing.T) {
 	}
 }
 
-func TestBranchSafeAndNames(t *testing.T) {
-	if branchSafe("Some_User[bot]") != "some-user-bot" {
-		t.Fatal(branchSafe("Some_User[bot]"))
-	}
+func TestNames(t *testing.T) {
 	if mcpName("repo.read_file") != "repo_read_file" {
 		t.Fatal("mcpName")
 	}

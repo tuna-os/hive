@@ -6,33 +6,25 @@ import (
 	"strings"
 )
 
-// Open parses a store spec:
+// Open parses the store spec a binary accepts:
 //
-//	github                          branch hive-lite-state in defaultRepo
-//	github:owner/name@branch        a branch in another repository
+//	"" or memory                    no durable store: (nil, nil), the caller
+//	                                keeps state in its own process
 //	d1:<account-id>/<database-id>   a Cloudflare D1 database
 //
-// ghToken authenticates the GitHub driver, cfToken the D1 driver. An empty
-// spec returns (nil, nil): no store.
-func Open(spec, defaultRepo, ghToken, cfToken, author string) (Store, error) {
+// cfToken authenticates the D1 driver.
+//
+// The GitHub Contents driver (ContentsStore) is deliberately not
+// selectable here. Every checkpoint it writes is a commit to a branch, which
+// is a GitHub write, and per the maintainer decision on hivecommons/hive#18464
+// all GitHub writes stay with the Hive App. A "github" spec is refused with
+// that reason; embedders that need the driver construct it explicitly.
+func Open(spec, cfToken string) (Store, error) {
 	switch {
-	case spec == "":
+	case spec == "" || spec == "memory":
 		return nil, nil
 	case spec == "github" || strings.HasPrefix(spec, "github:"):
-		target, branch := defaultRepo, "hive-lite-state"
-		if rest, ok := strings.CutPrefix(spec, "github:"); ok {
-			target = rest
-			if at := strings.LastIndex(rest, "@"); at >= 0 {
-				target, branch = rest[:at], rest[at+1:]
-			}
-		}
-		if strings.Count(target, "/") != 1 || strings.HasPrefix(target, "/") || strings.HasSuffix(target, "/") || branch == "" {
-			return nil, fmt.Errorf("coordstate: %q: want github or github:owner/name@branch", spec)
-		}
-		if ghToken == "" {
-			return nil, fmt.Errorf("coordstate: %q needs a GitHub token with contents write", spec)
-		}
-		return &ContentsStore{Repo: target, Branch: branch, Author: author, Token: func(context.Context) (string, error) { return ghToken, nil }}, nil
+		return nil, fmt.Errorf("coordstate: %q is a GitHub write (a commit per checkpoint) and is not selectable; GitHub writes stay with the Hive App (hivecommons/hive#18464). Use memory or d1:<account>/<database>", spec)
 	case strings.HasPrefix(spec, "d1:"):
 		acct, db, ok := strings.Cut(strings.TrimPrefix(spec, "d1:"), "/")
 		if !ok || acct == "" || db == "" || strings.Contains(db, "/") {
@@ -43,6 +35,6 @@ func Open(spec, defaultRepo, ghToken, cfToken, author string) (Store, error) {
 		}
 		return &D1Store{AccountID: acct, DatabaseID: db, Token: func(context.Context) (string, error) { return cfToken, nil }}, nil
 	default:
-		return nil, fmt.Errorf("coordstate: unknown store %q (github, github:owner/name@branch, d1:<account>/<database>)", spec)
+		return nil, fmt.Errorf("coordstate: unknown store %q (memory, d1:<account>/<database>)", spec)
 	}
 }

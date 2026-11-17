@@ -91,7 +91,7 @@ func (a Admission) Validate() error {
 		return fmt.Errorf("%w: generation must be greater than zero", ErrInvalidAdmission)
 	}
 	if !ValidMode(a.Authority.Mode) {
-		return fmt.Errorf("%w: authority.mode %q is not one of off, shadow, report-only, tool-hosted, github-mediated", ErrInvalidAdmission, a.Authority.Mode)
+		return fmt.Errorf("%w: authority.mode %q is not one of off, shadow, report-only, tool-hosted", ErrInvalidAdmission, a.Authority.Mode)
 	}
 	return nil
 }

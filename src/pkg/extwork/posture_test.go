@@ -3,7 +3,6 @@ package extwork
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/hivecommons/hive/crux/agentmode"
@@ -22,30 +21,80 @@ func TestPostureTable(t *testing.T) {
 		mode               string
 		starts, hiveWrites bool
 		ceiling            agentmode.AgentMode
-		untrusted          bool
 	}{
-		{ModeOff, false, false, agentmode.ModeAdvisory, false},
-		{ModeShadow, false, false, agentmode.ModeAdvisory, false},
-		{ModeReportOnly, true, false, agentmode.ModeAdvisory, false},
-		{ModeToolHosted, true, true, agentmode.ModeIssuesAndPRs, false},
-		{ModeGitHubMediated, true, false, agentmode.ModeAdvisory, true},
+		{ModeOff, false, false, agentmode.ModeAdvisory},
+		{ModeShadow, false, false, agentmode.ModeAdvisory},
+		{ModeReportOnly, true, false, agentmode.ModeAdvisory},
+		{ModeToolHosted, true, true, agentmode.ModeIssuesAndPRs},
 	}
 	for _, c := range cases {
 		p, ok := PostureFor(c.mode)
 		if !ok || !ValidMode(c.mode) {
 			t.Fatalf("%s: unknown", c.mode)
 		}
-		if p.StartsWork != c.starts || p.HiveExecutesWrites != c.hiveWrites || p.Ceiling != c.ceiling || p.UntrustedOutput != c.untrusted {
+		if p.StartsWork != c.starts || p.HiveExecutesWrites != c.hiveWrites || p.Ceiling != c.ceiling {
 			t.Errorf("%s: posture = %+v", c.mode, p)
 		}
 	}
-	if _, ok := PostureFor("enforce"); ok || ValidMode("enforce") {
-		t.Fatal("enforce must stay invalid")
+	for _, bad := range []string{"enforce", "github-mediated"} {
+		if _, ok := PostureFor(bad); ok || ValidMode(bad) {
+			t.Fatalf("%s must stay invalid", bad)
+		}
+	}
+}
+
+// TestNoVendorWriteMode pins the maintainer decision on RFC #18464: vendor
+// agents never write to GitHub, so a github-mediated admission does not
+// exist, validates nowhere, and a binding configured with it resolves off.
+func TestNoVendorWriteMode(t *testing.T) {
+	adm := testAdmission()
+	adm.Authority.Mode = "github-mediated"
+	if err := adm.Validate(); !errors.Is(err, ErrInvalidAdmission) {
+		t.Fatalf("github-mediated admission validated: %v", err)
+	}
+	if b := New(newFake(), NewMemoryStore(), nil, nil, "github-mediated"); b.Mode() != ModeOff {
+		t.Fatalf("binding mode = %q, want off", b.Mode())
+	}
+}
+
+// TestClampModeNeverRaises: for every admission mode (known or not) and
+// every requested agent mode, including out-of-range values, the clamp is
+// never above the request, never above the posture's ceiling, and never
+// above ISSUES_AND_PRS.
+func TestClampModeNeverRaises(t *testing.T) {
+	modes := []string{ModeOff, ModeShadow, ModeReportOnly, ModeToolHosted, "github-mediated", "bogus", ""}
+	for _, m := range modes {
+		ceiling := agentmode.ModeAdvisory
+		if p, ok := PostureFor(m); ok {
+			ceiling = p.Ceiling
+		}
+		for req := agentmode.AgentMode(-3); req <= agentmode.ModeIssuesPRsMerge+3; req++ {
+			got := ClampMode(m, req)
+			if got > ToolHostedCeiling || got > ceiling || got.CanMerge() {
+				t.Errorf("ClampMode(%q, %d) = %v: above ceiling %v", m, req, got, ceiling)
+			}
+			if req >= agentmode.ModeAdvisory && got > req {
+				t.Errorf("ClampMode(%q, %v) = %v: raised the request", m, req, got)
+			}
+			if got < agentmode.ModeAdvisory {
+				t.Errorf("ClampMode(%q, %d) = %d: below ADVISORY", m, req, got)
+			}
+		}
+	}
+	if ToolHostedCeiling != agentmode.ModeIssuesAndPRs {
+		t.Fatalf("tool-hosted ceiling = %v", ToolHostedCeiling)
+	}
+	// PostureFor hands out a copy: mutating it changes nothing.
+	p, _ := PostureFor(ModeToolHosted)
+	p.Ceiling = agentmode.ModeIssuesPRsMerge
+	_ = p
+	if got := ClampMode(ModeToolHosted, agentmode.ModeIssuesPRsMerge); got != agentmode.ModeIssuesAndPRs {
+		t.Fatalf("mutated posture copy raised the clamp to %v", got)
 	}
 }
 
 func TestClampModeNeverGrantsMerge(t *testing.T) {
-	for _, m := range []string{ModeOff, ModeShadow, ModeReportOnly, ModeToolHosted, ModeGitHubMediated, "bogus"} {
+	for _, m := range []string{ModeOff, ModeShadow, ModeReportOnly, ModeToolHosted, "bogus"} {
 		if got := ClampMode(m, agentmode.ModeIssuesPRsMerge); got.CanMerge() {
 			t.Errorf("%s: clamp kept merge (%v)", m, got)
 		}
@@ -56,14 +105,14 @@ func TestClampModeNeverGrantsMerge(t *testing.T) {
 	if got := ClampMode(ModeToolHosted, agentmode.ModeIssuesOnly); got != agentmode.ModeIssuesOnly {
 		t.Fatalf("clamp raised a lower request: %v", got)
 	}
-	if got := ClampMode(ModeGitHubMediated, agentmode.ModeIssuesAndPRs); got != agentmode.ModeAdvisory {
-		t.Fatalf("github-mediated granted %v", got)
+	if got := ClampMode(ModeReportOnly, agentmode.ModeIssuesAndPRs); got != agentmode.ModeAdvisory {
+		t.Fatalf("report-only granted %v", got)
 	}
 }
 
 func TestBindingRefusesUndeclaredPosture(t *testing.T) {
 	ctx := context.Background()
-	for _, mode := range []string{ModeToolHosted, ModeGitHubMediated} {
+	for _, mode := range []string{ModeToolHosted} {
 		adm := testAdmission()
 		adm.Authority.Mode = mode
 		if err := adm.Validate(); err != nil {
@@ -100,34 +149,5 @@ func TestBindingRefusesUndeclaredPosture(t *testing.T) {
 	adm := testAdmission()
 	if _, err := New(newFake(), NewMemoryStore(), nil, nil, ModeReportOnly).Dispatch(ctx, adm, testPayload()); err != nil {
 		t.Fatalf("report-only without declaration: %v", err)
-	}
-}
-
-func TestVetMediatedPR(t *testing.T) {
-	good := MediatedPR{Number: 9, Author: "octo-user", ChangedFiles: []string{"src/a.go"}, ChecksPassed: true, Approvers: []string{"maintainer"}, HiveIdentities: []string{"hivecommons-hive[bot]"}}
-	if err := VetMediatedPR(good, nil); err != nil {
-		t.Fatalf("good PR refused: %v", err)
-	}
-	cases := map[string]func(*MediatedPR){
-		"no PR number":             func(p *MediatedPR) { p.Number = 0 },
-		"checks have not passed":   func(p *MediatedPR) { p.ChecksPassed = false },
-		"protected paths":          func(p *MediatedPR) { p.ChangedFiles = append(p.ChangedFiles, ".github/workflows/ci.yml") },
-		"independent":              func(p *MediatedPR) { p.Approvers = nil },
-		"independent approving":    func(p *MediatedPR) { p.Approvers = []string{"Octo-User"} },
-		"no independent approving": func(p *MediatedPR) { p.Approvers = []string{"HiveCommons-Hive[bot]"} },
-	}
-	for want, mutate := range cases {
-		pr := good
-		pr.ChangedFiles = append([]string(nil), good.ChangedFiles...)
-		mutate(&pr)
-		err := VetMediatedPR(pr, nil)
-		if !errors.Is(err, ErrMediatedPR) || !strings.Contains(err.Error(), want) {
-			t.Errorf("%s: err = %v", want, err)
-		}
-	}
-	custom := good
-	custom.ChangedFiles = []string{"deploy/secret.yaml"}
-	if err := VetMediatedPR(custom, []string{"deploy/"}); err == nil {
-		t.Fatal("custom protected list ignored")
 	}
 }

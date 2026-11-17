@@ -22,8 +22,9 @@ import (
 type TokenEntry struct {
 	SHA256 string `json:"sha256" yaml:"sha256"`
 	Login  string `json:"login" yaml:"login"`
-	// Mode is an agentmode name (ADVISORY, ISSUES_ONLY, ISSUES_AND_PRS);
-	// anything above ISSUES_AND_PRS is clamped by the tool-hosted posture.
+	// Mode must be empty or ADVISORY: the server is read-only
+	// (hivecommons/hive#18464 phase 2), and TokenAuth refuses any other
+	// mode rather than silently downgrading it.
 	Mode string `json:"mode" yaml:"mode"`
 }
 
@@ -48,6 +49,9 @@ func TokenAuth(entries []TokenEntry) (Authenticator, error) {
 			m, ok := agentmode.ParseAgentMode(e.Mode)
 			if !ok {
 				return nil, fmt.Errorf("hivemcp: token entry %d: unknown mode %q", i, e.Mode)
+			}
+			if m != agentmode.ModeAdvisory {
+				return nil, fmt.Errorf("hivemcp: token entry %d: mode %s refused; this server is read-only and serves ADVISORY only (hivecommons/hive#18464)", i, m)
 			}
 			mode = m
 		}

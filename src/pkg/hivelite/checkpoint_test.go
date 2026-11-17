@@ -106,11 +106,27 @@ func TestCheckpointNotResumedAcrossModes(t *testing.T) {
 	if _, err := RunTriage(context.Background(), c); !errors.Is(err, turn.ErrInferenceCapacity) {
 		t.Fatal(err)
 	}
-	fix := cfg(&scripted{steps: []turn.LLMResponse{tc(hivetool.ToolTaskAbort, `{"reason":"nothing"}`)}})
-	fix.State, fix.Fix, fix.Writer = store, true, &memWriter{refs: map[string]string{}}
-	res, err := RunTriage(context.Background(), fix)
-	if err != nil || res.Resumed {
-		t.Fatalf("fix session resumed a report-only checkpoint: %+v %v", res, err)
+	// Rewrite the stored checkpoint as if a different admission (or an
+	// older shape, such as a v1 fix-mode session) had written it.
+	for _, mutate := range []func(*Checkpoint){
+		func(ck *Checkpoint) { ck.Admission = extwork.ModeToolHosted },
+		func(ck *Checkpoint) { ck.Version = 1 },
+	} {
+		ck, _ := storedCheckpoint(t, store)
+		ck.Admission, ck.Version, ck.Done = extwork.ModeReportOnly, checkpointVersion, false
+		mutate(&ck)
+		raw, _ := json.Marshal(ck)
+		key := coordstate.SessionKey("hive-lite:o/r#7")
+		_, ver, _ := store.Get(context.Background(), key)
+		if _, err := store.Put(context.Background(), key, raw, ver); err != nil {
+			t.Fatal(err)
+		}
+		next := cfg(&scripted{steps: []turn.LLMResponse{tc(hivetool.ToolTaskAbort, `{"reason":"nothing"}`)}})
+		next.State = store
+		res, err := RunTriage(context.Background(), next)
+		if err != nil || res.Resumed {
+			t.Fatalf("report-only session resumed a foreign checkpoint: %+v %v", res, err)
+		}
 	}
 }
 

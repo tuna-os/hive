@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// CommentMarker identifies the single advisory comment hive-lite keeps per
-// issue; posting upserts it rather than adding a new comment each run.
+// CommentMarker heads a rendered advisory so a reader (or the Hive App, if
+// it ever publishes one) can recognise it. hive-lite itself never posts.
 const CommentMarker = "<!-- hive-lite:triage -->"
 
 func jsonObject(key, value string) (string, error) {
@@ -15,7 +15,8 @@ func jsonObject(key, value string) (string, error) {
 	return string(b), err
 }
 
-// RenderComment formats an advisory comment for a result. model names the
+// RenderComment formats the advisory report for a result (Markdown, printed
+// to stdout or a step summary; hive-lite does not post it). model names the
 // provider/model that served the session (for transparency).
 func RenderComment(r Result, model string) string {
 	var b strings.Builder
@@ -37,9 +38,6 @@ func RenderComment(r Result, model string) string {
 		if body == "" {
 			body = r.Outcome.Summary
 		}
-	}
-	if r.Outcome.PRNumber > 0 {
-		fmt.Fprintf(&b, "**Draft PR:** #%d (tool-hosted: patches were applied by Hive, not by the model)\n\n", r.Outcome.PRNumber)
 	}
 	b.WriteString(strings.TrimSpace(body))
 	b.WriteString("\n")
