@@ -97,6 +97,12 @@ type SelfServiceHive struct {
 	// OwnershipCheckedAt is when the hub last confirmed the owner's admin
 	// permission on Repos. Zero when never checked.
 	OwnershipCheckedAt time.Time `json:"ownership_checked_at,omitempty"`
+	// RepoProofs is when the owner's admin permission was last proven, per
+	// repo, keyed by the lower-cased owner/name (#18642). Create sets every
+	// repo; a v1 PATCH sets only the repos it adds and drops the ones it
+	// removes. Records from before the field have no entries; their repos
+	// were all proven at OwnershipCheckedAt.
+	RepoProofs map[string]time.Time `json:"repo_proofs,omitempty"`
 	// LastAcceptedHeartbeatAt is the last heartbeat that passed the bearer
 	// check. Zero until the first one; the expiry sweep (selfservice_expiry.go)
 	// counts the window from here, or from CreatedAt while it is zero.
@@ -107,6 +113,29 @@ type SelfServiceHive struct {
 	// written before the field existed load as 0, which is still a valid
 	// revision.
 	Revision int64 `json:"revision,omitempty"`
+}
+
+// selfServiceProofTimes returns the per-repo proof map for repos: repos in
+// proven are stamped at; any other repo keeps its entry in prev, or gets
+// fallback (a record's OwnershipCheckedAt) when it has none. Repos not in
+// repos are dropped. prev is never modified.
+func selfServiceProofTimes(prev map[string]time.Time, repos []string, fallback, at time.Time, proven []string) map[string]time.Time {
+	stamp := make(map[string]struct{}, len(proven))
+	for _, repo := range proven {
+		stamp[strings.ToLower(repo)] = struct{}{}
+	}
+	out := make(map[string]time.Time, len(repos))
+	for _, repo := range repos {
+		key := strings.ToLower(repo)
+		if _, fresh := stamp[key]; fresh {
+			out[key] = at.UTC()
+		} else if t, ok := prev[key]; ok {
+			out[key] = t
+		} else if !fallback.IsZero() {
+			out[key] = fallback.UTC()
+		}
+	}
+	return out
 }
 
 // selfServiceETag is the strong ETag for h. It covers the ID, the creation
@@ -364,6 +393,10 @@ func (st *selfServiceStore) update(id, ifMatch string, mutate func(*SelfServiceH
 	before := *h
 	next := *h
 	next.Repos = append([]string(nil), h.Repos...)
+	next.RepoProofs = make(map[string]time.Time, len(h.RepoProofs))
+	for k, v := range h.RepoProofs {
+		next.RepoProofs[k] = v
+	}
 	if err := mutate(&next); err != nil {
 		return SelfServiceHive{}, err
 	}

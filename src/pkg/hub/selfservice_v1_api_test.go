@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Tests for the hub registration protocol v1, rollout step 1 (#18642). They
@@ -148,7 +149,7 @@ func TestHubV1Discovery(t *testing.T) {
 				d.Limits.Expiry != selfServiceExpiryDefault.String() || d.Limits.KeyRotationOverlap != selfServiceKeyRotationOverlap.String() {
 				t.Fatalf("limits = %+v", d.Limits)
 			}
-			if !reflect.DeepEqual(d.ProofMethods, []string{"github-user-token"}) {
+			if !reflect.DeepEqual(d.ProofMethods, []string{"hub-session-token"}) {
 				t.Fatalf("proof_methods = %v", d.ProofMethods)
 			}
 			if !reflect.DeepEqual(d.PatchFields, []string{"repos", "dashboard_url"}) {
@@ -342,6 +343,7 @@ func TestHubV1PatchRefusals(t *testing.T) {
 		ifMatch string // "current" = read it first, "stale" = from before a change
 		body    string
 		status  int
+		wantErr string // exact error message, when set
 	}{
 		{name: "stale etag", user: selfServiceTestUser, ifMatch: "stale", body: `{"repos":{"add":["alice/docs"]}}`, status: http.StatusPreconditionFailed},
 		{name: "made-up etag", user: selfServiceTestUser, ifMatch: `"nope"`, body: `{"repos":{"add":["alice/docs"]}}`, status: http.StatusPreconditionFailed},
@@ -351,7 +353,8 @@ func TestHubV1PatchRefusals(t *testing.T) {
 		{name: "hub admin cannot edit", user: selfServiceTestAdmin, ifMatch: "current", body: `{"dashboard_url":"https://x.example.org/"}`, status: http.StatusNotFound},
 		{name: "not admin of added repo", user: selfServiceTestUser, ifMatch: "current", body: `{"repos":{"add":["alice/readonly"]}}`, status: http.StatusForbidden},
 		{name: "added repo invisible to token", user: selfServiceTestUser, ifMatch: "current", body: `{"repos":["alice/lab","alice/secret"]}`, status: http.StatusForbidden},
-		{name: "org is not editable", user: selfServiceTestUser, ifMatch: "current", body: `{"org":"evil"}`, status: http.StatusBadRequest},
+		{name: "org is not editable", user: selfServiceTestUser, ifMatch: "current", body: `{"org":"evil"}`, status: http.StatusBadRequest, wantErr: "org is not editable; delete and re-register"},
+		{name: "org with other fields", user: selfServiceTestUser, ifMatch: "current", body: `{"org":"evil","dashboard_url":"https://x.example.org/"}`, status: http.StatusBadRequest, wantErr: "org is not editable; delete and re-register"},
 		{name: "key is not editable", user: selfServiceTestUser, ifMatch: "current", body: `{"key_hash":"00"}`, status: http.StatusBadRequest},
 		{name: "empty patch", user: selfServiceTestUser, ifMatch: "current", body: `{}`, status: http.StatusBadRequest},
 		{name: "remove every repo", user: selfServiceTestUser, ifMatch: "current", body: `{"repos":{"remove":["alice/lab","alice/tools"]}}`, status: http.StatusBadRequest},
@@ -381,6 +384,11 @@ func TestHubV1PatchRefusals(t *testing.T) {
 			rec := env.v1Patch(t, tc.user, id, ifMatch, tc.body)
 			if rec.Code != tc.status {
 				t.Fatalf("status = %d, want %d (%s)", rec.Code, tc.status, rec.Body.String())
+			}
+			if tc.wantErr != "" {
+				if got := decodeError(t, rec)["error"]; got != tc.wantErr {
+					t.Fatalf("error = %q, want %q", got, tc.wantErr)
+				}
 			}
 			after, _ := env.s.selfService.get(id)
 			if !reflect.DeepEqual(before, after) {
@@ -412,17 +420,21 @@ func TestHubV1ConfigurableRepoCap(t *testing.T) {
 		return string(b)
 	}
 	cases := []struct {
-		name        string
-		env         string
-		registerN   int
-		wantCreate  int
-		patchAddN   int // extra repos a PATCH adds after a successful create
-		wantPatch   int
-		wantPatchIn string
+		name         string
+		env          string
+		registerN    int
+		v1Create     bool // create through POST /api/hub/v1/registrations
+		wantCreate   int
+		wantCreateIn string
+		patchAddN    int // extra repos a PATCH adds after a successful create
+		wantPatch    int
+		wantPatchIn  string
 	}{
 		{name: "default 20 refuses 21 on create", env: "", registerN: 21, wantCreate: http.StatusBadRequest},
 		{name: "default 20 accepts 20", env: "", registerN: 20, wantCreate: http.StatusCreated},
 		{name: "raised cap accepts 21", env: "25", registerN: 21, wantCreate: http.StatusCreated},
+		{name: "v1 create over the cap is 413 naming the limit", env: "", registerN: 21, v1Create: true, wantCreate: http.StatusRequestEntityTooLarge, wantCreateIn: `"limit":"max_repos"`},
+		{name: "v1 create at the cap", env: "", registerN: 20, v1Create: true, wantCreate: http.StatusCreated},
 		{name: "patch past the cap is 413 naming the limit", env: "22", registerN: 21, wantCreate: http.StatusCreated, patchAddN: 2, wantPatch: http.StatusRequestEntityTooLarge, wantPatchIn: `"limit":"max_repos"`},
 		{name: "patch up to the cap", env: "22", registerN: 21, wantCreate: http.StatusCreated, patchAddN: 1, wantPatch: http.StatusOK},
 	}
@@ -432,10 +444,21 @@ func TestHubV1ConfigurableRepoCap(t *testing.T) {
 			t.Setenv(selfServiceMaxReposEnv, tc.env)
 			all := repos(tc.registerN + tc.patchAddN)
 			body := fmt.Sprintf(`{"name":"big","repos":%s}`, quoted(all[:tc.registerN]))
-			// The v6 route reads the same cap.
-			rec := env.register(t, selfServiceTestUser, body)
+			// The v6 route reads the same cap but keeps its 400.
+			var rec *httptest.ResponseRecorder
+			if tc.v1Create {
+				rec = env.v1(t, selfServiceTestUser, http.MethodPost, hubV1BasePath+"/registrations", body, nil, env.s.handleHubV1Create)
+			} else {
+				rec = env.register(t, selfServiceTestUser, body)
+			}
 			if rec.Code != tc.wantCreate {
 				t.Fatalf("create: %d, want %d (%s)", rec.Code, tc.wantCreate, rec.Body.String())
+			}
+			if tc.wantCreateIn != "" && !strings.Contains(rec.Body.String(), tc.wantCreateIn) {
+				t.Fatalf("create body %s lacks %s", rec.Body.String(), tc.wantCreateIn)
+			}
+			if tc.wantCreate != http.StatusCreated && len(env.s.selfService.list()) != 0 {
+				t.Fatal("refused create stored a record")
 			}
 			if tc.patchAddN == 0 {
 				return
@@ -580,7 +603,7 @@ func TestHubV1LegacyRoutesUnchanged(t *testing.T) {
 			if tc.rec.Header().Get("ETag") != "" {
 				t.Fatal("v6 route started sending an ETag")
 			}
-			for _, leaked := range []string{`"etag"`, `"revision"`, `"key_hash"`} {
+			for _, leaked := range []string{`"etag"`, `"revision"`, `"key_hash"`, `"repo_proofs"`} {
 				if strings.Contains(tc.rec.Body.String(), leaked) {
 					t.Fatalf("v6 body gained %s: %s", leaked, tc.rec.Body.String())
 				}
@@ -609,5 +632,86 @@ func TestHubV1LegacyRoutesUnchanged(t *testing.T) {
 	del := env.remove(t, selfServiceTestUser, hubV1TestID)
 	if del.Code != http.StatusOK || !reflect.DeepEqual(topKeys(t, del), []string{"id", "removed"}) {
 		t.Fatalf("v6 delete: %d %s", del.Code, del.Body.String())
+	}
+}
+
+// TestHubV1RepoProofs checks the per-repo proof times: create stamps every
+// repo, a PATCH stamps only the repos it adds, keeps the others' times, and
+// drops a removed repo's entry. A record from before the field reports
+// OwnershipCheckedAt for every repo.
+func TestHubV1RepoProofs(t *testing.T) {
+	proofsOf := func(t *testing.T, env *selfServiceTestEnv) map[string]time.Time {
+		t.Helper()
+		rec := env.v1Get(t, selfServiceTestUser, hubV1TestID)
+		out := map[string]time.Time{}
+		for _, p := range decodeV1Registration(t, rec).RepoProofs {
+			out[p.Repo] = p.CheckedAt
+		}
+		return out
+	}
+	cases := []struct {
+		name       string
+		legacy     bool // strip RepoProofs as a pre-#18642 record would have none
+		patch      string
+		wantRepos  []string
+		wantFresh  []string // proof time moved past the create's
+		wantSameAs []string // proof time equals the create's
+	}{
+		{name: "create stamps every repo", wantRepos: []string{"alice/lab", "alice/tools"}, wantSameAs: []string{"alice/lab", "alice/tools"}},
+		{name: "add stamps only the new repo", patch: `{"repos":{"add":["alice/docs"]}}`, wantRepos: []string{"alice/lab", "alice/tools", "alice/docs"}, wantFresh: []string{"alice/docs"}, wantSameAs: []string{"alice/lab", "alice/tools"}},
+		{name: "remove keeps the rest", patch: `{"repos":{"remove":["alice/tools"]}}`, wantRepos: []string{"alice/lab"}, wantSameAs: []string{"alice/lab"}},
+		{name: "url edit keeps every proof", patch: `{"dashboard_url":""}`, wantRepos: []string{"alice/lab", "alice/tools"}, wantSameAs: []string{"alice/lab", "alice/tools"}},
+		{name: "legacy record reads OwnershipCheckedAt", legacy: true, wantRepos: []string{"alice/lab", "alice/tools"}, wantSameAs: []string{"alice/lab", "alice/tools"}},
+		{name: "legacy record add keeps the fallback", legacy: true, patch: `{"repos":{"add":["alice/site"]}}`, wantRepos: []string{"alice/lab", "alice/tools", "alice/site"}, wantFresh: []string{"alice/site"}, wantSameAs: []string{"alice/lab", "alice/tools"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newHubV1TestEnv(t)
+			id, _ := env.registerHappy(t)
+			created, _ := env.s.selfService.get(id)
+			if len(created.RepoProofs) != 2 {
+				t.Fatalf("create stored proofs %v", created.RepoProofs)
+			}
+			for repo, at := range created.RepoProofs {
+				if !at.Equal(created.OwnershipCheckedAt) {
+					t.Fatalf("create proof for %s = %v, want %v", repo, at, created.OwnershipCheckedAt)
+				}
+			}
+			if tc.legacy {
+				if _, err := env.s.selfService.update(id, "", func(h *SelfServiceHive) error { h.RepoProofs = nil; return nil }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.patch != "" {
+				// Make sure a fresh stamp is distinguishable from the create's.
+				time.Sleep(2 * time.Millisecond)
+				if rec := env.v1Patch(t, selfServiceTestUser, id, env.etagOf(t, id), tc.patch); rec.Code != http.StatusOK {
+					t.Fatalf("PATCH: %d %s", rec.Code, rec.Body.String())
+				}
+			}
+			got := proofsOf(t, env)
+			if len(got) != len(tc.wantRepos) {
+				t.Fatalf("repo_proofs = %v, want repos %v", got, tc.wantRepos)
+			}
+			for _, repo := range tc.wantRepos {
+				if _, ok := got[repo]; !ok {
+					t.Fatalf("repo_proofs lacks %s: %v", repo, got)
+				}
+			}
+			for _, repo := range tc.wantSameAs {
+				if !got[repo].Equal(created.OwnershipCheckedAt) {
+					t.Errorf("%s proof = %v, want the create's %v", repo, got[repo], created.OwnershipCheckedAt)
+				}
+			}
+			for _, repo := range tc.wantFresh {
+				if !got[repo].After(created.OwnershipCheckedAt) {
+					t.Errorf("%s proof = %v, want after %v", repo, got[repo], created.OwnershipCheckedAt)
+				}
+			}
+			after, _ := env.s.selfService.get(id)
+			if !after.OwnershipCheckedAt.Equal(created.OwnershipCheckedAt) {
+				t.Error("OwnershipCheckedAt moved; legacy readers rely on it")
+			}
+		})
 	}
 }

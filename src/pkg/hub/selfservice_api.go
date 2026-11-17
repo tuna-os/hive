@@ -440,7 +440,7 @@ func (s *HubServer) handleSelfServiceRegister(w http.ResponseWriter, r *http.Req
 	if !s.requireSelfServiceEnabled(w) {
 		return
 	}
-	stored, rawKey, ok := s.selfServiceRegisterCore(w, r)
+	stored, rawKey, ok := s.selfServiceRegisterCore(w, r, false)
 	if !ok {
 		return
 	}
@@ -458,8 +458,9 @@ func (s *HubServer) handleSelfServiceRegister(w http.ResponseWriter, r *http.Req
 // selfServiceRegisterCore validates a registration body, runs the ownership
 // proof and stores the record. It writes every refusal itself and returns
 // ok=false; on success it writes nothing, so the v6 route and the v1 resource
-// route (selfservice_v1_api.go) can each shape their own 201 body.
-func (s *HubServer) selfServiceRegisterCore(w http.ResponseWriter, r *http.Request) (SelfServiceHive, string, bool) {
+// route (selfservice_v1_api.go) can each shape their own 201 body. v1 selects
+// the v1 over-cap answer (413 naming the limit); the v6 route keeps its 400.
+func (s *HubServer) selfServiceRegisterCore(w http.ResponseWriter, r *http.Request, v1 bool) (SelfServiceHive, string, bool) {
 	login := s.getAuthUser(r)
 	user := loadSaaSUser(login)
 	if user == nil {
@@ -503,6 +504,10 @@ func (s *HubServer) selfServiceRegisterCore(w http.ResponseWriter, r *http.Reque
 	repos, err := selfServiceValidateRepos(body.Repos)
 	if err != nil {
 		s.auditSelfServiceRefused(login, id, selfServiceRefusedInvalidRepos)
+		if maxRepos := selfServiceMaxRepos(); v1 && len(body.Repos) > maxRepos {
+			writeHubV1RepoCapError(w, err, maxRepos)
+			return SelfServiceHive{}, "", false
+		}
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return SelfServiceHive{}, "", false
 	}
@@ -529,6 +534,7 @@ func (s *HubServer) selfServiceRegisterCore(w http.ResponseWriter, r *http.Reque
 	maxPerUser := selfServiceMaxPerUser()
 	rawKey, err := s.selfService.registerCapped(SelfServiceHive{
 		ID: id, Owner: login, Org: org, Repos: repos, DashboardURL: dashboardURL, OwnershipCheckedAt: now,
+		RepoProofs: selfServiceProofTimes(nil, repos, time.Time{}, now, repos),
 	}, maxPerUser)
 	if err != nil {
 		if errors.Is(err, errSelfServiceExists) {

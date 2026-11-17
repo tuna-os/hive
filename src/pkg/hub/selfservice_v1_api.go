@@ -33,6 +33,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -42,9 +43,11 @@ const (
 	hubV1Protocol = "hive-hub-registration"
 	// hubV1ProtocolVersion is the protocol version discovery advertises.
 	hubV1ProtocolVersion = "1"
-	// hubV1ProofGitHubUserToken is the only ownership proof step 1 offers: the
-	// hub checks permissions.admin on each repo with the caller's GitHub token.
-	hubV1ProofGitHubUserToken = "github-user-token"
+	// hubV1ProofHubSessionToken is the only ownership proof step 1 offers: the
+	// hub checks permissions.admin on each repo with the GitHub token stored at
+	// hub sign-in. The RFC's github-user-token (a per-request token with
+	// explicit scopes) is rollout step 2 and is not advertised until it exists.
+	hubV1ProofHubSessionToken = "hub-session-token"
 )
 
 // hubV1Operation is one entry in the discovery operations list.
@@ -85,14 +88,47 @@ func (s *HubServer) registerHubV1Routes() {
 }
 
 // hubV1RegistrationView is a v6 view plus the record's ETag, so a list
-// response carries a usable precondition for every item.
+// response carries a usable precondition for every item, and the per-repo
+// proof times.
 type hubV1RegistrationView struct {
 	selfServiceHiveView
-	ETag string `json:"etag"`
+	ETag       string           `json:"etag"`
+	RepoProofs []hubV1RepoProof `json:"repo_proofs"`
+}
+
+// hubV1RepoProof is when the owner's admin permission on one repo was last
+// proven.
+type hubV1RepoProof struct {
+	Repo      string    `json:"repo"`
+	CheckedAt time.Time `json:"checked_at"`
 }
 
 func (s *HubServer) hubV1View(h SelfServiceHive) hubV1RegistrationView {
-	return hubV1RegistrationView{selfServiceHiveView: selfServiceView(h, s.selfServiceOnline(h.ID)), ETag: selfServiceETag(h)}
+	proofs := make([]hubV1RepoProof, 0, len(h.Repos))
+	for _, repo := range h.Repos {
+		at, ok := h.RepoProofs[strings.ToLower(repo)]
+		if !ok {
+			// A record from before per-repo proofs: every repo was proven
+			// when the record was.
+			at = h.OwnershipCheckedAt
+		}
+		proofs = append(proofs, hubV1RepoProof{Repo: repo, CheckedAt: at})
+	}
+	return hubV1RegistrationView{
+		selfServiceHiveView: selfServiceView(h, s.selfServiceOnline(h.ID)),
+		ETag:                selfServiceETag(h),
+		RepoProofs:          proofs,
+	}
+}
+
+// writeHubV1RepoCapError is the v1 over-cap answer for create and PATCH: 413
+// naming the limit, so a client can read it without parsing the message.
+func writeHubV1RepoCapError(w http.ResponseWriter, err error, maxRepos int) {
+	writeHubV1JSON(w, http.StatusRequestEntityTooLarge, "", hubV1RepoCapBody(err, maxRepos))
+}
+
+func hubV1RepoCapBody(err error, maxRepos int) map[string]any {
+	return map[string]any{"error": err.Error(), "limit": "max_repos", "max_repos": maxRepos}
 }
 
 func writeHubV1JSON(w http.ResponseWriter, code int, etag string, body any) {
@@ -121,7 +157,7 @@ func (s *HubServer) handleHubV1Discovery(w http.ResponseWriter, r *http.Request)
 			"expiry":               selfServiceExpiry().String(),
 			"key_rotation_overlap": selfServiceKeyRotationOverlap.String(),
 		},
-		"proof_methods": []string{hubV1ProofGitHubUserToken},
+		"proof_methods": []string{hubV1ProofHubSessionToken},
 	})
 }
 
@@ -131,7 +167,7 @@ func (s *HubServer) handleHubV1Create(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSelfServiceEnabled(w) {
 		return
 	}
-	stored, rawKey, ok := s.selfServiceRegisterCore(w, r)
+	stored, rawKey, ok := s.selfServiceRegisterCore(w, r, true)
 	if !ok {
 		return
 	}
@@ -266,9 +302,7 @@ func hubV1PlanRepos(current []string, raw json.RawMessage) (next, added []string
 	next, err := selfServiceValidateRepos(proposed)
 	if err != nil {
 		if maxRepos := selfServiceMaxRepos(); len(proposed) > maxRepos {
-			return nil, nil, false, &hubV1PatchError{code: http.StatusRequestEntityTooLarge, body: map[string]any{
-				"error": err.Error(), "limit": "max_repos", "max_repos": maxRepos,
-			}}
+			return nil, nil, false, &hubV1PatchError{code: http.StatusRequestEntityTooLarge, body: hubV1RepoCapBody(err, maxRepos)}
 		}
 		return nil, nil, false, hubV1Refuse(http.StatusBadRequest, err.Error())
 	}
@@ -317,6 +351,15 @@ func (s *HubServer) handleHubV1Patch(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "could not read the request body")
 		return
 	}
+	// org changes who the record speaks for, so it is not an edit: refuse it
+	// by name rather than as an unknown field.
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) == nil {
+		if _, ok := fields["org"]; ok {
+			writeJSONError(w, http.StatusBadRequest, "org is not editable; delete and re-register")
+			return
+		}
+	}
 	var body hubV1PatchRequest
 	if err := decodeStrict(data, &body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body; only repos and dashboard_url can be changed")
@@ -357,6 +400,9 @@ func (s *HubServer) handleHubV1Patch(w http.ResponseWriter, r *http.Request) {
 	stored, err := s.selfService.update(h.ID, ifMatch, func(rec *SelfServiceHive) error {
 		rec.Repos = nextRepos
 		rec.DashboardURL = nextURL
+		// Added repos are stamped now; kept repos keep their proof time; a
+		// removed repo's entry goes, so re-adding it needs a new proof.
+		rec.RepoProofs = selfServiceProofTimes(rec.RepoProofs, nextRepos, rec.OwnershipCheckedAt, time.Now(), added)
 		return nil
 	})
 	if err != nil {
