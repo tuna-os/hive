@@ -54,6 +54,16 @@ var inheritedCredentialEnvVars = []string{
 	"LINEAR_CLIENT_ID",
 	"LINEAR_CLIENT_SECRET",
 	"LINEAR_WEBHOOK_SECRET",
+	// Hive credentials. agentExecEnv already keeps them out of the server's
+	// environment; removing them here as well hides them from panes of a
+	// server that was started before that change.
+	"DASHBOARD_AUTH_TOKEN",
+	"HIVE_DASHBOARD_TOKEN",
+	"HIVE_HUB_SECRET",
+	"HIVE_TERMINAL_KEY",
+	"HIVE_TTYD_CREDENTIAL",
+	"HIVE_SESSION_KEY",
+	"HIVE_MIRROR_HUB_HEARTBEAT_KEY",
 }
 
 // githubTokenEnvVars are the environment variables gh, git tooling and the
@@ -245,11 +255,17 @@ func (m *Manager) tmuxCmd(agent *AgentProcess, args ...string) *exec.Cmd {
 
 	base := m.tmuxBaseArgs(agent)
 	tmuxArgs := append(base[1:], args...)
+	var cmd *exec.Cmd
 	if agent.UID > 0 {
 		suExecArgs := append([]string{m.agentExecUserSpec(agent), base[0]}, tmuxArgs...)
-		return exec.Command("su-exec", suExecArgs...)
+		cmd = exec.Command("su-exec", suExecArgs...)
+	} else {
+		cmd = exec.Command(base[0], tmuxArgs...)
 	}
-	return exec.Command(base[0], tmuxArgs...)
+	// A tmux client runs as the agent's user, so its environ is readable by
+	// the agent, and a client that starts the server hands it its environment.
+	cmd.Env = agentExecEnv()
+	return cmd
 }
 
 func validateTmuxKillSessionArgs(args []string) error {
@@ -283,16 +299,12 @@ func validateTmuxKillSessionArgs(args []string) error {
 	return nil
 }
 
-func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
-	if m.tmuxSessionExistsForAgent(agent) {
-		return nil
-	}
-
-	agentDir := m.workDir + "/" + agent.Name
-	if err := os.MkdirAll(agentDir, 0o755); err != nil {
-		return fmt.Errorf("creating agent work dir %s: %w", agentDir, err)
-	}
-
+// tmuxServerStartCmd is the command ensureTmuxSession runs to create the
+// agent's session, which also starts the agent's tmux server. The server
+// keeps this command's environment for its whole life, in its global
+// environment and in its own /proc/<pid>/environ, both readable by the agent.
+// So it gets agentExecEnv, never the hive's environment.
+func (m *Manager) tmuxServerStartCmd(agent *AgentProcess, agentDir string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if agent.UID > 0 {
 		suExecArgs := []string{"su-exec", m.agentExecUserSpec(agent)}
@@ -303,6 +315,21 @@ func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
 		tmuxArgs := append(base[1:], newSessionCommands(agent.tmuxSession, agentDir)...)
 		cmd = exec.Command(base[0], tmuxArgs...)
 	}
+	cmd.Env = agentExecEnv()
+	return cmd
+}
+
+func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
+	if m.tmuxSessionExistsForAgent(agent) {
+		return nil
+	}
+
+	agentDir := m.workDir + "/" + agent.Name
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		return fmt.Errorf("creating agent work dir %s: %w", agentDir, err)
+	}
+
+	cmd := m.tmuxServerStartCmd(agent, agentDir)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return outputErr(fmt.Sprintf("creating tmux session for %s", agent.Name), err, output)
 	}
@@ -313,7 +340,9 @@ func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
 	// agent user who owns the directory. Use su-exec to chmod as the agent.
 	if agent.UID > 0 {
 		tmuxDir := fmt.Sprintf("/tmp/tmux-%d", agent.UID)
-		_ = exec.Command("su-exec", m.agentExecUserSpec(agent), "chmod", "710", tmuxDir).Run()
+		chmod := exec.Command("su-exec", m.agentExecUserSpec(agent), "chmod", "710", tmuxDir)
+		chmod.Env = agentExecEnv()
+		_ = chmod.Run()
 	}
 
 	// Pre-create the agent-owned CODEX_HOME before launch (codex won't create

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -79,7 +78,7 @@ func installJevSkill(dir, userSpec string) error {
 		}
 		return os.WriteFile(path, jev.SkillMarkdown(), 0o644)
 	}
-	if out, err := exec.Command("su-exec", userSpec, "mkdir", "-p", dir).CombinedOutput(); err != nil {
+	if out, err := suExec(userSpec, "mkdir", "-p", dir).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkdir %s as %s: %w: %s", dir, userSpec, err, string(out))
 	}
 	return writeFileAsUser(userSpec, path, jev.SkillMarkdown())
@@ -102,7 +101,7 @@ func removeJevSkill(dir, userSpec string) (bool, error) {
 		return err == nil, nil
 	}
 	script := `if [ -e "$1" ]; then rm -f -- "$1" && echo removed; fi; rmdir -- "$2" 2>/dev/null; exit 0`
-	out, err := exec.Command("su-exec", userSpec, "sh", "-c", script, "sh", path, dir).CombinedOutput()
+	out, err := suExec(userSpec, "sh", "-c", script, "sh", path, dir).CombinedOutput()
 	if err != nil {
 		return false, fmt.Errorf("removing %s as %s: %w: %s", path, userSpec, err, string(out))
 	}

@@ -95,6 +95,17 @@ default_socket_candidates() {
   done
 }
 
+# AGENT_CLIENT_ENV is the whole environment of a tmux client this script runs
+# as an agent's user. ttyd, and so this script, has the hive's environment,
+# with the dashboard token (the owner credential on the dashboard API) and the
+# hub secret in it. A process running as the agent's user exposes its
+# environment to that agent in /proc/<pid>/environ, and the attach client lives
+# as long as the browser terminal is open. `env -i` runs as this script's user,
+# before su-exec, so no process owned by the agent ever holds those values.
+AGENT_CLIENT_ENV=("PATH=${PATH}" "TERM=${TERM:-xterm-256color}" "LANG=${LANG:-C.UTF-8}")
+[ -n "${LC_ALL:-}" ] && AGENT_CLIENT_ENV+=("LC_ALL=${LC_ALL}")
+[ -n "${TZ:-}" ] && AGENT_CLIENT_ENV+=("TZ=${TZ}")
+
 socket_has_session() {
   local socket="$1"
   local owner_uid owner_gid owner_spec current_uid
@@ -104,7 +115,7 @@ socket_has_session() {
   current_uid=$(id -u)
   if [ -n "$owner_uid" ] && [ "$owner_uid" != "$current_uid" ] && command -v su-exec >/dev/null 2>&1; then
     owner_spec="${owner_uid}:${owner_gid}"
-    run=(su-exec "$owner_spec")
+    run=(env -i "${AGENT_CLIENT_ENV[@]}" su-exec "$owner_spec")
   fi
   "${run[@]}" tmux -S "$socket" has-session -t "$SESSION" 2>/dev/null
 }
@@ -290,7 +301,7 @@ attach_with() {
 }
 
 if [ -n "$SOCK_OWNER_UID" ] && [ "$SOCK_OWNER_UID" != "$CURRENT_UID" ] && command -v su-exec >/dev/null 2>&1; then
-  attach_with su-exec "$SOCK_OWNER_SPEC"
+  attach_with env -i "${AGENT_CLIENT_ENV[@]}" su-exec "$SOCK_OWNER_SPEC"
   exit $?
 else
   attach_with

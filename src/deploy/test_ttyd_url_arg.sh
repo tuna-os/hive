@@ -94,7 +94,7 @@ pass "flag assembly extracted from src/deploy/entrypoint.sh (not restated here)"
 # change what is measured. `ttyd` is a shell function, so nothing is executed.
 render_argv() {
   (
-    unset HIVE_TTYD_PORT HIVE_TTYD_BIND HIVE_TTYD_CREDENTIAL HIVE_DASHBOARD_TOKEN
+    unset HIVE_TTYD_PORT HIVE_TTYD_BIND HIVE_TTYD_SOCKET HIVE_TTYD_CREDENTIAL HIVE_DASHBOARD_TOKEN
     for kv in "$@"; do export "${kv?}"; done
     ttyd() { printf '%s\n' "$@"; }
     # shellcheck disable=SC1090
@@ -167,38 +167,42 @@ check_case() {
     fi
   fi
 
-  # The loopback bind is the primary control from #2178 — ttyd is a writable
-  # terminal into the container that holds the GitHub credentials.
+  # The loopback bind is the control from #2178 in this (opt-in TCP) mode —
+  # ttyd is a writable terminal into the container that holds the GitHub
+  # credentials.
   if has_arg "$out" "127.0.0.1"; then
-    pass "${label}: ttyd still binds loopback by default"
+    pass "${label}: ttyd binds the requested loopback address"
   else
-    fail "${label}: ttyd still binds loopback by default" \
+    fail "${label}: ttyd binds the requested loopback address" \
          "$(tr '\n' ' ' < "$out")"
   fi
   rm -f "$out"
 }
 
 echo ""
-echo "--- the argv ttyd is actually started with ---"
+echo "--- the argv ttyd is started with when HIVE_TTYD_BIND asks for TCP ---"
+# These cases cover the opt-in loopback/TCP mode. The default (a unix socket,
+# no credential) is checked further down.
+LB=HIVE_TTYD_BIND=127.0.0.1
 
 # The branch that was NOT broken. Kept so a fix that only moves the bug around
 # — say, making -a conditional the other way — still fails here.
-check_case "no credential" no
+check_case "no credential" no "$LB"
 
 # THE REGRESSION. HIVE_DASHBOARD_TOKEN is generated unconditionally by
 # bin/hive-podman-setup.sh, so this is the configuration nearly every hive runs.
-check_case "dashboard token" yes HIVE_DASHBOARD_TOKEN=t0ken-abc123
+check_case "dashboard token" yes "$LB" HIVE_DASHBOARD_TOKEN=t0ken-abc123
 
 # An operator-supplied credential takes the same path.
-check_case "explicit credential" yes HIVE_TTYD_CREDENTIAL=hive:t0ken-xyz789
+check_case "explicit credential" yes "$LB" HIVE_TTYD_CREDENTIAL=hive:t0ken-xyz789
 
 # Both set: the explicit credential wins, and -a survives that branch too.
-check_case "both set" yes HIVE_DASHBOARD_TOKEN=t0ken-abc123 HIVE_TTYD_CREDENTIAL=hive:t0ken-xyz789
+check_case "both set" yes "$LB" HIVE_DASHBOARD_TOKEN=t0ken-abc123 HIVE_TTYD_CREDENTIAL=hive:t0ken-xyz789
 
 # The explicit credential really is the one used, so "both set" above is not
 # silently testing the dashboard-token path twice.
 BOTH="${WORK}/both.argv"
-render_argv HIVE_DASHBOARD_TOKEN=t0ken-abc123 HIVE_TTYD_CREDENTIAL=hive:t0ken-xyz789 > "$BOTH" 2>/dev/null
+render_argv "$LB" HIVE_DASHBOARD_TOKEN=t0ken-abc123 HIVE_TTYD_CREDENTIAL=hive:t0ken-xyz789 > "$BOTH" 2>/dev/null
 if has_arg "$BOTH" "hive:t0ken-xyz789"; then
   pass "HIVE_TTYD_CREDENTIAL takes precedence over HIVE_DASHBOARD_TOKEN"
 else
@@ -208,11 +212,59 @@ fi
 # The dashboard token is wrapped as hive:<token>, which is the username the
 # proxy authenticates with.
 TOK="${WORK}/tok.argv"
-render_argv HIVE_DASHBOARD_TOKEN=t0ken-abc123 > "$TOK" 2>/dev/null
+render_argv "$LB" HIVE_DASHBOARD_TOKEN=t0ken-abc123 > "$TOK" 2>/dev/null
 if has_arg "$TOK" "hive:t0ken-abc123"; then
   pass "a dashboard token is passed as hive:<token>"
 else
   fail "a dashboard token is passed as hive:<token>" "$(tr '\n' ' ' < "$TOK")"
+fi
+
+# --- default: a private unix socket and nothing secret in argv ---------------
+# Every user in the container, agents included, can read /proc/<pid>/cmdline,
+# and on loopback TCP every local user can connect. So by default ttyd listens
+# on a unix socket in a directory only dev can enter, and gets no credential:
+# with -c the dashboard token (the owner credential on the dashboard API) was
+# readable by every agent for as long as ttyd ran.
+echo ""
+echo "--- default: unix socket, no credential on the command line ---"
+SOCK_PATH=/tmp/hive-ttyd.TESTONLY/ttyd.sock
+for creds in "HIVE_DASHBOARD_TOKEN=t0ken-abc123" "HIVE_TTYD_CREDENTIAL=hive:t0ken-xyz789"; do
+  SOCKV="${WORK}/sock.argv"
+  render_argv HIVE_TTYD_SOCKET="$SOCK_PATH" "$creds" > "$SOCKV" 2>/dev/null
+  echo "     ${creds%%=*}: $(tr '\n' ' ' < "$SOCKV" | sed 's/t0ken-[^ ]*/<REDACTED>/g')"
+  if grep -q 't0ken-' "$SOCKV" || has_arg "$SOCKV" "-c"; then
+    fail "${creds%%=*}: no credential on ttyd's command line" \
+         "every user in the container can read /proc/<pid>/cmdline"
+  else
+    pass "${creds%%=*}: no credential on ttyd's command line"
+  fi
+  if has_arg "$SOCKV" "-i" && has_arg "$SOCKV" "$SOCK_PATH" && ! has_arg "$SOCKV" "127.0.0.1"; then
+    pass "${creds%%=*}: ttyd listens on the unix socket, not on loopback"
+  else
+    fail "${creds%%=*}: ttyd listens on the unix socket, not on loopback" "$(tr '\n' ' ' < "$SOCKV")"
+  fi
+  if has_arg "$SOCKV" "-a"; then
+    pass "${creds%%=*}: ttyd keeps -a (--url-arg) on the socket"
+  else
+    fail "${creds%%=*}: ttyd keeps -a (--url-arg) on the socket" "$(tr '\n' ' ' < "$SOCKV")"
+  fi
+  rm -f "$SOCKV"
+done
+
+# The socket path must end in .sock (ttyd only treats such a -i value as a
+# unix socket), live in a fresh 0700 directory, and be exported before the Go
+# binary and the Node proxy start, since both connect to it.
+SOCK_LINE=$(grep -n 'mktemp -d /tmp/hive-ttyd\.' "$ENTRYPOINT" | head -1 | cut -d: -f1)
+HIVE_LINE=$(grep -n '^hive "\$@" &' "$ENTRYPOINT" | head -1 | cut -d: -f1)
+PROXY_LINE=$(grep -n 'node server.js &' "$ENTRYPOINT" | head -1 | cut -d: -f1)
+if [ -n "$SOCK_LINE" ] && [ -n "$HIVE_LINE" ] && [ -n "$PROXY_LINE" ] \
+   && [ "$SOCK_LINE" -lt "$HIVE_LINE" ] && [ "$SOCK_LINE" -lt "$PROXY_LINE" ] \
+   && grep -q 'chmod 700 "\$_ttyd_dir"' "$ENTRYPOINT" \
+   && grep -q 'HIVE_TTYD_SOCKET="\${_ttyd_dir}/ttyd.sock"' "$ENTRYPOINT"; then
+  pass "the ttyd socket directory is created 0700 before the hive and the proxy start"
+else
+  fail "the ttyd socket directory is created 0700 before the hive and the proxy start" \
+       "socket:${SOCK_LINE:-?} hive:${HIVE_LINE:-?} proxy:${PROXY_LINE:-?}"
 fi
 
 # --- the credential must not be logged ---------------------------------------

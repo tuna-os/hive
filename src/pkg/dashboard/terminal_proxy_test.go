@@ -32,6 +32,7 @@ func startFakeTtyd(t *testing.T) (lastURL *string) {
 		t.Fatalf("splitting backend addr: %v", err)
 	}
 	t.Setenv("HIVE_TTYD_PORT", port)
+	t.Setenv("HIVE_TTYD_SOCKET", "") // this fake listens on TCP
 	return &last
 }
 

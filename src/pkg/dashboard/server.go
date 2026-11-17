@@ -2062,13 +2062,28 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		r.Header.Del("X-Hive-Role")
 		r.Header.Del(ownerRoleVerifiedHeader)
 
+		// sharedTokenRefused is checked only after the shared token matched:
+		// the token is refused from a process running as an agent's user (see
+		// shared_token_peer.go). Evaluated at most once per request.
+		var tokenRefusal *bool
+		sharedTokenRefused := func() bool {
+			if tokenRefusal == nil {
+				refused := sharedTokenFromAgentUser(r.RemoteAddr)
+				if refused && s.logger != nil {
+					s.logger.Warn("dashboard token presented by an agent user; refused", "remote", r.RemoteAddr, "path", r.URL.Path)
+				}
+				tokenRefusal = &refused
+			}
+			return *tokenRefusal
+		}
+
 		trustProxyIdentity := func(markOwner bool) (bool, string) {
 			if directRouteAuthz || inboundUser == "" || inboundRole == "" {
 				return false, ""
 			}
 			proof := r.Header.Get(proxyAuthHeader)
 			switch {
-			case proof != "" && s.authToken != "" && secureCompare(proof, s.authToken):
+			case proof != "" && s.authToken != "" && secureCompare(proof, s.authToken) && !sharedTokenRefused():
 				r.Header.Set("X-Hive-User", inboundUser)
 				r.Header.Set("X-Hive-Role", inboundRole)
 				if markOwner && isOwnerRole(inboundRole) {
@@ -2145,7 +2160,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		// is TRUE, so without this an absent/empty header would authenticate on
 		// a direct-route spoke that has no token. The shared-token paths are only
 		// valid when a real token is configured.
-		internalTrusted := s.authToken != "" && secureCompare(r.Header.Get("X-Hive-Internal"), s.authToken)
+		internalTrusted := s.authToken != "" && secureCompare(r.Header.Get("X-Hive-Internal"), s.authToken) && !sharedTokenRefused()
 		trusted := internalTrusted
 		if internalTrusted {
 			if sess := s.sessionFromRequest(r); sess != nil {
@@ -2281,7 +2296,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		if !trusted && !directRouteAuthz && s.authToken != "" {
 			token := r.Header.Get("Authorization")
 			expected := "Bearer " + s.authToken
-			if secureCompare(token, expected) || secureCompare(token, s.authToken) {
+			if (secureCompare(token, expected) || secureCompare(token, s.authToken)) && !sharedTokenRefused() {
 				trusted = true
 				// Same reasoning as the X-Hive-Internal path above: the shared
 				// dashboard token is the operator credential, and the dashboard

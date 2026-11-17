@@ -40,7 +40,7 @@ var runAsAgentUser = func(spec string, stdin []byte, argv ...string) ([]byte, er
 	ctx, cancel := context.WithTimeout(context.Background(), claudeSessionAdoptTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "su-exec", append([]string{spec}, argv...)...)
+	cmd := suExecContext(ctx, append([]string{spec}, argv...)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Stdout = &stdout
