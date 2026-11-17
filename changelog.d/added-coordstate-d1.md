@@ -1,1 +1,1 @@
-- `pkg/coordstate` adds a Cloudflare D1 driver (per-row version CAS over the D1 HTTP query API) and `coordstate.Open`, so hive-lite and hive-mcp accept `-state d1:<account>/<database>` (or `memory`); a `github` spec is refused as a GitHub write.
+- `pkg/coordstate` adds a Cloudflare D1 driver (per-row version CAS over the D1 HTTP query API), deferred and unwired per RFC #18464, and `coordstate.Open`, which accepts only `memory`: `github` specs are refused as a GitHub write and `d1:` specs as a deferred serverless store, so hive-lite and hive-mcp keep state in memory.

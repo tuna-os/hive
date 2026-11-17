@@ -16,7 +16,7 @@ func jsonObject(key, value string) (string, error) {
 }
 
 // RenderComment formats the advisory report for a result (Markdown, printed
-// to stdout or a step summary; hive-lite does not post it). model names the
+// to stdout; hive-lite does not post or publish it). model names the
 // provider/model that served the session (for transparency).
 func RenderComment(r Result, model string) string {
 	var b strings.Builder

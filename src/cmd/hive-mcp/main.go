@@ -40,7 +40,7 @@ func main() {
 	tokens := flag.String("tokens", "", "JSON file of hashed bearer tokens")
 	addr := flag.String("addr", "127.0.0.1:8765", "listen address")
 	checkout := flag.String("checkout", "", "local checkout for repo_search_code (pkg/codeindex)")
-	state := flag.String("state", "", "session store for stateless hosting: \"d1:<account-id>/<database-id>\" (CLOUDFLARE_API_TOKEN); empty or \"memory\" keeps sessions in memory. A GitHub-branch store is not selectable: it would be a GitHub write")
+	state := flag.String("state", "", "session store: only empty or \"memory\" (sessions stay in this process). GitHub-branch and D1 stores are not selectable (hivecommons/hive#18464)")
 	hash := flag.String("hash-token", "", "print the sha256 for a token and exit")
 	flag.Parse()
 	if *hash != "" {
@@ -95,7 +95,7 @@ func run(repo, ref, label, tokensPath, addr, checkout, stateSpec string) error {
 		}
 		cfg.Searcher = hivetool.CodeIndexSearcher{Index: func() *codeindex.Index { return idx }}
 	}
-	store, err := coordstate.Open(stateSpec, cfToken())
+	store, err := coordstate.Open(stateSpec)
 	if err != nil {
 		return err
 	}
@@ -131,14 +131,4 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
-}
-
-// cfToken is the Cloudflare token for a d1: state store.
-func cfToken() string {
-	for _, k := range []string{"HIVE_STATE_CF_TOKEN", "CLOUDFLARE_API_TOKEN"} {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
-		}
-	}
-	return ""
 }

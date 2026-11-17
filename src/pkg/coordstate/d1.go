@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+// D1Store is deferred and unwired: per the maintainer decision on
+// hivecommons/hive#18464, serverless stores wait until phase 1 shows
+// advisory quality, so Open refuses "d1:" specs and no binary constructs
+// one. The code is kept for that later phase.
+//
 // D1Store keeps keys as rows in a Cloudflare D1 table through the D1 HTTP
 // query API, so it works from any host (a hosted CI runner, a Worker, a
 // laptop). The Version is a per-row integer: create is INSERT ... ON

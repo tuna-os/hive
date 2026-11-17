@@ -199,29 +199,20 @@ func TestD1StoreErrors(t *testing.T) {
 
 func TestOpen(t *testing.T) {
 	for _, spec := range []string{"", "memory"} {
-		if s, err := Open(spec, "cf"); s != nil || err != nil {
+		if s, err := Open(spec); s != nil || err != nil {
 			t.Fatalf("%q = %v %v", spec, s, err)
 		}
 	}
-	s, err := Open("d1:acct/db", "cf")
-	if d, ok := s.(*D1Store); err != nil || !ok || d.AccountID != "acct" || d.DatabaseID != "db" {
-		t.Fatalf("d1 = %+v %v", s, err)
-	}
-	if tok, _ := s.(*D1Store).Token(context.Background()); tok != "cf" {
-		t.Fatal("d1 token")
-	}
-	// The GitHub Contents driver is a GitHub write and never selectable.
-	for _, spec := range []string{"github", "github:a/b@state"} {
-		s, err := Open(spec, "cf")
-		if s != nil || err == nil || !strings.Contains(err.Error(), "GitHub write") {
-			t.Errorf("%q = %v %v; want a GitHub-write refusal", spec, s, err)
-		}
-	}
-	for _, bad := range []struct{ spec, cf string }{
-		{"d1:acct", "cf"}, {"d1:acct/db/x", "cf"}, {"d1:acct/db", ""}, {"s3:bucket", "cf"},
+	// Durable drivers are never selectable: GitHub is a GitHub write, and
+	// serverless stores are deferred (hivecommons/hive#18464).
+	for spec, why := range map[string]string{
+		"github": "GitHub write", "github:a/b@state": "GitHub write",
+		"d1:acct/db": "deferred", "d1:acct": "deferred",
+		"s3:bucket": "unknown store",
 	} {
-		if _, err := Open(bad.spec, bad.cf); err == nil {
-			t.Errorf("%q accepted", bad.spec)
+		s, err := Open(spec)
+		if s != nil || err == nil || !strings.Contains(err.Error(), why) {
+			t.Errorf("%q = %v %v; want a refusal mentioning %q", spec, s, err, why)
 		}
 	}
 }

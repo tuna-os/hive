@@ -11,8 +11,8 @@
 // triages, and prints the advisory and a JSON result to stdout. It never
 // writes to GitHub: no comments, labels, branches, commits or pull
 // requests, and its GitHub calls are all GETs. Any GitHub write belongs to
-// the Hive App. The only state it can write is an optional -state d1:...
-// checkpoint store outside GitHub.
+// the Hive App. State lives in process memory only: durable stores are
+// deferred, so it writes nothing anywhere.
 //
 // gateways.yaml is an ordered failover list; each entry is a Hive Model
 // Gateway (same fields as governor.gateways in hive.yaml) plus an optional
@@ -83,7 +83,7 @@ func main() {
 	finishAfter := flag.Int("finish-after", 8, "turn at which only task.complete/task.abort are offered")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline")
 	verbose := flag.Bool("v", false, "log each step to stderr")
-	state := flag.String("state", "", "checkpoint store: empty or \"memory\" keeps state in this process; \"d1:<account-id>/<database-id>\" (CLOUDFLARE_API_TOKEN with D1 write) lets a run paused for capacity resume and persists the router ledger. A GitHub-branch store is not selectable: it would be a GitHub write")
+	state := flag.String("state", "", "checkpoint store: only empty or \"memory\" (state stays in this process). GitHub-branch and D1 stores are not selectable (hivecommons/hive#18464)")
 	flag.Parse()
 	if err := run(*repo, *issue, *ref, *gatewaysPath, *checkout, *state, *allowTraining, *maxTurns, *finishAfter, *timeout, *verbose); err != nil {
 		fmt.Fprintln(os.Stderr, "hive-lite:", err)
@@ -143,7 +143,7 @@ func run(repo string, issue int, ref, gatewaysPath, checkout, stateSpec string, 
 	// state store it is loaded from and flushed back to the store, so daily
 	// caps and cooldowns hold across passes.
 	var ledger llmrouter.Ledger = llmrouter.NewMemoryLedger()
-	store, err := coordstate.Open(stateSpec, cfToken())
+	store, err := coordstate.Open(stateSpec)
 	if err != nil {
 		return err
 	}
@@ -327,14 +327,4 @@ func (g *githubClient) repoInfo(ctx context.Context, repo string) (repoInfo, err
 	// "internal" (enterprise) repositories are not public either.
 	r.Private = r.Private || (r.Visibility != "" && r.Visibility != "public")
 	return r, nil
-}
-
-// cfToken is the Cloudflare token for a d1: state store.
-func cfToken() string {
-	for _, k := range []string{"HIVE_STATE_CF_TOKEN", "CLOUDFLARE_API_TOKEN"} {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
-		}
-	}
-	return ""
 }
