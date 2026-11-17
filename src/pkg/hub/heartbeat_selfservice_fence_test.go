@@ -32,6 +32,9 @@ func TestHeartbeatResponseFieldFenceInventory(t *testing.T) {
 	}
 	var stale []string
 	for name := range heartbeatResponseFieldFence {
+		if _, upstreamOnly := heartbeatFenceUpstreamOnlyFields[name]; upstreamOnly {
+			continue
+		}
 		if !seen[name] {
 			stale = append(stale, name)
 		}
@@ -40,6 +43,16 @@ func TestHeartbeatResponseFieldFenceInventory(t *testing.T) {
 		sort.Strings(stale)
 		t.Errorf("heartbeatResponseFieldFence names fields HeartbeatResponse no longer has: %v", stale)
 	}
+}
+
+// heartbeatFenceUpstreamOnlyFields are fields the fence (backported unchanged
+// from hivecommons/hive) classifies but tuna/v6's HeartbeatResponse does not
+// have yet. The stale check skips them so the fence file can stay identical
+// to upstream; drop an entry when an upstream sync adds the field here.
+var heartbeatFenceUpstreamOnlyFields = map[string]struct{}{
+	"ActivityETag":      {},
+	"ActivityEventsAck": {},
+	"UpgradeAnnounce":   {},
 }
 
 // The fields the RFC names explicitly must stay fenced, so a later edit to the
