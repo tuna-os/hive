@@ -1,7 +1,9 @@
 package dashboard
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -29,6 +31,11 @@ const terminalPathPrefix = "/terminal"
 // Resolved once at proxy construction and never logged: the pass half IS the
 // dashboard token on every default deployment.
 func ttydCredential() (user, pass string, ok bool) {
+	if ttydSocket() != "" {
+		// On the private unix socket ttyd runs without a credential; see
+		// ttydSocket.
+		return "", "", false
+	}
 	cred := os.Getenv("HIVE_TTYD_CREDENTIAL")
 	if cred == "" {
 		if tok := os.Getenv("HIVE_DASHBOARD_TOKEN"); tok != "" {
@@ -40,6 +47,15 @@ func ttydCredential() (user, pass string, ok bool) {
 	}
 	user, pass, _ = strings.Cut(cred, ":")
 	return user, pass, true
+}
+
+// ttydSocket is the unix socket deploy/entrypoint.sh starts ttyd on by
+// default (HIVE_TTYD_SOCKET), in a directory only the hive's user can enter.
+// ttyd has no credential there: no other user, agents included, can connect,
+// and a credential on ttyd's command line is readable by every user in the
+// container. Empty when an operator set HIVE_TTYD_BIND and ttyd is on TCP.
+func ttydSocket() string {
+	return strings.TrimSpace(os.Getenv("HIVE_TTYD_SOCKET"))
 }
 
 // ttydPort resolves the local ttyd port, falling back to the default on an
@@ -85,8 +101,22 @@ func ttydPort() int {
 // authenticated the browser to the dashboard, not to ttyd.
 func (s *Server) registerTerminalProxy() {
 	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", ttydPort())}
+	var transport http.RoundTripper
+	if sock := ttydSocket(); sock != "" {
+		target.Host = "localhost"
+		var d net.Dialer
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return d.DialContext(ctx, "unix", sock)
+			},
+			// ttyd serves one request per connection (see the Node proxy's
+			// keepAlive:false agent); do not reuse one.
+			DisableKeepAlives: true,
+		}
+	}
 	ttydUser, ttydPass, ttydCredentialed := ttydCredential()
 	proxy := &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Header.Del("Authorization")

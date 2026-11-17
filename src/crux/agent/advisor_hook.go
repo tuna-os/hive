@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -200,7 +199,7 @@ func (m *Manager) provisionAdvisorHooks(agent *AgentProcess, backend string) {
 	user := m.agentExecUserSpec(agent)
 	if !m.advisorHooksActive(agent, backend) {
 		if existing, err := readFileAsUser(user, path); err == nil && strings.Contains(string(existing), advisorhook.HookSubcommand) {
-			if err := exec.Command("su-exec", user, "rm", "-f", path).Run(); err != nil {
+			if err := suExec(user, "rm", "-f", path).Run(); err != nil {
 				m.logger.Warn("failed to remove stale advisor hook file", "agent", agent.Name, "path", path, "error", err)
 			}
 		}
@@ -213,7 +212,7 @@ func (m *Manager) provisionAdvisorHooks(agent *AgentProcess, backend string) {
 	if len(content) == 0 {
 		return
 	}
-	if err := exec.Command("su-exec", user, "mkdir", "-p", filepath.Dir(path)).Run(); err != nil {
+	if err := suExec(user, "mkdir", "-p", filepath.Dir(path)).Run(); err != nil {
 		m.logger.Warn("failed to create advisor hook directory; agent launches without the advisor", "agent", agent.Name, "dir", filepath.Dir(path), "error", err)
 		return
 	}
@@ -275,7 +274,7 @@ func (m *Manager) trustCodexAdvisorHook(userSpec, hooksPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), codexHookTrustTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "su-exec", userSpec, "env", "CODEX_HOME="+home,
+	cmd := suExecContext(ctx, userSpec, "env", "CODEX_HOME="+home,
 		binary, "app-server", "--listen", "stdio://")
 	// Never the manager's own environment: it carries hub-only secrets
 	// (HIVE_GITHUB_TOKEN, HIVE_HUB_SECRET, ...) and this process runs as the

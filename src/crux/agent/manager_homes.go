@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -83,7 +82,7 @@ func (m *Manager) setupCodexHome(agent *AgentProcess) {
 	dir := codexHomePath(agent.Name)
 	agentUser := m.agentExecUserSpec(agent)
 	salvagedConfig := m.healCodexHomeOwnership(agent, dir, agentUser)
-	if err := exec.Command("su-exec", agentUser, "mkdir", "-p", dir).Run(); err != nil {
+	if err := suExec(agentUser, "mkdir", "-p", dir).Run(); err != nil {
 		m.logger.Error("failed to pre-create codex home; codex cannot start without it, and a later run may create it under the wrong identity", "agent", agent.Name, "dir", dir, "error", err)
 	}
 	configPath := filepath.Join(dir, "config.toml")
@@ -114,7 +113,7 @@ func (m *Manager) setupCodexHome(agent *AgentProcess) {
 	// overwrites a stale regular-file auth.json left by an earlier codex version.
 	// The symlink target need not exist yet (a later `codex login` creates it).
 	authLink := filepath.Join(dir, "auth.json")
-	if err := exec.Command("su-exec", agentUser, "ln", "-sfn", codexSharedAuthFile, authLink).Run(); err != nil {
+	if err := suExec(agentUser, "ln", "-sfn", codexSharedAuthFile, authLink).Run(); err != nil {
 		m.logger.Warn("failed to link codex auth", "agent", agent.Name, "link", authLink, "error", err)
 	}
 }
@@ -179,7 +178,7 @@ func lineEnding(line string) string {
 }
 
 func readFileAsUser(userSpec, path string) ([]byte, error) {
-	cmd := exec.Command("su-exec", userSpec, "cat", path)
+	cmd := suExec(userSpec, "cat", path)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, outputErr(fmt.Sprintf("reading %s as %s", path, userSpec), err, output)
@@ -274,7 +273,7 @@ func (m *Manager) chownCodexHomeToAgent(agent *AgentProcess, dir string) error {
 // harness that performs the same re-owning without the SUID helper (which
 // exists only inside the image). Production always uses the exec below.
 var chownTreeAsRoot = func(dir, spec string) error {
-	cmd := exec.Command("su-exec", codexHomeChownUserSpec, "chown", "-Rh", spec, dir)
+	cmd := suExec(codexHomeChownUserSpec, "chown", "-Rh", spec, dir)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return outputErr(fmt.Sprintf("chown -Rh %s %s", spec, dir), err, output)
 	}
@@ -290,7 +289,7 @@ var chownTreeAsRoot = func(dir, spec string) error {
 // succeeds immediately. Keep this as an exec, not a Go walk.
 // It is a var for the same test-substitution reason as chownTreeAsRoot.
 var removeTreeAsRoot = func(dir string) error {
-	cmd := exec.Command("su-exec", codexHomeChownUserSpec, "rm", "-rf", dir)
+	cmd := suExec(codexHomeChownUserSpec, "rm", "-rf", dir)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return outputErr(fmt.Sprintf("rm -rf %s", dir), err, output)
 	}
@@ -309,7 +308,7 @@ func (m *Manager) healForeignCodexConfig(agent *AgentProcess, dir, agentUser str
 		return nil
 	}
 	salvaged, readErr := os.ReadFile(cfgPath)
-	if err := exec.Command("su-exec", agentUser, "rm", "-f", cfgPath).Run(); err != nil {
+	if err := suExec(agentUser, "rm", "-f", cfgPath).Run(); err != nil {
 		m.logger.Error("codex config.toml is owned by the wrong UID and could not be removed; codex will fail until it is chowned or removed manually", "agent", agent.Name, "path", cfgPath, "ownerUID", owner, "wantUID", agent.UID, "error", err)
 		return nil
 	}
@@ -339,7 +338,7 @@ func fileOwnerUID(path string) int {
 // cannot chown). The `sh -c 'cat > "$1"'` form keeps the path out of shell
 // parsing entirely.
 func writeFileAsUser(userSpec, path string, content []byte) error {
-	cmd := exec.Command("su-exec", userSpec, "sh", "-c", `cat > "$1"`, "sh", path)
+	cmd := suExec(userSpec, "sh", "-c", `cat > "$1"`, "sh", path)
 	cmd.Stdin = strings.NewReader(string(content))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return outputErr(fmt.Sprintf("writing %s as %s", path, userSpec), err, output)

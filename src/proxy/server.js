@@ -6,6 +6,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { installOutputLog } from './output_log.js';
+import { peerIsAgentUser } from './peer_uid.js';
 
 // Keep everything this proxy prints as the "proxy" log source (#11944); it
 // still goes to the container's stdout/stderr unchanged.
@@ -18,15 +19,24 @@ const GO_API_PORT = parseInt(process.env.HIVE_API_PORT || '3002', 10);
 const GO_API_URL = process.env.HIVE_API_URL || `http://127.0.0.1:${GO_API_PORT}`;
 const TTYD_PORT = parseInt(process.env.HIVE_TTYD_PORT || '7681', 10);
 const TTYD_URL = `http://127.0.0.1:${TTYD_PORT}`;
+// HIVE_TTYD_SOCKET is the unix socket deploy/entrypoint.sh starts ttyd on by
+// default, in a directory only this process's user can enter. ttyd then has no
+// credential, because no other user can connect to it. Without it (an operator
+// set HIVE_TTYD_BIND), ttyd is on TCP as before.
+const TTYD_SOCKET = (process.env.HIVE_TTYD_SOCKET || '').trim();
+const TTYD_TARGET = TTYD_SOCKET
+  ? { socketPath: TTYD_SOCKET, protocol: 'http:', host: 'localhost' }
+  : TTYD_URL;
 const DASHBOARD_TOKEN = process.env.HIVE_DASHBOARD_TOKEN || '';
 // The basic-auth credential ttyd itself was started with — the same precedence
-// as deploy/entrypoint.sh: explicit HIVE_TTYD_CREDENTIAL, else
-// hive:<HIVE_DASHBOARD_TOKEN>, else none. The /terminal route presents it to
-// ttyd on every forwarded request (see ttydProxy) so an already-authenticated
-// browser is never re-challenged with ttyd's own user/password dialog. Never
-// logged: the password half is the dashboard token on default deployments.
-const TTYD_CREDENTIAL = process.env.HIVE_TTYD_CREDENTIAL
-  || (DASHBOARD_TOKEN ? `hive:${DASHBOARD_TOKEN}` : '');
+// as deploy/entrypoint.sh: none on the unix socket; on TCP an explicit
+// HIVE_TTYD_CREDENTIAL, else hive:<HIVE_DASHBOARD_TOKEN>, else none. The
+// /terminal route presents it to ttyd on every forwarded request (see
+// ttydProxy) so an already-authenticated browser is never re-challenged with
+// ttyd's own user/password dialog. Never logged: on TCP the password half is
+// the dashboard token unless HIVE_TTYD_CREDENTIAL is set.
+const TTYD_CREDENTIAL = TTYD_SOCKET ? '' : (process.env.HIVE_TTYD_CREDENTIAL
+  || (DASHBOARD_TOKEN ? `hive:${DASHBOARD_TOKEN}` : ''));
 const TTYD_AUTHORIZATION = TTYD_CREDENTIAL
   ? 'Basic ' + Buffer.from(TTYD_CREDENTIAL).toString('base64')
   : '';
@@ -1024,6 +1034,14 @@ app.use((req, res, next) => {
   // to a verified owner — including GET /api/config/download, which returns
   // the raw hive.yaml verbatim (issue #7695).
   req.hiveTokenVerified = bearerTokenMatches(req.headers.authorization);
+  // The token is the owner credential. From a process running as an agent's
+  // user it is refused: see peer_uid.js. The Authorization header is dropped
+  // too, or the Go API would accept the same bearer from this proxy.
+  if (req.hiveTokenVerified && peerIsAgentUser(req.socket)) {
+    console.warn(`[SECURITY] dashboard token presented by an agent user from ${req.socket.remoteAddress}:${req.socket.remotePort}; refused`);
+    req.hiveTokenVerified = false;
+    delete req.headers.authorization;
+  }
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
     if (PUBLIC_POST_PATHS.some(p => req.url.startsWith(p))) return next();
     if (PUBLIC_POST_EXACT.has(req.url.split('?')[0])) return next();
@@ -1168,7 +1186,7 @@ const terminalGoProxy = createProxyMiddleware({
 });
 
 const ttydProxy = createProxyMiddleware({
-  target: TTYD_URL,
+  target: TTYD_TARGET,
   changeOrigin: true,
   // ttyd (libwebsockets) serves ONE request per TCP connection and hangs up
   // on any reuse. Without an explicit agent, httpxy (the proxy engine) pools

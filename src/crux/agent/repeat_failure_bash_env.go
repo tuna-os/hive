@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -279,7 +278,7 @@ func ensureRepeatFailureRecordDirAs(userSpec, recordPath string) error {
 		return EnsureRepeatFailureRecordDir(recordPath, 0)
 	}
 	dir := filepath.Dir(recordPath)
-	if out, err := exec.Command("su-exec", userSpec, "sh", "-c", `umask 077 && mkdir -p "$1" && chmod 700 "$1"`, "sh", dir).CombinedOutput(); err != nil {
+	if out, err := suExec(userSpec, "sh", "-c", `umask 077 && mkdir -p "$1" && chmod 700 "$1"`, "sh", dir).CombinedOutput(); err != nil {
 		return outputErr("creating "+dir+" as "+userSpec, err, out)
 	}
 	return nil
@@ -343,7 +342,7 @@ func (m *Manager) removeRepeatFailureFile(agent *AgentProcess, path, header stri
 			err = nil
 		}
 	} else {
-		err = exec.Command("su-exec", userSpec, "rm", "-f", path).Run()
+		err = suExec(userSpec, "rm", "-f", path).Run()
 	}
 	if err != nil {
 		m.logger.Warn("repeat-failure: removing a stale route file failed", "agent", agent.Name, "path", path, "error", err)

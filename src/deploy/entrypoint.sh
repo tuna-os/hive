@@ -2911,6 +2911,26 @@ hive_ensure_terminal_signing_key() {
 }
 hive_ensure_terminal_signing_key
 
+# ── ttyd socket ──────────────────────────────────────────────────────────
+# ttyd is a writable terminal into every agent's session. On loopback TCP every
+# local user could connect to it, agents included, so its password had to be
+# on its command line (-c), and every user in the container can read that in
+# /proc/<pid>/cmdline. That password was the dashboard token, the owner
+# credential on the dashboard API. Instead ttyd listens on a unix socket in a
+# directory only this user (dev) can enter: the Node proxy and the Go
+# dashboard, both dev, reach it, and no agent user can, so no password is
+# needed. Exported before the Go binary and the Node proxy start, because
+# both connect to it. HIVE_TTYD_BIND keeps the old loopback/TCP mode for an
+# operator who sets it on purpose.
+if [ -z "${HIVE_TTYD_BIND:-}" ] && [ -z "${HIVE_TTYD_SOCKET:-}" ]; then
+  if _ttyd_dir="$(mktemp -d /tmp/hive-ttyd.XXXXXXXX)" && chmod 700 "$_ttyd_dir"; then
+    HIVE_TTYD_SOCKET="${_ttyd_dir}/ttyd.sock"
+    export HIVE_TTYD_SOCKET
+  else
+    echo "[entrypoint] ERROR: could not create a private directory for the ttyd socket; the browser terminal is disabled" >&2
+  fi
+fi
+
 echo "[entrypoint] Starting Go binary on :${HIVE_API_PORT} (uid=$(id -u))"
 hive "$@" &
 HIVE_PID=$!
@@ -2977,16 +2997,28 @@ PROXY_PID=$!
 
 TTYD_PORT="${HIVE_TTYD_PORT:-7681}"
 # SECURITY: ttyd is a WRITABLE terminal into the container that holds the GitHub
-# credentials, so :7681 must NEVER be reachable directly — the only path to it is
-# the Node proxy's /terminal route, which authenticates first (cookie on hosted
-# hives, ?token= on self-hosted). It binds to loopback so nothing on the pod
-# network (or a raw nginx stream proxy) can reach it without going through that
-# gate. As defense in depth, ttyd is additionally credentialed when a dashboard
-# token is available.
-TTYD_BIND="${HIVE_TTYD_BIND:-127.0.0.1}"
-TTYD_CRED="${HIVE_TTYD_CREDENTIAL:-}"
-if [ -z "$TTYD_CRED" ] && [ -n "${HIVE_DASHBOARD_TOKEN:-}" ]; then
-  TTYD_CRED="hive:${HIVE_DASHBOARD_TOKEN}"
+# credentials, so it must NEVER be reachable directly — the only path to it is
+# the Node proxy's /terminal route (or the Go dashboard's), which authenticates
+# first (cookie on hosted hives, ?token= on self-hosted).
+#
+# By default it listens on the unix socket HIVE_TTYD_SOCKET (see "ttyd socket"
+# above): -i with a path ending in .sock. Only dev can enter its directory, so
+# neither the pod network nor an agent user can connect, and ttyd runs without
+# a credential: there is nothing secret on its command line.
+#
+# With HIVE_TTYD_BIND set, ttyd listens on that address and port as before and
+# is credentialed when a dashboard token is available. Any local user can then
+# read that credential from /proc/<pid>/cmdline, so set HIVE_TTYD_CREDENTIAL to
+# a value that is not the dashboard token if you need this mode.
+TTYD_BIND="${HIVE_TTYD_BIND:-}"
+TTYD_CRED=""
+if [ -n "$TTYD_BIND" ]; then
+  TTYD_CRED="${HIVE_TTYD_CREDENTIAL:-}"
+  if [ -z "$TTYD_CRED" ] && [ -n "${HIVE_DASHBOARD_TOKEN:-}" ]; then
+    TTYD_CRED="hive:${HIVE_DASHBOARD_TOKEN}"
+  fi
+elif [ -n "${HIVE_TTYD_SOCKET:-}" ]; then
+  TTYD_BIND="${HIVE_TTYD_SOCKET}"
 fi
 # CRED_ARGS carries ONLY the credential. --url-arg (-a) is passed unconditionally
 # on the ttyd command line below and must never live in here: #4593 was caused by
@@ -2999,10 +3031,12 @@ CRED_ARGS=""
 if [ -n "$TTYD_CRED" ]; then
   CRED_ARGS="-c ${TTYD_CRED}"
 fi
-echo "[entrypoint] Starting ttyd on ${TTYD_BIND}:${TTYD_PORT}"
+echo "[entrypoint] Starting ttyd on ${TTYD_BIND:-<nothing: no socket>}"
 # Wrap ttyd in a respawn loop: ttyd exits on SIGHUP (its close signal),
 # and orphaned LISTEN sockets block rebind, so we wait before retrying.
 TTYD_RESPAWN_DELAY_SECS=5
+TTYD_PID=""
+if [ -n "$TTYD_BIND" ]; then
 (
   trap '' HUP
   while true; do
@@ -3018,6 +3052,7 @@ TTYD_RESPAWN_DELAY_SECS=5
   done
 ) &
 TTYD_PID=$!
+fi
 
 cleanup() {
   echo "[entrypoint] Shutting down..."
