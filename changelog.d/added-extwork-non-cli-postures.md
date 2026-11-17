@@ -1,0 +1,1 @@
+- `pkg/extwork` adds the `tool-hosted` admission mode (RFC #18464): an adapter must declare it before the binding admits it, its ceiling is permanently ISSUES_AND_PRS, and `ClampMode` never returns a mode above the request, the posture's ceiling or ISSUES_AND_PRS. There is no mode in which a vendor agent writes to GitHub; GitHub writes stay with the Hive App.
