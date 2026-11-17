@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -273,7 +274,9 @@ func (m *Manager) chownCodexHomeToAgent(agent *AgentProcess, dir string) error {
 // harness that performs the same re-owning without the SUID helper (which
 // exists only inside the image). Production always uses the exec below.
 var chownTreeAsRoot = func(dir, spec string) error {
-	cmd := suExec(codexHomeChownUserSpec, "chown", "-Rh", spec, dir)
+	// A direct exec, not suExec, so codex_home_nfs_safety_test can see it.
+	cmd := exec.Command("su-exec", codexHomeChownUserSpec, "chown", "-Rh", spec, dir)
+	cmd.Env = agentExecEnv()
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return outputErr(fmt.Sprintf("chown -Rh %s %s", spec, dir), err, output)
 	}
@@ -289,7 +292,9 @@ var chownTreeAsRoot = func(dir, spec string) error {
 // succeeds immediately. Keep this as an exec, not a Go walk.
 // It is a var for the same test-substitution reason as chownTreeAsRoot.
 var removeTreeAsRoot = func(dir string) error {
-	cmd := suExec(codexHomeChownUserSpec, "rm", "-rf", dir)
+	// A direct exec, not suExec, so codex_home_nfs_safety_test can see it.
+	cmd := exec.Command("su-exec", codexHomeChownUserSpec, "rm", "-rf", dir)
+	cmd.Env = agentExecEnv()
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return outputErr(fmt.Sprintf("rm -rf %s", dir), err, output)
 	}
