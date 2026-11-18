@@ -15,6 +15,7 @@ import (
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/effects"
+	"github.com/hivecommons/hive/pkg/prstatus"
 	"github.com/hivecommons/hive/pkg/review"
 )
 
@@ -77,6 +78,11 @@ type ReviewRequest struct {
 	// instead of adding another one. Only honored for repos in
 	// Review.ReviseRepos; see review_revise.go.
 	Revise bool `json:"revise,omitempty"`
+	// Comments are line-anchored findings (hivecommons/hive#18531),
+	// submitted with Body in the SAME create-review call: one review, one
+	// notification, one resolvable thread per comment. A comment the diff
+	// cannot anchor is folded into Body. See review_inline_comments.go.
+	Comments []ReviewInlineComment `json:"comments,omitempty"`
 }
 
 // ReviewResponse is written next to a consumed request as <name>.result.json.
@@ -298,6 +304,26 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 	threadID := strings.TrimSpace(req.ThreadID)
 	// A "comment" that names a thread is an in-thread reply, not a PR review.
 	threadReply := okEvent && apiEvent == "COMMENT" && threadID != ""
+	// Quiet notification mode: a clean review — the one-line acknowledgement
+	// ("**Reviewed** — no findings from …"), or a narrated body that says it
+	// has no findings while its verdict report approves with none
+	// (review.CleanReview; the plain reviewer lanes write the latter,
+	// hivecommons/hive#16433) — is recorded as a verdict and never
+	// submitted. Submitting it emails the author and every watcher to say
+	// nothing happened; the verdict still reaches the evidence bundle and
+	// the Activity Monitor, and the body is folded into the PR's status
+	// comment below so the reasoning is not lost. The request keeps its
+	// report, so the shape checks below treat it exactly as record_verdict.
+	noFindingsSuppressed := false
+	if okEvent && !recordOnly && !resolveThread && threadID == "" && !req.Revise && len(req.Comments) == 0 &&
+		c.notificationsQuiet() && strings.TrimSpace(req.Report) != "" {
+		reports, _ := review.ValidateReportsFor([]byte(strings.TrimSpace(req.Report)), c.perspectives)
+		if review.CleanReview(req.Body, reports) {
+			recordOnly = true
+			noFindingsSuppressed = true
+			req.Event = ReviewEventRecordVerdict
+		}
+	}
 	// Validate shape BEFORE authorizing or touching the API — a hopeless request
 	// must never retry.
 	var shapeErr string
@@ -314,6 +340,10 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 		shapeErr = "thread_id is only valid with event comment (reply) or resolve_thread"
 	case okEvent && apiEvent != "APPROVE" && strings.TrimSpace(req.Body) == "":
 		shapeErr = "review request body is required for request_changes/comment"
+	case len(req.Comments) > 0 && (recordOnly || resolveThread || threadID != ""):
+		shapeErr = "inline comments are only valid on a PR-level review (approve|request_changes|comment)"
+	case len(req.Comments) > 0 && inlineCommentsShapeError(req.Comments) != "":
+		shapeErr = inlineCommentsShapeError(req.Comments)
 	case !recordOnly && !resolveThread && strings.TrimSpace(req.Body) != "":
 		// A finding whose evidence is text a secret scrubber already masked
 		// is wrong by construction (hivecommons/hive#8067). Refuse it here
@@ -462,6 +492,17 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 	// state record_verdict and a note, so the agent's own loop is done.
 	if !recordOnly && !req.Revise && apiEvent != "APPROVE" {
 		if reason := c.perHeadReviewRefusal(ctx, req); reason != "" {
+			if c.notificationsQuiet() && strings.TrimSpace(req.Body) != "" {
+				// The head already carries its one hive review. The
+				// findings are not dropped: they go into the PR's status
+				// comment, edited in place, where a later perspective's
+				// findings for the same head join them without another
+				// review submission (and another email).
+				if _, ferr := c.UpsertPRStatusSection(ctx, req.Repo, req.Number, prstatus.KeyReviewFindingsPrefix+verdictSlug(req.Agent), reviewFindingsSection(req)); ferr != nil {
+					c.logger.Warn("review-request watcher: could not fold findings into the status comment",
+						slog.String("repo", req.Repo), slog.Int("number", req.Number), slog.String("error", ferr.Error()))
+				}
+			}
 			c.recordReviewEvidence(ctx, req, c.recordReviewVerdict(ctx, req, ""), nil, nowFn())
 			if err := c.fileOutOfScopeReviewBacklog(ctx, req, nowFn().UTC()); err != nil {
 				c.logger.Warn("review-request watcher: could not file out-of-scope backlog",
@@ -481,35 +522,69 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 	// Authorized and well-formed, but nothing to post: record and finish
 	// without touching the GitHub API.
 	if recordOnly {
+		if noFindingsSuppressed {
+			// The clean verdict lands in the status comment, edited in
+			// place, instead of a review submission of its own.
+			if _, ferr := c.UpsertPRStatusSection(ctx, req.Repo, req.Number, prstatus.KeyReviewFindingsPrefix+verdictSlug(req.Agent), reviewNoFindingsSection(req)); ferr != nil {
+				c.logger.Warn("review-request watcher: could not fold the clean verdict into the status comment",
+					slog.String("repo", req.Repo), slog.Int("number", req.Number), slog.String("error", ferr.Error()))
+			}
+		}
 		c.recordReviewEvidence(ctx, req, c.recordReviewVerdict(ctx, req, ""), nil, nowFn())
 		if err := c.fileOutOfScopeReviewBacklog(ctx, req, nowFn().UTC()); err != nil {
 			c.logger.Warn("review-request watcher: could not file out-of-scope backlog",
 				slog.String("repo", req.Repo), slog.Int("number", req.Number),
 				slog.String("error", err.Error()))
 		}
-		c.writeReviewResult(path, ReviewResponse{OK: true, Number: req.Number, State: ReviewEventRecordVerdict, At: nowFn().UTC().Format(time.RFC3339)})
+		resp := ReviewResponse{OK: true, Number: req.Number, State: ReviewEventRecordVerdict, At: nowFn().UTC().Format(time.RFC3339)}
+		if noFindingsSuppressed {
+			resp.Note = reviewNoFindingsSuppressedNote
+		}
+		c.writeReviewResult(path, resp)
 		_ = os.Remove(path)
 		c.reviewRetries.clear(path)
 		c.logger.Info("review-request watcher: verdict recorded without a comment",
 			slog.String("repo", req.Repo), slog.Int("number", req.Number),
-			slog.String("agent", req.Agent))
+			slog.String("agent", req.Agent), slog.Bool("no_findings_suppressed", noFindingsSuppressed))
 		return
 	}
 
 	meta := c.attributionMeta(req.Agent)
-	body := leadWithDecisionQuestion(c.relayBody(req.Agent, req.Body))
-	if c.confidenceScoreOn() {
-		body = appendConfidenceLine(body, req.Report, c.perspectives)
-	}
-	if c.attributionTrailerOn() {
-		body = AppendTrailer(body, meta)
+	buildBody := func(text string) string {
+		b := leadWithDecisionQuestion(c.relayBody(req.Agent, text))
+		if c.confidenceScoreOn() {
+			b = appendConfidenceLine(b, req.Report, c.perspectives)
+		}
+		if c.attributionTrailerOn() {
+			b = AppendTrailer(b, meta)
+		}
+		return b
 	}
 
 	owner, repoName := c.splitRepo(req.Repo)
+	// Inline comments ride the one create-review call. An edit in place
+	// (--revise, a refreshed decision question) cannot add threads, so
+	// those paths carry every comment in the body; a fresh review carries
+	// the anchorable ones as threads and folds the rest.
+	var anchored []ReviewInlineComment
+	bodyText := req.Body
+	if len(req.Comments) > 0 {
+		if req.Revise {
+			bodyText = foldInlineComments(req.Body, req.Comments)
+			c.logInlineFold(req, len(req.Comments), "revision edits the existing review in place")
+		} else {
+			var folded []ReviewInlineComment
+			anchored, folded = c.partitionInlineComments(ctx, owner, repoName, req.Number, req.Comments)
+			bodyText = foldInlineComments(req.Body, folded)
+			c.logInlineFold(req, len(folded), "line is not part of the PR diff")
+		}
+	}
+	body := buildBody(bodyText)
 	reviewReq := &gh.PullRequestReviewRequest{Event: gh.Ptr(apiEvent)}
 	if strings.TrimSpace(body) != "" {
 		reviewReq.Body = gh.Ptr(body)
 	}
+	reviewReq.Comments = draftReviewComments(anchored, func(text string) string { return c.relayBody(req.Agent, text) })
 	resp := ReviewResponse{At: nowFn().UTC().Format(time.RFC3339)}
 	// Canary-gated like CreateIssue/CreatePR/CreateIssueComment
 	// (kubestellar/hive#4960): a PR review body is agent-supplied text posted
@@ -517,7 +592,10 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 	// so it must honor the same fail-closed contract and flow through the same
 	// error/retry handling as a real CreateReview failure below.
 	var created *gh.PullRequestReview
-	if leak, ok := c.scanCanaryText(req.Body, "hive-review:"+req.Repo); ok && c.canaryFailClosed {
+	decisionDeduped := false
+	ownPRNote := ""
+	reviewSubmitted := false
+	if leak, ok := c.scanCanaryText(req.Body+"\n"+inlineCommentsText(req.Comments), "hive-review:"+req.Repo); ok && c.canaryFailClosed {
 		err = fmt.Errorf("ioscan canary leak detected: agent=%s source=%s", leak.Agent, leak.Source)
 	} else if req.Revise {
 		// Correct the record rather than shouting over it. A revision that
@@ -526,28 +604,75 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 		var revised bool
 		created, revised, err = c.reviseReview(ctx, req, body)
 		if err == nil && created == nil && !revised {
+			reviewSubmitted = true
 			created, _, err = c.client.PullRequests.CreateReview(ctx, owner, repoName, req.Number, reviewReq)
 		}
+	} else if existing := c.findOwnOpenDecisionReview(ctx, owner, repoName, req.Number, req.Body); existing != nil && apiEvent == "COMMENT" {
+		// The same decision question is already standing on this PR from
+		// an earlier head (hivecommons/hive#15499): refresh that review in
+		// place rather than asking the person again. The verdict for the
+		// new head is still recorded below. An edit cannot add threads, so
+		// every inline comment goes into the refreshed body.
+		if len(req.Comments) > 0 {
+			body = buildBody(foldInlineComments(req.Body, req.Comments))
+			c.logInlineFold(req, len(req.Comments), "decision review refreshed in place")
+		}
+		created, err = c.refreshDecisionReview(ctx, owner, repoName, req.Number, existing, body)
+		if err == nil {
+			decisionDeduped = true
+		}
 	} else {
+		reviewSubmitted = true
 		provenance := owner + "/" + repoName + "#" + strconv.Itoa(req.Number)
-		_, err = effects.ExecuteReconciling(ctx, c.mutationBoundary(), effects.Claim{
-			Repo:   owner + "/" + repoName,
-			Kind:   effects.KindReviewSubmit,
-			Target: strconv.Itoa(req.Number),
-			Actor:  req.Agent,
-			// The request file is the unit of intent: retries of one file must
-			// dedupe, but two files carrying byte-identical text (a second
-			// "no findings" pass on a newer head) are two reviews, not a
-			// replay. Without this the journal refused the second one as
-			// already applied and the request retried until quarantine.
-			Inputs: map[string]string{"event": apiEvent, "body": effects.StableDigest(body), "request": filepath.Base(path)},
-		}, func(ctx context.Context) (effects.ExternalState, error) {
-			return c.observeReviewSubmit(ctx, owner, repoName, req.Number, body, "", provenance)
-		}, effects.DefaultUnresolvedTTL, func(ctx context.Context) (effects.Result, error) {
-			var apiErr error
-			created, _, apiErr = c.client.PullRequests.CreateReview(ctx, owner, repoName, req.Number, reviewReq)
-			return effects.Result{Provenance: provenance}, apiErr
-		})
+		for {
+			_, err = effects.ExecuteReconciling(ctx, c.mutationBoundary(), effects.Claim{
+				Repo:   owner + "/" + repoName,
+				Kind:   effects.KindReviewSubmit,
+				Target: strconv.Itoa(req.Number),
+				Actor:  req.Agent,
+				// The request file is the unit of intent: retries of one file must
+				// dedupe, but two files carrying byte-identical text (a second
+				// "no findings" pass on a newer head) are two reviews, not a
+				// replay. Without this the journal refused the second one as
+				// already applied and the request retried until quarantine.
+				Inputs: map[string]string{"event": apiEvent, "body": effects.StableDigest(body), "request": filepath.Base(path)},
+			}, func(ctx context.Context) (effects.ExternalState, error) {
+				return c.observeReviewSubmit(ctx, owner, repoName, req.Number, body, "", provenance)
+			}, effects.DefaultUnresolvedTTL, func(ctx context.Context) (effects.Result, error) {
+				var apiErr error
+				for {
+					created, _, apiErr = c.client.PullRequests.CreateReview(ctx, owner, repoName, req.Number, reviewReq)
+					if !IsOwnPullRequestReviewRefusal(apiErr) || ownPRNote != "" {
+						return effects.Result{Provenance: provenance}, apiErr
+					}
+					// GitHub never lets the App approve or request changes on
+					// its own pull request (422), and no retry changes that:
+					// post the same text once more as a COMMENT review so the
+					// verdict still lands on the PR (hivecommons/hive#15666).
+					// The verdict itself is recorded below as asked.
+					ownPRNote = fmt.Sprintf("%s downgraded to COMMENT: GitHub refuses a review on the App's own pull request", apiEvent)
+					commentEvent, _, _ := reviewEventToAPI("comment")
+					reviewReq.Event = gh.Ptr(commentEvent)
+					if reviewReq.Body == nil {
+						reviewReq.Body = gh.Ptr(contributorCommentBody(""))
+					}
+				}
+			})
+			// GitHub refused an anchor the diff check let through (a
+			// truncated file list, a race with a push). Resubmit ONCE as a
+			// fresh claim with every comment in the body: the review and
+			// its findings still land, as one review and one notification.
+			if len(reviewReq.Comments) == 0 || !isInlineAnchorRefusal(err) {
+				break
+			}
+			c.logInlineFold(req, len(anchored), "GitHub refused an inline anchor: "+err.Error())
+			body = buildBody(foldInlineComments(req.Body, req.Comments))
+			reviewReq.Body = gh.Ptr(body)
+			reviewReq.Comments = nil
+		}
+	}
+	if reviewSubmitted {
+		c.recordNotificationWrite(ctx, notificationWrite{kind: notificationWriteReview, repo: owner + "/" + repoName, item: req.Number, body: body, class: NotificationClassRequiredReview, err: err})
 	}
 	if errors.Is(err, errReviseNotAllowlisted) {
 		// Policy, not a transient fault (#13252): the repo is not in
@@ -555,6 +680,11 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 		// the file aside so it is not re-attempted on every tick.
 		c.denyReviewRequest(path, req, err.Error(), nowFn)
 		return
+	}
+	if err == nil && ownPRNote != "" {
+		_, state, _ = reviewEventToAPI("comment")
+		c.logger.Warn("review-request watcher: own-PR review refused by GitHub, posted as COMMENT",
+			slog.String("agent", req.Agent), slog.String("repo", req.Repo), slog.Int("number", req.Number))
 	}
 	if err != nil {
 		// Retry with exponential backoff and quarantine at the give-up horizon
@@ -581,8 +711,14 @@ func (c *Client) handleOneReviewRequest(ctx context.Context, path string, src re
 	if commentOnlyNote != "" {
 		resp.Note = commentOnlyNote
 	}
+	if ownPRNote != "" {
+		resp.Note = ownPRNote
+	}
 	if sentinelBlockNote != "" {
 		resp.Note = sentinelBlockNote
+	}
+	if decisionDeduped {
+		resp.Note = decisionDedupedNote
 	}
 
 	// Record where the review landed so the queue views can link to it. A
@@ -887,5 +1023,38 @@ func (c *Client) maxReviewsPerHead() int {
 	if c.combinedPerspectivesFn != nil && c.combinedPerspectivesFn() {
 		return 1
 	}
+	if c.notificationsQuiet() {
+		// One review submission per head, whatever the perspective count:
+		// later perspectives' findings join it through the status comment.
+		return 1
+	}
 	return c.perspectives.Len()
+}
+
+// reviewNoFindingsSuppressedNote is the result-file note for a clean
+// acknowledgement the quiet mode recorded instead of submitting.
+const reviewNoFindingsSuppressedNote = "comment suppressed: no-findings acknowledgement recorded as a verdict (github.notifications.mode: quiet)"
+
+// reviewNoFindingsSection renders a suppressed clean review for the status
+// comment: the verdict on its own line, the reviewer's reasoning folded.
+func reviewNoFindingsSection(req ReviewRequest) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Reviewed** by `%s` — no findings.", strings.TrimSpace(req.Agent))
+	body := strings.TrimSpace(req.Body)
+	if body != "" && !review.NoFindingsAcknowledgement(body) {
+		b.WriteString("\n\n<details><summary>Reviewer notes</summary>\n\n")
+		b.WriteString(body)
+		b.WriteString("\n\n</details>")
+	}
+	return b.String()
+}
+
+// reviewFindingsSection renders a perspective's findings for the status
+// comment: who found them, then the body as written.
+func reviewFindingsSection(req ReviewRequest) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Review findings** from `%s`", strings.TrimSpace(req.Agent))
+	b.WriteString(" (folded here because this head already carries its hive review):\n\n")
+	b.WriteString(foldInlineComments(strings.TrimSpace(req.Body), req.Comments))
+	return b.String()
 }

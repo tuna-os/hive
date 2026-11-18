@@ -1,8 +1,21 @@
 # Current Settings dialog parity gaps.
 # Every entry must have a Settings control before it is removed.
 # TODO #11854
-agent_sandbox.job.env_from_secrets[] # TODO #11854
+agent_sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].preference.matchExpressions[].key # TODO #18809
+agent_sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].preference.matchExpressions[].operator # TODO #18809
+agent_sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].preference.matchExpressions[].values[] # TODO #18809
+agent_sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].weight # TODO #18809
+agent_sandbox.job.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[].key # TODO #18809
+agent_sandbox.job.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[].operator # TODO #18809
+agent_sandbox.job.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[].values[] # TODO #18809
+agent_sandbox.job.github_read_proxy.enabled # TODO #18865
+agent_sandbox.job.github_read_proxy.endpoint # TODO #18865
+agent_sandbox.job.github_read_proxy.listen_addr # TODO #18865
+agent_sandbox.job.github_read_proxy.no_proxy[] # TODO #18865
+agent_sandbox.job.image_pull_secrets[] # TODO #11854
 agent_sandbox.job.node_selector.<key> # TODO #11854
+agent_sandbox.job.relay_image # TODO #11854
+agent_sandbox.job.relay_run_as_user # TODO #11854
 agent_sandbox.job.resources.limits.<key> # TODO #11854
 agent_sandbox.job.resources.requests.<key> # TODO #11854
 agent_sandbox.job.tolerations[].effect # TODO #11854
@@ -13,8 +26,29 @@ agent_sandbox.job.volumes[].claim # TODO #11854
 agent_sandbox.job.volumes[].mount_path # TODO #11854
 agent_sandbox.job.volumes[].name # TODO #11854
 agent_sandbox.job.volumes[].read_only # TODO #11854
+agent_sandbox.openshell.allow_hosts[] # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.binaries[] # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.gateway_url # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.insecure_tls # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.namespace # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.node_selector.<key> # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.policy_profile # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.runtime_class_name # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.timeout_s # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.token_env # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.tolerations[].effect # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.tolerations[].key # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.tolerations[].operator # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.tolerations[].value # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.workspace_claim # TODO #17645 (OpenShell runtime; Settings control pending)
+agent_sandbox.openshell.workspace_claim_mount # TODO #17645 (OpenShell runtime; Settings control pending)
 agent_sandbox.publish.verify[] # TODO #14999 (policy-file knob; Settings control pending)
 agent_sandbox.publish.verify_timeout_s # TODO #14999 (policy-file knob; Settings control pending)
+agent_sandbox.preflight.commands[] # TODO #18811 (policy-file knob; Settings control pending)
+agent_sandbox.preflight.retry_delay_s # TODO #18811 (policy-file knob; Settings control pending)
+agent_sandbox.preflight.timeout_s # TODO #18811 (policy-file knob; Settings control pending)
+agent_sandbox.preflight.total_timeout_s # TODO #18811 (policy-file knob; Settings control pending)
+agent_sandbox.job.schedule_timeout_s # TODO #18811 (policy-file knob; Settings control pending)
 agents.<key>.acmm_levels[] # TODO #11854
 agents.<key>.agent_spec # TODO #11854
 agents.<key>.aliases[] # TODO #11854
@@ -45,6 +79,7 @@ agents.<key>.continuous_budget_pct # TODO #11854
 agents.<key>.continuous_cooldown # TODO #11854
 agents.<key>.continuous_turn_ceiling # TODO #11854
 agents.<key>.converse # TODO #11854
+agents.<key>.definition_source.discovered # TODO #11854
 agents.<key>.definition_source.owner # TODO #11854
 agents.<key>.definition_source.path # TODO #11854
 agents.<key>.definition_source.ref # TODO #11854
@@ -57,7 +92,6 @@ agents.<key>.display_name # TODO #11854
 agents.<key>.emoji # TODO #11854
 agents.<key>.enabled # TODO #11854
 agents.<key>.explain_mode # TODO #11854
-agents.<key>.github_api_hourly_cap # TODO #11854
 agents.<key>.id # TODO #11854
 agents.<key>.include_repos # TODO #11854
 agents.<key>.jev_mode # TODO #11854
@@ -97,8 +131,22 @@ agents.<key>.role # TODO #11854
 agents.<key>.sandbox.enabled # TODO #11854
 agents.<key>.sandbox.env_allowlist[] # TODO #11854
 agents.<key>.sandbox.image # TODO #11854
+agents.<key>.sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].preference.matchExpressions[].key # TODO #18809
+agents.<key>.sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].preference.matchExpressions[].operator # TODO #18809
+agents.<key>.sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].preference.matchExpressions[].values[] # TODO #18809
+agents.<key>.sandbox.job.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[].weight # TODO #18809
+agents.<key>.sandbox.job.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[].key # TODO #18809
+agents.<key>.sandbox.job.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[].operator # TODO #18809
+agents.<key>.sandbox.job.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[].values[] # TODO #18809
 agents.<key>.sandbox.job.env_from_secrets[] # TODO #11854
+agents.<key>.sandbox.job.github_read_proxy.enabled # TODO #18865
+agents.<key>.sandbox.job.github_read_proxy.endpoint # TODO #18865
+agents.<key>.sandbox.job.github_read_proxy.listen_addr # TODO #18865
+agents.<key>.sandbox.job.github_read_proxy.no_proxy[] # TODO #18865
+agents.<key>.sandbox.job.image_pull_secrets[] # TODO #11854
 agents.<key>.sandbox.job.node_selector.<key> # TODO #11854
+agents.<key>.sandbox.job.relay_image # TODO #11854
+agents.<key>.sandbox.job.relay_run_as_user # TODO #11854
 agents.<key>.sandbox.job.resources.limits.<key> # TODO #11854
 agents.<key>.sandbox.job.resources.requests.<key> # TODO #11854
 agents.<key>.sandbox.job.scheduler_name # TODO #11854
@@ -115,10 +163,35 @@ agents.<key>.sandbox.job.volumes[].read_only # TODO #11854
 agents.<key>.sandbox.job.workspace_claim # TODO #11854
 agents.<key>.sandbox.job.workspace_claim_mount # TODO #11854
 agents.<key>.sandbox.network_mode # TODO #11854
+agents.<key>.sandbox.openshell.allow_hosts[] # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.binaries[] # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.gateway_url # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.insecure_tls # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.namespace # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.node_selector.<key> # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.policy_profile # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.runtime_class_name # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.timeout_s # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.token_env # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.tolerations[].effect # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.tolerations[].key # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.tolerations[].operator # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.tolerations[].value # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.workspace_claim # TODO #17645 (OpenShell runtime; Settings control pending)
+agents.<key>.sandbox.openshell.workspace_claim_mount # TODO #17645 (OpenShell runtime; Settings control pending)
 agents.<key>.sandbox.runtime # TODO #11854
 agents.<key>.sandbox.timeout_s # TODO #11854
 agents.<key>.sandbox.publish.verify[] # TODO #14999 (policy-file knob; Settings control pending)
 agents.<key>.sandbox.publish.verify_timeout_s # TODO #14999 (policy-file knob; Settings control pending)
+agents.<key>.sandbox.preflight.commands[] # TODO #18811 (policy-file knob; Settings control pending)
+agents.<key>.sandbox.preflight.retry_delay_s # TODO #18811 (policy-file knob; Settings control pending)
+agents.<key>.sandbox.preflight.timeout_s # TODO #18811 (policy-file knob; Settings control pending)
+agents.<key>.sandbox.preflight.total_timeout_s # TODO #18811 (policy-file knob; Settings control pending)
+agents.<key>.sandbox.job.schedule_timeout_s # TODO #18811 (policy-file knob; Settings control pending)
+agents.<key>.cli_memory.auto_memory # TODO #11854
+agents.<key>.cli_memory.clear_on_kick # TODO #11854
+agents.<key>.cli_memory.drain_on_write # TODO #11854
+agents.<key>.cli_memory.drain_to_knowledge # TODO #11854
 agents.<key>.session_recycle.enabled # TODO #11854
 agents.<key>.session_recycle.max_age # TODO #11854
 agents.<key>.session_recycle.max_rss_mb # TODO #11854
@@ -147,19 +220,27 @@ agents.<key>.variables.<key>.scope # TODO #11854
 agents.<key>.variables.<key>.type # TODO #11854
 agents.<key>.variables.<key>.url # TODO #11854
 agents.<key>.variables.<key>.value # TODO #11854
-agents.github_api_hourly_cap # TODO #11854
+agents.cli_memory.auto_memory # TODO #11854
+agents.cli_memory.clear_on_kick # TODO #11854
+agents.cli_memory.drain_on_write # TODO #11854
+agents.cli_memory.drain_to_knowledge # TODO #11854
 agents.session_recycle.enabled # TODO #11854
 agents.session_recycle.max_age # TODO #11854
 agents.session_recycle.max_rss_mb # TODO #11854
 agents.session_recycle.min_idle # TODO #11854
 auto_merge.credit_issue_authors # merge-time Co-authored-by credit (#14581); yaml-only
-auto_merge.merge_train.enabled # merge-train front selection (#15141); yaml-only
-auto_merge.allow_unprotected_base[] # TODO #11854
+auto_merge.human_merge_title_prefixes[] # breaking-titled PRs wait for a human; yaml-only
+auto_merge.human_merge_labels[] # needs-owner-merge PRs wait for a human; yaml-only
 auto_merge.merge_forward_trusted_human[] # TODO #11854
-auto_merge.no_ci_ok[] # TODO #11854
+auto_merge.native_merge_queue.enabled # native merge queue hand-off opt-in (#15198); yaml-only
+auto_merge.native_merge_queue.probe_ttl # merge-queue probe cache TTL (#15198); yaml-only
+auto_merge.native_merge_queue.repos[] # native merge queue per-repo allow-list (#15198); yaml-only
+auto_merge.native_merge_queue.skip_current_base_gate # explicit current-base bypass on queue bases (#15198); yaml-only
+auto_merge.hive_superseding.auto_merge # hive-authored superseding PRs auto-merge without an operator decision; yaml-only
 auto_merge.queue_on_approve_and_unhold[] # per-repo L5 opt-in; yaml-only (#13629)
 auto_merge.repos.<key>.required_checks[] # TODO #11854
 auto_merge.required_checks[] # TODO #11854
+auto_merge.skip_current_base[] # current-base gate per-repo "off" override, written by the Repos tab (#15335)
 auto_merge.trusted_authors.exclude_labels[] # TODO #11854
 auto_merge.trusted_authors.repos[] # TODO #11854
 auto_merge.trusted_bot_authors[] # TODO #11854
@@ -167,17 +248,35 @@ chat.grounded_answers.model # TODO #14412
 classification.review_bots.logins[] # TODO #11854
 classification.review_bots.max_attempts_per_thread # TODO #11854
 classification.review_bots.resolve_after_fix # TODO #11854
+code_scanning.repos.<key>.exclude_rules[] # per-repository override: set through PUT /api/config/code-scanning, the admin MCP or hive.yaml; the Features tab shows it and keeps it on save
+code_scanning.repos.<key>.include_tools[] # per-repository override: set through PUT /api/config/code-scanning, the admin MCP or hive.yaml; the Features tab shows it and keeps it on save
+code_scanning.repos.<key>.max_new_issues_per_run # per-repository override: set through PUT /api/config/code-scanning, the admin MCP or hive.yaml; the Features tab shows it and keeps it on save
+code_scanning.repos.<key>.min_severity # per-repository override: set through PUT /api/config/code-scanning, the admin MCP or hive.yaml; the Features tab shows it and keeps it on save
 compliance.frameworks[] # TODO #11854
 data.nous_dir # TODO #11854
 contribute.token_idle_max # TODO #11854
 contribute.token_max_age # TODO #11854
 convergence.mutation.max_writers_per_target # boundary capacity tuning; yaml-only (#14645)
+dashboard.kick_failure_threshold # deep-health tuning knob, no Settings control (#17908)
+dashboard.matrix.enabled # experimental default-off Matrix block; gates the header tab via /api/status, no Settings control (#15862, #16042)
+dashboard.matrix.exclude_paths[] # experimental default-off Matrix block; nothing reads it yet (#15862)
+dashboard.matrix.repos[] # experimental default-off Matrix block; nothing reads it yet (#15862)
+dashboard.sessions.workspace_repo # Sessions workspace repo; hive.yaml/env only, Settings control pending
 debug.pprof_addr # loopback-only pprof bind address, operator/debug knob, not a Settings control (#14681)
+dedupe.advisory_autoclose # advisory-checklist sweep; yaml-only (#15754)
 deployment.runtime # set via HIVE_DEPLOYMENT_RUNTIME env var or auto-detected, not a Settings control (#14072)
 duplicate_sweep.bot_authors[] # TODO #11854
 evidence.complexity.enabled # TODO #11854
 evidence.complexity.static_analysis # TODO #11854
 github.additional_bot_logins[] # TODO #11854
+github.attention.admitter.<key> # single-admitter ownership and flap window are YAML-only rollout controls; see src/docs/attention-episodes.md
+github.attention.digest_recipients[] # opt-in attention digest recipients; yaml-only, see docs/notifications.md (#16271)
+github.attention.flap_window # single-admitter ownership and flap window are YAML-only rollout controls; see src/docs/attention-episodes.md
+github.attention.recipient_budget # per-recipient attention budget, off by default; yaml-only, see docs/notifications.md (#16271)
+github.attention.reminder_interval # attention-pilot reminder interval; yaml-only, see src/docs/attention-episodes.md (#16361)
+github.notifications.attention_pilot # opt-in attention-pilot issue status card; yaml-only, see docs/notifications.md (#16358)
+github.notifications.claim_ledger # one per-issue claim-ledger comment edited in place; yaml-only, see operator-reference (#16433)
+github.notifications.mode # quiet|normal PR notification mode; yaml-only, see operator-reference.md
 github.shared_uid_read_token # shared-UID App read-token opt-in; yaml-only, restart required (#14778)
 good_first_issue.exclude_labels[] # advanced scorer tuning; yaml-only (#12185)
 good_first_issue.repos[] # advanced scorer tuning; yaml-only (#12185)
@@ -199,6 +298,20 @@ governor.budget.coins.<key>.budget # TODO #11854
 governor.budget.coins.<key>.label # TODO #11854
 governor.budget.coins.<key>.tokens_per_coin # TODO #11854
 governor.budget.coins.<key>.usd_per_coin # TODO #11854
+governor.ci_failure_kick_cooldown_s # webhook CI-failure kick cooldown (#15291); yaml-only
+governor.ci_failure_webhook_kick # webhook CI-failure kick flag (#15291); yaml-only
+governor.dependency_bot_rebase_after_s # stranded dependency-bot PR window (bot_rebase_request); yaml-only
+governor.release_feeds.agents.<key>.cooldown_s # release-feed watcher (#18494); yaml-only
+governor.release_feeds.agents.<key>.sources[].auth_var # release-feed watcher (#18494); yaml-only
+governor.release_feeds.agents.<key>.sources[].kind # release-feed watcher (#18494); yaml-only
+governor.release_feeds.agents.<key>.sources[].name # release-feed watcher (#18494); yaml-only
+governor.release_feeds.agents.<key>.sources[].package # release-feed watcher (#18494); yaml-only
+governor.release_feeds.agents.<key>.sources[].repo # release-feed watcher (#18494); yaml-only
+governor.release_feeds.agents.<key>.sources[].url # release-feed watcher (#18494); yaml-only
+governor.release_feeds.agents.<key>.sources[].version_field # release-feed watcher (#18494); yaml-only
+governor.release_feeds.cooldown_s # release-feed watcher (#18494); yaml-only
+governor.release_feeds.enabled # release-feed watcher (#18494); yaml-only
+governor.release_feeds.interval_s # release-feed watcher (#18494); yaml-only
 governor.claims.contributor_flap_threshold # contributor flap cool-off (#13579); yaml-only
 governor.claims.contributor_flap_window_s # contributor flap cool-off (#13579); yaml-only
 governor.claims.contributor_flap_cooloff_s # contributor flap cool-off (#13579); yaml-only
@@ -213,13 +326,21 @@ governor.gateways[].endpoint # TODO #11854
 governor.gateways[].key_name # TODO #11854
 governor.gateways[].kind # TODO #11854
 governor.gateways[].name # TODO #11854
+governor.gateways[].prices.cached_input # TODO #11854
+governor.gateways[].prices.input # TODO #11854
+governor.gateways[].prices.models.<key>.cached_input # TODO #11854
+governor.gateways[].prices.models.<key>.input # TODO #11854
+governor.gateways[].prices.models.<key>.output # TODO #11854
+governor.gateways[].prices.output # TODO #11854
 governor.gateways[].project_id # TODO #11854
 governor.gateways[].region # TODO #11854
 governor.health.healthcheck_interval # TODO #11854
 governor.labels.author.clanker # label-name override; yaml-only (#12581)
 governor.labels.author.hive # label-name override; yaml-only (#12581)
 governor.labels.author.human # label-name override; yaml-only (#12581)
+governor.labels.decision_needed # label-name override; yaml-only (#18468)
 governor.labels.exempt[] # TODO #11854
+governor.labels.ready_for_review # label-name override; yaml-only (#18468)
 governor.labels.stage.dco.required.<key> # TODO #12542
 governor.litellm.api_key_env # TODO #11854
 governor.litellm.api_key_file # TODO #11854
@@ -287,6 +408,9 @@ hooks[].on # TODO #11854
 hooks[].params.<key> # TODO #11854
 hooks[].rate_limit_per_minute # TODO #11854
 hooks[].when # TODO #11854
+hub.activity.enabled # spoke activity digest publish; yaml-only, see telemetry.md (#15963)
+hub.activity.max_items # spoke activity digest cap; yaml-only, see telemetry.md (#15963)
+hub.activity.share_private # spoke activity digest private-repo opt-in; yaml-only, see telemetry.md (#15963)
 hub.contribute_allow_labels[] # TODO #11854
 hub.contribute_allow_models[] # TODO #11854
 hub.contribute_delegatable_roles[] # TODO #11854
@@ -319,6 +443,22 @@ issues.rfc_existing_check.max_age # triage existing-coverage check; yaml-only (#
 issues.rfc_existing_check.max_matches # triage existing-coverage check; yaml-only (#13575)
 issues.rfc_existing_check.post_when_nothing_found # triage existing-coverage check; yaml-only (#13575)
 issues.sha_hold_trusted_label # TODO #11854
+knowledge.advisor # mid-task knowledge advisor, yaml-only while it soaks (#17052)
+knowledge.advisor_exclude_agents[] # mid-task knowledge advisor, yaml-only while it soaks (#17052)
+knowledge.advisor_llm.api_key_env # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.api_key_file # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.budget_override # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.candidates # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.endpoint # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.holdout_percent # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.max_calls_per_agent_hour # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.max_calls_per_day # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.mode # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.model # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.on_error # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.pane_lines # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_llm.timeout_s # LLM-ranked knowledge advisor, yaml-only while it soaks (#17054)
+knowledge.advisor_max_per_kick # mid-task knowledge advisor, yaml-only while it soaks (#17052)
 knowledge.agent_scopes.<key>.include_states[] # TODO #11854
 knowledge.agent_scopes.<key>.layers[] # TODO #11854
 knowledge.agent_scopes.<key>.repos[] # TODO #11854
@@ -362,6 +502,14 @@ knowledge.vaults[].auto_index # TODO #11854
 knowledge.vaults[].git_sync # TODO #11854
 knowledge.vaults[].name # TODO #11854
 knowledge.vaults[].path # TODO #11854
+network.upstream_proxy.hosts[] # deployment-level egress knob (corporate forward proxy), set via hive.yaml/env/hub clusters.json, not a Settings control (#17637)
+network.upstream_proxy.no_proxy[] # deployment-level egress knob (corporate forward proxy), set via hive.yaml/env/hub clusters.json, not a Settings control (#17637)
+network.upstream_proxy.url # deployment-level egress knob (corporate forward proxy), set via hive.yaml/env/hub clusters.json, not a Settings control (#17637)
+notifications.discord.rfc_announcer # opt-in rich RFC notify gates; yaml-only, documented in docs/notifications.md (#15926)
+notifications.discord.rfc_backlink_comment # opt-in rich RFC notify gates; yaml-only, documented in docs/notifications.md (#15926)
+notifications.discord.rfc_format # opt-in rich RFC notify gates; yaml-only, documented in docs/notifications.md (#15926)
+notifications.discord.rfc_include_private # opt-in rich RFC notify gates; yaml-only, documented in docs/notifications.md (#15926)
+notifications.discord.rfc_threads # opt-in rich RFC notify gates; yaml-only, documented in docs/notifications.md (#15926)
 planning.design_labels[] # TODO #11854
 planning.plan_labels[] # TODO #11854
 project.agent_issue_decision_policy # TODO #12851
@@ -369,12 +517,12 @@ project.agents_md_max_bytes # TODO #11854
 project.checkouts_dir # TODO #11854
 project.forge # TODO #11854
 project.style_max_bytes # TODO #14575
+project.issue_filter.agent_proposal.labels[] # agent proposal gate; yaml-only (#15329)
+project.issue_filter.agent_proposal.title_prefixes[] # agent proposal gate; yaml-only (#15329)
 project.issue_filter.hard_suppress_labels.needs_decision[] # TODO #11854
 project.issue_filter.hard_suppress_labels.needs_direction[] # TODO #11854
 project.issue_filter.hard_suppress_labels.needs_human[] # TODO #11854
 project.issue_filter.hard_suppress_labels.needs_spec[] # TODO #11854
-project.issue_filter.agent_proposal.labels[] # TODO #11854
-project.issue_filter.agent_proposal.title_prefixes[] # TODO #11854
 project.issue_filter.reporter_trust.awaiting_label # TODO #11854
 project.issue_filter.reporter_trust.clanker_requested # TODO #11854
 project.issue_filter.reporter_trust.clanker_requested_addendum # TODO #11854
@@ -385,10 +533,7 @@ project.issue_filter.reporter_trust.trusted_associations[] # TODO #11854
 project.issue_filter.reporter_trust.trusted_logins[] # TODO #11854
 project.issue_filter.reporter_trust.untrusted_require_labels[] # TODO #11854
 project.issue_filter.require_labels[] # TODO #11854
-project.label_driven_approval_labels[] # TODO #11854
 project.label_driven_supersede_park_actors[] # TODO #11854
-project.label_driven_trust_org_members # TODO #11854
-project.label_driven_trusted_bots[] # TODO #11854
 project.open_prs # TODO #11854
 project.paused_repos[].at # TODO #11854
 project.paused_repos[].by # TODO #11854
@@ -408,8 +553,6 @@ project.repo_policies[].auto_merge # TODO #11854
 project.repo_policies[].companion_repos[] # TODO #11854
 project.repo_policies[].forge # TODO #11854
 project.repo_policies[].forge_url # TODO #11854
-project.repo_policies[].label_driven # TODO #11854
-project.repo_policies[].label_driven_approval_labels[] # TODO #11854
 project.repo_policies[].release_on_approve # TODO #12635
 project.repo_policies[].release_version_source # TODO #12635
 project.repo_policies[].label_driven_supersede_park_actors[] # TODO #11854
@@ -423,6 +566,8 @@ repeat_failure.enabled # yaml-only until the check reaches the dashboard (#14550
 repeat_failure.exclude[] # yaml-only until the check reaches the dashboard (#14550)
 repeat_failure.threshold # yaml-only until the check reaches the dashboard (#14550)
 repeat_failure.window_s # yaml-only until the check reaches the dashboard (#14550)
+repos.<key>.agents_md_max_bytes # TODO #18495 (per-repo AGENTS.md cap; Settings control pending)
+repos.<key>.parent_autoclose # TODO #18869 (per-repo decomposed-parent auto-close policy; Settings control pending)
 retro.lesson_confidence_cap # TODO #11854
 retro.lesson_confidence_step # TODO #11854
 revert_sheriff.confirm_timeout # tuna-os pilot (revert sheriff); yaml-only
@@ -443,6 +588,13 @@ review.perspective_models.<key>.backend # TODO #13243
 review.perspective_models.<key>.model # TODO #13243
 review.perspective_prompts.<key> # TODO #11854
 review.perspectives[] # TODO #11854
+review.perspectives_source.discovered # TODO #17975 (shared DefinitionSourceConfig field; meaningful only on agents.<key>.definition_source)
+review.perspectives_source.owner # TODO #17975
+review.perspectives_source.path # TODO #17975
+review.perspectives_source.ref # TODO #17975
+review.perspectives_source.repo # TODO #17975
+review.perspectives_source.type # TODO #17975
+review.perspectives_source.url # TODO #17975
 review.recommendations.labels[] # TODO #11854
 review.recommendations.repos[] # TODO #11854
 review.reviewer_agents[] # TODO #11854
@@ -468,15 +620,6 @@ runs.external.claude_managed_agents.network_policy # prototype hosted backend; y
 runs.external.claude_managed_agents.state_dir # prototype hosted backend; yaml-only (#14214)
 runs.external.claude_managed_agents.toolset_version # prototype hosted backend; yaml-only (#14214)
 runs.external.claude_managed_agents.workflow_version # prototype hosted backend; yaml-only (#14214)
-runs.spektacular.recheck.discovery.sources[].allow_prerelease # TODO #11854
-runs.spektacular.recheck.discovery.sources[].kind # TODO #11854
-runs.spektacular.recheck.discovery.sources[].max_items # TODO #11854
-runs.spektacular.recheck.discovery.sources[].name # TODO #11854
-runs.spektacular.recheck.discovery.sources[].url_or_repo # TODO #11854
-runs.spektacular.recheck.egress_allowlist[] # TODO #11854
-runs.spektacular.recheck.sources[].kind # TODO #11854
-runs.spektacular.recheck.sources[].name # TODO #11854
-runs.spektacular.recheck.sources[].url # TODO #11854
 runs.triage.fix_labels[] # TODO #11854
 runs.triage.spec_labels[] # TODO #11854
 forgestate.drift_threshold # yaml-only until readers migrate (#13373)
@@ -499,10 +642,12 @@ search.max_index_bytes_per_repo # portfolio search indexer (#14635); yaml-only
 search.max_memory_bytes # portfolio search indexer (#14635); yaml-only
 search.retention # portfolio search indexer (#14635); yaml-only
 scanner.skip_issues_with_open_pr # open-PR dispatch guard (#14799); yaml-only
+security.sensitive_paths[] # TODO #15640
 self_experiments.scheduler.enabled # TODO #11854
 self_experiments.scheduler.interval_s # TODO #11854
 self_experiments.scheduler.mode # TODO #11854
-shared_ci_rerun.enabled # TODO #11854
+shared_ci_issues.enabled # shared-CI tracking issue sweep; yaml-only
+shared_ci_issues.min_prs # shared-CI tracking issue sweep; yaml-only
 swarm.themes.<key>.call_to_arms # TODO #11854
 swarm.themes.<key>.event_name # TODO #11854
 swarm.themes.<key>.leaderboard_title # TODO #11854
@@ -551,6 +696,7 @@ advisor.instructions # TODO #11854
 advisor.max_consecutive_blocks # TODO #11854
 advisor.model # TODO #11854
 advisor.timeout_s # TODO #11854
+agents.<key>.advisor.backend # TODO #11854
 agents.<key>.advisor.daily_budget_tokens # TODO #11854
 agents.<key>.advisor.enabled # TODO #11854
 agents.<key>.advisor.instructions # TODO #11854
@@ -650,3 +796,42 @@ runs.spektacular.interview # TODO #11854
 task_mcp.launch_token_ttl # TODO #11854
 task_mcp.lease_rate_limit_per_minute # TODO #11854
 upstream_watch.repos.<key>.start_from # TODO #11854
+governor.hotspot_enabled # merge-hotspot advisor; yaml-only
+governor.hotspot_window_days # merge-hotspot advisor; yaml-only
+governor.hotspot_min_prs # merge-hotspot advisor; yaml-only
+governor.hotspot_min_overlaps # merge-hotspot advisor; yaml-only
+governor.hotspot_min_lines # merge-hotspot advisor; yaml-only
+governor.hotspot_refile_days # merge-hotspot advisor; yaml-only
+governor.hotspot_max_open # merge-hotspot advisor; yaml-only
+governor.hotspot_max_per_pass # merge-hotspot advisor; yaml-only
+data.workflows_dir # workflow-model store root; deployment knob, no Settings control planned (RFC #17620)
+project.workflow_bindings[].name # set through the per-repo workflow select on Settings → Repos via PUT /api/workflows/bindings, not a leaf-path control (RFC #17620)
+project.workflow_bindings[].repo # see project.workflow_bindings[].name
+project.workflow_bindings[].version # see project.workflow_bindings[].name
+workflow.label_gc # operator safety knob for model-label garbage collection on rebind; yaml-only, no Settings control planned (RFC #17620)
+workflow.dispatch.enabled # workflow-model agent dispatch kill switch; yaml-only (cncf/techdocs#395)
+workflow.dispatch.profiles.<key>.agent # which hive agent fills a model profile; yaml-only (cncf/techdocs#395)
+workflow.dispatch.profiles.<key>.prompt_template # see workflow.dispatch.profiles.<key>.agent
+workflow.dispatch.profiles.<key>.disabled # see workflow.dispatch.profiles.<key>.agent
+inbox.sources[] # which voice connector types feed the Inbox; defaults to every configured plaud/wisprflow connector, yaml-only (Inbox RFC)
+inbox.rules[].source # auto-routing rules are edited as whole rows in Inbox → Auto-routing via POST /api/inbox/settings, not leaf-path controls (Inbox RFC)
+inbox.rules[].title_prefix # see inbox.rules[].source
+inbox.rules[].tag # see inbox.rules[].source
+inbox.rules[].destination # see inbox.rules[].source
+inbox.rules[].repo # see inbox.rules[].source
+inbox.recording.enabled # ● Record (dashboard recordings) limits are yaml-only; the recorder reads them from GET /api/inbox settings.recording (see docs/inbox-recording.md)
+inbox.recording.retention_days # see inbox.recording.enabled
+inbox.recording.max_seconds # see inbox.recording.enabled
+inbox.recording.max_bytes # see inbox.recording.enabled
+inbox.recording.quota_bytes # see inbox.recording.enabled
+inbox.recording.idle_finalize_minutes # see inbox.recording.enabled
+# Advisory engine phase 1 (#18464): YAML-only and default off; Settings control pending.
+advisory_engine.allow_training_providers_for_private # TODO #18464
+advisory_engine.enabled # TODO #18464
+advisory_engine.gateways[].daily_cap # TODO #18464
+advisory_engine.gateways[].model # TODO #18464
+advisory_engine.gateways[].name # TODO #18464
+advisory_engine.items_per_cycle # TODO #18464
+advisory_engine.max_turns # TODO #18464
+advisory_engine.mode # TODO #18464
+governor.gateways[].trains_on_inputs # TODO #18464

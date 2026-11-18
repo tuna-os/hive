@@ -11,16 +11,16 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/hivecommons/hive/crux"
 	"github.com/hivecommons/hive/crux/agent"
 	"github.com/hivecommons/hive/crux/config"
+	"github.com/hivecommons/hive/crux/egressmark"
 	"github.com/hivecommons/hive/crux/inferencehealth"
+	"github.com/hivecommons/hive/crux/upstreamproxy"
 )
 
 const (
@@ -37,94 +37,26 @@ const (
 	maxViolationLog        = 1000
 	maxGitHubWriteBodyScan = 2 << 20
 
-	// defaultProxyEgressMark is the fwmark (SO_MARK) the proxy stamps onto its
-	// OWN upstream :443 dials so the forced-egress iptables redirect can exempt
-	// them (via `-m mark --mark <mark> -j RETURN`) and avoid looping the proxy's
-	// traffic back into itself.
-	//
-	// This replaces the `-m owner --uid-owner` self-exemption, which needs the
-	// xt_owner kernel module — absent on OpenShift/OVN nodes. A packet mark works
-	// on both OKE and OpenShift. The value is arbitrary but MUST match the mark
-	// the entrypoint exempts; entrypoint.sh is the single source of truth and
-	// exports HIVE_PROXY_EGRESS_MARK (defaulting to this same value) into the
-	// proxy process, which reads it via proxyEgressMark().
-	defaultProxyEgressMark = 0x1112
-
-	// proxyEgressMarkEnv is the env var the entrypoint exports to keep the proxy
-	// and the iptables rule in sync from one source of truth.
-	proxyEgressMarkEnv = "HIVE_PROXY_EGRESS_MARK"
+	// defaultProxyEgressMark and proxyEgressMarkEnv mirror crux/egressmark,
+	// the shared home of the SO_MARK self-exemption (also used by the hive's
+	// in-cluster Kubernetes API clients). entrypoint.sh remains the single
+	// source of truth for the value.
+	defaultProxyEgressMark = egressmark.DefaultMark
+	proxyEgressMarkEnv     = egressmark.Env
 )
 
-// proxyEgressMark returns the fwmark to stamp on the proxy's upstream dials,
-// read from HIVE_PROXY_EGRESS_MARK (set by entrypoint.sh) so the Go proxy and
-// the iptables exemption stay in lockstep. Accepts hex (0x1112) or decimal.
-// Falls back to defaultProxyEgressMark when unset or unparseable — that default
-// matches the entrypoint default, so an accidental drift fails safe by staying
-// on the agreed value rather than silently disabling the exemption.
+// proxyEgressMark returns the fwmark to stamp on the proxy's upstream dials;
+// see egressmark.Mark.
 func proxyEgressMark() int {
-	raw := strings.TrimSpace(os.Getenv(proxyEgressMarkEnv))
-	if raw == "" {
-		return defaultProxyEgressMark
-	}
-	// ParseInt with base 0 honours a 0x prefix (hex) and plain decimal.
-	if v, err := strconv.ParseInt(raw, 0, 64); err == nil && v > 0 {
-		return int(v)
-	}
-	return defaultProxyEgressMark
+	return egressmark.Mark()
 }
 
-// markDialer returns a *net.Dialer whose Control hook stamps the proxy egress
-// fwmark (SO_MARK) on the outbound socket before connect. On non-Linux builds
-// setSockMark is a no-op, so the dialer is portable. The optional timeout is
-// applied when non-zero.
-//
-// SO_MARK is a BEST-EFFORT egress hint, never a hard requirement: it exists so
-// the forced-egress iptables redirect can exempt the proxy's own upstream dials
-// via `-m mark`. But setsockopt(SO_MARK) needs CAP_NET_ADMIN in the process's
-// EFFECTIVE set, and the hive Go process runs as a non-root user (entrypoint
-// drops from root to `dev` via gosu, which strips all capabilities). So the mark
-// call fails with EPERM ("operation not permitted") on exactly the deployments
-// that run non-root — which is all of them. Returning that error from the
-// Control hook ABORTS the dial, so every proxy upstream dial fails and agents
-// can't reach GitHub at all. That is a regression: on OKE the `-m owner
-// --uid-owner` exemption already covers the proxy's uid dials, so an unmarked
-// dial succeeds; on OpenShift (no xt_owner) the mark is the only exemption, but
-// there too, failing the dial helps nothing. So we log the mark failure ONCE and
-// proceed unmarked rather than killing the connection.
+// markDialer returns a *net.Dialer whose sockets carry the proxy egress fwmark
+// so the forced-egress REDIRECT exempts them. The mark is best-effort: without
+// CAP_NET_ADMIN the dial proceeds unmarked (owner-UID exemption on OKE); see
+// egressmark.Dialer for the full rationale.
 func markDialer(timeout time.Duration) *net.Dialer {
-	mark := proxyEgressMark()
-	return &net.Dialer{
-		Timeout: timeout,
-		Control: func(_, _ string, c syscall.RawConn) error {
-			// A failure to enter the raw-conn control context is a real dial
-			// problem (the fd is unusable) — propagate it.
-			if err := c.Control(func(fd uintptr) {
-				if markErr := setSockMark(fd, mark); markErr != nil {
-					warnSockMarkOnce(mark, markErr)
-				}
-			}); err != nil {
-				return err
-			}
-			// Deliberately do NOT propagate a setSockMark failure: the mark is a
-			// best-effort exemption hint, and the owner-UID iptables RETURN
-			// already exempts the proxy's own uid on OKE, so an unmarked dial
-			// still reaches GitHub.
-			return nil
-		},
-	}
-}
-
-// warnSockMarkOnce logs the first SO_MARK failure at WARN and every subsequent
-// one at DEBUG, so a non-CAP_NET_ADMIN deployment (the common non-root case)
-// does not flood the log with one line per dial while still surfacing the
-// condition once.
-var sockMarkWarnOnce sync.Once
-
-func warnSockMarkOnce(mark int, err error) {
-	sockMarkWarnOnce.Do(func() {
-		slog.Warn("proxy egress SO_MARK unavailable — dialing unmarked (owner-UID exemption still applies on OKE); this is expected when the hive runs non-root without CAP_NET_ADMIN in its effective set",
-			"mark", mark, "error", err)
-	})
+	return egressmark.Dialer(timeout)
 }
 
 // CACertPath and caKeyPath are the PVC locations of the persisted MITM CA.
@@ -144,12 +76,34 @@ type GitHubProxy struct {
 	// localInferencePaths records CLI telemetry paths already logged once by
 	// localInferenceResponse, so per-path DEBUG lines do not repeat.
 	localInferencePaths sync.Map
-	listenAddr          string
-	caCert              tls.Certificate
-	caX509              *x509.Certificate
-	logger              *slog.Logger
-	uidMap              *agent.UIDMap
-	allowedRepos        map[string]bool
+	// timeoutWarnAt holds the last WARN time per timeout message, so bursts of
+	// identical upstream timeouts emit one WARN per window (see logTimeout).
+	timeoutWarnMu sync.Mutex
+	timeoutWarnAt map[string]time.Time
+	listenAddr    string
+	caCert        tls.Certificate
+	caX509        *x509.Certificate
+	logger        *slog.Logger
+	// uidMap is read through loadedUIDMap and swapped only by refreshUIDMap
+	// under uidMapMu (#18184): agents added at runtime land in uid-map.json
+	// after construction. uidMapPath/uidMapInfo are what the refresh compares
+	// against; an empty path (no map at boot, or a test literal) never reloads.
+	uidMap         *agent.UIDMap
+	uidMapMu       sync.RWMutex
+	uidMapReloadMu sync.Mutex
+	uidMapPath     string
+	uidMapInfo     os.FileInfo
+	allowedRepos   map[string]bool
+	// Reference repos (#18015): study-only repositories outside allowedRepos,
+	// read-only by default with a per-entry issues/prs opt-in. Reads to them
+	// are forwarded without the hive's credential; writes are gated by
+	// referenceRepoRefusal. referenceDefaults caches each repo's default
+	// branch for the push guard; referenceLookup is the GET those checks use
+	// (nil = defaultReferenceLookup; tests inject one).
+	referenceMu       sync.RWMutex
+	referenceRepos    map[string]ReferenceRepoPolicy
+	referenceDefaults map[string]referenceDefaultBranch
+	referenceLookup   referenceLookupFunc
 
 	// repoPaused reports whether a repo ("owner/repo", as ExtractRepo yields it)
 	// is under an operator pause (#6203). Guarded because the dashboard can
@@ -194,9 +148,10 @@ type GitHubProxy struct {
 
 	// allowPrivateForward snapshots HIVE_PROXY_ALLOW_PRIVATE_FORWARD at
 	// construction (a boot-time deployment choice like proxyAdvisoryOK). The
-	// zero value keeps the plain-HTTP forward guard ON: non-routable
-	// destinations (loopback, link-local/metadata, RFC 1918, CGNAT, multicast)
-	// are refused on the plain path. See plain_forward_guard.go.
+	// zero value keeps the destination guard ON: non-routable destinations
+	// (loopback, link-local/metadata, RFC 1918, CGNAT, multicast) are refused
+	// on the plain-HTTP forward path and on uninspected CONNECT/transparent
+	// tunnels. See plain_forward_guard.go.
 	allowPrivateForward bool
 
 	// injectGHAuth snapshots config.ProxyInjectGHAuth() at construction (#1861,
@@ -284,6 +239,11 @@ type GitHubProxy struct {
 	// without network access.
 	tunnelDial func(host string) (net.Conn, error)
 
+	// upstream, when set, names the hosts whose upstream leg is chained
+	// through a corporate HTTP forward proxy (SetUpstreamProxy). nil keeps
+	// every upstream dial direct.
+	upstream *upstreamproxy.Selector
+
 	canariesEnabled  bool
 	canaryFailClosed bool
 	canaryRegistry   CanaryScanner
@@ -327,8 +287,14 @@ func NewGitHubProxyEphemeral(logger *slog.Logger, org string, repos []string) (*
 
 func newGitHubProxyWithCA(caCert tls.Certificate, caX509 *x509.Certificate, logger *slog.Logger, org string, repos []string) *GitHubProxy {
 	var uidMap *agent.UIDMap
+	var uidMapPath string
+	var uidMapInfo os.FileInfo
+	// Stat before load: a write landing in between leaves an older stamp, so
+	// the next lookup miss reloads rather than missing the change.
+	statInfo, _ := os.Stat(agent.UIDMapPath)
 	if loaded, loadErr := agent.LoadUIDMap(agent.UIDMapPath); loadErr == nil {
 		uidMap = loaded
+		uidMapPath, uidMapInfo = agent.UIDMapPath, statInfo
 		logger.Info("proxy loaded UID map", "agents", len(uidMap.Agents), "iptables", uidMap.IptablesActive)
 	}
 
@@ -361,7 +327,7 @@ func newGitHubProxyWithCA(caCert tls.Certificate, caX509 *x509.Certificate, logg
 	// dial the private estate on an agent's behalf.
 	allowPrivateForward := plainForwardAllowPrivate()
 	if allowPrivateForward {
-		logger.Warn("proxy: plain-HTTP forwards to non-routable destinations are ALLOWED — agents can reach loopback, link-local (cloud metadata) and private-network services through this proxy",
+		logger.Warn("proxy: plain-HTTP forwards and uninspected tunnels to non-routable destinations are ALLOWED — agents can reach loopback, link-local (cloud metadata) and private-network services through this proxy",
 			"env", plainForwardAllowPrivateEnv)
 	}
 
@@ -371,6 +337,8 @@ func newGitHubProxyWithCA(caCert tls.Certificate, caX509 *x509.Certificate, logg
 		caX509:              caX509,
 		logger:              logger,
 		uidMap:              uidMap,
+		uidMapPath:          uidMapPath,
+		uidMapInfo:          uidMapInfo,
 		proxyAdvisoryOK:     advisoryOK,
 		allowPrivateForward: allowPrivateForward,
 		injectGHAuth:        injectGHAuth,

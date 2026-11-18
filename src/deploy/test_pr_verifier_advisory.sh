@@ -19,18 +19,20 @@
 # observable after merge. A static assertion is the only way to demonstrate it
 # in CI, and the only thing that stops the combination drifting back.
 #
-# THE INVARIANT IS RELATIVE, not a pinned pair of values. Either coherent
-# posture is allowed:
+# #18764 removed the image, and with it the registry: the verdicts are now
+# computed in-repo (.github/scripts/pr-verifier.cjs) and each required check
+# is recorded with one already-completed create. The image had created each
+# run in_progress and then updated it; when GitHub 404'd the update, the
+# required runs hung in_progress for ever while the continue-on-error wrapper
+# stayed green. So the posture this suite pins is now:
 #
-#   - verification advisory  => registry access advisory too (today's answer)
-#   - verification fatal     => registry access may be fatal as well
-#
-# What is forbidden is the split that was there: registry access treated MORE
-# harshly than the verification it exists to enable. An unreachable verifier is
-# strictly less informative than a verifier that ran and objected, so it must
-# not fail harder. #6085 says as much: if a missing verifier should block, the
-# continue-on-error on the verification is the thing to reconsider -- the split
-# is the one combination that cannot be right either way.
+#   - nothing touches a registry or a container image (the #6085 failure
+#     mode cannot come back with it);
+#   - the verdict about the PR's TITLE stays advisory for the wrapper job --
+#     the required PR Type / PR Issue checks carry it (pr-verifier.test.cjs);
+#   - failing to RECORD a verdict is not advisory: the verifier step is not
+#     continue-on-error, so the job goes red with the reason instead of green
+#     beside a check that never concluded.
 #
 # Run: bash src/deploy/test_pr_verifier_advisory.sh
 # Exit codes: 0 the posture is coherent, 1 it is not.
@@ -45,7 +47,7 @@ WORKFLOW="$(cd "$HERE/../../.github/workflows" && pwd)/pr-verifier.yml"
 ok()  { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 bad() { echo "  FAIL: $1"; [ -n "${2:-}" ] && echo "        $2"; FAIL=$((FAIL + 1)); }
 
-echo "=== #6085: PR Verifier reports on the PR, not on registry reachability ==="
+echo "=== #6085/#18764: PR Verifier reports on the PR and never hides a lost result ==="
 
 if [ ! -f "$WORKFLOW" ]; then
   bad "workflow not found: $WORKFLOW"
@@ -60,9 +62,9 @@ if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import yaml' >/dev/null
   echo; echo "=== $PASS passed, $FAIL failed ==="; exit 1
 fi
 
-# The whole verdict is computed in one python pass over the PARSED workflow --
-# not greps -- because `continue-on-error: true` and an `if:` expression are
-# structure, and a substring check cannot tell which step owns them.
+# One python pass over the PARSED workflow -- not greps -- because
+# `continue-on-error` and an `if:` expression are structure, and a substring
+# check cannot tell which step owns them.
 verdict="$(python3 - "$WORKFLOW" <<'PY'
 import sys, yaml
 
@@ -71,59 +73,38 @@ jobs = doc.get("jobs") or {}
 problems = []
 notes = []
 
+if "packages" in (doc.get("permissions") or {}):
+    problems.append("workflow still asks for packages permission -- nothing here pulls an image any more (#18764)")
+
 for job_id, job in jobs.items():
     steps = job.get("steps") or []
 
-    def find(pred):
-        return [s for s in steps if pred(s)]
-
-    # The verification step: the one that runs the verifier image.
-    verifier = find(lambda s: s.get("id") == "verifier")
+    verifier = [s for s in steps if s.get("id") == "verifier"]
     if not verifier:
         problems.append(f"{job_id}: no step with id 'verifier' -- this suite can no longer find the verification it is about")
         continue
     verifier = verifier[0]
-    verifier_advisory = bool(verifier.get("continue-on-error"))
 
-    # Registry-touching steps: the GHCR login, and the pull.
-    registry = find(lambda s:
-        "login" in str(s.get("name", "")).lower()
-        or "docker pull" in str(s.get("run", ""))
-        or "login-action" in str(s.get("uses", "")))
-    if not registry:
-        problems.append(f"{job_id}: no registry login/pull step found -- the suite would assert nothing")
-        continue
-    notes.append(f"{job_id}: verification advisory={verifier_advisory}, registry steps={len(registry)}")
+    # A result that could not be recorded must fail the job (#18764).
+    if verifier.get("continue-on-error"):
+        problems.append(f"{job_id}: the verifier step is continue-on-error, so a result it could not record reads as green")
+    if not str(verifier.get("uses", "")).startswith("actions/github-script@"):
+        problems.append(f"{job_id}: the verifier step must be the in-repo github-script verifier, not an image")
+    if ".github/scripts/pr-verifier.cjs" not in str((verifier.get("with") or {}).get("script", "")):
+        problems.append(f"{job_id}: the verifier step does not run .github/scripts/pr-verifier.cjs")
+    if "steps.dispatch_event.outputs.stale != 'true'" not in str(verifier.get("if", "")):
+        problems.append(f"{job_id}: the verifier must not record a verdict on a dispatched run whose head moved on")
 
-    # THE INVARIANT: registry access must not be treated more harshly than the
-    # verification it exists to enable.
-    if verifier_advisory:
-        for s in registry:
-            if not s.get("continue-on-error"):
-                problems.append(
-                    f"{job_id}: step {s.get('name')!r} touches the registry and is FATAL, "
-                    f"while the verification it enables is advisory -- a registry hiccup fails every PR")
-
-    # The verifier must not run against an image that was not pulled.
-    pull = find(lambda s: "docker pull" in str(s.get("run", "")))
-    if pull:
-        pull_id = pull[0].get("id")
-        if not pull_id:
-            problems.append(f"{job_id}: the pull step has no id, so nothing can gate on whether it succeeded")
-        elif f"steps.{pull_id}.outcome" not in str(verifier.get("if", "")):
-            problems.append(
-                f"{job_id}: the verification does not gate on the pull's outcome -- "
-                f"it would run against an image that was never pulled")
-
-        # A skip has to be legible. Green-because-nothing-ran and
-        # green-because-it-passed must not look identical.
-        announced = [s for s in steps
-                     if pull_id and f"steps.{pull_id}.outcome" in str(s.get("if", ""))
-                     and "::warning" in str(s.get("run", ""))]
-        if not announced:
-            problems.append(
-                f"{job_id}: a skipped verification is silent -- no step warns when the image "
-                f"could not be pulled, so 'nothing ran' reads as 'it passed'")
+    # No registry, no image: the #6085 failure mode stays gone.
+    for s in steps:
+        blob = " ".join(str(s.get(k, "")) for k in ("name", "run", "uses"))
+        if "docker" in blob or "login-action" in blob or "ghcr.io" in blob:
+            problems.append(f"{job_id}: step {s.get('name')!r} touches a registry or container image")
+        if s.get("continue-on-error"):
+            problems.append(f"{job_id}: step {s.get('name')!r} is continue-on-error; nothing in this job may hide a failure")
+    if "PR_VERIFIER_IMAGE" in str(job.get("env", "")):
+        problems.append(f"{job_id}: the job still pins a verifier image")
+    notes.append(f"{job_id}: verifier={verifier.get('uses')}, steps={len(steps)}")
 
 for n in notes:
     print("NOTE " + n)
@@ -145,9 +126,9 @@ while IFS= read -r line; do
 done <<<"$verdict"
 
 if ! printf '%s' "$verdict" | grep -q '^PROBLEM'; then
-  ok "registry access is not treated more harshly than the verification it enables"
-  ok "the verification is gated on the pull having succeeded"
-  ok "a skipped verification announces itself rather than passing silently"
+  ok "no registry or image stands between the PR and its verdict"
+  ok "a result the verifier could not record fails the job"
+  ok "a dispatched run whose head moved on records nothing"
 fi
 
 echo

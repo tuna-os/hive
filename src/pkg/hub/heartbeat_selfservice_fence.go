@@ -73,12 +73,13 @@ var heartbeatResponseFieldFence = map[string]heartbeatFieldClass{
 	"GitHubAppConfig": heartbeatFieldFenced, // App, cluster and secondary keys, webhook relay key
 	"PendingGateway":  heartbeatFieldFenced, // funded gateway API key
 	// Upgrade and lifecycle management.
-	"UpgradeTo":        heartbeatFieldFenced,
-	"UpgradeInterrupt": heartbeatFieldFenced,
-	"SwitchToTag":      heartbeatFieldFenced,
-	"RestartSpoke":     heartbeatFieldFenced,
-	"UpgradeAnnounce":  heartbeatFieldFenced,
-	"UpgradePolicy":    heartbeatFieldFenced, // the owner, not the hub, sets upgrade posture
+	"UpgradeTo":         heartbeatFieldFenced,
+	"UpgradeInterrupt":  heartbeatFieldFenced,
+	"UpgradeChannelTag": heartbeatFieldFenced, // rides with UpgradeTo
+	"SwitchToTag":       heartbeatFieldFenced,
+	"RestartSpoke":      heartbeatFieldFenced,
+	"UpgradeAnnounce":   heartbeatFieldFenced,
+	"UpgradePolicy":     heartbeatFieldFenced, // the owner, not the hub, sets upgrade posture
 	// Operational actions.
 	"ResetAgentRestarts": heartbeatFieldFenced,
 	"Breaker":            heartbeatFieldFenced,
@@ -90,6 +91,8 @@ var heartbeatResponseFieldFence = map[string]heartbeatFieldClass{
 	"ProjectConfig":       heartbeatFieldFenced, // claimed project config
 	// Resolved from spoke-reported or hub-provisioned identity.
 	"ClusterID": heartbeatFieldFenced,
+	// Hub-held cluster network policy: patches the hive's own Deployment.
+	"HostAliases": heartbeatFieldFenced,
 }
 
 // fenceSelfServiceHeartbeatResponse zeroes every fenced field of resp when

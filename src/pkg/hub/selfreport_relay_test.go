@@ -57,6 +57,8 @@ func selfReportGitHubScript(searchHit bool) (http.HandlerFunc, *[]string) {
 				items = append(items, map[string]any{"number": 7, "html_url": "https://github.com/hivecommons/hive/issues/7", "body": "<!-- hive-fleet-fingerprint:abc123 -->\n" + fleetreport.RenderAffectedBlock([]string{"other-hive"}, 1)})
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			_ = json.NewEncoder(w).Encode([]any{})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments"):
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
@@ -121,7 +123,7 @@ func TestHubSelfReportIngestCreatesUnderAppIdentity(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || !out.OK || out.Number != 42 || out.Joined {
 		t.Fatalf("response = %s (%v)", rec.Body.String(), err)
 	}
-	if strings.Join(*paths, ",") != "GET /search/issues,POST /repos/hivecommons/hive/issues" {
+	if strings.Join(*paths, ",") != "GET /search/issues,GET /search/issues,GET /search/issues,POST /repos/hivecommons/hive/issues" {
 		t.Fatalf("github calls = %v", *paths)
 	}
 	for _, req := range gh.requests {
@@ -133,7 +135,7 @@ func TestHubSelfReportIngestCreatesUnderAppIdentity(t *testing.T) {
 		Labels []string `json:"labels"`
 		Body   string   `json:"body"`
 	}
-	_ = json.Unmarshal(gh.bodies[1], &payload)
+	_ = json.Unmarshal(gh.bodies[len(gh.bodies)-1], &payload)
 	if !strings.Contains(strings.Join(payload.Labels, ","), selfReportRelayLabel) || !strings.Contains(payload.Body, "hive-fleet-fingerprint:abc123") {
 		t.Fatalf("issue payload = %+v", payload)
 	}
@@ -253,12 +255,12 @@ func TestHubSelfReportIngestJoinsExistingFingerprint(t *testing.T) {
 		t.Fatalf("github calls = %v", *paths)
 	}
 	var comment map[string]string
-	_ = json.Unmarshal(gh.bodies[1], &comment)
-	if !strings.Contains(comment["body"], "hive:selfreport-seen hive=h1 fp=abc123") || !strings.Contains(comment["body"], "Also seen on **h1**") {
+	_ = json.Unmarshal(gh.bodies[2], &comment)
+	if !strings.Contains(comment["body"], fleetreport.SeenLogMarker) || !strings.Contains(comment["body"], "hive:selfreport-seen hive=h1 fp=abc123") || !strings.Contains(comment["body"], "Also seen on **h1**") {
 		t.Fatalf("comment = %q", comment["body"])
 	}
 	var labels map[string][]string
-	_ = json.Unmarshal(gh.bodies[2], &labels)
+	_ = json.Unmarshal(gh.bodies[3], &labels)
 	if strings.Join(labels["labels"], ",") != "hive/selfreport" {
 		t.Fatalf("labels = %v", labels)
 	}
@@ -269,7 +271,7 @@ func TestHubSelfReportIngestJoinsExistingFingerprint(t *testing.T) {
 		t.Fatalf("github calls = %v", *paths)
 	}
 	var patch map[string]string
-	_ = json.Unmarshal(gh.bodies[3], &patch)
+	_ = json.Unmarshal(gh.bodies[4], &patch)
 	if !strings.Contains(patch["body"], "**Affected hives (2):**\n- h1 — owner(s): unknown — seen 1, last ") || !strings.Contains(patch["body"], "\n- other-hive — owner(s): unknown — seen 1\n") || !strings.Contains(patch["body"], "seen_count: 2") {
 		t.Fatalf("patched body = %q", patch["body"])
 	}
@@ -278,6 +280,74 @@ func TestHubSelfReportIngestJoinsExistingFingerprint(t *testing.T) {
 // TestHubSelfReportIngestJoinNamesOwners: the spoke's owners field lands on
 // the hive's affected line, and a spoke that predates the field is named
 // from the hub's own SaaS owner record.
+// A later relayed sighting edits the hub's one seen-log comment instead of
+// posting a new comment per join (#18608). A seen log written by another
+// account is left alone and the hub posts its own.
+func TestHubSelfReportIngestJoinEditsSeenLogInPlace(t *testing.T) {
+	for _, tc := range []struct {
+		name, author string
+		wantEdit     bool
+	}{
+		{"own seen log is edited", "hub-bot", true},
+		{"another account's seen log is not", "someone-else", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetSelfReportRate(t)
+			previous := fleetreport.SeenLog("", "<!-- hive:selfreport-seen hive=other-hive fp=abc123 --> Also seen on **other-hive** (v5.0.0) at 2026-11-01T00:00:00Z — relayed via hub.")
+			var mu sync.Mutex
+			var paths []string
+			var edited, posted string
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				paths = append(paths, r.Method+" "+r.URL.Path)
+				mu.Unlock()
+				switch {
+				case r.URL.Path == "/search/issues":
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{"number": 7, "html_url": "https://github.com/hivecommons/hive/issues/7", "body": "<!-- hive-fleet-fingerprint:abc123 -->"}}})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/hivecommons/hive/issues/7/comments":
+					_ = json.NewEncoder(w).Encode([]map[string]any{
+						{"id": 11, "body": "unrelated", "user": map[string]any{"login": "hub-bot"}},
+						{"id": 12, "body": previous, "user": map[string]any{"login": tc.author}},
+					})
+				case r.Method == http.MethodPatch && r.URL.Path == "/repos/hivecommons/hive/issues/comments/12":
+					var p map[string]string
+					_ = json.NewDecoder(r.Body).Decode(&p)
+					edited = p["body"]
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 12})
+				case r.Method == http.MethodPost && r.URL.Path == "/repos/hivecommons/hive/issues/7/comments":
+					var p map[string]string
+					_ = json.NewDecoder(r.Body).Decode(&p)
+					posted = p["body"]
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 13})
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/labels"):
+					_ = json.NewEncoder(w).Encode([]any{})
+				default:
+					http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusTeapot)
+				}
+			}
+			interceptFeedbackGitHub(t, handler)
+			s := npsTestHub("h1")
+			rec := selfReportIngest(s, selfReportValidBody, s.heartbeatKeyFor("h1"))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if tc.wantEdit {
+				if posted != "" || edited == "" {
+					t.Fatalf("posted=%q edited=%q, want an edit only (calls %v)", posted, edited, paths)
+				}
+				if !strings.Contains(edited, "Also seen on **h1**") || !strings.Contains(edited, "Also seen on **other-hive**") || strings.Index(edited, "hive=h1 ") > strings.Index(edited, "hive=other-hive ") {
+					t.Fatalf("edited seen log = %q, want h1 first and other-hive kept", edited)
+				}
+				return
+			}
+			if edited != "" || !strings.Contains(posted, fleetreport.SeenLogMarker) || !strings.Contains(posted, "Also seen on **h1**") {
+				t.Fatalf("posted=%q edited=%q, want a new seen log (calls %v)", posted, edited, paths)
+			}
+		})
+	}
+}
+
 func TestHubSelfReportIngestJoinNamesOwners(t *testing.T) {
 	resetSelfReportRate(t)
 	oldHives := saasHivesDir
@@ -306,7 +376,7 @@ func TestHubSelfReportIngestJoinNamesOwners(t *testing.T) {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
 			var patch map[string]string
-			_ = json.Unmarshal(gh.bodies[3], &patch)
+			_ = json.Unmarshal(gh.bodies[4], &patch)
 			if !strings.Contains(patch["body"], tc.want) {
 				t.Fatalf("patched body = %q, want line %q", patch["body"], tc.want)
 			}
@@ -340,13 +410,13 @@ func TestHubSelfReportIngestCreateFillsOwnersForLegacySpoke(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if strings.Join(*paths, ",") != "GET /search/issues,POST /repos/hivecommons/hive/issues" {
+	if strings.Join(*paths, ",") != "GET /search/issues,GET /search/issues,GET /search/issues,POST /repos/hivecommons/hive/issues" {
 		t.Fatalf("github calls = %v", *paths)
 	}
 	var payload struct {
 		Body string `json:"body"`
 	}
-	_ = json.Unmarshal(gh.bodies[1], &payload)
+	_ = json.Unmarshal(gh.bodies[len(gh.bodies)-1], &payload)
 	if !strings.Contains(payload.Body, "**Affected hives (1):**\n- h1 — owner(s): @dana — seen 1, last ") || !strings.Contains(payload.Body, "seen_count: 1") {
 		t.Fatalf("created body = %q", payload.Body)
 	}
@@ -692,7 +762,7 @@ func TestHubSelfReportIngestNamesHiveAndLinksSpoke(t *testing.T) {
 			var payload struct {
 				Body string `json:"body"`
 			}
-			_ = json.Unmarshal(gh.bodies[1], &payload)
+			_ = json.Unmarshal(gh.bodies[len(gh.bodies)-1], &payload)
 			if !strings.Contains(payload.Body, tc.wantLine) || !strings.Contains(payload.Body, tc.wantRows) {
 				t.Fatalf("created body = %q\nwant line %q\nwant rows %q", payload.Body, tc.wantLine, tc.wantRows)
 			}
@@ -909,7 +979,7 @@ func selfReportClosedGitHubScript(closedAt time.Time) (http.HandlerFunc, *[]stri
 		switch {
 		case r.URL.Path == "/search/issues":
 			if strings.Contains(r.URL.RawQuery, "is%3Aopen") {
-				http.Error(w, "fingerprint search must not be limited to open issues", http.StatusTeapot)
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
@@ -956,6 +1026,87 @@ func TestHubSelfReportIngestRefilesAfterClosedCooldown(t *testing.T) {
 	rec := selfReportIngest(s, selfReportValidBody, s.heartbeatKeyFor("h1"))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Join(*paths, ",") != "GET /search/issues,GET /search/issues,GET /search/issues,POST /repos/hivecommons/hive/issues" {
+		t.Fatalf("github calls = %v", *paths)
+	}
+}
+
+// selfReportClassJoinScript answers the fingerprint search with nothing and
+// the class-level searches with classHit (an open hive/selfreport issue).
+func selfReportClassJoinScript(classHit bool) (http.HandlerFunc, *[]string) {
+	var mu sync.Mutex
+	var paths []string
+	return func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		switch {
+		case r.URL.Path == "/search/issues":
+			items := []map[string]any{}
+			if classHit && !strings.Contains(r.URL.RawQuery, "hive-fleet-fingerprint") {
+				items = append(items,
+					map[string]any{"number": 5, "html_url": "https://github.com/hivecommons/hive/pull/5", "pull_request": map[string]any{}},
+					map[string]any{"number": 7, "state": "open", "html_url": "https://github.com/hivecommons/hive/issues/7", "body": "<!-- hive-fleet-fingerprint:other -->\n" + fleetreport.RenderAffectedBlock([]string{"other-hive"}, 1)})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments"):
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/labels"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/hivecommons/hive/issues/7":
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 7})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/hivecommons/hive/issues":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 42, "html_url": "https://github.com/hivecommons/hive/issues/42"})
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, http.StatusTeapot)
+		}
+	}, &paths
+}
+
+// Two keyword phrasings of one class have different fingerprints; the relay
+// must still land them on one open issue (#16954, #16955).
+func TestHubSelfReportIngestJoinsOpenIssueOfSameKeywordedClass(t *testing.T) {
+	resetSelfReportRate(t)
+	handler, paths := selfReportClassJoinScript(true)
+	interceptFeedbackGitHub(t, handler)
+	s := npsTestHub("h1")
+	body := `{"hive_id":"h1","fingerprint":"76a28c15535e297434078127","class":"ioscan_classifier_unavailable","title":"[selfreport] ioscan_classifier_unavailable: ioscan classifier failed closed; text withheld","body":"<!-- hive-fleet-fingerprint:76a28c15535e297434078127 -->\nbody","labels":["hive/selfreport"],"version":"v5.1.0"}`
+	rec := selfReportIngest(s, body, s.heartbeatKeyFor("h1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out selfReportRelayResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if !out.OK || !out.Joined || out.Number != 7 {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+	joined := strings.Join(*paths, ",")
+	if !strings.Contains(joined, "POST /repos/hivecommons/hive/issues/7/comments") || !strings.Contains(joined, "PATCH /repos/hivecommons/hive/issues/7") || strings.HasSuffix(joined, "POST /repos/hivecommons/hive/issues") {
+		t.Fatalf("github calls = %v", *paths)
+	}
+}
+
+// A class without keywords (the catch-all) says nothing about the defect: it
+// must not join by class alone (#14256), so the relay still creates.
+func TestHubSelfReportIngestKeywordlessClassDoesNotJoinByClass(t *testing.T) {
+	resetSelfReportRate(t)
+	handler, paths := selfReportClassJoinScript(true)
+	interceptFeedbackGitHub(t, handler)
+	s := npsTestHub("h1")
+	body := `{"hive_id":"h1","fingerprint":"abc123","class":"unclassified_error_repeated","title":"[selfreport] unclassified_error_repeated: something odd","body":"<!-- hive-fleet-fingerprint:abc123 -->\nbody","labels":["hive/selfreport"],"version":"v5.1.0"}`
+	rec := selfReportIngest(s, body, s.heartbeatKeyFor("h1"))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out selfReportRelayResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if !out.OK || out.Joined || out.Number != 42 {
+		t.Fatalf("response = %s", rec.Body.String())
 	}
 	if strings.Join(*paths, ",") != "GET /search/issues,POST /repos/hivecommons/hive/issues" {
 		t.Fatalf("github calls = %v", *paths)

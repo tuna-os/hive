@@ -2,292 +2,105 @@ package chat
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
-func TestCmdInceptionStateReportsPhaseAndQuestions(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Hive-Internal") != "dash-token" {
-			t.Fatalf("missing dashboard internal auth: %q", r.Header.Get("X-Hive-Internal"))
-		}
-		if r.URL.Path != "/api/inception/state" {
-			t.Fatalf("path = %q, want /api/inception/state", r.URL.Path)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":     true,
-			"active": true,
-			"state": map[string]any{
-				"phase":     "clarify",
-				"mode":      "greenfield",
-				"idea_text": "Build a hive",
-				"questions": []map[string]string{{"id": "q1", "text": "Who uses it?"}},
-				"answers":   map[string]string{},
-			},
-		})
-	}))
-	defer ts.Close()
-
-	s := NewService(&recordingBackend{}, Config{DashboardURL: ts.URL, DashboardToken: "dash-token", AllowedUsers: []string{"uid:owner"}}, discardLogger())
-	s.client = ts.Client()
-	got, err := s.cmdInception(context.Background(), "state")
-	if err != nil {
-		t.Fatalf("cmdInception returned error: %v", err)
-	}
-	for _, want := range []string{"clarify", "Build a hive", "Who uses it?"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("state reply %q missing %q", got, want)
-		}
-	}
+func inceptionCtx(role string) context.Context {
+	return context.WithValue(context.Background(), commandRoleContextKey{}, role)
 }
 
-func TestCmdInceptionStateReportsKickError(t *testing.T) {
+// newInceptionStubService wires a dashboard that counts every request: the
+// stub must never call it, since /api/inception/* is retired (410 Gone).
+func newInceptionStubService(t *testing.T) (*Service, *atomic.Int64) {
+	t.Helper()
+	var calls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":     true,
-			"active": true,
-			"state": map[string]any{
-				"phase":      "capture",
-				"mode":       "greenfield",
-				"idea_text":  "Build a hive",
-				"kick_error": "brainstorm could not be started: agent brainstorm not found",
-			},
-		})
+		calls.Add(1)
+		w.WriteHeader(http.StatusGone)
 	}))
-	defer ts.Close()
-
+	t.Cleanup(ts.Close)
 	s := NewService(&recordingBackend{}, Config{DashboardURL: ts.URL}, discardLogger())
 	s.client = ts.Client()
-	got, err := s.cmdInception(context.Background(), "state")
-	if err != nil {
-		t.Fatalf("cmdInception returned error: %v", err)
-	}
-	if !strings.Contains(got, "❌ brainstorm could not be started") {
-		t.Fatalf("state reply %q missing kick error", got)
-	}
+	return s, &calls
 }
 
-func TestCmdInceptionStartSurfacesBrainstormRefusal(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":"inception needs the brainstorm agent, which this hive does not run"}`, http.StatusConflict)
-	}))
-	defer ts.Close()
-
-	s := NewService(&recordingBackend{}, Config{DashboardURL: ts.URL}, discardLogger())
-	s.client = ts.Client()
-	ctx := context.WithValue(context.Background(), commandRoleContextKey{}, "owner")
-	got, err := s.cmdInception(ctx, "start build a hive")
-	if err != nil {
-		t.Fatalf("cmdInception returned error: %v", err)
-	}
-	if !strings.HasPrefix(got, "❌") || !strings.Contains(got, "brainstorm agent") {
-		t.Fatalf("reply = %q, want brainstorm refusal", got)
-	}
-}
-
-func TestCmdInceptionAnswerPostsQuestionID(t *testing.T) {
-	var answerBody map[string]map[string]string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Hive-Internal") != "dash-token" {
-			t.Fatalf("missing dashboard internal auth: %q", r.Header.Get("X-Hive-Internal"))
-		}
-		switch r.URL.Path {
-		case "/api/inception/state":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"ok":     true,
-				"active": true,
-				"state": map[string]any{
-					"phase":     "clarify",
-					"questions": []map[string]string{{"id": "q1", "text": "First?"}, {"id": "q2", "text": "Second?"}},
-					"answers":   map[string]string{},
-				},
-			})
-		case "/api/inception/answer":
-			if err := json.NewDecoder(r.Body).Decode(&answerBody); err != nil {
-				t.Fatalf("decode answer: %v", err)
-			}
-			w.WriteHeader(http.StatusOK)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer ts.Close()
-
-	s := NewService(&recordingBackend{}, Config{DashboardURL: ts.URL, DashboardToken: "dash-token", AllowedUsers: []string{"uid:owner"}}, discardLogger())
-	s.client = ts.Client()
-	ctx := context.WithValue(context.Background(), commandRoleContextKey{}, "owner")
-	got, err := s.cmdInception(ctx, "answer 2 The second answer")
-	if err != nil {
-		t.Fatalf("cmdInception returned error: %v", err)
-	}
-	if !strings.Contains(got, "Answered question 2") {
-		t.Fatalf("reply = %q", got)
-	}
-	if answerBody["answers"]["q2"] != "The second answer" {
-		t.Fatalf("answer body = %#v, want q2", answerBody)
-	}
-}
-
-func TestCmdInceptionOwnerGuard(t *testing.T) {
-	s := NewService(&recordingBackend{}, Config{}, discardLogger())
-	ctx := context.WithValue(context.Background(), commandRoleContextKey{}, "read-write")
-	got, err := s.cmdInception(ctx, "start build a hive")
-	if err != nil {
-		t.Fatalf("cmdInception returned error: %v", err)
-	}
-	if !strings.Contains(got, "owner role required") {
-		t.Fatalf("reply = %q, want owner refusal", got)
-	}
-}
-
-func TestCmdInceptionMutatingSubcommands(t *testing.T) {
-	tests := []struct {
-		name     string
-		args     string
-		wantPath string
-		wantBody string
-	}{
-		{name: "start", args: "start build a hive", wantPath: "/api/inception/start", wantBody: "build a hive"},
-		{name: "scan", args: "scan https://example.com/repo.git", wantPath: "/api/inception/scan", wantBody: "https://example.com/repo.git"},
-		{name: "facts", args: `facts [{"title":"Vision","body":"Do it","type":"vision","tags":["chat"]}]`, wantPath: "/api/inception/facts", wantBody: "Vision"},
-		{name: "approve", args: "approve", wantPath: "/api/inception/approve"},
-		{name: "reset", args: "reset", wantPath: "/api/inception/reset"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var gotPath, gotBody string
-			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				gotPath = r.URL.Path
-				data, _ := io.ReadAll(r.Body)
-				gotBody = string(data)
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer ts.Close()
-
-			s := NewService(&recordingBackend{}, Config{DashboardURL: ts.URL, AllowedUsers: []string{"uid:owner"}}, discardLogger())
-			s.client = ts.Client()
-			ctx := context.WithValue(context.Background(), commandRoleContextKey{}, "owner")
-			got, err := s.cmdInception(ctx, tt.args)
-			if err != nil {
-				t.Fatalf("cmdInception returned error: %v", err)
-			}
-			if !strings.Contains(got, "✅") {
-				t.Fatalf("reply = %q, want success", got)
-			}
-			if gotPath != tt.wantPath {
-				t.Fatalf("path = %q, want %q", gotPath, tt.wantPath)
-			}
-			if tt.wantBody != "" && !strings.Contains(gotBody, tt.wantBody) {
-				t.Fatalf("body = %q, want substring %q", gotBody, tt.wantBody)
-			}
-		})
-	}
-}
-
-func TestCmdInceptionUsageAndErrors(t *testing.T) {
-	s := NewService(&recordingBackend{}, Config{}, discardLogger())
-	ctx := context.WithValue(context.Background(), commandRoleContextKey{}, "owner")
-	for _, args := range []string{"", "bogus", "start", "scan", "answer nope text", "answer 0 text", "facts", "facts not-json"} {
-		got, err := s.cmdInception(ctx, args)
+func TestCmdInceptionRepliesWithSessionsPointerForEverySubcommand(t *testing.T) {
+	s, calls := newInceptionStubService(t)
+	for _, args := range []string{
+		"", "start an idea", "scan https://github.com/o/r", "state", "answer 1 yes",
+		"skip 2", "submit", `facts [{"title":"t"}]`, "approve", "reset", "bogus",
+	} {
+		got, err := s.cmdInception(inceptionCtx("owner"), args)
 		if err != nil {
-			t.Fatalf("cmdInception(%q) returned error: %v", args, err)
+			t.Fatalf("%q: unexpected error %v", args, err)
 		}
-		if !strings.Contains(got, "❌") {
-			t.Fatalf("cmdInception(%q) = %q, want refusal", args, got)
+		if !strings.Contains(got, "Start an Inception session from the dashboard Sessions section") {
+			t.Fatalf("%q reply = %q, want the Sessions pointer", args, got)
+		}
+		if strings.Contains(got, "❌") {
+			t.Fatalf("%q reply = %q, an owner's pointer is not an error", args, got)
 		}
 	}
-}
-
-func TestCmdInceptionStateNoActiveRun(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "active": false})
-	}))
-	defer ts.Close()
-
-	s := NewService(&recordingBackend{}, Config{DashboardURL: ts.URL}, discardLogger())
-	s.client = ts.Client()
-	got, err := s.cmdInception(context.Background(), "state")
-	if err != nil {
-		t.Fatalf("cmdInception returned error: %v", err)
-	}
-	if !strings.Contains(got, "No active") {
-		t.Fatalf("reply = %q", got)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("stub made %d dashboard requests, want 0", n)
 	}
 }
 
-func TestDiffInceptionQueuesQuestionsAndMaintainsPending(t *testing.T) {
-	s := NewService(&recordingBackend{}, Config{AllowedUsers: []string{"uid:owner", "reader:read"}}, discardLogger())
-	prev := &statusSnapshot{Inception: inceptionSnapshot{Active: true, Phase: "capture"}}
-	cur := &statusSnapshot{Inception: inceptionSnapshot{
-		Active:    true,
-		Phase:     "clarify",
-		Questions: []inceptionQuestion{{ID: "q1", Text: "First?"}},
-		Answers:   map[string]string{},
-	}}
-	s.diffInception(prev, cur)
-	if s.pendingInterviews[s.pendingKey("uid")] == nil {
-		t.Fatal("owner pending interview was not seeded")
+func TestCmdInceptionOwnerGate(t *testing.T) {
+	s, calls := newInceptionStubService(t)
+	for _, sub := range []string{"start idea", "scan repo", "answer 1 x", "skip 1", "submit", "facts []", "approve", "RESET"} {
+		for _, role := range []string{"read", ""} {
+			got, err := s.cmdInception(inceptionCtx(role), sub)
+			if err != nil || !strings.Contains(got, "owner role required") {
+				t.Fatalf("role %q %q = %q, %v; want owner refusal", role, sub, got, err)
+			}
+		}
 	}
-	if s.pendingInterviews[s.pendingKey("reader")] != nil {
-		t.Fatal("read-only user should not get pending interview")
+	// Read-only forms keep answering below owner, as before the retirement.
+	for _, sub := range []string{"", "state", "bogus"} {
+		got, _ := s.cmdInception(inceptionCtx("read"), sub)
+		if !strings.Contains(got, "dashboard Sessions section") {
+			t.Fatalf("read role %q = %q, want the pointer", sub, got)
+		}
 	}
-	var sent []string
-	drainQueue(s, &sent)
-	if len(sent) != 1 || !strings.Contains(sent[0], "First?") {
-		t.Fatalf("queued questions = %#v", sent)
-	}
-
-	s.diffInception(cur, &statusSnapshot{Inception: inceptionSnapshot{Active: true, Phase: "structure"}})
-	if s.pendingInterviews[s.pendingKey("uid")] == nil {
-		t.Fatal("structure keeps unanswered pending replies available")
-	}
-	s.pendingInterviews[s.pendingKey("uid")].Answers["q1"] = "done"
-	s.diffInception(cur, &statusSnapshot{Inception: inceptionSnapshot{Active: true, Phase: "structure"}})
-	if s.pendingInterviews[s.pendingKey("uid")] != nil {
-		t.Fatal("completed pending interview should be cleared in structure")
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("stub made %d dashboard requests, want 0", n)
 	}
 }
 
-func TestInceptionPendingHelpers(t *testing.T) {
-	s := NewService(&recordingBackend{}, Config{}, discardLogger())
+func TestCmdInceptionRefusesMultilineInputAsAWhole(t *testing.T) {
+	s, calls := newInceptionStubService(t)
+	for _, args := range []string{
+		"start line one\nline two",
+		"start idea\r\nsecond",
+		"state\nstart sneaky",
+		"answer 1 a\nanswer 2 b",
+	} {
+		got, err := s.cmdInception(inceptionCtx("owner"), args)
+		if err != nil || !strings.Contains(got, "single line") || !strings.Contains(got, "Nothing was run") {
+			t.Fatalf("%q = %q, %v; want a whole-input multi-line refusal", args, got, err)
+		}
+	}
+	// A trailing newline alone is not multi-line input.
+	if got, _ := s.cmdInception(inceptionCtx("owner"), "state\n"); strings.Contains(got, "single line") {
+		t.Fatalf("trailing newline refused: %q", got)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("stub made %d dashboard requests, want 0", n)
+	}
+}
+
+func TestInceptionCommandStaysRegisteredAndRoutes(t *testing.T) {
+	s, _ := newInceptionStubService(t)
 	s.registerBuiltinCommands()
 	s.mu.RLock()
-	_, registered := s.commands["inception"]
+	_, ok := s.commands["inception"]
 	s.mu.RUnlock()
-	if !registered {
-		t.Fatal("inception command was not registered")
-	}
-
-	s.pendingInterviews[s.pendingKey("uid")] = &pendingInterview{
-		Questions: []inceptionQuestion{{ID: "q1", Text: "First?"}},
-	}
-	s.markPendingAnsweredForRole("q1")
-	if got := s.pendingInterviews[s.pendingKey("uid")].Answers["q1"]; got != "answered" {
-		t.Fatalf("marked answer = %q", got)
-	}
-	s.clearPendingInterviews()
-	if len(s.pendingInterviews) != 0 {
-		t.Fatalf("pending interviews not cleared: %#v", s.pendingInterviews)
-	}
-	if got := formatInceptionQuestions(nil, nil); !strings.Contains(got, "No pending") {
-		t.Fatalf("empty question format = %q", got)
-	}
-}
-
-func TestDiffInceptionClearsInactiveOrComplete(t *testing.T) {
-	s := NewService(&recordingBackend{}, Config{AllowedUsers: []string{"uid:owner"}}, discardLogger())
-	s.pendingInterviews[s.pendingKey("uid")] = &pendingInterview{Questions: []inceptionQuestion{{ID: "q1"}}}
-	s.diffInception(&statusSnapshot{}, &statusSnapshot{Inception: inceptionSnapshot{Active: false}})
-	if len(s.pendingInterviews) != 0 {
-		t.Fatal("inactive inception should clear pending interviews")
-	}
-	s.pendingInterviews[s.pendingKey("uid")] = &pendingInterview{Questions: []inceptionQuestion{{ID: "q1"}}}
-	s.diffInception(&statusSnapshot{}, &statusSnapshot{Inception: inceptionSnapshot{Active: true, Phase: "complete"}})
-	if len(s.pendingInterviews) != 0 {
-		t.Fatal("complete inception should clear pending interviews")
+	if !ok {
+		t.Fatal("inception command is no longer registered")
 	}
 }

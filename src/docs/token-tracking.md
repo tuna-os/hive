@@ -7,9 +7,9 @@ Hive tracks token usage for local budgeting, dashboard cost estimates, and hub-l
 The collector starts from `data.metrics_dir` and rescans every 30 seconds. It merges:
 
 - Hive JSONL session files in `data.metrics_dir` (`*.jsonl`) using the flat `SessionEntry` schema.
-- Claude Code session JSONL under `data.claude_sessions_dir` when configured. It reads assistant `message.usage` blocks from recent files (30-day mtime window).
+- Claude Code session JSONL under `data.claude_sessions_dir` when configured, plus every per-agent `/data/home/agents/<name>/.claude/projects` beside it (each per-UID agent's `~/.claude` is a real directory since [#17031](https://github.com/hivecommons/hive/issues/17031)); sessions in a per-agent tree are attributed to that agent when the project directory name carries no work-dir hint. It reads assistant `message.usage` blocks from recent files (30-day mtime window).
 - Copilot CLI `events.jsonl` under `data.copilot_sessions_dir` when configured. It reads `session.shutdown.modelMetrics` and avoids double-counting sessions already captured live by the proxy.
-- Bob CLI chat recordings under `data.bob_sessions_dir` (default `/data/home/.bob`) when configured. It reads `tmp/*/chats/*.json`, maps Bob project hashes back to trusted agent folders, and records explicit `tokens` fields (falling back to content-size estimates only when a recording has no token data).
+- Bob CLI chat recordings under `data.bob_sessions_dir` (default `/data/home/.bob`) and every per-agent `/data/home/agents/<name>/.bob` beside it, when configured. It reads `tmp/*/chats/*.json`, maps Bob project hashes back to trusted agent folders (falling back to the owning agent of a per-agent tree), and records explicit `tokens` fields (falling back to content-size estimates only when a recording has no token data).
 - In the optional Claude Managed Agents hosted path, `pkg/tokens/managed_agents_ledger.go`
   writes `managed-agents-*.jsonl` after deduplicating vendor
   `span.model_request_end` IDs. Its `managed-agents-ledger.json` sidecar keeps
@@ -102,7 +102,7 @@ The kick path records a `LaunchRecord` (`pkg/tokens/launch.go`) each time the go
 - USD is `null` when nothing was attributed — never `$0.00`.
 - `?ref=owner/repo#N` narrows `by_ref` and `by_launch` to one work item; totals stay whole-window.
 
-The dashboard Cost panel renders the top rows as "cost by work item". Manual `send-kick` and startup prompts do not record launches, so their spend stays unattributed. This is visibility only: nothing here gates or budgets a kick, and the governor window budget remains the single enforced budget.
+The dashboard Cost panel renders the top rows as "cost by work item". The Governor **PRs by model** card (`GET /api/governor/pr-models`) sums the PR refs' `share_usd` per authoring model as `hive_cost` (#18717): refs with `kind: "pr"` only, joined on the canonical `owner/repo#N` (a short configured repo name joins on the repo name), never `launch_usd`, and `null` when no matched ref carried usage. `hive_cost_coverage` copies the snapshot's `window_hours`, `unattributed` and `backend_unsupported` USD and the disclaimer; on backends without a usage timeline most models show `null`. Manual `send-kick` and startup prompts do not record launches, so their spend stays unattributed. This is visibility only: nothing here gates or budgets a kick, and the governor window budget remains the single enforced budget.
 
 ## Metering diagnostics and zero-token health
 

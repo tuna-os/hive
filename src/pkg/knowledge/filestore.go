@@ -58,11 +58,13 @@ type filePage struct {
 	Path       string
 	ModTime    time.Time
 	Embedding  []float64
+	Scope      *FactScope
 
 	// Lifecycle frontmatter (#11102); see resolveLifecycleState for defaults.
 	State        LifecycleState
 	Supersedes   string
 	SupersededBy string
+	Author       string
 }
 
 // NewFileStore creates a store that indexes markdown files under rootDir.
@@ -92,14 +94,44 @@ func NewFileStore(rootDir string, name string, logger *slog.Logger) (*FileStore,
 }
 
 // Name returns the display name of this vault.
-func (s *FileStore) Name() string { return s.name }
+func (s *FileStore) Name() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.name
+}
 
 // SetName changes the display name of this vault (vanity rename).
-// The underlying directory path is unchanged.
-func (s *FileStore) SetName(name string) { s.name = name }
+// The underlying directory path is unchanged. It takes the store lock because
+// a git source's sync loop may be reindexing concurrently.
+func (s *FileStore) SetName(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.name = name
+}
 
 // RootDir returns the filesystem path.
-func (s *FileStore) RootDir() string { return s.rootDir }
+func (s *FileStore) RootDir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rootDir
+}
+
+// Relocate re-points the store at rootDir after the directory it indexed was
+// renamed there. The index stays valid; only the recorded file paths move.
+func (s *FileStore) Relocate(rootDir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.rootDir
+	s.rootDir = rootDir
+	for slug, p := range s.pages {
+		rel, err := filepath.Rel(old, p.Path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		p.Path = filepath.Join(rootDir, rel)
+		s.pages[slug] = p
+	}
+}
 
 // WriteFacts persists facts into the vault as markdown files with YAML
 // frontmatter, one file per fact. This is the local-write counterpart to the
@@ -117,9 +149,7 @@ func (s *FileStore) WriteFacts(facts []ExtractedFact) error {
 			// clobber a shared "untitled.md".
 			continue
 		}
-		slug := slugify(f.Title)
-		filename := strings.ReplaceAll(slug+".md", "/", "_")
-		path := filepath.Join(s.rootDir, filename)
+		path := s.factPath(f.Title)
 
 		var buf strings.Builder
 		buf.WriteString("---\n")
@@ -132,6 +162,9 @@ func (s *FileStore) WriteFacts(facts []ExtractedFact) error {
 		}
 		if len(f.Tags) > 0 {
 			fmt.Fprintf(&buf, "tags: [%s]\n", sanitizeFrontmatterList(f.Tags))
+		}
+		if f.State != "" {
+			fmt.Fprintf(&buf, "state: %s\n", sanitizeFrontmatterValue(string(f.State)))
 		}
 		if len(f.Related) > 0 {
 			fmt.Fprintf(&buf, "related: [%s]\n", sanitizeFrontmatterList(f.Related))
@@ -151,10 +184,18 @@ func (s *FileStore) WriteFacts(facts []ExtractedFact) error {
 	return nil
 }
 
+// factPath is the file WriteFacts writes a fact with this title to.
+func (s *FileStore) factPath(title string) string {
+	return filepath.Join(s.rootDir, strings.ReplaceAll(slugify(title)+".md", "/", "_"))
+}
+
 func (s *FileStore) reindex() {
 	pages := make(map[string]filePage)
+	s.mu.RLock()
+	rootDir := s.rootDir
+	s.mu.RUnlock()
 
-	err := filepath.WalkDir(s.rootDir, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -182,7 +223,7 @@ func (s *FileStore) reindex() {
 			return nil
 		}
 
-		rel, _ := filepath.Rel(s.rootDir, path)
+		rel, _ := filepath.Rel(rootDir, path)
 		slug := strings.TrimSuffix(rel, ext)
 		slug = strings.ReplaceAll(slug, string(filepath.Separator), "/")
 
@@ -211,18 +252,23 @@ func (s *FileStore) reindex() {
 		page.State = parsed.state
 		page.Supersedes = parsed.supersedes
 		page.SupersededBy = parsed.supersededBy
+		if !parsed.scope.IsZero() {
+			page.Scope = parsed.scope
+		}
+		page.Author = parsed.author
 		pages[slug] = page
 
 		return nil
 	})
 
 	if err != nil {
-		s.logger.Warn("vault reindex error", "dir", s.rootDir, "error", err)
+		s.logger.Warn("vault reindex error", "dir", rootDir, "error", err)
 	}
 
 	s.embedCache.Clear()
 	s.mu.Lock()
 	prevCount := s.prevPageCount
+	name := s.name
 	for slug, page := range s.derivedPages {
 		pages[slug] = page
 	}
@@ -233,8 +279,8 @@ func (s *FileStore) reindex() {
 
 	if len(pages) != prevCount {
 		s.logger.Info("vault indexed",
-			"name", s.name,
-			"dir", s.rootDir,
+			"name", name,
+			"dir", rootDir,
 			"pages", len(pages),
 			"page_delta", len(pages)-prevCount,
 		)
@@ -543,6 +589,8 @@ type parsedObsidianFile struct {
 	state        LifecycleState
 	supersedes   string
 	supersededBy string
+	scope        *FactScope
+	author       string
 }
 
 var wikilinkRe = regexp.MustCompile(`\[\[([^\]|]+)(?:\|[^\]]+)?\]\]`)
@@ -573,8 +621,33 @@ func parseObsidianFileDetailed(content string, fallbackTitle string) parsedObsid
 			frontmatter := content[4 : 4+endIdx]
 			parsed.body = strings.TrimSpace(content[4+endIdx+4:])
 
+			// The parser is line-oriented and trims indentation, so a nested
+			// `scope:` block is recognised by state: once "scope:" is seen, the
+			// keys paths/labels/lanes belong to it until the next unrelated key.
+			inScope := false
 			for _, line := range strings.Split(frontmatter, "\n") {
 				line = strings.TrimSpace(line)
+				if line == "scope:" {
+					inScope = true
+					if parsed.scope == nil {
+						parsed.scope = &FactScope{}
+					}
+					continue
+				}
+				if inScope {
+					if consumed := parsed.scope.setFromLine(line); consumed {
+						continue
+					}
+					if strings.HasPrefix(line, "- ") || line == "" {
+						// Block-list items are not supported inside scope:
+						// (documented); skip them rather than let them leak
+						// into tags.
+						continue
+					}
+					if strings.Contains(line, ":") {
+						inScope = false
+					}
+				}
 				if strings.HasPrefix(line, "title:") {
 					parsed.title = strings.TrimSpace(strings.TrimPrefix(line, "title:"))
 					parsed.title = strings.Trim(parsed.title, "\"'")
@@ -596,6 +669,10 @@ func parseObsidianFileDetailed(content string, fallbackTitle string) parsedObsid
 				}
 				if strings.HasPrefix(line, "superseded_by:") {
 					parsed.supersededBy = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "superseded_by:")), "\"'")
+				}
+				if strings.HasPrefix(line, "author:") || strings.HasPrefix(line, "owner:") {
+					_, value, _ := strings.Cut(line, ":")
+					parsed.author = strings.Trim(strings.TrimSpace(value), "\"'")
 				}
 				if strings.HasPrefix(line, "source:") {
 					parsed.source = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "source:")), "\"'")
@@ -691,8 +768,10 @@ func (p filePage) effectiveLayer() LayerType {
 // applyLifecycle copies the page's lifecycle and TOC metadata onto f, defaulting
 // legacy pages without a recorded state to approved.
 func (p filePage) applyLifecycle(f *Fact) {
+	f.Scope = p.Scope
 	f.Supersedes = p.Supersedes
 	f.SupersededBy = p.SupersededBy
+	f.Author = p.Author
 	f.State = resolveLifecycleState(p.State, p.Status, p.SupersededBy)
 	f.Updated = p.ModTime
 	f.BodySize = len(p.Body)

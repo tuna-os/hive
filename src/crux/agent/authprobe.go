@@ -351,6 +351,16 @@ func (m *Manager) AgentCredentialRefreshable(agentName string) (refreshable, kno
 	if backend != "claude" {
 		return false, false
 	}
+	// A credential the provider rejected on a live check (#18732) is not
+	// refreshable however the file reads: the grant behind it is dead, and
+	// reporting "refreshable" here is what sent the hub's provider status to
+	// "restart the agents" for a login only an operator can fix.
+	m.mu.RLock()
+	revoked := proc.BackendAuth.Status == BackendAuthRevoked
+	m.mu.RUnlock()
+	if revoked {
+		return false, true
+	}
 	return m.credentialFileProves(agentName, proc.UID, backend), true
 }
 
@@ -381,6 +391,15 @@ func (m *Manager) credentialFileProves(agentName string, uid int, backend string
 			}
 		}
 	case "copilot":
+		// Evaluate the file the agent's CLI actually reads (#18443). When its
+		// ~/.copilot/config.json is a private copy that no longer follows the
+		// shared login (the CLI's atomic save replaced the symlink), neither
+		// the shared file nor the in-memory token proves anything about this
+		// agent: report no proof, so the poller repairs the link instead of
+		// restarting a CLI that will read the same broken copy again.
+		if link, target, ok := copilotConfigBridgePaths(agentName, uid, backend); ok && copilotConfigDiverged(link, target) {
+			return false
+		}
 		if m != nil {
 			m.mu.RLock()
 			tok := m.copilotAuthToken
@@ -446,6 +465,12 @@ func (m *Manager) AgentHasValidCredential(agentName string) bool {
 	backend := proc.Config.Backend
 	if proc.BackendOverride != "" {
 		backend = proc.BackendOverride
+	}
+	// A claude agent on the operator's long-lived token does not use the
+	// credentials file, so a fresh dashboard sign-in there proves nothing:
+	// login text on its pane is Claude rejecting the token (#17759).
+	if backend == "claude" && m.claudeOperatorTokenMode() {
+		return false
 	}
 	return m.credentialFileProves(agentName, proc.UID, backend)
 }

@@ -1,70 +1,127 @@
 name: PR Verifier
 
+# REQUIRED CONTEXT on v5: `verify PR contents` must report on the final head
+# of every PR. On #16567 changelog-fragment-guard's autofix pushed b9cd4bac
+# with github.token (a Dependabot-triggered `pull_request` run sees no Actions
+# secrets, so TOPUP_PUSH_TOKEN was empty; every run on that head reports
+# actor=github-actions[bot]). That push fired the `pull_request` workflows
+# but NOT this `pull_request_target` one, no label event followed for three
+# days, and the context stayed "expected" until a human closed and reopened
+# the PR — BLOCKED the whole time (#16567, #17036). A PAT or App-token push
+# fires both event kinds, so the gap is specific to github.token pushes.
+# Two things close it:
+#   - `labeled`/`unlabeled` (and `ready_for_review`) are listed, mirroring
+#     native-queue-policy.yml, so any App- or PAT-made label flip re-runs the
+#     verifier on the current head (github.token label flips fire nothing).
+#   - `workflow_dispatch`: changelog-fragment-guard dispatches this workflow
+#     on the PR branch right after a github.token autofix push.
+#     workflow_dispatch is one of the two events a github.token may trigger,
+#     and the run's check lands on the branch tip, i.e. the pushed head. Only
+#     same-repo branches are ever dispatched (the autofix never pushes to
+#     forks); such a run uses the GitHub-hosted ARM runner like fork PRs do.
+# The concurrency group below bounds the cost without cancelling anything.
 on:
   pull_request_target:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the same-repo PR whose branch tip this run verifies (#17036)
+        required: true
+        type: string
 
+# Required context: never CANCEL a run on the head SHA (#18578). GitHub scores
+# every check-run of a required name on a commit, so one cancelled sibling
+# leaves the PR BLOCKED beside a green survivor and Tide jams on it (#11250).
+# A per-PR group with cancel-in-progress let every label flip (lgtm, approved,
+# size, stage) cancel the run in flight, and a queued run in a shared group is
+# cancelled by the next one to queue even with cancel-in-progress false. So:
+#   - the group carries the head SHA, so runs on different commits never meet;
+#   - events that re-check the same head (labeled, unlabeled, edited,
+#     reopened, ready_for_review) also carry github.run_id: each runs in its
+#     own group and can neither cancel nor be cancelled. The wrapper is green
+#     whatever the label set or title verdict (the PR Type / PR Issue checks
+#     carry the verdict; the job fails only when it cannot record one,
+#     #18764), and the label types stay for #17036, not for the verdict.
+#   - runs on a superseded commit finish (10 min cap) rather than being
+#     cancelled; their verdict lands on that old SHA, which never merges.
+# .github/scripts/test-required-check-concurrency.py enforces this.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}-${{ github.event.pull_request.head.sha || github.sha }}${{ contains(fromJSON('["labeled","unlabeled","edited","reopened","ready_for_review"]'), github.event.action) && format('-{0}-{1}', github.event.action, github.run_id) || '' }}
+  cancel-in-progress: false
 
 permissions:
   checks: write
+  contents: read
   pull-requests: read
-  packages: read
 
 jobs:
   verify:
     name: verify PR contents
-    if: github.actor != 'dependabot[bot]'
-    # Required on v5: keep on the self-hosted pool so a GitHub-hosted runner
-    # outage does not make otherwise-mergeable PRs impossible to merge.
-    # Fork PRs still fall back to GitHub-hosted for pull_request_target safety.
-    runs-on: ${{ (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest' }}
+    # Two API calls and no image: any runner will do. Forks never reach the
+    # self-hosted pool; a dispatch is only ever for a same-repo branch.
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.HIVE_RUNNER_LABELS || '["ubuntu-latest"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
-    env:
-      PR_VERIFIER_IMAGE: ghcr.io/hivecommons/pr-verifier@sha256:8c2b63817c4bfa7de510ab699b154637f27a42f87826c98083903daf2a539943
     steps:
-      # Login and pull are advisory for the same reason the verification below
-      # is: this check exists to report on PR CONTENTS, and a registry-side
-      # failure (org rename, package visibility change, GHCR outage — #6085
-      # documents 11 consecutive runs red on `manifest unknown` after the
-      # kubestellar→hivecommons move) says nothing about the PR. Failing here
-      # turns every open PR red at once before any content is examined, while
-      # the one step allowed to have an opinion is continue-on-error. When the
-      # image is unreachable the job logs it and stays green — an unreachable
-      # verifier is strictly less informative than a verifier that ran and
-      # objected, so it must not be treated more harshly.
-      - name: Login to GHCR
-        continue-on-error: true
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      # A dispatched run has no pull_request payload. Rebuild one from the API,
+      # and bail out (green, nothing verified, said so) when the PR head is no
+      # longer this ref's tip: whoever moved it fired the normal events, and a
+      # verdict on a non-head commit is noise.
+      - name: Reconstruct the pull_request payload for a dispatched run
+        if: github.event_name == 'workflow_dispatch'
+        id: dispatch_event
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::pr_number must be a PR number, got '$PR_NUMBER'"
+            exit 1
+          fi
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          head_repo="$(jq -r '.head.repo.full_name' <<<"$pr")"
+          head_sha="$(jq -r '.head.sha' <<<"$pr")"
+          if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::#${PR_NUMBER} comes from ${head_repo}; only same-repo PRs may be dispatched"
+            exit 1
+          fi
+          if [ "$head_sha" != "$GITHUB_SHA" ]; then
+            echo "::notice::#${PR_NUMBER} head is ${head_sha}, not this run's ${GITHUB_SHA}; the push that moved it fired pr-verifier itself — nothing verified here (#17036)."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          repo="$(gh api "repos/${GITHUB_REPOSITORY}")"
+          jq -n --argjson pr "$pr" --argjson repo "$repo" \
+            '{action: "synchronize", number: $pr.number, pull_request: $pr, repository: $repo}' \
+            > "${RUNNER_TEMP}/pr-verifier-event.json"
+          echo "event_path=${RUNNER_TEMP}/pr-verifier-event.json" >> "$GITHUB_OUTPUT"
+      # The verifier scripts only. On pull_request_target GitHub runs the
+      # DEFAULT branch's copy of this workflow and github.sha is that branch's
+      # tip, so this never checks out PR code; a dispatched run checks out its
+      # own same-repo branch, which already supplied this workflow file.
+      - name: Check out the verifier scripts
+        if: steps.dispatch_event.outputs.stale != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Pull verifier image
-        id: pull
-        continue-on-error: true
-        run: docker pull "$PR_VERIFIER_IMAGE"
-      - name: Report unreachable verifier image
-        if: steps.pull.outcome != 'success'
-        run: |
-          echo "::warning::PR Verifier image $PR_VERIFIER_IMAGE could not be pulled — verification was SKIPPED, not passed. This is a registry/image problem, not a PR problem (#6085)."
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      # One completed create per check, never create-then-update (#18764).
+      # Not continue-on-error: a title verdict leaves this step green (the
+      # required check carries it), and the step fails only when a result
+      # could not be recorded.
       - name: Verifier action
-        if: steps.pull.outcome == 'success'
+        if: steps.dispatch_event.outputs.stale != 'true'
         id: verifier
-        continue-on-error: true
-        run: |
-          docker run --rm \
-            -e INPUT_GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
-            -e GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
-            -e GITHUB_ACTIONS="true" \
-            -e GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" \
-            -e GITHUB_EVENT_PATH="/github/event.json" \
-            -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
-            -e GITHUB_SHA="$GITHUB_SHA" \
-            -e GITHUB_REF="$GITHUB_REF" \
-            -e GITHUB_WORKSPACE="/github/workspace" \
-            -v "$GITHUB_EVENT_PATH:/github/event.json:ro" \
-            -v "$GITHUB_WORKSPACE:/github/workspace:ro" \
-            "$PR_VERIFIER_IMAGE"
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          VERIFIER_EVENT_PATH: ${{ steps.dispatch_event.outputs.event_path || github.event_path }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const {record} = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-verifier.cjs'));
+            const event = JSON.parse(fs.readFileSync(process.env.VERIFIER_EVENT_PATH, 'utf8'));
+            await record({github, core, owner: context.repo.owner, repo: context.repo.repo, pr: event.pull_request});

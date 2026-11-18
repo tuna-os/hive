@@ -64,10 +64,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	gh "github.com/google/go-github/v72/github"
 	"github.com/hivecommons/hive/pkg/authorkind"
 	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/prstatus"
+	"github.com/hivecommons/hive/pkg/spekmarker"
 	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
@@ -78,6 +81,16 @@ type IssueStagePolicy struct {
 	Enabled bool
 	// Dwell overrides the stage table's expected dwell per stage slug.
 	Dwell map[string]time.Duration
+	// AgentNames are this hive's agent names. A `hive/claimed-by-<agent>`
+	// label naming one of them is removed once the issue carries no live
+	// claim (removeLapsedClaimedByLabels); any other claimed-by label —
+	// the generic human one, a retired per-login one, another hive's
+	// agent — is never touched by that sweep.
+	AgentNames []string
+	// ParentAutoClose returns the decomposed-parent auto-close policy for a
+	// repo (config.ParentAutoCloseOn / Off / EpicsToo, repos.<repo>.
+	// parent_autoclose, hivecommons/hive#18869). Nil means the default.
+	ParentAutoClose func(repo string) string
 }
 
 // SetIssueStageLabels installs the live policy resolver. Nil disables.
@@ -100,6 +113,9 @@ type IssueStageResult struct {
 	Items    int
 	Writes   int
 	Comments int
+	// NoPRParked counts stalled 010 issues the hive had answered without a
+	// PR, parked for the owner (issue_no_pr_park.go).
+	NoPRParked int
 	// PRBodiesEdited counts Hive-authored PR bodies amended with a closing
 	// trailer so GitHub can show the issue↔PR link for default-branch work.
 	PRBodiesEdited int
@@ -112,6 +128,10 @@ type IssueStageResult struct {
 	// `hive/claimed-by-*` labels rewritten to the holder's label (see
 	// healBackendClaimedByLabels).
 	ClaimedByHealed int
+	// ClaimedByLapsed counts this hive's agent `hive/claimed-by-<agent>`
+	// labels removed from issues with no live claim (see
+	// removeLapsedClaimedByLabels).
+	ClaimedByLapsed int
 	// LegacyDecisionMigrated counts issues whose retired needs-decision /
 	// needs-direction label came off after stage/045 was confirmed on them;
 	// NeedsDecisionRestaged counts issues moved from the pre-045
@@ -153,9 +173,13 @@ var triageAwaitingLabel = config.DefaultReporterTrustAwaitingLabel
 // IssueStageInput is the one shape both actionable items and work-detail
 // rows reduce to before classification.
 type IssueStageInput struct {
-	Repo      string
-	Number    int
-	Labels    []string
+	Repo   string
+	Number int
+	Labels []string
+	// Title is the issue title; the only derivation that reads it is the
+	// RFC-title discussion signal ("[RFC]" / "RFC:" opener stages an
+	// unlabelled RFC 018, hivecommons/hive#18141).
+	Title     string
 	Bucket    string // "" for an issue still in the actionable set
 	Reason    string // the bucket's reason; for "filtered", the label that parked it
 	ClaimKind string
@@ -170,6 +194,10 @@ type IssueStageInput struct {
 	// DelegatesWork mirrors the watcher's unchecked issue-task predicate.
 	// Unlike Children, it includes body-only delegation without ledger entries.
 	DelegatesWork bool
+	// SpekUmbrella is set when the body carries the Spek publish marker with
+	// no `task=`: the issue is a Spek-published RFC (spektacular#114), an
+	// umbrella like `epic`, so a claim on it is never staged.
+	SpekUmbrella bool
 	// Held is set for an issue the enumeration put in the Hold list
 	// (Client.isHeld: the hive's hold-label matcher, including the
 	// configured hive-pause/<id> label). IssueStageFor also reads the
@@ -181,6 +209,11 @@ type IssueStageInput struct {
 	// Carried through to the stage engine's AuthorFacts; the 010/015
 	// derivation does not read it.
 	AuthorKind authorkind.Kind
+	// UpdatedAt and Assignees are the enumeration's Issue fields of the same
+	// name (zero for a held item): the claim read keys its comment cache on
+	// UpdatedAt and infers an assignee claim from Assignees.
+	UpdatedAt time.Time
+	Assignees []string
 }
 
 // issueUntriaged reports whether an actionable issue derives
@@ -196,6 +229,90 @@ func issueUntriaged(in IssueStageInput) (untriaged bool, why string) {
 		return true, "reporter-trust gate: awaiting the triage label"
 	}
 	return false, ""
+}
+
+// triageClearAllowed is the one decision on whether the hive may take the
+// reporter-trust awaiting label off an issue whose stage settled triage
+// (hivecommons/hive#18387). The hive removes it at most once per issue: a
+// repository's own triage tooling (Prow's require-matching-label, another
+// bot, a person) may own the same label and re-add it seconds later, and
+// removing it again on every pass only feeds a remove / re-add loop. So:
+// label absent → nothing to remove; already yielded → leave it; removed
+// once and back now → yield (yieldNow) and leave it; otherwise → remove.
+func triageClearAllowed(rec stagelabels.Record, labels []string) (remove, yieldNow bool) {
+	switch {
+	case !issueHasLabel(labels, triageAwaitingLabel), rec.TriageClearYielded:
+		return false, false
+	case !rec.TriageClearedAt.IsZero():
+		return false, true
+	}
+	return true, false
+}
+
+// settleTriageClear applies triageClearAllowed to key's stage record: on a
+// fresh yield it marks the record (persisted with the store, so the yield
+// survives a restart) and logs it once. remove says whether the stage
+// write may take the label off; yielded is what
+// IssueFacts.TriageClearYielded carries to the deriver. The issue sweep
+// and the FactSink's enrichment both call it, so the two paths cannot
+// disagree.
+func settleTriageClear(store *stagelabels.Store, key, repo string, number int, labels []string, logger *slog.Logger) (remove, yielded bool) {
+	if store == nil {
+		return issueHasLabel(labels, triageAwaitingLabel), false
+	}
+	rec, _ := store.Get(key)
+	remove, yieldNow := triageClearAllowed(rec, labels)
+	if yieldNow && store.MarkTriageClearYielded(key) && logger != nil {
+		logger.Info("issue stage labels: "+triageAwaitingLabel+" came back after the hive removed it; leaving it on this issue", "repo", repo, "issue", number, "label", triageAwaitingLabel)
+	}
+	return remove, rec.TriageClearYielded || yieldNow
+}
+
+// openPRLabelClearAllowed is the once-per-issue rule for taking a stale
+// `has-open-pr` off, the same shape as triageClearAllowed: already yielded
+// → leave it; removed once and back now (still no linking PR) → yield and
+// leave it; otherwise → remove. ResetOpenPRLabelClear starts it over when a
+// linking PR is seen beside the label again.
+func openPRLabelClearAllowed(rec stagelabels.Record) (remove, yieldNow bool) {
+	switch {
+	case rec.OpenPRLabelClearYielded:
+		return false, false
+	case !rec.OpenPRLabelClearedAt.IsZero():
+		return false, true
+	}
+	return true, false
+}
+
+// settleOpenPRLabelClear decides whether the issue sweep takes
+// `has-open-pr` off an open issue, returning the label to clear ("" to
+// keep it). The open-PR guard adds the label and nothing else touched it,
+// so after the linking PR merged or closed the issue kept claiming an open
+// PR (projectbluefin/bluefin-bling#82, projectbluefin/common#1656). It asks
+// the guard's own evidence, OpenPRLinkingIssue, and removes the label only
+// on a positive answer: the listing succeeded and no open PR links the
+// issue. A failed listing keeps it, and with the guard off
+// (scanner.skip_issues_with_open_pr: false) the label is left alone.
+func (c *Client) settleOpenPRLabelClear(ctx context.Context, store *stagelabels.Store, key string, in IssueStageInput, logger *slog.Logger) string {
+	if store == nil || !issueHasLabel(in.Labels, HasOpenPRLabel) || !c.SkipIssuesWithOpenPR() {
+		return ""
+	}
+	_, linked, err := c.OpenPRLinkingIssue(ctx, in.Repo, in.Number)
+	if err != nil {
+		return ""
+	}
+	if linked {
+		store.ResetOpenPRLabelClear(key)
+		return ""
+	}
+	rec, _ := store.Get(key)
+	remove, yieldNow := openPRLabelClearAllowed(rec)
+	if yieldNow && store.MarkOpenPRLabelClearYielded(key) && logger != nil {
+		logger.Info("issue stage labels: "+HasOpenPRLabel+" came back after the hive removed it and no open PR links the issue; leaving it on this issue", "repo", in.Repo, "issue", in.Number, "label", HasOpenPRLabel)
+	}
+	if !remove {
+		return ""
+	}
+	return HasOpenPRLabel
 }
 
 // IssueStageFor classifies one enumerated issue: it resolves the hive's
@@ -275,6 +392,68 @@ func parkedOnPersonLabel(in IssueStageInput) string {
 	return ""
 }
 
+// discussionLabels are the labels that mark an issue whose remaining
+// content is a discussion — a proposal, a design question or an
+// architecture RFC — rather than agent work. An open issue wearing one
+// with no live claim derives stage/018-open-for-discussion instead of
+// 010/015 (hivecommons/hive#17150, hivecommons/hive#18141). Most specific
+// first: the reason names the first match. They are NOT claim-gate labels:
+// admission lets anyone claim such an issue, and the claim stages 020/030.
+var discussionLabels = []string{"proposal", "kind/design", "architecture discussion"}
+
+// rfcTitleDiscussionReason is the IssueFacts.DiscussionLabel value for an
+// issue whose title, not its labels, marks it as an RFC
+// (hivecommons/hive#18141): the 018 reason reads
+// "open for discussion: rfc title".
+const rfcTitleDiscussionReason = "rfc title"
+
+// rfcTitlePrefixes are the title openers (after any leading emoji,
+// case-insensitive) that mark an issue as an RFC before any label lands.
+var rfcTitlePrefixes = []string{"[rfc]", "rfc:"}
+
+// issueDiscussionLabel returns the first discussionLabels entry labels
+// carry (case-insensitive, as the issue spells it), or "".
+func issueDiscussionLabel(labels []string) string {
+	for _, want := range discussionLabels {
+		for _, l := range labels {
+			name := strings.TrimSpace(l)
+			if strings.EqualFold(name, want) {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// issueDiscussionSignal is what IssueFacts.DiscussionLabel carries: the
+// discussion label the issue wears, or rfcTitleDiscussionReason when it
+// wears none but its title opens with an RFC marker, or "".
+func issueDiscussionSignal(labels []string, title string) string {
+	if label := issueDiscussionLabel(labels); label != "" {
+		return label
+	}
+	if isRFCTitle(title) {
+		return rfcTitleDiscussionReason
+	}
+	return ""
+}
+
+// isRFCTitle reports whether title opens with "[RFC]" or "RFC:"
+// (case-insensitive) once any leading emoji, punctuation or whitespace is
+// skipped, so "📝 [RFC] v6 ..." and "RFC: ..." both count.
+func isRFCTitle(title string) bool {
+	rest := strings.TrimLeftFunc(title, func(r rune) bool {
+		return r != '[' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	rest = strings.ToLower(rest)
+	for _, p := range rfcTitlePrefixes {
+		if strings.HasPrefix(rest, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // issueAuthorKind is the stage input's author kind from the enumeration's
 // verdict (Client.isHumanAuthor): Human when it said so, Hive — the App
 // bot, a `[bot]` login or a hive identity — when it did not. The verdict
@@ -304,6 +483,11 @@ func forgeIssueLabels(labels []string, claim *IssueClaimContext) []string {
 	return removeIssueLabel(slices.Clone(labels), CoveredByPRLabel)
 }
 
+// issueStageInputFrom is the stage input for one actionable issue.
+func issueStageInputFrom(issue Issue) IssueStageInput {
+	return IssueStageInput{Repo: issue.Repo, Number: issue.Number, Labels: forgeIssueLabels(issue.Labels, issue.ClaimContext), Title: issue.Title, ClaimKind: issue.ClaimKind, ClaimedBy: issue.ClaimedBy, PRStarted: issue.ClaimPRStarted, Claim: issue.ClaimContext, Children: issue.Children, AuthorKind: issueAuthorKind(issue), DelegatesWork: hasUnfinishedDelegatedWork(issue.Body), SpekUmbrella: spekmarker.IsUmbrella(issue.Body), UpdatedAt: issue.UpdatedAt, Assignees: issue.Assignees}
+}
+
 // IssueStageInputs flattens an enumeration result into one row per open
 // issue the cycle saw, actionable items first, then every work-detail row.
 func IssueStageInputs(result *ActionableResult) []IssueStageInput {
@@ -312,7 +496,7 @@ func IssueStageInputs(result *ActionableResult) []IssueStageInput {
 	}
 	var out []IssueStageInput
 	for _, issue := range result.Issues.Items {
-		out = append(out, IssueStageInput{Repo: issue.Repo, Number: issue.Number, Labels: forgeIssueLabels(issue.Labels, issue.ClaimContext), ClaimKind: issue.ClaimKind, ClaimedBy: issue.ClaimedBy, PRStarted: issue.ClaimPRStarted, Claim: issue.ClaimContext, Children: issue.Children, AuthorKind: issueAuthorKind(issue), DelegatesWork: hasUnfinishedDelegatedWork(issue.Body)})
+		out = append(out, issueStageInputFrom(issue))
 	}
 	// Held issues leave the pipeline at enumeration (Hold list, no
 	// work-detail row). They still have to be walked so a stage label
@@ -335,7 +519,7 @@ func IssueStageInputs(result *ActionableResult) []IssueStageInput {
 			if row.Number <= 0 {
 				continue
 			}
-			out = append(out, IssueStageInput{Repo: row.Repo, Number: row.Number, Labels: forgeIssueLabels(row.Labels, row.ClaimContext), Bucket: row.Bucket, Reason: row.Reason, ClaimKind: row.ClaimKind, ClaimedBy: row.ClaimedBy, PRStarted: row.ClaimPRStarted, Claim: row.ClaimContext, Children: row.Children})
+			out = append(out, IssueStageInput{Repo: row.Repo, Number: row.Number, Labels: forgeIssueLabels(row.Labels, row.ClaimContext), Title: row.Title, Bucket: row.Bucket, Reason: row.Reason, ClaimKind: row.ClaimKind, ClaimedBy: row.ClaimedBy, PRStarted: row.ClaimPRStarted, Claim: row.ClaimContext, Children: row.Children, UpdatedAt: row.UpdatedAt, Assignees: row.Assignees})
 		}
 	}
 	return out
@@ -418,6 +602,13 @@ func SyncIssueStageLabelsWith(ctx context.Context, client *Client, result *Actio
 	legacyCarriers := map[string]int{}
 	reposSeen := map[string]bool{}
 	var pending []issueStagePending
+	linkRateLimited := false
+	linkSkipped := 0
+	defer func() {
+		if linkRateLimited && logger != nil {
+			logger.Info("issue stage labels: PR issue-link safeguard paused for this sweep, GitHub rate limit exceeded; retrying next sweep", "skipped_pairs", linkSkipped)
+		}
+	}()
 	for _, in := range IssueStageInputs(result) {
 		if ctx.Err() != nil {
 			return res
@@ -434,6 +625,10 @@ func SyncIssueStageLabelsWith(ctx context.Context, client *Client, result *Actio
 			legacyCarriers[in.Repo]++
 		}
 		res.ClaimedByHealed += healBackendClaimedByLabels(ctx, client, in, logger)
+		if reconcileDoneVerdictLabels(ctx, client, in, logger) {
+			res.Writes++
+		}
+		res.ClaimedByLapsed += removeLapsedClaimedByLabels(ctx, client, in, policy.AgentNames, now, logger)
 		// A decomposed parent is waiting on its children, not on itself
 		// (hivecommons/hive#12857): all closed → close it; any open → it
 		// keeps its stage but is never marked stalled.
@@ -469,28 +664,67 @@ func SyncIssueStageLabelsWith(ctx context.Context, client *Client, result *Actio
 		stage, covered, reason := d.Stage, d.Covered, d.Reason
 		var want stagelabels.Desired
 		var tr stagelabels.Transition
+		var triageYielded bool
+		var staleOpenPR string
 		if stage == stagelabels.None {
-			store.Forget(key)
+			store.ForgetStage(key)
 		} else {
-			tr = store.ObserveProgress(key, stage, reason, d.Progress)
+			// A parent held for its open sub-issues leaves its merged PR's
+			// stage because the PR merged, not because work was lost: the
+			// fall is progress, so no regression is booked or narrated.
+			tr = store.ObserveProgress(key, stage, reason, d.Progress || mergedPRHeldParentFallIsProgress(in, stage))
 			noteIssueCoveringPR(client, store, key, in, stage)
 			rec, _ := store.Get(key)
 			want = stagelabels.Desired{Stage: stage}
 			if !covered && !awaitingChildren {
 				want.Stalled = stagelabels.Stalled(rec, policy.Dwell, now)
 			}
+			// The hive answered a stalled 010 issue without a PR and left it
+			// there: park it for the owner (issue_no_pr_park.go). Parked, it
+			// skips the 010 write below, which would undo the park.
+			if stage == stagelabels.Actionable && want.Stalled && !covered && noPRParkCandidate(in) {
+				parked, err := client.parkUnansweredNoPRIssue(ctx, in, rec, now)
+				if err != nil && logger != nil {
+					logger.Warn("issue stage labels: parking an issue the hive answered without a PR failed", "repo", in.Repo, "issue", in.Number, "error", err)
+				}
+				if parked {
+					res.NoPRParked++
+					res.Writes++
+					continue
+				}
+			}
 			// A claimed / covered issue still wearing the reporter-trust
 			// awaiting label is stale (015 is not a gate): the engine's
 			// Decision.Clear takes it off in the stage write, and the
 			// pre-plan here must see the same write as due so an issue
 			// whose stage label is already right is still reconciled
-			// (hivecommons/hive#14586).
-			if stage.SettlesTriage() && issueHasLabel(in.Labels, triageAwaitingLabel) {
-				want.Clear = []string{triageAwaitingLabel}
+			// (hivecommons/hive#14586). Only once per issue, though: a
+			// label that came back after that removal belongs to another
+			// writer and stays (hivecommons/hive#18387). The yield is only
+			// judged at a stage that settles triage: at 010/015 (say,
+			// after a claim release) the label is legitimately back, and
+			// a sticky yield must not be booked from that read.
+			triageYielded = rec.TriageClearYielded
+			if stage.SettlesTriage() {
+				clearTriage, yielded := settleTriageClear(store, key, in.Repo, in.Number, in.Labels, logger)
+				triageYielded = yielded
+				if clearTriage {
+					want.Clear = []string{triageAwaitingLabel}
+				}
+			}
+			// A `has-open-pr` whose linking PR is gone comes off in the same
+			// write; Decision.Clear carries it through StaleOpenPRLabel.
+			if staleOpenPR = client.settleOpenPRLabelClear(ctx, store, key, in, logger); staleOpenPR != "" {
+				want.Clear = append(want.Clear, staleOpenPR)
 			}
 		}
 		if stage == stagelabels.PRInProgress || stage == stagelabels.CoveredByPR {
-			edited, commented := ensureIssueStagePRLink(ctx, client, in, store, key, logger)
+			var edited, commented bool
+			if linkRateLimited {
+				linkSkipped++
+			} else {
+				edited, commented, linkRateLimited = ensureIssueStagePRLink(ctx, client, in, store, key, logger)
+			}
 			if edited {
 				res.PRBodiesEdited++
 				res.Writes++
@@ -509,7 +743,7 @@ func SyncIssueStageLabelsWith(ctx context.Context, client *Client, result *Actio
 			}
 			continue
 		}
-		if client.stageArchived.has(strings.ToLower(owner + "/" + name)) {
+		if repoKey := strings.ToLower(owner + "/" + name); client.stageArchived.has(repoKey) || client.stageLabelForbidden.has(repoKey) {
 			continue
 		}
 		if err := client.ensureStageLabelFamily(ctx, in.Repo); err != nil {
@@ -519,6 +753,8 @@ func SyncIssueStageLabelsWith(ctx context.Context, client *Client, result *Actio
 			if logger != nil {
 				if client.stageArchived.has(strings.ToLower(owner + "/" + name)) {
 					logger.Warn("issue stage labels: repository is archived and read-only, skipping it until restart; remove it from the configured repos", "repo", in.Repo, "error", err)
+				} else if client.stageLabelForbidden.has(strings.ToLower(owner + "/" + name)) {
+					logger.Warn("issue stage labels: GitHub App cannot write labels in this repository, skipping it until restart; grant the App Issues write access or remove the repo from the configured repos", "repo", in.Repo, "error", err)
 				} else {
 					logger.Warn("issue stage labels: provisioning failed", "repo", in.Repo, "error", err)
 				}
@@ -529,6 +765,8 @@ func SyncIssueStageLabelsWith(ctx context.Context, client *Client, result *Actio
 		facts.Ref.Owner, facts.Ref.Repo = owner, name
 		facts.ObservedAt = now
 		facts.Issue.Stalled = want.Stalled
+		facts.Issue.TriageClearYielded = triageYielded
+		facts.Issue.StaleOpenPRLabel = staleOpenPR
 		pending = append(pending, issueStagePending{in: in, key: key, want: want, tr: tr, covered: covered, reason: reason, facts: facts})
 	}
 	// The write: one ReconcileBatch for the pass. The reconciler re-reads
@@ -592,7 +830,10 @@ func SyncIssueStageLabelsWith(ctx context.Context, client *Client, result *Actio
 		// note; a covering PR's own falls are narrated on the PR.
 		if tr.Regressed && !covered && tr.Prev.Before(stagelabels.CoveredByPR) {
 			if rec, ok := store.Get(key); ok && !rec.RegressionCommented {
-				if err := client.CreateIssueComment(ctx, in.Repo, in.Number, stagelabels.RegressionComment(tr.Prev, tr.Next, reason)); err != nil {
+				note := stagelabels.RegressionComment(tr.Prev, tr.Next, reason)
+				if _, err := client.PostIssueNote(ctx, in.Repo, in.Number, prstatus.KeyStageRegressed, note, func(ctx context.Context) error {
+					return client.CreateIssueComment(ctx, in.Repo, in.Number, note)
+				}); err != nil {
 					if logger != nil {
 						logger.Warn("issue stage labels: regression comment failed", "repo", in.Repo, "issue", in.Number, "error", err)
 					}
@@ -641,6 +882,11 @@ const mergedPRPartialStageMarker = "<!-- hive:issue-stage-merged-partial"
 // comment landed is retried without a second comment.
 const mergedPRClosedStageMarker = "<!-- hive:closed-by-merged-pr"
 
+// mergedPRClosedStageMarkerFor is the full marker for pr.
+func mergedPRClosedStageMarkerFor(pr int) string {
+	return fmt.Sprintf("%s pr=%d -->", mergedPRClosedStageMarker, pr)
+}
+
 func handleMergedPRIssueStage(ctx context.Context, client *Client, in IssueStageInput, logger *slog.Logger) (closed, commented bool) {
 	if client == nil || client.client == nil || in.Claim == nil || !in.Claim.MergedPR || in.Claim.PRNumber <= 0 {
 		return false, false
@@ -663,7 +909,9 @@ func handleMergedPRIssueStage(ctx context.Context, client *Client, in IssueStage
 			url = fmt.Sprintf("#%d", in.Claim.PRNumber)
 		}
 		body := fmt.Sprintf("%s\nPR #%d has merged: %s\n\nHive is moving this issue back to the actionable lane because the PR used a non-closing reference (`Refs` / `Part of`) and therefore landed partial work without closing the issue.", marker, in.Claim.PRNumber, url)
-		if err := client.CreateIssueComment(ctx, in.Repo, in.Number, body); err != nil {
+		if _, err := client.PostIssueNote(ctx, in.Repo, in.Number, prstatus.KeyIssuePartial(in.Claim.PRNumber), body, func(ctx context.Context) error {
+			return client.CreateIssueComment(ctx, in.Repo, in.Number, body)
+		}); err != nil {
 			if logger != nil {
 				logger.Warn("issue stage labels: merged partial PR comment failed", "repo", in.Repo, "issue", in.Number, "pr", in.Claim.PRNumber, "error", err)
 			}
@@ -674,17 +922,30 @@ func handleMergedPRIssueStage(ctx context.Context, client *Client, in IssueStage
 	if !in.Claim.Closing {
 		return false, false
 	}
-	marker := fmt.Sprintf("%s pr=%d -->", mergedPRClosedStageMarker, in.Claim.PRNumber)
-	alreadyCommented, err := client.IssueCommentsContain(ctx, in.Repo, in.Number, marker)
+	// A parent with an open sub-issue is not fixed by the PR that merged:
+	// no "Fixed by" note and no close. closeDecomposedParent closes it once
+	// every child is closed.
+	if mergedPRIssueStageHeldForOpenChildren(client, in, logger) {
+		return false, false
+	}
+	marker := mergedPRClosedStageMarkerFor(in.Claim.PRNumber)
+	// Close-on-merge's own "Fixed by #N" (CloseOnMergeMarker) counts as the
+	// closing comment too: one per issue, never both (hivecommons/hive#15727
+	// vs #15843).
+	alreadyCommented, err := client.issueCommentsContainAny(ctx, in.Repo, in.Number, marker, CloseOnMergeMarker)
 	if err != nil && logger != nil {
 		logger.Warn("issue stage labels: could not check merged full-fix PR close comment; posting a fresh note", "repo", in.Repo, "issue", in.Number, "pr", in.Claim.PRNumber, "error", err)
 	}
-	if !alreadyCommented {
+	if alreadyCommented {
+		client.noteCommentSuppressed()
+	} else {
 		body := fmt.Sprintf("%s\nFixed by #%d (merged). Closing because Hive's PR claim metadata says this PR was the full fix.", marker, in.Claim.PRNumber)
 		if strings.TrimSpace(in.Claim.PRURL) != "" {
 			body = fmt.Sprintf("%s\nFixed by #%d (%s, merged). Closing because Hive's PR claim metadata says this PR was the full fix.", marker, in.Claim.PRNumber, in.Claim.PRURL)
 		}
-		if err := client.CreateIssueComment(ctx, in.Repo, in.Number, body); err != nil {
+		if _, err := client.PostIssueNote(ctx, in.Repo, in.Number, prstatus.KeyIssueClose, body, func(ctx context.Context) error {
+			return client.CreateIssueComment(ctx, in.Repo, in.Number, body)
+		}); err != nil {
 			if logger != nil {
 				logger.Warn("issue stage labels: merged full-fix PR close comment failed", "repo", in.Repo, "issue", in.Number, "pr", in.Claim.PRNumber, "error", err)
 			}
@@ -701,15 +962,15 @@ func handleMergedPRIssueStage(ctx context.Context, client *Client, in IssueStage
 	return true, commented
 }
 
-func ensureIssueStagePRLink(ctx context.Context, client *Client, in IssueStageInput, store *stagelabels.Store, key string, logger *slog.Logger) (edited, commented bool) {
+func ensureIssueStagePRLink(ctx context.Context, client *Client, in IssueStageInput, store *stagelabels.Store, key string, logger *slog.Logger) (edited, commented, rateLimited bool) {
 	if client == nil || client.client == nil || in.Claim == nil || in.Claim.PRNumber <= 0 {
-		return false, false
+		return false, false, false
 	}
 	// Older tests and payloads may carry only a PR number. Real claim rows
 	// include URL/repo/grade metadata; require at least one such field before
 	// spending a PR lookup.
 	if in.Claim.PRURL == "" && in.Claim.PRRepo == "" && in.Claim.PRAuthor == "" && !in.Claim.Closing && !in.Claim.Reference {
-		return false, false
+		return false, false, false
 	}
 	claim := in.Claim
 	if claim.Reference && (in.DelegatesWork || in.Children != nil && in.Children.Open() > 0 || issueHasLabel(in.Labels, PartiallyAddressedLabel)) {
@@ -721,39 +982,46 @@ func ensureIssueStagePRLink(ctx context.Context, client *Client, in IssueStageIn
 	}
 	link, err := client.EnsureIssueStagePRLink(ctx, in.Repo, in.Number, claim)
 	if err != nil {
+		if isSearchRateLimit(err) {
+			// The client short-circuits locally while limited; every
+			// further pair would fail identically. Stop for this sweep.
+			return false, false, true
+		}
 		if logger != nil {
 			logger.Warn("issue stage labels: PR issue-link safeguard failed", "repo", in.Repo, "issue", in.Number, "pr", in.Claim.PRNumber, "error", err)
 		}
-		return false, false
+		return false, false, false
 	}
 	if link.EditedBody {
 		if logger != nil {
 			logger.Info("issue stage labels: appended closing keyword to Hive-authored PR body for GitHub issue link", "repo", in.Repo, "issue", in.Number, "pr", in.Claim.PRNumber, "base", link.Base)
 		}
-		return true, false
+		return true, false, false
 	}
 	if strings.TrimSpace(link.StageComment) == "" {
-		return false, false
+		return false, false, false
 	}
 	rec, ok := store.Get(key)
 	if !ok || rec.EntryCommented {
-		return false, false
+		return false, false, false
 	}
-	if err := client.CreateIssueComment(ctx, in.Repo, in.Number, link.StageComment); err != nil {
+	if _, err := client.PostInformationalIssueNote(ctx, in.Repo, in.Number, prstatus.KeyIssuePRLink, link.StageComment, func(ctx context.Context) error {
+		return client.CreateIssueComment(ctx, in.Repo, in.Number, link.StageComment)
+	}); err != nil {
 		owner, name := client.splitRepo(in.Repo)
 		if client.noteArchivedWrite(strings.ToLower(owner+"/"+name), err) {
 			if logger != nil {
 				logger.Debug("issue stage labels: repository is archived and read-only, skipping PR link stage comment", "repo", in.Repo, "issue", in.Number)
 			}
-			return false, false
+			return false, false, false
 		}
 		if logger != nil {
 			logger.Warn("issue stage labels: PR link stage comment failed", "repo", in.Repo, "issue", in.Number, "pr", in.Claim.PRNumber, "error", err)
 		}
-		return false, false
+		return false, false, false
 	}
 	store.MarkEntryCommented(key, "")
-	return false, true
+	return false, true, false
 }
 
 // ensureStageLabelFamily provisions (or recolours) the stage/author label
@@ -789,13 +1057,13 @@ func (c *Client) ensureStageLabelFamily(ctx context.Context, repo string) error 
 		cur, ok := existing[strings.ToLower(def.Name)]
 		switch {
 		case !ok:
-			_, _, err := c.client.Issues.CreateLabel(ctx, owner, name, &gh.Label{Name: gh.Ptr(def.Name), Color: gh.Ptr(def.Color), Description: gh.Ptr(def.Description)})
+			_, _, err := c.client.Issues.CreateLabel(ctx, owner, name, &gh.Label{Name: gh.Ptr(def.Name), Color: gh.Ptr(def.Color), Description: gh.Ptr(clampLabelDescription(def.Description))})
 			if err != nil && !githubStatusError(err, http.StatusUnprocessableEntity) {
 				c.noteArchivedLabelRefusal(key, err)
 				return err
 			}
 		case !strings.EqualFold(cur.GetColor(), def.Color):
-			if _, _, err := c.client.Issues.EditLabel(ctx, owner, name, cur.GetName(), &gh.Label{Name: gh.Ptr(def.Name), Color: gh.Ptr(def.Color), Description: gh.Ptr(def.Description)}); err != nil {
+			if _, _, err := c.client.Issues.EditLabel(ctx, owner, name, cur.GetName(), &gh.Label{Name: gh.Ptr(def.Name), Color: gh.Ptr(def.Color), Description: gh.Ptr(clampLabelDescription(def.Description))}); err != nil {
 				c.noteArchivedLabelRefusal(key, err)
 				return err
 			}
@@ -810,7 +1078,12 @@ func (c *Client) ensureStageLabelFamily(ctx context.Context, repo string) error 
 // create or edit because the repository is archived and read-only
 // (hivecommons/hive#14026), so later sweeps skip it instead of retrying.
 func (c *Client) noteArchivedLabelRefusal(key string, err error) {
-	c.noteArchivedWrite(key, err)
+	if c.noteArchivedWrite(key, err) {
+		return
+	}
+	if githubStatusError(err, http.StatusForbidden) && strings.Contains(strings.ToLower(err.Error()), "resource not accessible by integration") {
+		c.stageLabelForbidden.mark(key)
+	}
 }
 
 // noteArchivedWrite memoises the repo when err is GitHub's 403 refusal of a

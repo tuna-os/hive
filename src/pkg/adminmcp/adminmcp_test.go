@@ -785,3 +785,347 @@ func TestLimitSchemaDescribesCap(t *testing.T) {
 		}
 	}
 }
+
+// TestClaudeAuthStatusToolReadsStatusEndpoint: claude_auth_status is a listed,
+// argument-free read-only tool answered by GET /api/claude-auth/status, so the
+// in-hive provider and stdio hive-admin-mcp report the same auth mode the
+// dashboard does (#17759).
+func TestClaudeAuthStatusToolReadsStatusEndpoint(t *testing.T) {
+	if !AllowedTool(ToolClaudeAuthStatus) {
+		t.Fatal("claude_auth_status is not an allowed tool")
+	}
+	if path, ok := ReadPath(ToolClaudeAuthStatus, 0); !ok || path != "/api/claude-auth/status" {
+		t.Fatalf("claude_auth_status path = %q, %v", path, ok)
+	}
+	var found bool
+	for _, tool := range Tools() {
+		if tool["name"] != ToolClaudeAuthStatus {
+			continue
+		}
+		found = true
+		annotations, _ := tool["annotations"].(map[string]any)
+		if annotations["readOnlyHint"] != true {
+			t.Fatalf("annotations = %#v", annotations)
+		}
+		schema, _ := tool["inputSchema"].(map[string]any)
+		if props, _ := schema["properties"].(map[string]any); len(props) != 0 {
+			t.Fatalf("claude_auth_status takes no arguments, schema properties = %#v", props)
+		}
+	}
+	if !found {
+		t.Fatal("claude_auth_status tool not listed")
+	}
+}
+
+// pr_models_read, contributor_model_stats_read and effective_models_read are
+// listed read-only, take no write role, and describe their window argument,
+// its bounds, limit and offset.
+func TestModelEffectivenessToolsAreListedReadOnly(t *testing.T) {
+	want := map[string]string{ToolPRModelsRead: "window", ToolContributorModelStatsRead: "days", ToolEffectiveModelsRead: "filter"}
+	for _, tool := range Tools() {
+		name, _ := tool["name"].(string)
+		arg, ok := want[name]
+		if !ok {
+			continue
+		}
+		delete(want, name)
+		if !AllowedTool(name) {
+			t.Errorf("%s is listed but not allowed", name)
+		}
+		annotations, _ := tool["annotations"].(map[string]any)
+		if annotations["readOnlyHint"] != true {
+			t.Errorf("%s annotations = %#v, want read-only", name, annotations)
+		}
+		if meta, _ := tool["metadata"].(ToolMetadata); meta.Writes {
+			t.Errorf("%s metadata says it writes", name)
+		}
+		schema, _ := tool["inputSchema"].(map[string]any)
+		props, _ := schema["properties"].(map[string]any)
+		if _, ok := props[arg]; !ok {
+			t.Errorf("%s schema has no %q: %#v", name, arg, props)
+		}
+		if _, ok := props["limit"]; !ok {
+			t.Errorf("%s schema has no limit: %#v", name, props)
+		}
+		if _, ok := props["offset"]; !ok {
+			t.Errorf("%s schema has no offset: %#v", name, props)
+		}
+	}
+	for name := range want {
+		t.Errorf("%s is not listed", name)
+	}
+	window, _ := inputSchema(ToolPRModelsRead)["properties"].(map[string]any)["window"].(map[string]any)
+	if enum, _ := window["enum"].([]string); strings.Join(enum, ",") != "7d,30d,all" {
+		t.Errorf("window enum = %#v, want 7d, 30d, all", window["enum"])
+	}
+	days, _ := inputSchema(ToolContributorModelStatsRead)["properties"].(map[string]any)["days"].(map[string]any)
+	if days["minimum"] != 0 || days["maximum"] != 365 {
+		t.Errorf("days bounds = %v-%v, want 0-365", days["minimum"], days["maximum"])
+	}
+	effProps, _ := inputSchema(ToolEffectiveModelsRead)["properties"].(map[string]any)
+	filter, _ := effProps["filter"].(map[string]any)
+	if enum, _ := filter["enum"].([]string); strings.Join(enum, ",") != "all,hive,contributor" {
+		t.Errorf("filter enum = %#v, want all, hive, contributor", filter["enum"])
+	}
+	effWindow, _ := effProps["window"].(map[string]any)
+	if enum, _ := effWindow["enum"].([]string); strings.Join(enum, ",") != "7d,30d,all" {
+		t.Errorf("effective_models_read window enum = %#v, want 7d, 30d, all", effWindow["enum"])
+	}
+	if _, ok := effProps["min_merged_prs"]; ok {
+		t.Error("effective_models_read offers min_merged_prs, which the Operations panel has no control for")
+	}
+}
+
+// Each tool reads the endpoint the dashboard reads, with the dashboard's
+// default window when none is given: 7d for PRs by model, 7 days for the
+// contributor run stats.
+func TestModelEffectivenessReadPaths(t *testing.T) {
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+		want string
+	}{
+		{ToolPRModelsRead, nil, "/api/governor/pr-models?window=7d"},
+		{ToolPRModelsRead, map[string]any{}, "/api/governor/pr-models?window=7d"},
+		{ToolPRModelsRead, map[string]any{"window": ""}, "/api/governor/pr-models?window=7d"},
+		{ToolPRModelsRead, map[string]any{"window": "30d"}, "/api/governor/pr-models?window=30d"},
+		{ToolPRModelsRead, map[string]any{"window": " ALL "}, "/api/governor/pr-models?window=all"},
+		{ToolContributorModelStatsRead, nil, "/api/contribute/run-stats/models?days=7"},
+		{ToolContributorModelStatsRead, map[string]any{"days": float64(0)}, "/api/contribute/run-stats/models?days=0"},
+		{ToolContributorModelStatsRead, map[string]any{"days": float64(365)}, "/api/contribute/run-stats/models?days=365"},
+		{ToolContributorModelStatsRead, map[string]any{"days": 30}, "/api/contribute/run-stats/models?days=30"},
+		{ToolContributorModelStatsRead, map[string]any{"days": "14"}, "/api/contribute/run-stats/models?days=14"},
+		{ToolContributorModelStatsRead, map[string]any{"days": float64(0), "offset": float64(50)}, "/api/contribute/run-stats/models?days=0"},
+		{ToolEffectiveModelsRead, nil, "/api/contribute/effective-models?window=7d&filter=all"},
+		{ToolEffectiveModelsRead, map[string]any{"window": "30d", "filter": "hive"}, "/api/contribute/effective-models?window=30d&filter=hive"},
+		{ToolEffectiveModelsRead, map[string]any{"window": "all", "filter": " Contributor "}, "/api/contribute/effective-models?window=all&filter=contributor"},
+		{ToolEffectiveModelsRead, map[string]any{"filter": ""}, "/api/contribute/effective-models?window=7d&filter=all"},
+	} {
+		got, err := ModelEffectivenessReadPath(tc.tool, tc.args)
+		if err != nil || got != tc.want {
+			t.Errorf("%s %v path = %q, %v; want %q", tc.tool, tc.args, got, err, tc.want)
+		}
+	}
+	for tool, want := range map[string]string{
+		ToolPRModelsRead:              "/api/governor/pr-models?window=7d",
+		ToolContributorModelStatsRead: "/api/contribute/run-stats/models?days=7",
+		ToolEffectiveModelsRead:       "/api/contribute/effective-models?window=7d&filter=all",
+	} {
+		if got, ok := ReadPath(tool, 5); !ok || got != want {
+			t.Errorf("ReadPath(%s) = %q, %v; want %q", tool, got, ok, want)
+		}
+	}
+}
+
+// The endpoints answer an unknown window with their default, so the tools
+// refuse one with its reason instead of passing it through.
+func TestModelEffectivenessRefusesBadWindows(t *testing.T) {
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+		want string
+	}{
+		{ToolPRModelsRead, map[string]any{"window": "14d"}, "window must be one of 7d, 30d, all"},
+		{ToolPRModelsRead, map[string]any{"window": "7d&x=1"}, "window must be one of"},
+		{ToolPRModelsRead, map[string]any{"window": float64(7)}, "window must be one of"},
+		{ToolContributorModelStatsRead, map[string]any{"days": float64(-1)}, "days must be a whole number from 0 to 365"},
+		{ToolContributorModelStatsRead, map[string]any{"days": float64(366)}, "days must be a whole number from 0 to 365"},
+		{ToolContributorModelStatsRead, map[string]any{"days": 1.5}, "days must be a whole number"},
+		{ToolContributorModelStatsRead, map[string]any{"days": "week"}, "days must be a whole number"},
+		{ToolContributorModelStatsRead, map[string]any{"days": true}, "days must be a whole number"},
+		{ToolContributorModelStatsRead, map[string]any{"offset": float64(-1)}, "offset must be a non-negative integer"},
+		{ToolPRModelsRead, map[string]any{"offset": "two"}, "offset must be a non-negative integer"},
+		{ToolEffectiveModelsRead, map[string]any{"window": "90d"}, "window must be one of 7d, 30d, all"},
+		{ToolEffectiveModelsRead, map[string]any{"filter": "agents"}, "filter must be one of all, hive, contributor"},
+		{ToolEffectiveModelsRead, map[string]any{"filter": "hive&x=1"}, "filter must be one of"},
+		{ToolEffectiveModelsRead, map[string]any{"filter": true}, "filter must be one of"},
+	} {
+		path, err := ModelEffectivenessReadPath(tc.tool, tc.args)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s %v = %q, %v; want a refusal containing %q", tc.tool, tc.args, path, err, tc.want)
+		}
+	}
+}
+
+// An answer within limit is returned as the endpoint sent it. A longer one
+// has its per-model rows cut to limit and says so.
+func TestModelEffectivenessResultCapsModelRows(t *testing.T) {
+	rows := []any{map[string]any{"model": "a"}, map[string]any{"model": "b"}, map[string]any{"model": "c"}}
+	body := map[string]any{"window": "30d", "total": float64(9), "buckets": rows, "fixer_queue": map[string]any{}}
+	same, err := ModelEffectivenessResult(ToolPRModelsRead, body, map[string]any{"limit": float64(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := mustJSON(t, same), mustJSON(t, body); a != b {
+		t.Fatalf("uncapped answer changed:\n got %s\nwant %s", a, b)
+	}
+	capped, err := ModelEffectivenessResult(ToolPRModelsRead, body, map[string]any{"limit": float64(2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := capped.(map[string]any)
+	if got, _ := out["buckets"].([]any); len(got) != 2 || out["buckets_total"] != 3 {
+		t.Fatalf("capped buckets = %#v, total %v", out["buckets"], out["buckets_total"])
+	}
+	meta, _ := out["_admin_mcp"].(map[string]any)
+	if meta["truncated"] != true || meta["limit"] != 2 || meta["total"] != 3 || !strings.Contains(fmt.Sprint(meta["note"]), "first 2 of 3") {
+		t.Fatalf("capped disclosure = %#v", meta)
+	}
+	if len(body["buckets"].([]any)) != 3 {
+		t.Fatal("capping modified the endpoint's answer")
+	}
+	stats := map[string]any{"window_days": float64(7), "models": rows}
+	cappedStats, err := ModelEffectivenessResult(ToolContributorModelStatsRead, stats, map[string]any{"limit": float64(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := cappedStats.(map[string]any)["models"].([]any); len(got) != 1 {
+		t.Fatalf("capped models = %#v", cappedStats)
+	}
+	if _, err := ModelEffectivenessResult(ToolPRModelsRead, []any{}, nil); err == nil {
+		t.Fatal("a non-object answer was accepted")
+	}
+}
+
+// offset pages the per-model rows past the limit cap: each page says where
+// it starts, how many rows there are and where the next page starts, and a
+// page past the end is empty and says so. effective_models_read pages
+// insufficient and returns ranked whole.
+func TestModelEffectivenessResultPagesWithOffset(t *testing.T) {
+	rows := []any{}
+	for _, m := range []string{"a", "b", "c", "d", "e"} {
+		rows = append(rows, map[string]any{"model": m})
+	}
+	stats := map[string]any{"window_days": float64(0), "models": rows}
+	page := func(args map[string]any) map[string]any {
+		t.Helper()
+		got, err := ModelEffectivenessResult(ToolContributorModelStatsRead, stats, args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.(map[string]any)
+	}
+	models := func(out map[string]any) string {
+		var names []string
+		for _, r := range out["models"].([]any) {
+			names = append(names, r.(map[string]any)["model"].(string))
+		}
+		return strings.Join(names, ",")
+	}
+
+	first := page(map[string]any{"limit": float64(2)})
+	if models(first) != "a,b" || first["next_offset"] != 2 || first["models_total"] != 5 || first["offset"] != 0 {
+		t.Fatalf("first page = %#v", first)
+	}
+	middle := page(map[string]any{"limit": float64(2), "offset": float64(2)})
+	meta, _ := middle["_admin_mcp"].(map[string]any)
+	if models(middle) != "c,d" || middle["next_offset"] != 4 || meta["truncated"] != true || !strings.Contains(fmt.Sprint(meta["note"]), "rows 3-4 of 5") {
+		t.Fatalf("middle page = %#v", middle)
+	}
+	last := page(map[string]any{"limit": float64(2), "offset": float64(4)})
+	if models(last) != "e" {
+		t.Fatalf("last page = %#v", last)
+	}
+	if _, ok := last["next_offset"]; ok {
+		t.Fatalf("last page has a next_offset: %#v", last)
+	}
+	past := page(map[string]any{"offset": float64(9)})
+	pastMeta, _ := past["_admin_mcp"].(map[string]any)
+	if len(past["models"].([]any)) != 0 || !strings.Contains(fmt.Sprint(pastMeta["note"]), "past the last") {
+		t.Fatalf("page past the end = %#v", past)
+	}
+	if len(stats["models"].([]any)) != 5 {
+		t.Fatal("paging modified the endpoint's answer")
+	}
+
+	ranked := []any{map[string]any{"model": "r1"}, map[string]any{"model": "r2"}, map[string]any{"model": "r3"}}
+	eff := map[string]any{"window": "30d", "filter": "hive", "ranked": ranked, "insufficient": rows, "coverage": map[string]any{"closed_prs_partial": true}}
+	got, err := ModelEffectivenessResult(ToolEffectiveModelsRead, eff, map[string]any{"limit": float64(1), "offset": float64(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := got.(map[string]any)
+	if len(out["ranked"].([]any)) != 3 {
+		t.Fatalf("ranked was paged: %#v", out["ranked"])
+	}
+	if ins := out["insufficient"].([]any); len(ins) != 1 || ins[0].(map[string]any)["model"] != "b" || out["insufficient_total"] != 5 || out["next_offset"] != 2 {
+		t.Fatalf("insufficient page = %#v", out)
+	}
+	if out["coverage"] == nil {
+		t.Fatal("coverage was dropped")
+	}
+	if _, err := ModelEffectivenessResult(ToolContributorModelStatsRead, stats, map[string]any{"offset": float64(-3)}); err == nil {
+		t.Fatal("a negative offset was accepted")
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// governor.ci's workflow-approval keys are writable through
+// governor.feature_settings, and the preview discloses turning approval on
+// and changing who is trusted.
+func TestFeatureSettingsWorkflowApproval(t *testing.T) {
+	preview, err := featureSettingsOp{}.Preview(context.Background(), map[string]any{"ciAutoApproveWorkflows": true, "ciAutoApproveWorkflowActors": "dependabot[bot], github-actions[bot]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := preview.Request.Body.(map[string]any)
+	if body["ciAutoApproveWorkflows"] != true || body["ciAutoApproveWorkflowActors"] != "dependabot[bot], github-actions[bot]" {
+		t.Fatalf("body = %#v", body)
+	}
+	for _, want := range []string{"ciAutoApproveWorkflows", "ciAutoApproveWorkflowActors"} {
+		if !strings.Contains(preview.WideningDisclosure, want) {
+			t.Fatalf("disclosure %q does not name %s", preview.WideningDisclosure, want)
+		}
+	}
+	if p, err := (featureSettingsOp{}).Preview(context.Background(), map[string]any{"ciAutoApproveWorkflows": false, "ciAutoApproveWorkflowActors": "none"}); err != nil || strings.Contains(p.WideningDisclosure, "ciAutoApprove") {
+		t.Fatalf("turning approval off and trusting no one is no widening: %q, %v", p.WideningDisclosure, err)
+	}
+}
+
+// shared_ci_rerun.enabled is writable through governor.feature_settings;
+// turning the sweep on is disclosed, turning it off is not.
+func TestFeatureSettingsSharedCIRerun(t *testing.T) {
+	preview, err := featureSettingsOp{}.Preview(context.Background(), map[string]any{"sharedCiRerunEnabled": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := preview.Request.Body.(map[string]any); body["sharedCiRerunEnabled"] != true {
+		t.Fatalf("body = %#v", body)
+	}
+	if !strings.Contains(preview.WideningDisclosure, "sharedCiRerunEnabled") {
+		t.Fatalf("disclosure %q does not name sharedCiRerunEnabled", preview.WideningDisclosure)
+	}
+	if p, err := (featureSettingsOp{}).Preview(context.Background(), map[string]any{"sharedCiRerunEnabled": false}); err != nil || strings.Contains(p.WideningDisclosure, "sharedCiRerunEnabled") {
+		t.Fatalf("turning the rerun sweep off is no widening: %q, %v", p.WideningDisclosure, err)
+	}
+}
+
+// Write-back containment's unsolicited knobs (Settings → Features →
+// Write-back containment) are writable here too, and the preview names
+// each change that lets the hive write to more items (#18846 follow-up).
+func TestFeatureSettingsWritebackUnsolicited(t *testing.T) {
+	preview, err := featureSettingsOp{}.Preview(context.Background(), map[string]any{"writebackBackfill": true, "writebackRequireLabels": false, "writebackMinLevel": 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := preview.Request.Body.(map[string]any)
+	if body["writebackBackfill"] != true || body["writebackRequireLabels"] != false || body["writebackMinLevel"] != 3 {
+		t.Fatalf("body = %#v", body)
+	}
+	for _, want := range []string{"writebackBackfill", "writebackRequireLabels", "writebackMinLevel"} {
+		if !strings.Contains(preview.WideningDisclosure, want) {
+			t.Fatalf("disclosure %q does not name %s", preview.WideningDisclosure, want)
+		}
+	}
+	if p, err := (featureSettingsOp{}).Preview(context.Background(), map[string]any{"writebackBackfill": false}); err != nil || strings.Contains(p.WideningDisclosure, "writebackBackfill") {
+		t.Fatalf("turning backfill off is no widening: %q, %v", p.WideningDisclosure, err)
+	}
+}

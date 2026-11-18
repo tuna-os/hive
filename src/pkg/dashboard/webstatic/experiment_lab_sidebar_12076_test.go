@@ -37,7 +37,6 @@ func TestStaticExperimentLabSidebarEntry(t *testing.T) {
 		`const ACMM_NOUS_MIN_LEVEL = 3;`,
 		`const nousVisible = experimentLabEnabled() && level >= ACMM_NOUS_MIN_LEVEL;`,
 		`nousVisible ? show(nousSection, '') : hide(nousSection);`,
-		`nousVisible ? show(nousSidebarCfg, '') : hide(nousSidebarCfg);`,
 		`if (section === 'nous-section' && !nousVisible) hide(item);`,
 		// The toggle says what it does, always states the L3 requirement, and
 		// surfaces the current level + an in-app notice/toast (no native dialog)
@@ -91,8 +90,8 @@ func TestStaticCodenamedSidebarLabelsShareOneConvention(t *testing.T) {
 	}
 	codenamed := regexp.MustCompile(`^[A-Z][A-Za-z ]+ \([a-z]+\)$`)
 	for section, want := range map[string]string{
-		"inception-section": "Inception (spektacular)",
-		"nous-section":      "Experiment Lab (nous)",
+		"sessions-section": "Inception (spek)",
+		"nous-section":     "Experiment Lab (nous)",
 	} {
 		got, ok := labels[section]
 		if !ok {

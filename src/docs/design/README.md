@@ -54,7 +54,49 @@ that status is the thing to check before treating a page as current behaviour:
   impossible rather than merely unwise, including why `POST /api/contribute/invite` cannot work
   from a role-derived credential at all — and the one real gap it does not close: writes audit as
   `local`, so an assistant-mediated action is indistinguishable from a dashboard one.
+- [Customers: a profile per person and a customer graph](customers.md) -
+  **design only / proposed; build in progress.** RFC
+  [#18742](https://github.com/hivecommons/hive/issues/18742): a Customers
+  section under Collaborate, one profile per person built from what the hive
+  already holds, a read-only GraphQL endpoint over people and artefacts, and
+  goals and a satisfaction signal that Hive infers with evidence and a person
+  confirms. Records the customer versus suggested line, identity resolution,
+  retention by reference, forget with tombstones, the role rules, the bounded
+  agent context block, and the position on personal data of people who never
+  signed up. Nothing leaves the hive.
+
+- [Meeting recordings in the Inbox: Zoom and Microsoft Teams](meeting-recordings.md) -
+  **Zoom shipped; Teams scaffold shipped, live verification blocked on tenant
+  consent.** Zoom cloud recordings (user-level OAuth with the hosted paste
+  flow, or Server-to-Server) and Teams recordings/transcripts (Graph
+  application permissions) become one fact per recorded meeting and Inbox
+  items next to Plaud, sharing a VTT renderer and the audio endpoint; records
+  the auth model per platform, polling over webhooks, the fact shape, the
+  Teams playback gap and the privacy posture.
+
+- [Betty on Zoom without a Zoom app: dial-in, desktop companion, live stream](meetings-without-a-zoom-app.md) -
+  **design only.** #18596: Zoom now refuses web-client meeting bots and
+  reserves its Meeting SDK for human use, so this page compares the ways
+  Betty can still take part without a Zoom app, RTMS or any bot-detection
+  evasion: phone dial-in (paid host, about $1.10 per meeting-hour, spoken
+  consent only), a desktop companion that streams the user's own call audio
+  to their hive (free account, attestation as the consent gate, per-user
+  revocable token), and Zoom's RTMP live stream (paid, listen-only).
+  Recommends the companion, macOS first, and records its streaming contract,
+  distribution plan and prototype PR set.
+
+- [Email to Inbox: a per-hive inbound address](email-inbox.md) - **design only /
+  proposed.** Gives every hive a unique, unguessable inbound address
+  (`<uid>@inbox.<hub domain>`, plus-addressing as routing tags) whose mail lands
+  as an Inbox item and is triaged like Plaud recordings today. Recommends a
+  hub-owned inbound domain fed by a provider webhook and relayed to the spoke
+  over the existing signed webhook-relay channel, with a heartbeat pull for
+  push-reported spokes, and records the fail-closed guard set (provider
+  DKIM/DMARC verdicts, allowlist, caps, ioscan, audit). Nothing is built.
+
 - [Crux: the agent runtime boundary](crux.md) — **Stage 1 shipped (v5); Stage 2 blocked on `pkg/config`.** RFC [#13536](https://github.com/hivecommons/hive/issues/13536): names the agent runtime inside Hive (`pkg/agent` and its ring) as Crux, lists what stays in Hive, records the staged plan (in-repo boundary → nested module → `crux serve`) and the naming decision. Inbound and outbound ratchets in `src/internal/testutil/crux_*_ratchet_test.go`, the tmux funnel, `crux.Runtime`, Crux-owned value types, CI path filters and the `crux` CLI are live; the nested module waits on an agent-runtime config leaf (the doc lists the measured outbound edges and prerequisites).
+
+- [Draining CLI auto-memory into draft knowledge](cli-memory-drain.md) — **Partly shipped** (phase 1: manager-side drain, dedup tags, spool, draft create path; phase 3: review flow, draft exclusion, legacy drain; phase 2, the Claude Code `SessionEnd` hook, is open). #17033: turns each coding CLI's hidden memory store (Claude Code `projects/*/memory`, Codex `memories`, Gemini `GEMINI.md`) into `draft` knowledge facts tagged `cli-memory` and `agent:<name>`. Claude Code drains through a `SessionEnd` hook; the others drain on the manager side at kick time, before `clear_on_kick`. Decides content-hash dedup across agents, an ingest-only drain with the existing curator as the only promoter, and untrusted-content handling (never primed while draft). Implementation is split into three child issues.
 
 - [Crux: generic tool policy for the MITM proxy](crux-tool-policy.md) — **Design only (proposed).** #14228, child of #14138: a shared operation vocabulary with per-forge adapters, a `relay(<command>)` verdict, deny-by-default for unrecognised operations, and the proxy's evaluation pipeline written down once. It also covers migrating behind a parity test and treating #14211 as the first non-GitHub adapter.
 
@@ -247,6 +289,16 @@ that status is the thing to check before treating a page as current behaviour:
   keeping the bot credential-free and having Hive perform the audited,
   server-side allowlisted label write. Credits RFC #6239 and records the
   Discord intents/partials trap before implementation.
+
+- [Nous → Spek: the winning experiment as a `spek-new` source](nous-spek-source.md)
+  — **proposed / design only, no Hive change.** #17020: what the external Nous
+  framework leaves on disk for a winning candidate (`best_found.json`,
+  `meta_findings.json` `deployment_recommendation`, findings, bundle
+  `code_changes`), what Hive reads of it (two files at boot, a ledger
+  vocabulary the framework's rows don't share), and what `spek-new` accepts (a
+  `sources[].uri`). Proposes a straw-man artifact and publishing it as a GitHub
+  issue so `spek-new` can start from the link, and lists the questions the Nous
+  team has to answer.
 
 - [`hive tui` — a terminal dashboard for Hive](tui.md) — **shipped (v1).** The
   design record for the k9s-style terminal client tracked in #4907: scope, the

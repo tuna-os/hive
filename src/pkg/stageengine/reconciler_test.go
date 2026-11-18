@@ -409,3 +409,91 @@ func TestNewDefaults(t *testing.T) {
 		t.Fatalf("defaults not applied: %+v", r.opts)
 	}
 }
+
+// suppressingWriter is a StageWriter standing in for the write-back gate
+// refusing a contributor PR's labels: Apply reports Suppressed and lands
+// nothing, as github.stageWriter does when the gate says no.
+type suppressingWriter struct {
+	suppress bool
+	err      error
+}
+
+func (w *suppressingWriter) Apply(context.Context, Ref, []string, stagelabels.Desired) (stagelabels.Outcome, error) {
+	out := stagelabels.Outcome{Suppressed: w.suppress}
+	if w.suppress {
+		out.SuppressedReason = "needs-opt-in-label — #15312 carries none of hive-review"
+	}
+	return out, w.err
+}
+
+// TestReconcileRecordsSuppressedLabels: a write the gate kept off GitHub
+// marks the record so readers know its labels never carried the stage;
+// the mark clears once a write lands, and a failed write leaves it as is.
+func TestReconcileRecordsSuppressedLabels(t *testing.T) {
+	ctx := context.Background()
+	w := &suppressingWriter{suppress: true}
+	r, _, store := newTestReconciler(t, ModeEnforce, w)
+	f := prFacts(15312, "pending")
+	if _, err := r.Reconcile(ctx, f); err != nil {
+		t.Fatal(err)
+	}
+	rec, ok := store.Get(f.Ref.Key())
+	if !ok || rec.Stage == stagelabels.None || !rec.LabelsSuppressed || rec.LabelsSuppressedReason != "needs-opt-in-label — #15312 carries none of hive-review" {
+		t.Fatalf("suppressed write: record = %+v ok=%t, want stage kept with labels_suppressed and the gate's reason", rec, ok)
+	}
+	w.err = errors.New("boom")
+	w.suppress = false
+	if _, err := r.Reconcile(ctx, f); err == nil {
+		t.Fatal("expected the writer's error")
+	}
+	if rec, _ := store.Get(f.Ref.Key()); !rec.LabelsSuppressed {
+		t.Fatalf("failed write cleared labels_suppressed: %+v", rec)
+	}
+	w.err = nil
+	if _, err := r.Reconcile(ctx, f); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := store.Get(f.Ref.Key()); rec.LabelsSuppressed || rec.LabelsSuppressedReason != "" {
+		t.Fatalf("landed write left labels_suppressed set: %+v", rec)
+	}
+}
+
+// TestReconcileDampenerSuppressionSkipsWriter: when the store's transition
+// dampener refuses a move, Reconcile reports the previous stage as both
+// From and To, marks the outcome suppressed, and never reaches the writer.
+func TestReconcileDampenerSuppressionSkipsWriter(t *testing.T) {
+	ctx := context.Background()
+	w := newFakeWriter()
+	r, _, store := newTestReconciler(t, ModeEnforce, w)
+	f := prFacts(16981, "pending")
+	key := f.Ref.Key()
+	head := f.PR.HeadSHA
+
+	// Three moves between 050 and 095 on one head arm the dampener; the
+	// record ends at 095, so the derived 050 would be the fourth.
+	store.ObserveHead(key, head, stagelabels.ReviewPending, "pending")
+	store.ObserveHead(key, head, stagelabels.MergeQueue, "soaking")
+	store.ObserveHead(key, head, stagelabels.ReviewPending, "pending")
+	store.ObserveHead(key, head, stagelabels.MergeQueue, "soaking")
+	prev, _ := store.Get(key)
+	if prev.Stage != stagelabels.MergeQueue {
+		t.Fatalf("setup: stage = %s, want %s", prev.Stage, stagelabels.MergeQueue)
+	}
+
+	tr, err := r.Reconcile(ctx, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.Outcome.Suppressed {
+		t.Fatalf("Outcome.Suppressed = false, want true: %+v", tr)
+	}
+	if tr.From != prev.Stage || tr.To != prev.Stage {
+		t.Fatalf("From/To = %s/%s, want both %s", tr.From, tr.To, prev.Stage)
+	}
+	if w.Writes != 0 || len(w.stageLabels(f.Ref)) != 0 {
+		t.Fatalf("writer applied a label change: writes=%d labels=%v", w.Writes, w.labels)
+	}
+	if rec, _ := store.Get(key); rec.Stage != prev.Stage {
+		t.Fatalf("record stage = %s, want %s", rec.Stage, prev.Stage)
+	}
+}

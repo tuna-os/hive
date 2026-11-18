@@ -81,10 +81,10 @@ func (fleetAutonomyLevelOp) Preview(_ context.Context, args map[string]any) (Wri
 
 func (planProposeOp) Name() string { return WriteOpPlanPropose }
 func (planProposeOp) Description() string {
-	return "Propose a draft plan through POST /api/plan/from-issue."
+	return "Propose a draft plan through POST /api/plan/from-issue. Give a title, or name an issue the hive already tracks by url or by repo and number."
 }
 func (planProposeOp) InputSchema() map[string]any {
-	return map[string]any{"type": "object", "properties": map[string]any{"repo": stringSchema(), "number": map[string]any{"type": "integer"}, "url": stringSchema(), "title": stringSchema(), "body": stringSchema()}, "required": []string{}, "additionalProperties": false}
+	return map[string]any{"type": "object", "properties": map[string]any{"repo": stringSchema(), "number": map[string]any{"type": "integer", "minimum": 1}, "url": stringSchema(), "title": stringSchema(), "body": stringSchema()}, "required": []string{}, "additionalProperties": false}
 }
 func (planProposeOp) Preview(_ context.Context, args map[string]any) (WritePreview, error) {
 	body := map[string]any{}
@@ -93,17 +93,31 @@ func (planProposeOp) Preview(_ context.Context, args map[string]any) (WritePrevi
 			body[key] = v
 		}
 	}
-	if n, ok, err := optionalIntArg(args, "number"); err != nil {
+	number, hasNumber, err := optionalIntArg(args, "number")
+	if err != nil {
 		return WritePreview{}, err
-	} else if ok {
-		body["number"] = n
 	}
-	if body["title"] == nil && (body["repo"] == nil || body["number"] == nil) {
-		return WritePreview{}, fmt.Errorf("plan proposal requires title or resolvable repo and number")
+	if hasNumber {
+		if number <= 0 {
+			return WritePreview{}, fmt.Errorf("number must be a positive integer")
+		}
+		body["number"] = number
 	}
-	target := strings.TrimSpace(fmt.Sprint(body["title"]))
-	if target == "" {
-		target = fmt.Sprintf("%s#%v", body["repo"], body["number"])
+	title, _ := body["title"].(string)
+	repo, _ := body["repo"].(string)
+	issueURL, _ := body["url"].(string)
+	// An untitled proposal is resolved by the endpoint from the issues the
+	// hive already tracks, by url or by repo and number.
+	if title == "" && issueURL == "" && (repo == "" || !hasNumber) {
+		return WritePreview{}, fmt.Errorf("plan proposal requires a title, an issue url, or a repo and number")
+	}
+	target := title
+	switch {
+	case target != "":
+	case repo != "" && hasNumber:
+		target = fmt.Sprintf("%s#%d", repo, number)
+	default:
+		target = issueURL
 	}
 	return WritePreview{Operation: WriteOpPlanPropose, Summary: "Propose draft plan for " + target, Target: target, Request: WriteRequest{Method: http.MethodPost, Path: "/api/plan/from-issue", Body: body}, Effects: []string{"Mint or reuse a draft epic for the issue.", "May queue or kick the architect to decompose the draft.", "Does not release child work until a plan is approved."}, WideningDisclosure: "No direct authority widening: proposal creates draft planning state only. Hive may refuse below ACMM L5 or on critical ioscan findings.", ConfirmationMessage: "Confirm proposing a draft plan for " + target + ".", Details: body}, nil
 }
@@ -136,7 +150,7 @@ func (planRejectOp) Preview(_ context.Context, args map[string]any) (WritePrevie
 
 func (featureSettingsOp) Name() string { return WriteOpFeatureSettings }
 func (featureSettingsOp) Description() string {
-	return "Update governor feature settings through PUT /api/config/governor/features."
+	return "Update governor feature settings through PUT /api/config/governor/features. This includes workflow-run approval (governor.ci: ciAutoApproveWorkflows, ciAutoApproveWorkflowActors), the shared-CI rerun sweep (shared_ci_rerun.enabled: sharedCiRerunEnabled) and write-back containment's unsolicited knobs (writeback.unsolicited: writebackMinLevel, writebackRequireLabels, writebackBackfill); the per-kind overrides have their own operation, writeback.kind_policy."
 }
 func (featureSettingsOp) InputSchema() map[string]any {
 	props := map[string]any{}
@@ -151,6 +165,10 @@ func (featureSettingsOp) InputSchema() map[string]any {
 	}
 	props["triageSpecLabels"] = map[string]any{"type": "array", "items": stringSchema()}
 	props["triageFixLabels"] = map[string]any{"type": "array", "items": stringSchema()}
+	// governor.ci (Settings → Features → Auto-merge → Workflow approval).
+	props["ciAutoApproveWorkflows"] = map[string]any{"type": "boolean", "description": "governor.ci.auto_approve_workflows: approve the workflow runs GitHub holds behind \"Approve and run\" on trusted PR heads (default true)."}
+	props["ciAutoApproveWorkflowActors"] = map[string]any{"type": "string", "description": "governor.ci.auto_approve_workflow_actors as a comma-separated list of GitHub logins trusted besides the hive's App and dashboard-approved heads; blank restores the default (dependabot[bot], renovate[bot]), \"none\" trusts neither."}
+	props["sharedCiRerunEnabled"] = map[string]any{"type": "boolean", "description": "shared_ci_rerun.enabled: re-run the failed jobs of PRs a [shared-ci] incident held red once it is over (default true; needs Actions write on the App, which is optional)."}
 	props["otelHeaders"] = map[string]any{"type": "object", "additionalProperties": stringSchema()}
 	props["rotationProviders"] = map[string]any{"type": "object"}
 	props["rotationAgents"] = map[string]any{"type": "object", "additionalProperties": stringSchema()}
@@ -201,6 +219,19 @@ func capabilityWidens(mode string) bool {
 
 func featureDisclosure(args map[string]any) string {
 	var warnings []string
+	// Approving held workflow runs lets a PR head's workflow files run on
+	// the repository's runners without a person's click.
+	if v, ok := args["ciAutoApproveWorkflows"].(bool); ok && v {
+		warnings = append(warnings, "ciAutoApproveWorkflows lets the hive approve held workflow runs on trusted PR heads, so their workflow files run on the repository's runners without a maintainer's click")
+	}
+	if v, ok := args["ciAutoApproveWorkflowActors"].(string); ok && !strings.EqualFold(strings.TrimSpace(v), "none") {
+		warnings = append(warnings, "ciAutoApproveWorkflowActors sets whose PRs get held workflow runs approved; a trusted author covers every run on the head, whoever pushed it")
+	}
+	// The shared-CI rerun sweep re-runs failed jobs and comments on the PRs
+	// it re-ran (or, without Actions write, asks a maintainer to).
+	if v, ok := args["sharedCiRerunEnabled"].(bool); ok && v {
+		warnings = append(warnings, "sharedCiRerunEnabled lets the hive re-run failed jobs on PRs a shared-CI incident held red and leave a note on each")
+	}
 	for _, key := range []string{"ioscanEnabled", "checkpointSpecEnabled", "checkpointPlanEnabled", "checkpointImplementEnabled", "claimsEnabled"} {
 		if v, ok := args[key].(bool); ok && !v {
 			warnings = append(warnings, key+" disables a protection or coordination gate")
@@ -210,6 +241,18 @@ func featureDisclosure(args map[string]any) string {
 		if v, ok := args[key].(bool); ok && v {
 			warnings = append(warnings, key+" enables additional fleet behavior")
 		}
+	}
+	// Write-back containment (writeback.unsolicited, Settings → Features →
+	// Write-back containment): each of these lets the hive write to more
+	// PRs and issues it was not asked to touch.
+	if v, ok := args["writebackBackfill"].(bool); ok && v {
+		warnings = append(warnings, "writebackBackfill lets the hive write unsolicited to PRs and issues created before it first saw the repository")
+	}
+	if v, ok := args["writebackRequireLabels"].(bool); ok && !v {
+		warnings = append(warnings, "writebackRequireLabels off drops the review opt-in label requirement for unsolicited write-backs on other people's PRs")
+	}
+	if _, ok := args["writebackMinLevel"]; ok {
+		warnings = append(warnings, "writebackMinLevel changes the ACMM floor for unsolicited write-backs (it raises per-kind floors, never lowers them; 0 restores the default)")
 	}
 	if len(warnings) == 0 {
 		return "No obvious authority widening detected from the provided feature fields."
@@ -276,11 +319,11 @@ func featureFieldSet(schema map[string]any) map[string]bool {
 }
 
 func boolFeatureFields() []string {
-	return []string{"ioscanEnabled", "tracingEnabled", "otelEnabled", "retroEnabled", "mintEnabled", "planFromLabel", "formalEnabled", "personaLearningEnabled", "checkpointSpecEnabled", "checkpointPlanEnabled", "checkpointImplementEnabled", "planMatchEnabled", "spektacularEnabled", "spektacularHubExecutor", "runStages", "triageEnabled", "triageClarifyComment", "publicationEnabled", "extFlueEnabled", "extOmpEnabled", "wavefrontEnabled", "claimsEnabled", "autonomyAutoPromote", "autonomyAutoDemote", "rotationEnabled", "otelInsecure"}
+	return []string{"ioscanEnabled", "tracingEnabled", "otelEnabled", "retroEnabled", "mintEnabled", "planFromLabel", "formalEnabled", "personaLearningEnabled", "checkpointSpecEnabled", "checkpointPlanEnabled", "checkpointImplementEnabled", "planMatchEnabled", "spektacularEnabled", "spektacularHubExecutor", "runStages", "triageEnabled", "triageClarifyComment", "publicationEnabled", "extFlueEnabled", "extOmpEnabled", "wavefrontEnabled", "claimsEnabled", "autonomyAutoPromote", "autonomyAutoDemote", "rotationEnabled", "otelInsecure", "writebackRequireLabels", "writebackBackfill"}
 }
 
 func intFeatureFields() []string {
-	return []string{"runWaitTimeoutSeconds", "spektacularPollS", "spektacularHubExecutorTimeoutS", "spektacularHubExecutorMaxConcurrent", "maxStageRetries", "triageMinBodyChars", "claimsTtlS", "autonomyPromoteAfter", "autonomyMaxLevel", "autonomyCooldownDays", "rotationThresholdPct", "rotationHighVolumeCadenceS"}
+	return []string{"runWaitTimeoutSeconds", "spektacularPollS", "spektacularHubExecutorTimeoutS", "spektacularHubExecutorMaxConcurrent", "maxStageRetries", "triageMinBodyChars", "claimsTtlS", "autonomyPromoteAfter", "autonomyMaxLevel", "autonomyCooldownDays", "rotationThresholdPct", "rotationHighVolumeCadenceS", "writebackMinLevel"}
 }
 
 func stringFeatureFields() []string {

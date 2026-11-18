@@ -174,6 +174,12 @@ type MyHiveEntry struct {
 	AdvisoryStale       bool   `json:"advisoryStale,omitempty"`
 	AdvisoryStaleReason string `json:"advisoryStaleReason,omitempty"`
 
+	// ForgeUnreachableLabel is "forge unreachable (host)" when the latest beat
+	// reported ForgeUnreachable and the hive is still online; the UI renders it
+	// in place of the generic failing-check / stale-advisory pills. Empty once
+	// the hive goes offline (forgeUnreachableLabel), like AdvisoryStale.
+	ForgeUnreachableLabel string `json:"forgeUnreachableLabel,omitempty"`
+
 	// AutoUpgradeBlocked is true when this hive has auto-upgrade ON but the hub
 	// will REFUSE to arm it: upgradeCollectible() is false, so the spoke cannot
 	// pull the instruction off its own heartbeat and triggerAutoUpgrades()
@@ -333,6 +339,27 @@ type MyHiveEntry struct {
 	// any axis is measured yet — the browser renders nothing at all in that
 	// case rather than an empty chart.
 	Quadrant *Quadrant `json:"quadrant,omitempty"`
+}
+
+// claimPendingGitHubHost returns the GitHub host the Location pill should show
+// for an assigned-but-unclaimed row, and whether that override applies.
+//
+// While a placeholder is "claim pending" the spoke still runs the pool's
+// default config, so its heartbeat reports the CLUSTER default (github.ibm.com
+// on vllm-d) even though the operator just picked github.com in the assign
+// dialog. For that window the hive record's github_host — the operator's
+// explicit choice, stamped by handleAssignHive — is the truth the row must
+// show; the spoke's value is simply the stale pre-claim config, not evidence
+// of where the assigned repos live. Once the claim is delivered the spoke
+// report resumes its authority (see resolveGitHubHost).
+func claimPendingGitHubHost(entry *MyHiveEntry, sh *SaaSHive) (string, bool) {
+	if entry == nil || sh == nil || !entry.AssignedUnclaimed {
+		return "", false
+	}
+	if strings.TrimSpace(sh.GitHubHost) == "" {
+		return "", false
+	}
+	return githubHostLabel(sh.GitHubHost), true
 }
 
 // myHivesRecentEventCount is how many timeline events ride the My Hives
@@ -717,6 +744,10 @@ func (s *HubServer) buildMyHivesResponse(username string, queryValues url.Values
 	// is left empty and rendered as "github.com" by the pill, so an old spoke
 	// shows a sane default rather than a wrong host.
 	resolveGitHubHost := func(entry *MyHiveEntry) {
+		if host, ok := claimPendingGitHubHost(entry, saasByID[entry.ID]); ok {
+			entry.GitHubHost = host
+			return
+		}
 		if entry.GitHubHost != "" {
 			return // spoke-reported — authoritative
 		}
@@ -1031,6 +1062,8 @@ func (s *HubServer) buildMyHivesResponse(username string, queryValues url.Values
 		result[i].AdvisoryIssueActivity = advisoryIssueActivityFor(result[i].RegistryEntry, journeyNow)
 		result[i].BudgetHealth = budgetHealthFor(result[i].RegistryEntry)
 		result[i].GitHubAppHealth = githubAppHealthFor(result[i].RegistryEntry, journeyNow)
+
+		result[i].ForgeUnreachableLabel = forgeUnreachableLabel(result[i].RegistryEntry)
 
 		// Advisory-staleness pill, computed on read (same as Journey) so the
 		// gating — advisory-mode participation, app-can-write, past-threshold —
@@ -1548,8 +1581,9 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 		IsPublic: req.IsPublic == nil || *req.IsPublic,
 		// Per-hive GitHub host override (empty = cluster default). Lets a
 		// public-GitHub org provision correctly on a GHE-defaulted cluster.
-		GitHubBaseURL: req.GitHubBaseURL,
-		GitHubAPIURL:  req.GitHubAPIURL,
+		GitHubBaseURL:   req.GitHubBaseURL,
+		GitHubAPIURL:    req.GitHubAPIURL,
+		WebhookRelayKey: newWebhookRelayKey(),
 	}
 
 	if err := saveSaaSHive(h); err != nil {
@@ -1623,8 +1657,12 @@ func (s *HubServer) handleHiveStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"access denied"}`, http.StatusForbidden)
 		return
 	}
+	// The relay key authenticates webhooks to this hive's spoke; it is
+	// delivered only over the spoke's own heartbeat, never to a browser.
+	out := *h
+	out.WebhookRelayKey = ""
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(h)
+	_ = json.NewEncoder(w).Encode(&out)
 }
 
 // handleOpenHive is the SSO handoff entry point: a hub-authenticated user hits
@@ -1747,8 +1785,32 @@ func (s *HubServer) handleDeleteHive(w http.ResponseWriter, r *http.Request) {
 		// the hive disappears from the listing immediately, and best-effort purge
 		// any leftover record dir / timeline file so a partial prior delete cannot
 		// leave a status:"available" husk that resurrects in the listing.
+		//
+		// This branch is reachable by any authenticated user, and
+		// removeRegistryEntry uses `by` only for the audit log, so the registry
+		// entry's Owner must be checked here before anything is removed. The
+		// same owner-or-admin rule as userIsHiveOwner applies; an entry whose
+		// spoke never reported an owner (self-hosted/BYO heartbeat) is admin-only
+		// rather than open to every authenticated user. When no entry exists
+		// there is nothing to protect, so the purge stays idempotent.
+		s.mu.RLock()
+		found := false
+		regOwner := ""
+		for _, e := range s.registry.Hives {
+			if e.ID == id {
+				found = true
+				regOwner = e.Owner
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if found && !userIsHiveOwner(username, &SaaSHive{ID: id, Owner: regOwner}) {
+			http.Error(w, `{"error":"only the owner can delete this hive"}`, http.StatusForbidden)
+			return
+		}
 		s.removeRegistryEntry(id, username)
 		removeHiveRecord(id, s.logger)
+		s.publicActivity.invalidate()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": deleteStatusDeleted})
 		return
@@ -1792,6 +1854,7 @@ func (s *HubServer) handleDeleteHive(w http.ResponseWriter, r *http.Request) {
 	// handler. So purging the record here cannot break placeholder recycling.
 	removeHiveRecord(id, s.logger)
 	s.removeRegistryEntry(id, username)
+	s.publicActivity.invalidate()
 	s.upgradeHistory.forget(id)
 
 	s.logger.Info("audit: hosted hive deleted", "hive_id", id, "by", username,
@@ -1873,6 +1936,7 @@ func (s *HubServer) handleToggleVisibility(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	s.mu.Unlock()
+	s.publicActivity.invalidate()
 
 	s.logger.Info("audit: visibility toggled", "hive_id", id, "is_public", body.IsPublic, "by", username)
 

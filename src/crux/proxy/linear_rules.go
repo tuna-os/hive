@@ -105,6 +105,17 @@ var linearReadRequirement = linearRequirement{MinMode: agent.ModeAdvisory}
 //     issue. That is how a PR-capable agent reports what it produced, so they
 //     sit at ModeIssuesAndPRs alongside PR creation.
 //
+//   - issueRelationCreate, projectCreate and projectUpdate are what an in-hive
+//     Spek needs to publish a finished spec as a parent plus children
+//     (hivecommons/spektacular#114): a Project (or a parent issue — that is
+//     plain issueCreate with parentId, already covered) for the RFC, child
+//     issueCreate per task, and `blockedBy` relations between children; the
+//     idempotent re-publish edits the parent in place with projectUpdate. They
+//     are the Linear analogues of GitHub's POST …/sub_issues and
+//     POST …/dependencies/blocked_by, so they sit at ModeIssuesOnly with no
+//     capability grant. Deliberately NOT included: issueRelationDelete,
+//     projectDelete, projectArchive — a published tree is only ever added to.
+//
 // Mutations NOT listed are denied, including every destructive one
 // (issueDelete, commentDelete, projectDelete, teamDelete, issueArchive) and
 // every administrative one (organizationInviteCreate, apiKeyCreate,
@@ -133,6 +144,11 @@ var linearMutations = map[string]linearRequirement{
 	"issueUpdate":      {MinMode: agent.ModeIssuesOnly},
 	"issueAddLabel":    {MinMode: agent.ModeIssuesOnly},
 	"issueRemoveLabel": {MinMode: agent.ModeIssuesOnly},
+
+	// Spek publish: RFC parent, children and their dependency edges.
+	"issueRelationCreate": {MinMode: agent.ModeIssuesOnly},
+	"projectCreate":       {MinMode: agent.ModeIssuesOnly},
+	"projectUpdate":       {MinMode: agent.ModeIssuesOnly},
 
 	// Linking produced artifacts (PRs, builds) onto an issue.
 	"attachmentCreate":          {MinMode: agent.ModeIssuesAndPRs},
@@ -355,14 +371,19 @@ func linearOperationStart(query string) (linearOpKind, int, bool) {
 // countGraphQLKeyword counts occurrences of an operation keyword appearing as a
 // standalone token at brace depth zero, ignoring occurrences inside strings and
 // comments. A substring count would miscount a field named `queryable` or the
-// word "mutation" inside a comment body.
+// word "mutation" inside a comment body. Returns -1 when the document cannot be
+// scanned (an unterminated string), so callers can fail closed.
 func countGraphQLKeyword(query, kw string) int {
 	n := 0
-	scanGraphQLTokens(query, func(name string, depth int) {
+	ok := scanGraphQLTokensAt(query, func(name string, depth, _ int) bool {
 		if depth == 0 && name == kw {
 			n++
 		}
+		return true
 	})
+	if !ok {
+		return -1
+	}
 	return n
 }
 
@@ -380,17 +401,11 @@ func indexGraphQLKeyword(query, kw string) int {
 	return idx
 }
 
-func scanGraphQLTokens(query string, fn func(name string, depth int)) {
-	scanGraphQLTokensAt(query, func(name string, depth, _ int) bool {
-		fn(name, depth)
-		return true
-	})
-}
-
 // scanGraphQLTokensAt walks the document emitting each bare name token with the
 // brace depth it was found at, skipping strings and comments so their contents
-// are never mistaken for tokens. fn returns false to stop the walk.
-func scanGraphQLTokensAt(query string, fn func(name string, depth, off int) bool) {
+// are never mistaken for tokens. fn returns false to stop the walk. Returns
+// false only when the walk aborted on an unreadable (unterminated) literal.
+func scanGraphQLTokensAt(query string, fn func(name string, depth, off int) bool) bool {
 	depth := 0
 	for i := 0; i < len(query); {
 		c := query[i]
@@ -402,7 +417,7 @@ func scanGraphQLTokensAt(query string, fn func(name string, depth, off int) bool
 		case c == '"':
 			var ok bool
 			if i, ok = skipGraphQLString(query, i); !ok {
-				return
+				return false
 			}
 		case c == '{':
 			depth++
@@ -413,25 +428,32 @@ func scanGraphQLTokensAt(query string, fn func(name string, depth, off int) bool
 		case isGraphQLNameStart(c):
 			name := graphQLIdentRe.FindString(query[i:])
 			if !fn(name, depth, i) {
-				return
+				return true
 			}
 			i += len(name)
 		default:
 			i++
 		}
 	}
+	return true
 }
 
 // skipGraphQLString advances past a string or block-string literal beginning at
 // i. Returns ok=false on an unterminated literal, which the callers treat as an
-// unreadable document.
+// unreadable document. Inside a block string `\"""` is an escaped triple quote,
+// not the terminator.
 func skipGraphQLString(query string, i int) (int, bool) {
 	if strings.HasPrefix(query[i:], `"""`) {
-		end := strings.Index(query[i+3:], `"""`)
-		if end < 0 {
-			return 0, false
+		for j := i + 3; j < len(query); j++ {
+			if strings.HasPrefix(query[j:], `\"""`) {
+				j += 3
+				continue
+			}
+			if strings.HasPrefix(query[j:], `"""`) {
+				return j + 3, true
+			}
 		}
-		return i + 3 + end + 3, true
+		return 0, false
 	}
 	i++ // opening quote
 	for i < len(query) {

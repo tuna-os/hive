@@ -326,6 +326,33 @@ the focus trap and the body scroll lock behave as on desktop; desktop layout
 is unchanged apart from the affordance. Metrics come from the
 `--modal-scroll-*` / `--modal-sheet-*` tokens in `tokens.css`.
 
+### Phone text floor for the Activity monitor
+
+Inside `#activity-monitor-section`, the phone tier
+(`@media (max-width: 640px), ((pointer: coarse) and (max-width: 820px))` in
+`responsive.css`) remaps `--fs-2xs` and `--fs-xs` to `--fs-sm` (`.75rem`,
+12px), so no `.ham-*` text renders below 12px on a phone. Inputs stay at
+`--fs-touch`. Desktop sizes are unchanged. New tracker CSS should size text
+through `--fs-2xs`/`--fs-xs`/`--fs-sm` and never hard-code a smaller size, so
+the floor applies automatically. `dashboard-mobile-shots.mjs` asserts it at
+390×844 through the `tracker-text-floor` probe.
+
+### Phone tap targets: `--tap-target-touch`
+
+`--tap-target` (40px) sizes icon-only controls on desktop and the 768px tier.
+Phone tiers that must meet the Apple HIG / WCAG 2.5.5 coarse-pointer floor
+remap it for their subtree to `--tap-target-touch` (44px, `base.css`) rather
+than hard-coding sizes: the activity monitor does this in the
+`.modal-sheet` phone query, so its chips, selects, search box, Merged /
+queue chips, label chips, ⧉ ⛶ 📺 header tools, grip, ?, ⚙ and the per-row
+select / ⋯ controls all grow together. The row controls leave the
+hover-revealed left gutter for the top-right corner of the row header and
+the ⋯ menu opens as a `.hive-dialog.modal-sheet` (`stageTrackerOpenSheet`,
+`tracker-actions.js`) with tap-sized items. Inline text links (issue / PR
+refs, prose anchors) are the one documented exclusion. The gate is
+`webstatic/testdata/tracker-phone-ergonomics.js`, run by
+`dashboard-mobile-shots.mjs` at 390×844.
+
 ## Ratchet plan
 
 `pkg/dashboard/webstatic/style_ratchet_test.go`, modeled on
@@ -464,9 +491,10 @@ Sidebar groups now map the existing destinations without changing IDs, `data-act
 | Group | Items |
 | --- | --- |
 | Overview | Governor |
+| Collaborate | Inbox, Calendar, Meetings, Customers, Inception (spek) |
 | Agents | Dynamic agent tree, `+ agent`, `+ group` |
 | Resources | Repos, Contributors |
-| Intelligence | Advisory, ACMM Eval, Inception, Knowledge, Experiment Lab |
+| Intelligence | Advisory, ACMM Eval, Knowledge, Experiment Lab |
 | Admin | Tokens, Cost, Audit Log |
 | Help | FAQ, Getting Started, API Spec (Redoc), Getting Started Guide, Report an Issue |
 
@@ -492,7 +520,7 @@ Count badges use `.badge-count`; zero counts render as dimmed `0` badges with `d
 | `.agent-card`, `.repo-card`, hub hero/proof cards | `--surface-2` (`.card`) | Legacy class names remain for JS/tests; bespoke gradients/radii/shadows were removed. |
 | `.governor`, `.token-panel`, `.cost-panel`, contribute `.ops-card`, `.steps`, hub comparison wrapper | `--surface-1` (`.card-panel`) | Section panels now share `--r-lg`, `--line-subtle`, and `--shadow-card`. |
 | `.card-inset`, `.card-tile`, `.row-card`, `.gov-pr-models`, contribute dossier stat/seal rows | `--surface-3` (`.card-inset`) | Nested cards keep local layout/click behavior but use the common inset surface. |
-| `#logs-output`, `#audit-panel`, `#inception-activity`, `.oc-detail-summary`, `.doing` | `--surface-terminal` | Terminal/log panes stay dark in both themes. |
+| `#logs-output`, `#audit-panel`, `.oc-detail-summary`, `.doing` | `--surface-terminal` | Terminal/log panes stay dark in both themes. |
 | `.token-stat`, `.cost-stat`, hub stats | `.metric-tile` equivalent | Numeric tiles use tokenized spacing, radius, border, and type scale. |
 
 Skipped table follow-ups: governor matrix and model-performance tables remain

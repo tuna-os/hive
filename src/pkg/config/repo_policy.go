@@ -61,6 +61,17 @@ type RepoPolicy struct {
 	// gitlab.gitlab_url / gitea.gitea_url / github's base URL for the repo's
 	// forge kind. Read it through Config.ForgeURLForRepo.
 	ForgeURL string `yaml:"forge_url,omitempty" json:"forge_url,omitempty"`
+	// SentinelSensitivePaths overrides sentinel.sensitive_paths for this
+	// repo: the globs whose change raises Sentinel's sensitive_path finding
+	// on this repo's pull requests. nil (unset) inherits the hive-wide list;
+	// an explicit empty list matches nothing, as the hive-wide key does.
+	// Read it through Config.RepoSentinelSensitivePaths.
+	SentinelSensitivePaths []string `yaml:"sentinel_sensitive_paths,omitempty" json:"sentinel_sensitive_paths,omitempty"`
+	// WorkflowFenceScope overrides
+	// auto_merge.contributor_lane.workflow_fence_scope for this repo: "all"
+	// or "human_merge_paths". Empty inherits the hive-wide value. Read it
+	// through Config.RepoWorkflowFenceScope.
+	WorkflowFenceScope string `yaml:"workflow_fence_scope,omitempty" json:"workflow_fence_scope,omitempty"`
 }
 
 // Per-repo merge strategies (hivecommons/hive#10886). The strategy decides how
@@ -414,7 +425,7 @@ func (c *Config) SetSelfAuthorizationHoldForRepoAndSave(repo string, enabled *bo
 }
 
 func repoPolicyHasNoOverrides(rp RepoPolicy) bool {
-	return rp.SelfAuthorizationHold == nil && rp.ReporterTrustHold == nil && rp.AutoMerge == nil && rp.ACMMLevel == nil && !rp.ACMMPinned && rp.ACMMLastAutomatic == nil && !rp.LabelDriven && !rp.ReleaseOnApprove && rp.ReleaseVersionSource == "" && rp.MergeStrategy == "" && rp.MergeFrontTimeout == "" && rp.RedMainThreshold == "" && rp.MaxOpenHeldPRs == nil && len(rp.LabelDrivenApprovalLabels) == 0 && len(rp.LabelDrivenSupersedeParkActors) == 0 && len(rp.CompanionRepos) == 0
+	return rp.SelfAuthorizationHold == nil && rp.ReporterTrustHold == nil && rp.AutoMerge == nil && rp.ACMMLevel == nil && !rp.ACMMPinned && rp.ACMMLastAutomatic == nil && !rp.LabelDriven && !rp.ReleaseOnApprove && rp.ReleaseVersionSource == "" && rp.MergeStrategy == "" && rp.MergeFrontTimeout == "" && rp.RedMainThreshold == "" && rp.MaxOpenHeldPRs == nil && len(rp.LabelDrivenApprovalLabels) == 0 && len(rp.LabelDrivenSupersedeParkActors) == 0 && len(rp.CompanionRepos) == 0 && rp.SentinelSensitivePaths == nil && strings.TrimSpace(rp.WorkflowFenceScope) == ""
 }
 
 // ValidateRepoMergeStrategy accepts "" (unset, meaning direct), "direct" and
@@ -774,6 +785,19 @@ func (c *Config) RepoAutoMergeEnabled(repo string) bool {
 		return *rp.AutoMerge
 	}
 	return true
+}
+
+// RepoAutoMergeSwitchedOff reports whether an owner switched this repo's
+// auto-merge off with `project.repo_policies[].auto_merge: false` at L6 or
+// above. It is the observe-only staging predicate (hivecommons/hive#17552):
+// below L6 RepoAutoMergeEnabled is false for every repo, but those hives
+// are not staged, so this is narrower than !RepoAutoMergeEnabled.
+func (c *Config) RepoAutoMergeSwitchedOff(repo string) bool {
+	if c == nil || c.ACMMLevelOrZero() < SelfMergeMinACMMLevel {
+		return false
+	}
+	rp, ok := c.RepoPolicyFor(repo)
+	return ok && rp.AutoMerge != nil && !*rp.AutoMerge
 }
 
 // SetRepoAutoMergeForRepoAndSave records, clears, and persists one repo's

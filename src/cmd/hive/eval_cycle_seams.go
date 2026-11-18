@@ -154,6 +154,8 @@ func mergeResumeKicks(agentsDue, restartedAgents []string, allow func(string) (b
 				logger.Warn("restarted agent NOT resume-kicked (cadence/budget gate); it idles until its next scheduled slot", "agent", a, "reason", string(reason))
 			case governor.ResumeRefusalBudgetExhausted:
 				logger.Warn("restarted agent NOT resume-kicked (cadence/budget gate); budget exhausted, kicks suspended", "agent", a, "reason", string(reason))
+			case governor.ResumeRefusalContributorCovering:
+				logger.Info("restarted agent NOT resume-kicked; a contributor relay is covering its role (contributor_first)", "agent", a, "reason", string(reason))
 			default:
 				logger.Info("restarted agent NOT resume-kicked (cadence/budget gate); idle by configuration", "agent", a, "reason", string(reason))
 			}
@@ -441,7 +443,11 @@ type providerBudgetAlert struct {
 // consulted the agent manager on the NOT-latched branch, and collecting agent
 // statuses every cycle while the provider is clipped would be work the old
 // code never did. Passing a thunk keeps that laziness exactly.
-func decideProviderBudgetAlert(latched, suppress bool, cause string, since time.Time, rebuffs int, quotaReason func() string) providerBudgetAlert {
+//
+// quotaProbeInterval is how often an agent held for exhausted provider quota
+// is probed (#18112); the quota banner names it so the operator knows the
+// hive is holding those kicks and when it will retry them.
+func decideProviderBudgetAlert(latched, suppress bool, cause string, since time.Time, rebuffs int, quotaProbeInterval time.Duration, quotaReason func() string) providerBudgetAlert {
 	if latched {
 		state := "agent kicks suspended"
 		if !suppress {
@@ -455,7 +461,8 @@ func decideProviderBudgetAlert(latched, suppress bool, cause string, since time.
 		return providerBudgetAlert{Message: msg, Cause: msg}
 	}
 	if reason := quotaReason(); reason != "" {
-		return providerBudgetAlert{Message: "provider quota exhausted — " + reason}
+		return providerBudgetAlert{Message: fmt.Sprintf("provider quota exhausted — %s; their kicks are held and retried every %s",
+			reason, compactDuration(quotaProbeInterval))}
 	}
 	return providerBudgetAlert{Clear: true}
 }
@@ -506,6 +513,9 @@ type kickDispatchDeps struct {
 	// continuous-mode scheduler uses this to exponential-backoff instead of
 	// returning the same due agent on every eval while the CLI is stalled.
 	onFailed func(msg scheduler.KickMessage, err error)
+	// onDeferred optionally records kicks that wait for a busy agent's lane.
+	// It runs in message order, like the delivered and failed effects.
+	onDeferred func(msg scheduler.KickMessage)
 	// markProbeReleased stamps the provider-budget probe. Called at most once
 	// per dispatch, and only after a kick actually goes out.
 	markProbeReleased func(at time.Time)
@@ -633,6 +643,9 @@ func dispatchAgentKicks(msgs []scheduler.KickMessage, releaseProbe bool, deps ki
 		if out.deferred || errors.Is(out.sendErr, crux.ErrAgentBusy) {
 			endSpan(nil)
 			logger.Info("agent busy: deferring kick", "agent", msg.Agent)
+			if deps.onDeferred != nil {
+				deps.onDeferred(msg)
+			}
 			continue
 		}
 		if out.startErr != nil {
@@ -645,7 +658,14 @@ func dispatchAgentKicks(msgs []scheduler.KickMessage, releaseProbe bool, deps ki
 		}
 		if out.sendErr != nil {
 			endSpan(out.sendErr)
-			logger.Warn("failed to send kick", "agent", msg.Agent, "error", out.sendErr)
+			// Shared-pool contention is expected backpressure: the kick is
+			// retried next cycle. Log below WARN so slogfeed does not file
+			// a repeated runtime defect for a healthy busy pool (#18544).
+			level := slog.LevelWarn
+			if isSharedPoolBusyErr(out.sendErr) {
+				level = slog.LevelInfo
+			}
+			logger.Log(context.Background(), level, "failed to send kick", "agent", msg.Agent, "error", out.sendErr)
 			if deps.onFailed != nil {
 				deps.onFailed(msg, out.sendErr)
 			}
@@ -670,7 +690,13 @@ func stoppedAgentStartErrorIsBenign(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "already running") ||
 		strings.Contains(msg, "launch already in progress") ||
-		strings.Contains(msg, "shared session pool is busy")
+		isSharedPoolBusyErr(err)
+}
+
+// isSharedPoolBusyErr reports the shared CLI session pool refusing a slot.
+// crux/agent does not export its busy sentinel, so match the message.
+func isSharedPoolBusyErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "shared session pool is busy")
 }
 
 // advisoryIngestDeps are the side effects of recording an ioscan canary leak

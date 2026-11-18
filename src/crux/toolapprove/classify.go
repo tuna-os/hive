@@ -4,11 +4,39 @@ import (
 	"strings"
 )
 
+// hive-tool/v1 (RFC #18464) is the tool surface Hive hosts for non-CLI
+// backends (stateless LLMs, cloud sessions, chat bridges): the remote model
+// holds no credential and Hive executes every call. Its names are dotted, so
+// none of the substring heuristics below (pull_request, merge, mcp__github__)
+// recognise them; without explicit classes a pr.create or issue.comment would
+// skip the AgentMode capability checks and auto-approve at L5/L6 on a green
+// scan. No CLI backend emits these names, so classifying them changes no
+// existing verdict.
+var (
+	hiveToolReadOnly = map[string]bool{
+		"issue.read": true, "repo.list_files": true, "repo.read_file": true,
+		"repo.search_code": true, "checks.read": true,
+		// Terminal markers: they record an outcome in the session, nothing else.
+		"task.complete": true, "task.abort": true,
+	}
+	hiveToolIssueWrite = map[string]bool{"issue.comment": true, "issue.label": true}
+	hiveToolPRWrite    = map[string]bool{"repo.patch_files": true, "pr.create": true, "pr.comment": true}
+)
+
+// IsHiveTool reports whether tool is a hive-tool/v1 name.
+func IsHiveTool(tool string) bool {
+	t := strings.ToLower(strings.TrimSpace(tool))
+	return hiveToolReadOnly[t] || hiveToolIssueWrite[t] || hiveToolPRWrite[t]
+}
+
 // IsReadOnly reports whether tool is an inspection / read-only tool.
 func IsReadOnly(tool string) bool {
 	t := strings.ToLower(strings.TrimSpace(tool))
+	if hiveToolReadOnly[t] {
+		return true
+	}
 	switch t {
-	case "read", "glob", "grep", "read_file", "view_file", "list_dir",
+	case "read", "view", "glob", "grep", "read_file", "view_file", "list_dir",
 		"grep_search", "glob_search", "read_browser_page", "read_url_content",
 		"websearch", "web_search", "fetchurl", "fetch_url":
 		return true
@@ -63,6 +91,9 @@ func IsDirectPRMerge(tool string) bool {
 // IsGitHubWrite reports whether tool writes to GitHub (issues, PRs, comments, labels).
 func IsGitHubWrite(tool string) bool {
 	t := strings.ToLower(strings.TrimSpace(tool))
+	if hiveToolIssueWrite[t] || hiveToolPRWrite[t] {
+		return true
+	}
 	if IsDirectPRCreation(tool) || IsDirectPRMerge(tool) {
 		return true
 	}
@@ -84,6 +115,13 @@ func IsGitHubWrite(tool string) bool {
 // IsGitHubIssueOperation reports whether tool interacts with issues/comments/labels.
 func IsGitHubIssueOperation(tool string) bool {
 	t := strings.ToLower(strings.TrimSpace(tool))
+	if hiveToolIssueWrite[t] {
+		return true
+	}
+	if hiveToolPRWrite[t] {
+		// pr.comment contains "comment" but is a PR operation only.
+		return false
+	}
 	if strings.Contains(t, "issue") || strings.Contains(t, "comment") || strings.Contains(t, "label") {
 		return IsGitHubWrite(tool)
 	}
@@ -93,17 +131,30 @@ func IsGitHubIssueOperation(tool string) bool {
 // IsGitHubPROperation reports whether tool interacts with PRs or merge operations.
 func IsGitHubPROperation(tool string) bool {
 	t := strings.ToLower(strings.TrimSpace(tool))
+	if hiveToolPRWrite[t] {
+		return true
+	}
 	if strings.Contains(t, "pull_request") || strings.Contains(t, "merge") {
 		return IsGitHubWrite(tool)
 	}
 	return false
 }
 
-// IsLocalWrite reports whether tool modifies local files.
+// IsLocalWrite reports whether tool modifies local files. It spells the
+// write tools of Claude Code and Cline (write, edit, write_to_file,
+// replace_file_content, edit_file, notebookeditcell), Copilot CLI (create,
+// apply_patch) and the Codex/Anthropic editor tools (str_replace_editor,
+// str_replace_based_edit_tool, multi_edit, multiedit, write_file,
+// create_file). The scan lane's guardrail-path check does not depend on
+// this list — it holds every tool not classified read-only that names a
+// file — so a name missing here does not open a gap; the predicate is kept
+// exported for callers that want the narrower "known editor" question.
 func IsLocalWrite(tool string) bool {
 	t := strings.ToLower(strings.TrimSpace(tool))
 	switch t {
-	case "write", "edit", "write_to_file", "replace_file_content", "edit_file", "notebookeditcell":
+	case "write", "edit", "write_to_file", "replace_file_content", "edit_file", "notebookeditcell",
+		"create", "apply_patch", "str_replace_editor", "str_replace_based_edit_tool",
+		"multi_edit", "multiedit", "write_file", "create_file":
 		return true
 	}
 	return false

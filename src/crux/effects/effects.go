@@ -43,6 +43,12 @@ var ErrNotApplied = errors.New("external effect definitely not applied")
 // must be reconciled (see Reconcile) before any retry.
 var ErrNeedsReconciliation = errors.New("external effect needs reconciliation before retry")
 
+// ErrUnresolvedExpired accompanies ErrNeedsReconciliation when the boundary
+// refused this attempt but, finding the operation unresolved past its TTL,
+// expired it to not-applied: the effect did not run, and the caller's next
+// attempt (after its own duplicate check) may.
+var ErrUnresolvedExpired = errors.New("unresolved external effect expired past TTL; retry authorized")
+
 // NotApplied wraps err as a definite refusal (ErrNotApplied) while keeping
 // err's own message and chain, so callers still see the original error.
 func NotApplied(err error) error {
@@ -146,6 +152,7 @@ func ExecuteReconciling(ctx context.Context, boundary Boundary, claim Claim, obs
 	if expErr != nil {
 		return Result{}, fmt.Errorf("%w (reconciliation lookup failed: %v; expiry failed: %v)", journalErr, lookupErr, expErr)
 	}
+	expired = expired || errors.Is(journalErr, ErrUnresolvedExpired)
 	if !expired {
 		return Result{}, fmt.Errorf("%w (reconciliation lookup failed: %v)", journalErr, lookupErr)
 	}
@@ -191,6 +198,13 @@ type Result struct {
 
 type Boundary interface {
 	Execute(ctx context.Context, claim Claim, effect func(context.Context) (Result, error)) (Result, error)
+}
+
+// JournaledBoundary refuses to invoke effect without an active operation
+// journal. Implementations freeze their effective mode for the whole operation;
+// ordinary Boundary may deliberately pass effects through when journaling is off.
+type JournaledBoundary interface {
+	ExecuteJournaled(ctx context.Context, claim Claim, effect func(context.Context) (Result, error)) (Result, error)
 }
 
 type NoopBoundary struct{}
@@ -299,6 +313,19 @@ type LoggingBoundary struct {
 
 func (b LoggingBoundary) Execute(ctx context.Context, claim Claim, effect func(context.Context) (Result, error)) (Result, error) {
 	res, err := Execute(ctx, b.Next, claim, effect)
+	return b.record(claim, res, err)
+}
+
+func (b LoggingBoundary) ExecuteJournaled(ctx context.Context, claim Claim, effect func(context.Context) (Result, error)) (Result, error) {
+	journaled, ok := b.Next.(JournaledBoundary)
+	if !ok {
+		return Result{}, fmt.Errorf("%w: mutation boundary cannot require journaling", ErrDenied)
+	}
+	res, err := journaled.ExecuteJournaled(ctx, claim, effect)
+	return b.record(claim, res, err)
+}
+
+func (b LoggingBoundary) record(claim Claim, res Result, err error) (Result, error) {
 	if err != nil && errors.Is(err, ErrDenied) && b.Logger != nil {
 		b.Logger.Warn("mutation boundary denied external effect",
 			"repo", claim.Repo, "kind", claim.Kind, "target", claim.Target, "error", err)
@@ -315,6 +342,10 @@ func (b LoggingBoundary) Reconcile(ctx context.Context, claim Claim, state Exter
 
 func (b LoggingBoundary) ExpireUnresolved(ctx context.Context, claim Claim, ttl time.Duration) (bool, error) {
 	return ExpireUnresolved(ctx, b.Next, claim, ttl)
+}
+
+func (b LoggingBoundary) LookupApplied(ctx context.Context, claim Claim) (Result, bool) {
+	return LookupApplied(ctx, b.Next, claim)
 }
 
 func (c Claim) Validate() error {

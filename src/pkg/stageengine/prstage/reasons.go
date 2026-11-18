@@ -1,6 +1,7 @@
 package prstage
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 
@@ -14,20 +15,28 @@ const ReasonSupersessionPending = "supersession-decision-pending"
 
 // Lane reasons are shared by the producers and the stage classifier.
 const (
-	ReviewGateOutcomeAwaiting              = "awaiting-review-approval"
-	ReviewGateOutcomeChangesRequested      = "changes-requested"
-	ReviewGateOutcomeNoBundle              = "no-review-bundle"
-	AutoMergeReasonBehindBudgetExhausted   = "behind-update-budget-exhausted"
-	AutoMergeReasonForkNotEditable         = "fork-not-editable"
-	AutoMergeReasonForkWorkflowUpdate      = "fork-workflow-update"
-	AutoMergeReasonHumanChangesRequested   = "human-changes-requested"
-	AutoMergeReasonHumanMergePath          = "human-merge-path"
-	AutoMergeReasonHumanMergePathEvidence  = "human-merge-path-evidence"
+	ReviewGateOutcomeAwaiting             = "awaiting-review-approval"
+	ReviewGateOutcomeChangesRequested     = "changes-requested"
+	ReviewGateOutcomeNoBundle             = "no-review-bundle"
+	AutoMergeReasonBehindBudgetExhausted  = "behind-update-budget-exhausted"
+	AutoMergeReasonForkNotEditable        = "fork-not-editable"
+	AutoMergeReasonForkWorkflowUpdate     = "fork-workflow-update"
+	AutoMergeReasonHumanChangesRequested  = stagelabels.LaneReasonHumanChangesRequested
+	AutoMergeReasonHumanMergePath         = "human-merge-path"
+	AutoMergeReasonHumanMergePathEvidence = "human-merge-path-evidence"
+	// AutoMergeReasonHumanMergeRequired: the PR's title says breaking
+	// change (⚠️, or an auto_merge.human_merge_title_prefixes prefix) or it
+	// wears an auto_merge.human_merge_labels label; no lane and no merge
+	// train ever merges it — the owner does (hivecommons/hive#15442).
+	AutoMergeReasonHumanMergeRequired      = "human-merge-required"
 	AutoMergeReasonIntentEvidence          = "intent-evidence"
 	AutoMergeReasonIntentUnauthorized      = "intent-unauthorized"
 	AutoMergeReasonMergeQueueRequired      = "merge-queue-required"
 	AutoMergeReasonMergeRefusedMethod      = "merge-refused:method-not-allowed"
 	AutoMergeReasonMergeRefusedReview      = "merge-refused:review-required"
+	AutoMergeReasonNativeQueuePrefix       = "native-merge-queue"
+	AutoMergeReasonNativeQueueMethod       = "native-merge-queue-method"
+	AutoMergeReasonNativeQueued            = "native-merge-queued"
 	AutoMergeReasonNoAppBotLogin           = "no-app-bot-login"
 	AutoMergeReasonReviewGatePrefix        = "review-gate:"
 	AutoMergeReasonWorkflowPermission      = "workflow-permission"
@@ -50,6 +59,7 @@ const (
 	ContributorLaneReasonNoReviewer        = "contributor-lane:no-reviewer"
 	ContributorLaneReasonNoVerdict         = "contributor-lane:no-verdict"
 	ContributorLaneReasonReporterTrustHold = "contributor-lane:reporter-trust-hold"
+	ContributorLaneReasonReviewOff         = "contributor-lane:review-off"
 	ContributorLaneReasonSentinelBlocked   = "contributor-lane:sentinel-blocked"
 	ContributorLaneReasonSoaking           = "contributor-lane:soaking"
 	ContributorLaneReasonTestsRemoved      = "contributor-lane:tests-removed"
@@ -61,9 +71,13 @@ const (
 	StageLaneSelf                          = "self-authored"
 	StageLaneTrusted                       = "trusted-author"
 	StageReasonBaseBranchRed               = "base-branch-red:"
-	StageReasonForkGuard                   = "fork-guard:"
-	StageReasonOptionalCheckFailing        = "optional-check-failing:"
-	StageReasonSharedCIIncident            = "shared-ci-incident:"
+	// StageReasonBaseRefreshMergeGuard: the lane did not evaluate the PR
+	// this pass because a merge to its destination was in flight
+	// (hivecommons/hive#16520); it says nothing about the stage.
+	StageReasonBaseRefreshMergeGuard = "base-refresh:merge-guard"
+	StageReasonForkGuard             = "fork-guard:"
+	StageReasonOptionalCheckFailing  = "optional-check-failing:"
+	StageReasonSharedCIIncident      = "shared-ci-incident:"
 	// StageReasonUnauthorizedPrefix: the lane's next step needs an API
 	// call the hive's GitHub App is not permitted to make (403 "Resource
 	// not accessible by integration"); the rest names the step
@@ -80,6 +94,18 @@ const (
 	TrustedAuthorReasonAppAuthored    = "trusted-author:app-authored"
 	TrustedBotLaneSkipReason          = "trusted-bot-lane"
 	WorkflowApprovalRequiredPrefix    = "workflow-approval-required:"
+	// WorkflowRunsHeldPrefix: GitHub holds workflow runs on the head behind
+	// its approve-workflows gate and the hive did not approve them (its
+	// policy does not trust the head, auto-approval is off, or GitHub
+	// refused); the rest is the run ids. Only a person's "Approve and run"
+	// (or a new head) moves the PR, so it parks at 085 over whatever the
+	// lane said next.
+	WorkflowRunsHeldPrefix = WorkflowApprovalRequiredPrefix + "held-runs:"
+	// RequiredCheckNeverReportedPrefix: auto_merge.required_checks names a
+	// check that has never reported on this repo, so the trusted-bot lane
+	// cannot gate on it and no other check vouches for the head. A person
+	// (or a per-repo required_checks override) resolves it.
+	RequiredCheckNeverReportedPrefix = "required-check-never-reported:"
 )
 
 // Closing-link reasons (hivecommons/hive#15025): a closing keyword the
@@ -129,6 +155,9 @@ const (
 	// requires_human and a trusted merger approved the head; the hive
 	// leaves the merge itself to a person.
 	HumanMergeReasonReviewerDeferred = "reviewer-deferred"
+	// HumanMergeReasonBreakingChange: the PR's title or label marks it a
+	// breaking change the owner merges by hand (AutoMergeReasonHumanMergeRequired).
+	HumanMergeReasonBreakingChange = "breaking-change"
 	// HumanMergeReasonPolicy: a lane rule no more specific code names.
 	HumanMergeReasonPolicy = "policy"
 )
@@ -164,6 +193,42 @@ func ParseLinkedIssueReason(reason string) (kindPrefix string, issue int, label 
 		return "", 0, "", false
 	}
 	return kindPrefix, n, label, true
+}
+
+// ReReviewRequestedReasonPrefix: every change request still standing on the
+// PR was left on an older commit, and the author has pushed content since.
+// GitHub keeps such a review blocking until its reviewer re-reviews or a
+// maintainer dismisses it, so the PR waits on the reviewer, not on its
+// author. The rest names the reviewers, comma-separated.
+const ReReviewRequestedReasonPrefix = "re-review-requested:"
+
+// ReReviewRequestedReason formats the lane reason for reviewers whose change
+// requests are on older commits, sorted so the reason is stable across
+// sweeps: `re-review-requested:alice,bob`.
+func ReReviewRequestedReason(reviewers []string) string {
+	var logins []string
+	for _, r := range reviewers {
+		if r = strings.TrimPrefix(strings.TrimSpace(r), "@"); r != "" && !slices.Contains(logins, r) {
+			logins = append(logins, r)
+		}
+	}
+	slices.SortFunc(logins, func(a, b string) int { return strings.Compare(strings.ToLower(a), strings.ToLower(b)) })
+	return ReReviewRequestedReasonPrefix + strings.Join(logins, ",")
+}
+
+// ParseReReviewRequested returns the reviewers a ReReviewRequestedReason
+// names. ok is false for any other reason.
+func ParseReReviewRequested(reason string) (reviewers []string, ok bool) {
+	rest, found := strings.CutPrefix(strings.TrimSpace(reason), ReReviewRequestedReasonPrefix)
+	if !found {
+		return nil, false
+	}
+	for _, r := range strings.Split(rest, ",") {
+		if r = strings.TrimSpace(r); r != "" {
+			reviewers = append(reviewers, r)
+		}
+	}
+	return reviewers, true
 }
 
 // ClosingContradictionReason formats the refusal for a PR body that closes
@@ -221,9 +286,11 @@ func HumanMergeReason(reason string) string {
 		return HumanMergeReasonTestsRemoved
 	case base == AutoMergeReasonHumanMergePath, base == AutoMergeReasonHumanMergePathEvidence:
 		return HumanMergeReasonManualMergePolicy
+	case base == AutoMergeReasonHumanMergeRequired:
+		return HumanMergeReasonBreakingChange
 	case base == AutoMergeReasonMergeRefusedReview, strings.HasPrefix(base, AutoMergeReasonReviewGatePrefix):
 		return HumanMergeReasonBranchProtection
-	case base == AutoMergeReasonMergeRefusedMethod:
+	case base == AutoMergeReasonMergeRefusedMethod, base == AutoMergeReasonNativeQueueMethod:
 		return HumanMergeReasonMergeMethod
 	case base == "repo-auto-merge-disabled", base == StageLaneContributor+":disabled", base == "disabled":
 		return HumanMergeReasonAutoMergeOff
@@ -236,4 +303,54 @@ func HumanMergeReason(reason string) string {
 		return HumanMergeReasonReviewerDeferred
 	}
 	return HumanMergeReasonPolicy
+}
+
+// humanMergeReasonWords are the short word and the one-sentence why for
+// each HumanMergeReason* code: why a person, not the hive, merges a PR
+// parked at 090 (hivecommons/hive#14658). The dashboard's gate cell and the
+// 090 entry comment both read them, so the two never disagree. Plain words,
+// one short sentence each, no config keys (hivecommons/hive#15394).
+var humanMergeReasonWords = map[string][2]string{
+	HumanMergeReasonWorkflowFiles:     {"workflow files", "It changes GitHub workflow files, which hive never merges on its own"},
+	HumanMergeReasonTestsRemoved:      {"tests removed", "It removes tests, which hive never merges on its own"},
+	HumanMergeReasonManualMergePolicy: {"manual-merge policy", "It touches files this repo reserves for a person to merge"},
+	HumanMergeReasonBranchProtection:  {"branch protection", "Branch protection wants a review hive cannot give; approve on GitHub or merge it"},
+	HumanMergeReasonMergeMethod:       {"merge method", "The repo does not allow the merge method this PR needs"},
+	HumanMergeReasonAutoMergeOff:      {"auto-merge off", "Auto-merge is off for this repo, so a person merges"},
+	HumanMergeReasonUntrustedAuthor:   {"untrusted author", "Hive won't merge it alone — the author isn't a trusted author yet"},
+	HumanMergeReasonUnauthorized:      {"hive bot lacks permission", "The hive bot's GitHub App is missing the permission to merge here; a person merges"},
+	HumanMergeReasonReviewerDeferred:  {"reviewer deferred", "A reviewer asked for a person to merge this one"},
+	HumanMergeReasonBreakingChange:    {"human merge", "Breaking change — owner merges; hive never merges a ⚠️-titled or needs-owner-merge PR"},
+}
+
+// HumanMergeReasonWords returns code's gate-cell word and its one-sentence
+// why. ok is false for a code with no words of its own
+// (HumanMergeReasonPolicy, "").
+func HumanMergeReasonWords(code string) (word, sentence string, ok bool) {
+	w, ok := humanMergeReasonWords[code]
+	return w[0], w[1], ok
+}
+
+// WorkflowRunsHeldReason formats the WorkflowRunsHeldPrefix reason for ids.
+func WorkflowRunsHeldReason(ids []int64) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, strconv.FormatInt(id, 10))
+	}
+	return WorkflowRunsHeldPrefix + strings.Join(parts, ",")
+}
+
+// ParseWorkflowRunsHeld returns the run ids a WorkflowRunsHeldPrefix reason
+// names; ok is false for any other reason.
+func ParseWorkflowRunsHeld(reason string) (ids []string, ok bool) {
+	rest, ok := strings.CutPrefix(reason, WorkflowRunsHeldPrefix)
+	if !ok {
+		return nil, false
+	}
+	for _, id := range strings.Split(rest, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, true
 }

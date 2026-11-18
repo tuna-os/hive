@@ -168,6 +168,38 @@ func TestBotTakeoverAutoMergeConfigDefaultsOnAndHonorsExplicitOff(t *testing.T) 
 	}
 }
 
+func TestDependencyBotAdoptAutoMergeConfigDefaultsOffAndRoundTrips(t *testing.T) {
+	var a AutoMergeConfig
+	if a.DependencyBotAdopt.IsEnabled() {
+		t.Fatal("auto_merge.dependency_bot_adopt.enabled must default off")
+	}
+	if err := yaml.Unmarshal([]byte("dependency_bot_adopt:\n  enabled: true\n"), &a); err != nil {
+		t.Fatal(err)
+	}
+	if !a.DependencyBotAdopt.IsEnabled() {
+		t.Fatal("explicit auto_merge.dependency_bot_adopt.enabled: true must enable the adoption request")
+	}
+	out, err := yaml.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back AutoMergeConfig
+	if err := yaml.Unmarshal(out, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.DependencyBotAdopt.IsEnabled() {
+		t.Fatalf("auto_merge.dependency_bot_adopt.enabled lost on a YAML round trip:\n%s", out)
+	}
+	var off AutoMergeConfig
+	out, err = yaml.Marshal(off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "dependency_bot_adopt") {
+		t.Fatalf("the default (off) must not be written to hive.yaml:\n%s", out)
+	}
+}
+
 // registry_tiers_sufficient defaults on so an operator-granted registry tier
 // admits a contributor-lane PR without a claim marker; an explicit false
 // turns the registry path off.
@@ -210,6 +242,39 @@ func TestContributorLaneAutoMergeConfigOwnerApprovalReleasesWorkflowFence(t *tes
 	cfg.OwnerApprovalReleasesWorkflowFence = &off
 	if cfg.EffectiveOwnerApprovalReleasesWorkflowFence() {
 		t.Fatal("explicit owner_approval_releases_workflow_fence: false must keep the fence absolute")
+	}
+}
+
+// workflow_fence_scope defaults to all (today's full fence), accepts
+// human_merge_paths in any case, and rejects anything else; a rejected value
+// still reads as all, so it never narrows the fence.
+func TestContributorLaneAutoMergeConfigWorkflowFenceScope(t *testing.T) {
+	var cfg ContributorLaneAutoMergeConfig
+	if got := cfg.EffectiveWorkflowFenceScope(); got != ContributorLaneWorkflowFenceScopeAll {
+		t.Fatalf("default workflow_fence_scope = %q, want all", got)
+	}
+	cfg.WorkflowFenceScope = " Human_Merge_Paths "
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("human_merge_paths scope should validate: %v", err)
+	}
+	if got := cfg.EffectiveWorkflowFenceScope(); got != ContributorLaneWorkflowFenceScopeHumanMergePaths {
+		t.Fatalf("workflow_fence_scope = %q, want human_merge_paths (trimmed, lower-cased)", got)
+	}
+	cfg.WorkflowFenceScope = "release_only"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "workflow_fence_scope") {
+		t.Fatalf("invalid scope must fail validation, got %v", err)
+	}
+	if got := cfg.EffectiveWorkflowFenceScope(); got != ContributorLaneWorkflowFenceScopeAll {
+		t.Fatalf("unknown workflow_fence_scope = %q, want all (never narrows the fence)", got)
+	}
+	var parsed struct {
+		ContributorLane ContributorLaneAutoMergeConfig `yaml:"contributor_lane"`
+	}
+	if err := yaml.Unmarshal([]byte("contributor_lane:\n  workflow_fence_scope: human_merge_paths\n"), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.ContributorLane.EffectiveWorkflowFenceScope(); got != ContributorLaneWorkflowFenceScopeHumanMergePaths {
+		t.Fatalf("yaml workflow_fence_scope = %q, want human_merge_paths", got)
 	}
 }
 

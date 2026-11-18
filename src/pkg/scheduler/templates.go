@@ -11,7 +11,6 @@ import (
 
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/github"
-	"github.com/hivecommons/hive/pkg/knowledge"
 	"github.com/hivecommons/hive/pkg/policies"
 	"github.com/hivecommons/hive/pkg/resolve"
 )
@@ -264,32 +263,6 @@ func (s *Scheduler) substituteTemplateWithPolicy(template string, actionable *gi
 	return s.substituteTemplateWithVars(template, actionable, agentName, issues, nil, elideStuffed)
 }
 
-// inceptionVars extracts template variable values from the inception engine.
-// Returns empty strings when no inception is active — templates render cleanly.
-func (s *Scheduler) inceptionVars() (idea, phase, mode, answers, slug, repoURL string) {
-	s.mu.RLock()
-	inception := s.inception
-	s.mu.RUnlock()
-	if inception == nil {
-		return
-	}
-	state := inception.GetState()
-	if state == nil {
-		return
-	}
-	phase = string(state.Phase)
-	mode = string(state.Mode)
-	slug = state.IdeaSlug
-	repoURL = state.RepoURL
-	answers = s.inception.FormatAnswersForPrompt()
-
-	idea = state.IdeaText
-	if idea == "" && state.Mode == knowledge.InceptionBrownfield {
-		idea = state.RepoURL
-	}
-	return
-}
-
 // substituteTemplateWithVars is substituteTemplateWithPolicy plus caller-supplied
 // ${VAR}s, for a template whose values only one call site can compute.
 //
@@ -304,6 +277,18 @@ func (s *Scheduler) inceptionVars() (idea, phase, mode, answers, slug, repoURL s
 // ${GH_AUTH} or ${AGENT_NAME}.
 func (s *Scheduler) substituteTemplateWithVars(template string, actionable *github.ActionableResult, agentName string, issues []github.Issue, extra map[string]func() string, elideOpt ...bool) (string, bool) {
 	elideStuffed := len(elideOpt) > 0 && elideOpt[0]
+	return s.substituteTemplate(template, actionable, agentName, issues, extra, elideStuffed, nil)
+}
+
+// substituteTemplate is the one ${VAR} renderer behind every kick. A non-nil
+// guidance marks a contributor's role-guidance render
+// (BuildAgentGuidanceForTask): the metrics-file work lists are not read at
+// all, the variables that carry the resident agent's work or its App
+// credentials render empty (guidanceBlankedVars), knowledge is primed from the
+// one assigned task without recording anything for the resident agent, and
+// AGENTS.md and skills come from the task's repository. Every resident kick
+// passes nil and is unchanged.
+func (s *Scheduler) substituteTemplate(template string, actionable *github.ActionableResult, agentName string, issues []github.Issue, extra map[string]func() string, elideStuffed bool, guidance *roleGuidance) (string, bool) {
 	baseName := s.cfg.BaseAgentName(agentName)
 	if actionable == nil {
 		actionable = &github.ActionableResult{}
@@ -320,7 +305,9 @@ func (s *Scheduler) substituteTemplateWithVars(template string, actionable *gith
 	//
 	// A nil scope (every agent on every hive that does not use the feature)
 	// skips all of this, and the values below are byte-identical to before.
-	if s.cfg.AgentRepoScope(agentName) != nil {
+	// A lane that requires a scope and has none (the red-team lane) is
+	// filtered too, down to nothing: AgentServesRepo refuses it everywhere.
+	if s.cfg.AgentRepoRestricted(agentName) {
 		keep := func(repo string) bool { return s.cfg.AgentServesRepo(agentName, repo) }
 		actionable = github.FilterActionableForRepos(actionable, keep)
 		issues = filterIssuesForRepos(issues, keep)
@@ -336,7 +323,7 @@ func (s *Scheduler) substituteTemplateWithVars(template string, actionable *gith
 	issueList, issueFailClosed := s.formatIssueListWithPolicyForAgent(agentIssuesForList, elideStuffed)
 	prList, prFailClosed := s.formatPRListWithPolicyForAgent(actionable, baseName, elideStuffed)
 	if issueFailClosed || prFailClosed {
-		s.warnBlockedKick(agentName)
+		s.warnBlockedKick(agentName, false)
 		return "", true
 	}
 
@@ -361,45 +348,62 @@ func (s *Scheduler) substituteTemplateWithVars(template string, actionable *gith
 	if len(agentIssues) == 0 && actionable != nil && len(actionable.Issues.Items) > 0 {
 		agentIssues = actionable.Issues.Items
 	}
-	knowledgeSection := s.primeKnowledge(agentName, agentIssues)
+	// A guidance render primes from its one assigned task, never from the
+	// resident agent's queue, and records no kick summary or primed slugs for
+	// the resident agent: no resident kick was sent.
+	var knowledgeInj knowledgeInjection
+	if guidance == nil {
+		knowledgeInj = s.primeKnowledgeStats(agentName, agentIssues)
+	} else {
+		knowledgeInj = s.primeKnowledgeForTask(agentName, guidance.task)
+	}
+	knowledgeSection := knowledgeInj.Section
 
-	repoRoot := s.agentsRepoRoot(primaryRepo)
+	repoRoot := s.agentsRepoRoot(guidance.instructionsRepo(primaryRepo))
 
 	// Additive: prepend the repo's AGENTS.md instructions + requested skills to
-	// the injected knowledge, when a local checkout root is available. This is a
+	// the injected knowledge, when a checkout root is available — local, or the
+	// GitHub-fetched copy a hosted spoke falls back to (#17090). This is a
 	// guarded, single call point — it returns "" (and never errors) when no
 	// AGENTS.md exists, so it is a no-op for repos that don't use the convention.
 	//
-	// The root is resolved for the PRIMARY repo, which is the repo this kick's
-	// instructions are about — the same repo ${PROJECT_PRIMARY_REPO} names here
-	// and HIVE_REPO names in the agent's environment. A multi-repo hive gets the
-	// primary repo's AGENTS.md, never a different repo's: resolution is keyed by
-	// repo name, so it cannot silently pick the wrong one.
+	// A resident kick resolves the root for the PRIMARY repo, which is the repo
+	// its instructions are about — the same repo ${PROJECT_PRIMARY_REPO} names
+	// here and HIVE_REPO names in the agent's environment. A multi-repo hive
+	// gets the primary repo's AGENTS.md, never a different repo's: resolution is
+	// keyed by repo name, so it cannot silently pick the wrong one. A role
+	// guidance render resolves it for the assigned task's repository instead,
+	// since that is the repo the contributor will change, and falls back to the
+	// primary only when the task names no repo (roleGuidance.instructionsRepo).
 	//
 	// TODO(agentsmd): once file-level targeting exists, prefer
 	// agentsmd.ParseNearest for closest-wins nested AGENTS.md. That still has no
 	// caller — nothing on the kick path knows which FILE an agent will touch —
 	// so it stays deferred, unlike the checkout root, which is now threaded.
-	if agentsSection := s.primeAgentsMd(repoRoot); agentsSection != "" {
+	agentsSection := s.primeAgentsMd(primaryRepo, repoRoot)
+	if agentsSection != "" {
 		knowledgeSection = agentsSection + "\n" + knowledgeSection
 	}
 
 	// Agent-declared skills prefer the hive-host-local registry, then fall back
-	// to definitions in the primary repo's AGENTS.md or adjacent skills/
+	// to definitions in that repo's AGENTS.md or adjacent skills/
 	// directory. The registry remains independently useful without a checkout;
 	// the fallback activates only when agentsRepoRoot found one above.
-	if skillsSection := s.primeSkills(agentName, repoRoot); skillsSection != "" {
+	skillsSection := s.primeSkills(agentName, repoRoot)
+	if skillsSection != "" {
 		knowledgeSection = skillsSection + "\n" + knowledgeSection
 	}
-
-	inceptionIdea, inceptionPhase, inceptionMode, inceptionAnswers, inceptionSlug, inceptionRepoURL := s.inceptionVars()
+	s.logKnowledgeInjection(agentName, knowledgeInj, len(agentsSection), len(skillsSection))
 
 	// The merge-eligible and CI-failing lists are read from hive-wide metrics
 	// files, so they need the same narrowing: a scoped agent asked to fix red CI
 	// must not be handed a red PR on a repo it cannot push to (#6204).
 	repoInScope := func(repo string) bool { return s.cfg.AgentServesRepo(agentName, repo) }
-	mergeEligibleList := s.buildMergeEligibleListFor(repoInScope, elideStuffed)
-	ciFailingList := s.buildCIFailingListFor(repoInScope)
+	mergeEligibleList, ciFailingList := "", ""
+	if guidance == nil {
+		mergeEligibleList = s.buildMergeEligibleListFor(repoInScope, elideStuffed)
+		ciFailingList = s.buildCIFailingListForAgent(baseName, repoInScope)
+	}
 
 	// The built-in per-kick variables. Each value is already computed above, so
 	// the thunks just return it — but wrapping them as resolve.RuntimeContext
@@ -425,6 +429,7 @@ func (s *Scheduler) substituteTemplateWithVars(template string, actionable *gith
 		"GH_AUTH":               lit(s.ghAuthInstructions()),
 		"WORK_TRACKER":          lit(s.workTrackerSection()),
 		"IN_FLIGHT":             lit(inflightNote(heldInflight)),
+		"TOPIC_CLAIMS":          lit(topicClaimsSection(s.topicClaimsFor(agentName))),
 		"PROJECT_ORG":           lit(s.cfg.Project.Org),
 		"PROJECT_NAME":          lit(s.cfg.Project.Name),
 		"PROJECT_PRIMARY_REPO":  lit(fullPrimaryRepo),
@@ -439,15 +444,27 @@ func (s *Scheduler) substituteTemplateWithVars(template string, actionable *gith
 		"AGENT_ROLES":           lit(agentRoles),
 		"ENABLED_AGENTS":        lit(agentList),
 		"KNOWLEDGE":             lit(knowledgeSection),
-		"INCEPTION_IDEA":        lit(inceptionIdea),
-		"INCEPTION_PHASE":       lit(inceptionPhase),
-		"INCEPTION_MODE":        lit(inceptionMode),
-		"INCEPTION_ANSWERS":     lit(inceptionAnswers),
-		"INCEPTION_SLUG":        lit(inceptionSlug),
-		"INCEPTION_REPO_URL":    lit(inceptionRepoURL),
-		"MERGE_ELIGIBLE":        lit(mergeEligibleList),
-		"CI_FAILING":            lit(ciFailingList),
+		// The ${INCEPTION_*} family belonged to the retired inception
+		// workflow. It always renders empty so an operator's custom template
+		// that still names it (the brainstorm "Normal Ideation Mode" branch
+		// keyed off an empty idea) keeps rendering cleanly for one release.
+		"INCEPTION_IDEA":     lit(""),
+		"INCEPTION_PHASE":    lit(""),
+		"INCEPTION_MODE":     lit(""),
+		"INCEPTION_ANSWERS":  lit(""),
+		"INCEPTION_SLUG":     lit(""),
+		"INCEPTION_REPO_URL": lit(""),
+		"MERGE_ELIGIBLE":     lit(mergeEligibleList),
+		"CI_FAILING":         lit(ciFailingList),
+		// Upstream releases the release-feed watcher found for this agent
+		// and has not yet delivered (hivecommons/hive#18494); "" when none.
+		"NEW_RELEASES": func() string { return s.newReleasesBlock(agentName) },
 	}}
+	if guidance != nil {
+		for _, name := range guidanceBlankedVars {
+			rt.Vars[name] = lit("")
+		}
+	}
 	// Caller-supplied vars lose a name clash: one already claimed by a built-in
 	// above is left alone, so no call site can redefine ${GH_AUTH}.
 	for name, fn := range extra {

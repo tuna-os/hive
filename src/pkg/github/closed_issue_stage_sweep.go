@@ -74,7 +74,8 @@ func (c *Client) SweepClosedIssueStageLabels(ctx context.Context, opts ClosedIss
 		since = time.Now().Add(-DefaultClosedIssueStageSweepWindow)
 	}
 	result := &ClosedIssueStageSweepResult{}
-	for _, repo := range c.getRepos() {
+	// activeRepos, not getRepos: a paused repo keeps its labels untouched (#6203).
+	for _, repo := range c.activeRepos() {
 		if len(result.Cleaned) >= maxActions {
 			break
 		}
@@ -120,10 +121,13 @@ func (c *Client) SweepClosedIssueStageLabels(ctx context.Context, opts ClosedIss
 
 // listClosedIssuesSince is one page per 100 closed issues updated after
 // since, newest activity first — the recent closes this sweep exists for.
+// The since sent is rounded down to the hour (cacheableSince): both callers
+// pass a since that moves on every pass, and a wider window only re-reads
+// closes they already handled idempotently.
 func (c *Client) listClosedIssuesSince(ctx context.Context, owner, repo string, since time.Time) ([]*gh.Issue, error) {
 	opts := &gh.IssueListByRepoOptions{
 		State:       "closed",
-		Since:       since,
+		Since:       cacheableSince(since),
 		Sort:        "updated",
 		Direction:   "desc",
 		ListOptions: gh.ListOptions{PerPage: 100},

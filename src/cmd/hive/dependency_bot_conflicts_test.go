@@ -128,17 +128,23 @@ type depBotHarness struct {
 	store  *depBotConflictStore
 	writer *depBotFakeWriter
 	reader *depBotFakeReader
+	// ledger is the escalation ledger the sweep reads for the transient
+	// re-run (dbrLedger): a fresh one per harness, so no test sees another
+	// test's re-run.
+	ledger *escalation.Store
 }
 
 func newDepBotHarness(t *testing.T) *depBotHarness {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "dependency-bot-conflicts.json")
+	ledger, _ := newTestEscalationStore(t)
 	return &depBotHarness{
 		t:      t,
 		path:   path,
 		store:  loadDepBotConflictStore(path),
 		writer: &depBotFakeWriter{},
 		reader: &depBotFakeReader{body: renovateNeverBody},
+		ledger: ledger,
 	}
 }
 
@@ -147,7 +153,7 @@ func (h *depBotHarness) pass(prs ...github.PullRequest) {
 	a := &github.ActionableResult{}
 	a.PRs.Items = prs
 	now := func() time.Time { return time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC) }
-	sweepDependencyBotConflicts(context.Background(), h.store, "acme", h.writer, h.reader, a, now, discardLogger())
+	sweepDependencyBotConflicts(context.Background(), h.store, "acme", 0, h.writer, h.reader, a, now, discardLogger())
 }
 
 const depBotKey = "acme/widgets#42"

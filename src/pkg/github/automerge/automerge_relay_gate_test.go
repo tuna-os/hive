@@ -70,7 +70,7 @@ func TestRelayMergeRefusalSoakAndHeadAge(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		for _, want := range []string{contributorLaneReasonSoaking, "remaining=30m", "soak is 30m0s"} {
+		for _, want := range []string{contributorLaneReasonSoaking, "30m0s remaining", "soak is 30m0s"} {
 			if !strings.Contains(refusal, want) {
 				t.Fatalf("refusal %q does not name %q", refusal, want)
 			}
@@ -251,16 +251,25 @@ func TestRelayMergeRefusalFailsClosed(t *testing.T) {
 			t.Fatalf("err = %v, want lane evidence error", err)
 		}
 	})
+	t.Run("incomplete files list refuses", func(t *testing.T) {
+		fx := validContributorFixture()
+		fx.changedFiles = 5204
+		engine, _ := relayGateEngine(t, &fx, defaultContributorLanePolicy(), Options{})
+		refusal, err := engine.RelayMergeRefusal(context.Background(), "widget", 7, "sha7")
+		if err != nil || !strings.Contains(refusal, contributorLaneReasonFilesEvidence) {
+			t.Fatalf("refusal=%q err=%v, want standing files-evidence refusal", refusal, err)
+		}
+	})
 }
 
 func TestRelayMergeRefusalText(t *testing.T) {
 	policy := ContributorLanePolicy{Soak: 30 * time.Minute, RequireTiers: map[string]bool{"trusted": true, "merger": true}}
-	got := relayMergeRefusal("Karibhou", "untrusted", policy, contributorLaneReasonClaimTier)
+	got := relayMergeRefusal("Karibhou", "untrusted", policy, contributorLaneReasonClaimTier, 0)
 	want := RelayMergeRefusalPrefix + ` for @Karibhou's PR: contributor-lane:claim-tier-untrusted (author tier "untrusted", require_tiers merger, trusted)`
 	if got != want {
 		t.Fatalf("got  %q\nwant %q", got, want)
 	}
-	if got := relayMergeRefusal("", "", ContributorLanePolicy{}, contributorLaneReasonNoClaim); !strings.Contains(got, `tier "none", require_tiers (none)`) {
+	if got := relayMergeRefusal("", "", ContributorLanePolicy{}, contributorLaneReasonNoClaim, 0); !strings.Contains(got, `tier "none", require_tiers (none)`) {
 		t.Fatalf("got %q", got)
 	}
 }

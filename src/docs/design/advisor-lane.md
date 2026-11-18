@@ -201,6 +201,9 @@ the dashboard's existing checks:
   client can read them.
 - **The admin MCP**, as a read tool that answers "what did the advisor flag" for an agent or the
   fleet over a window. It is built on the REST surface above and adds no authority beyond it.
+  The admin MCP can also change the advisor settings and roles (`advisor.settings`,
+  `advisor.agent`, `advisor.roles`) through the usual preview-and-confirm writes, owner-only like
+  the dashboard editor. No MCP write touches advisor records or acts on a verdict.
 
 ## Configuration
 
@@ -208,6 +211,33 @@ One fleet-wide `advisor` block in `hive.yaml` — enabled, model or `@role`, sta
 instructions, daily budget, timeout, consecutive-block limit — and a per-agent override that may
 change any part of it or opt the agent out, in the spirit of the trajectory lane's
 `exempt_agents`. The roles map sits beside it.
+
+**How a review reaches the model.** `advisor.backend` (fleet, or per agent) takes the values
+`governor.reviewer_backend` takes, and an unset value follows that setting:
+
+- `http`: the reviewer endpoint (`governor.trajectory`, else `governor.litellm`) with its API key.
+- `claude-cli`: the Claude CLI on the hive's own Claude sign-in (the operator's long-lived token
+  or the dashboard sign-in), so a Claude subscription can run the advisor. The CLI runs the same
+  way the Let hive decide turn does: every tool, MCP server and hook off, one turn, an empty
+  temporary directory and HOME, the prompt on stdin, no GitHub or hive token, as its own user
+  under UID isolation. Advisor reviews have their own two CLI slots. The role's effort is passed
+  as `--effort` when the Claude CLI accepts the value. Subscription turns record no cost; their
+  estimated tokens still count against the daily budget.
+- `auto`: the endpoint when one resolves, else the Claude CLI when Claude is signed in.
+
+When the chosen path cannot run (no endpoint, or Claude not signed in), every review is
+recorded as `skipped: unreachable` with route `none`, and the reason is logged. Each record names
+its route. Codex and Copilot subscriptions are not a backend: neither CLI documents a mode with
+every tool off, and the advisor reads untrusted transcript text, so it must not run with tools.
+
+The advisor's reasoning effort comes from the role its model names: with `model: "@advisor"`,
+each review sends that role's `reasoning_effort` to the reviewer endpoint as the chat request's
+`reasoning_effort`, on every backend, and the review record names it beside the model. A literal
+model id, or the trajectory reviewer fallback, sends no effort, so the endpoint's default applies.
+A review that asks for an effort may use up to 16 000 output tokens, because a reasoning model
+spends its thinking from the same allowance as the verdict; `timeout_s` and the daily budget
+still bound it, and a higher effort usually needs a longer `timeout_s`. The endpoint must accept
+the value: an effort it refuses makes every review a `skipped: unreachable` record.
 
 All of it is editable from the dashboard's Settings area, which shows the effective value per
 agent, and all of it is expressible in `hive.yaml`, so a fleet can be configured without the

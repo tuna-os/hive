@@ -268,11 +268,14 @@ type RateLimitSnapshot struct {
 	OK        bool      `json:"ok"`
 }
 
-// Usage kinds, the three UsageSink record paths.
+// Usage kinds, the UsageSink record paths.
 const (
 	UsageKindGateway      = "gateway"
 	UsageKindCopilot      = "copilot"
 	UsageKindCopilotCache = "copilot_cache"
+	// UsageKindGatewayCache is a gateway response whose prompt was partly
+	// served from cache: InputTokens excludes CacheRead.
+	UsageKindGatewayCache = "gateway_cache"
 )
 
 // UsageRecord is the body of POST /v1/usage.
@@ -583,7 +586,7 @@ type AgentMintRequest struct {
 // mint at all answers 404 not_configured.
 type AgentMintResponse struct {
 	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
 }
 
 // String prints the response with the token redacted.

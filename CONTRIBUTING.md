@@ -2,7 +2,7 @@
 
 Thank you for helping improve Hive. This guide is for contributing code and documentation to this repository. If you want to donate compute to a running hive, see [Contribute to a Hive](src/docs/what-is-hive.md#contribute-to-a-hive) instead.
 
-**New here?** Start with the [getting-started guide for first-time contributors](docs/getting-started-contributing.md) — it walks the end-to-end journey (finding an issue, local setup, testing without a cluster, key concepts, and what the review/CI process looks like) and links back into this guide for the mechanics. For live community help, [Join our Discord](https://hivecommons.dev/discord).
+**New here?** Start with the [getting-started guide for first-time contributors](docs/getting-started-contributing.md) — it walks the end-to-end journey (finding an issue, local setup, testing without a cluster, key concepts, and what the review/CI process looks like) and links back into this guide for the mechanics. For live community help, [Join our Discord](https://hivecommons.dev/discord) or attend the [community meeting](https://docs.hivecommons.dev/docs/community/meetings), held every other Thursday at 10:00 AM Eastern. To see a hive at work, [watch the hive live on Twitch](https://www.twitch.tv/hivecommons).
 
 ## Where to work
 
@@ -11,6 +11,7 @@ Thank you for helping improve Hive. This guide is for contributing code and docu
 - Not sure why the hive has not picked up your issue? It automatically works issues only from OWNER, MEMBER, and COLLABORATOR authors; anyone else waits for a maintainer to add `triage/accepted`. See [Reporter trust and escalation](GOVERNANCE.md#reporter-trust-and-escalation) for what those roles mean, [how to become a trusted reporter](GOVERNANCE.md#how-to-become-a-trusted-reporter), and how to escalate.
 - Pull requests are welcome too, and nothing above changes how they are reviewed.
 - Discuss design and review questions in public issues and pull requests so decisions remain public and searchable.
+- A proposal or design question goes in an issue labelled `proposal` (or `kind/design`). Until someone claims it, the hive shows it as **Open for discussion** (`stage/018-open-for-discussion`), not as agent work waiting to be picked up; `/claim` it when you want to take it on, and it moves through the pipeline like any other issue. See [stage labels](src/docs/labels-and-control-signals/stage-labels.md).
 - Follow the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md), adopted in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), and [Hive governance](GOVERNANCE.md).
 - Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 - Extending Hive? Start with the [Integration guide](src/docs/integration-guide.md) for the current work source, ClankeR/Flue-style external execution, and Spektacular Project Inception seams.
@@ -259,6 +260,33 @@ rewritten; their failures are resolved by maintainer disposition, not by you.
   blast radius — are documented in
   [`src/docs/v5-sync-policy.md`](src/docs/v5-sync-policy.md#inherited-dco-failures-from-v4).
 
+  **Note on waivers:** Per-SHA waivers in `DCO_WAIVED_COMMITS` cover squash
+  commits whose author/sign-off mismatch the checkers cannot resolve on their
+  own — typically a noreply author paired with a real sign-off address that
+  has no same-person evidence in the protected branch's history yet (see the
+  next paragraph). The "Sign-off survives the squash" pre-merge check
+  (`.github/workflows/dco-squash-attribution.yml`, running
+  `src/scripts/check-squash-signoff-attribution.sh`) catches every other kind
+  of mismatch at PR time. If your PR fails that check, fix your sign-off by
+  re-signing your branch commits (`git commit --amend -s`), not by seeking a
+  waiver; waivers are a maintainer disposition for already-landed commits, not
+  a way around the pre-merge gate.
+
+  One identity shape the post-merge check resolves on its own: GitHub's squash
+  writes the pull-request author's GitHub identity on the landing commit, so a
+  contributor with a private email lands as
+  `<id>+<login>@users.noreply.github.com` while the `Signed-off-by:` carried
+  over from the branch is their real address — the one the pre-merge DCO check
+  already accepted. The checker treats that as the same person **only when the
+  protected branch's own history shows the link**: another commit authored or
+  committed under the sign-off address by the same name, or a commit on which
+  that address and `<login>`'s noreply appear together. It makes no GitHub API
+  call for this, and it reports each acceptance as an informational
+  `same-person-noreply … evidence=<kind>:<sha>` line rather than hiding it. A
+  first-time contributor's squash has no such evidence yet and still needs a
+  per-SHA waiver, which becomes `STALE-WAIVER` once their next commit under
+  that address lands ([#15401](https://github.com/hivecommons/hive/issues/15401)).
+
 All four reuse the same trailer validation (`src/scripts/check-dco-trailers.sh`
 for the range-scanning gates), and the sign-off *identity* rules — noreply
 matching and author-login lookup — live in one shared library,
@@ -306,7 +334,7 @@ When a fix PR merges with `Closes #N`, `Fixes #N`, or `Resolves #N`, the issue c
 ## Pull requests
 
 - Target `v5` for all code and documentation contributions (the active development branch). `v4` is feature-frozen and accepts security and critical fixes only (see the base-branch table above).
-- Start PR titles with the repository's emoji convention: `✨ feature: ...`, `🐛 fix: ...`, `📖 docs: ...`, `📝 proposal: ...`, `⚠️` for a breaking change, `🌱` for chores and everything else. `📝` is for proposals only — a documentation PR is `📖 docs: ...`, and the required `PR Type` check fails the swap.
+- Start PR titles with the repository's emoji convention: `✨ feature: ...`, `🐛 fix: ...`, `📖 docs: ...`, `📖 proposal: ...`, `⚠️` for a breaking change, `🌱` for chores and everything else. The required `PR Type` check accepts only `⚠ ✨ 🐛 📖 🚀 🌱`, so `📝` fails it; the hive rewrites a leading `📝` on `proposal:`/`rfc:` to `📖`.
 - Include `Fixes #<issue>` lines for issues the PR closes.
 - Credit the issue's author with a `Co-authored-by:` trailer on the commit when the PR resolves somebody else's issue — see [Crediting issue authors](#crediting-issue-authors).
 - Describe what changed, why, and how you tested it.

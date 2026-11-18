@@ -17,6 +17,26 @@ Companion pages: [security-threat-model.md](security-threat-model.md)
 (attacker view), [security.md](security.md) (log scrubbing),
 [securing-your-hive.md](securing-your-hive.md) (first-time operator guide).
 
+## Choose a reading path
+
+- **First-time operator:** use the guide above for trust choices and who can
+  merge. This page is a technical inventory, not a deployment checklist.
+- **Check a running hive:** start with [Human in the loop](#10-human-in-the-loop)
+  and the inventory's “How to check” column. Dashboard owners can inspect
+  effective settings; file, kernel and network checks need deployment-admin
+  access. Hosted owners should ask their hub operator for those checks.
+- **Audit the implementation:** use the control sections and
+  [verification procedure](#12-how-to-audit-a-running-hive). Do not change production state
+  or print secrets to prove a check.
+
+**Terms used below:** a **UID** is a Unix user ID. A **cgroup** tracks and
+limits a process group's resources. **Egress** means outgoing network traffic.
+**MITM** means man-in-the-middle: Hive's local inspecting proxy. A **PAT** is
+a personal access token. A **JWT** is a JSON Web Token; its **TTL** is its
+time to live. **CSP** is Content Security Policy, a browser restriction on
+page resources and scripts. These names describe mechanisms, not proof they
+are enabled on a given hive.
+
 ## 1. Threats
 
 * **Prompt injection.** Issue and pull-request text, labels, comments,
@@ -45,14 +65,15 @@ Companion pages: [security-threat-model.md](security-threat-model.md)
 | Watchdog and crash-loop pause | stuck agents | `src/crux/agent/watchdog_fleet.go` | `conditions[]` in `GET /api/agents` |
 | Per-agent Unix users, `su-exec` 4750 | cross-agent access, privilege escalation | `src/deploy/entrypoint.sh`, `src/Dockerfile` | `/var/run/hive/uid-map.json`; `suid-contract` CI job |
 | Per-agent tool denials; GitHub MCP writes denied | GitHub writes through tools | `src/crux/agent/manager_launch.go` | agent launch command |
-| Credential-free sandbox and push broker (opt-in) | credential theft | `src/pkg/sandbox`, `src/pkg/pushbroker` | `agentSandboxEnabled` in `GET /api/config/governor` |
+| Credential-free sandbox and push broker (opt-in) | credential theft | `src/crux/sandbox`, `src/crux/pushbroker` | `agentSandboxEnabled` in `GET /api/config/governor` |
 | Work ledger and knowledge store instead of memory | injection persistence | `src/pkg/beads`, `src/pkg/knowledge` | `bd` CLI |
 | `ioscan` scanning and canaries (default on) | prompt injection, secret leakage | `src/pkg/ioscan` | `ioscanEnabled`, `ioscanFailMode` in `GET /api/config/governor` |
-| Trajectory review (default on) | goal drift | `src/pkg/trajectory` | `governor.trajectory.enabled` |
-| Policy proxy and repo allowlist | credential theft, out-of-scope writes | `src/pkg/proxy/rules.go` | `403` with `X-Hive-Proxy-Blocked` |
+| Trajectory review (default on) | goal drift | `src/crux/trajectory` | `governor.trajectory.enabled` |
+| Policy proxy and repo allowlist | credential theft, out-of-scope writes | `src/crux/proxy/rules.go` | `403` with `X-Hive-Proxy-Blocked` |
 | Forced egress through the proxy (iptables) | proxy bypass | `src/deploy/entrypoint.sh` | boot log; no `HIVE_PROXY_ADVISORY_OK` |
-| Tiered GitHub tokens per agent mode | blast radius of a leaked token | `src/pkg/agentmode`, `src/crux/agent/manager_tokens.go` | token tier on the agent card |
+| Tiered GitHub tokens per agent mode | blast radius of a leaked token | `src/crux/agentmode`, `src/crux/agent/manager_tokens.go` | token tier on the agent card |
 | Proxy-side credential injection (opt-in) | token theft | `HIVE_PROXY_INJECT_GH_AUTH` | `security.credentialInjection` in governor config |
+| Sandbox Job GitHub read relay (opt-in) | anonymous 60/hr API cap; token in the Job | `agent_sandbox.job.github_read_proxy` | `sandbox GitHub read relay enabled` boot line |
 | Inference-key placeholder swap | provider key theft | `src/pkg/apiproxy` | agent env shows `sk-hive-<agent>` |
 | `gh` wrapper with per-agent restrictions | denied commands | `bin/gh-wrapper.sh` | `gh` resolves to `/usr/local/bin/gh` |
 | `hive-open-pr` / `hive-merge` relays | forged authorship, stale-commit merges | `bin/hive-merge.sh`, `bin/hive-open-pr.sh` | `POST /pulls` returns 403 for agents |
@@ -69,7 +90,7 @@ Companion pages: [security-threat-model.md](security-threat-model.md)
 | Webhook signature check | forged events | `src/pkg/dashboard/api_github_webhook.go` | unsigned request rejected |
 | Hub auth (Ed25519 sessions, per-hive bearers) | platform compromise | `src/pkg/hub/saas_auth.go` | `GET /api/saas/admin/auth-rollout` |
 | Content Security Policy and headers | dashboard XSS | `src/pkg/dashboard/server.go` | response headers |
-| Log scrubbing | secrets in logs | `src/pkg/logscrub` | redacted patterns in logs |
+| Log scrubbing | secrets in logs | `src/crux/logscrub` | redacted patterns in logs |
 | Supply-chain guards | supply chain | `.github/workflows/*.yml`, `src/Dockerfile` | PR checks |
 | DCO on every commit | unattributed code | `src/scripts/check-dco-trailers.sh` | DCO check on PR |
 
@@ -120,9 +141,111 @@ knowledge store holds typed facts with sources and confidence. Neither stores
 conversation text. Agents are primed with a bounded set of facts in the task
 prompt; they cannot query the store, so a poisoned fact cannot be amplified.
 Untrusted text is scanned by `ioscan` before it reaches a prompt
-([ioscan.md](ioscan.md)); canaries are planted per task and agent output is
+([ioscan.md](ioscan.md)). Inbox item text (voice and meeting transcripts,
+summaries, messages) is fenced in a nonce-tagged `<untrusted-inbox-data>`
+envelope before it reaches spektacular or an agent prompt
+([inbox-voice-sources.md](inbox-voice-sources.md)); canaries are planted per task and agent output is
 scanned for them. Session state is pruned and logs are scrubbed
 ([security.md](security.md)).
+
+Customer profiles follow the same rule. An agent cannot read the customers
+store. When a kick is about an issue whose author, assignee or claimer is a
+customer, the hive adds one short block to the prompt: their GitHub login, the
+tags that are on, and the goals a person confirmed. The block is capped at 1,024
+bytes. It never holds an email address, an id, notes or the satisfaction
+assessment. A goal is text a person typed, so it is scanned by `ioscan` first. A
+goal that holds an address, an id or a recognised attack is dropped whole. The
+rest sit inside a fence with a random nonce, marked as data and not as
+instructions. The meeting persona gets the same slice for a customer a question
+names: a name, tags and confirmed goals. It never says notes or the satisfaction
+assessment aloud, because a room can hold people who are not the hive's users.
+Goals the hive inferred stay out until a person confirms them.
+
+Untrusted recordings transcribed by the built-in whisper provider are decoded
+and transcribed outside the hive process, in the `hive-whisper` sandbox: a
+separate `hive-transcribe` uid with no home, shell or supplementary groups,
+reached through su-exec; an empty environment (no tokens or keys); the audio
+on stdin and the model as an inherited read-only descriptor; a private 0700
+work dir removed on exit; FFmpeg (an LGPL build with only audio demuxers and
+decoders and no network protocols) and whisper.cpp under rlimits (address
+space, CPU seconds, file size, open files, no core dumps), `nice` and a
+wall-clock timeout scaled to the recording; and an empty network namespace
+where the kernel allows unprivileged user namespaces. With whisper the audio
+never leaves the spoke; with Gemini or Deepgram it is sent to that provider
+under the hive's own account ([inbox-transcription.md](inbox-transcription.md)).
+
+Files dropped onto the Inbox (owner and read-write only) are typed by content,
+not by name or client MIME type: magic bytes refuse executables, archives,
+PDFs, Office and media files whatever they are called, then the text must be
+UTF-8 and parse as the format its extension asks for. Extraction runs with a
+timeout and size caps; the original, the extracted text and the meta are
+stored 0600 in a 0700 directory per upload, never executed or served raw, and
+bounded by a per-hive quota. The extracted text is fenced in the same
+`<untrusted-inbox-data>` envelope in its Knowledge fact and before any agent
+prompt ([inbox-uploads.md](inbox-uploads.md)). Uploaded PDFs are never parsed in the hive process: the
+`hive-pdftext` sandbox reads them as the `hive-transcribe` uid through
+su-exec with an empty environment, under prlimit (address space, CPU, file
+size, open files, no core dumps) and nice, in an empty network namespace
+where the kernel allows it, from a private 0700 work dir, with a wall-clock
+timeout that kills the process group. Word documents are read in
+Go with zip-bomb caps (entry count, declared and actual inflated size,
+compression ratio) and an XML decoder that refuses DTDs and unknown entities
+(no XXE). Links dropped onto the Inbox are
+fetched by the hive under an SSRF guard: http/https only, no credentials in
+the URL, the hive's own DNS lookup with the connection pinned to the checked
+address (any private, loopback, link-local, CGNAT, multicast, ULA or metadata
+answer refuses the link), every redirect re-checked (at most 3), the body
+size- and time-capped, and the environment proxy never used.
+
+### Customers: people the hive has seen
+
+The Customers section keeps one profile per person. It lives in two files on the
+hive's own volume and nothing in it leaves the hive. It is not sent to the hub,
+written to GitHub or put in a heartbeat. The design is in
+[customers](design/customers.md).
+
+Some of these people never signed up. They are issue authors, meeting guests and
+mail senders. The hive keeps only a key, a few counts and up to five references
+for them, and only until someone accepts them. A suggestion ends when the thing
+it came from is deleted. Forgetting a person deletes them and leaves a salted
+hash, so they are not rebuilt.
+
+Links between identities are made only on exact keys. A display name never links
+anyone. One link rests on an assumption you should know about. When the access
+list holds a name such as `github:alice`, or the bare login `alice` that a
+GitHub device-flow sign-in produces (the access list treats the two as one
+user), the hive treats `alice` as that person's GitHub login. A name with
+another provider prefix, an address, a dot or an underscore is not read as a
+login. The hub put that entry there after it signed the person in with GitHub,
+so the hive trusts it. If your access list is edited by hand, an entry like
+that gives the named person's profile the matching GitHub activity.
+
+One part of this section is a request your browser makes, not the hive. The list
+shows a GitHub picture for each person with a confirmed GitHub login. Your
+browser asks `github.com/<login>.png` over https for the people on screen. It does
+this late, only for rows you can see, and it sends no referrer. GitHub learns
+your IP address and which logins were asked for. So it can tell you have those
+GitHub users in your customer list. It learns nothing else about them. The hive
+does not fetch or keep the pictures. A person known only by an email address is
+never looked up, and neither is any hash of the address. The dashboard already
+allows `https:` images, so no policy changes, and a test pins it. To turn the
+pictures off, set `customers.avatars.enabled: false` or
+`HIVE_CUSTOMERS_AVATARS_ENABLED=false`, or use the switch in Settings. The list
+then shows initials and asks GitHub for nothing.
+
+A read-only user sees only their own profile. An identity they add is shown as
+unconfirmed. It links nothing until the owner or a read-write user confirms it.
+
+Goal and satisfaction suggestions are off by default, because they send text to
+a model. When the owner turns them on, the hive sends a customer's own issues,
+pull requests and approved mail to the model set up for meetings. That text can
+be about people who never signed up, so it is cleaned first. A line that holds an
+address, an id or a recognised attack is dropped, and the rest sits in a fenced
+block marked as data. The reply is checked too: at most three short goals, a
+level from a short list and no number, each citing the evidence it was given. A
+suggestion is never applied. A person confirms, edits or rejects it, and a value
+a person set is never overwritten. The model has a daily token budget, and
+nothing it suggests leaves the hive.
 
 ## 5. Network and credentials
 
@@ -135,6 +258,32 @@ file on the volume, never from `hive.yaml`, which records only paths and
 variable names. The dashboard never returns a key value. Agents using cloud
 CLI backends (Claude, Copilot, Codex, Goose) run with the provider credential
 you connected, because the CLI needs it.
+
+**Secrets at rest.** The secret values a spoke stores on its data volume
+(the owner-only key files under `/data/secrets`, the Copilot device-flow
+token, and the `github.token` value in the persisted runtime config) are
+sealed through a keystore provider interface
+([#18214](https://github.com/hivecommons/hive/issues/18214)). Each value is
+written as a single-line envelope, `hive-enc:v1:<provider>:<key
+generation>:<ciphertext>`, bound with additional authenticated data to the
+slot it belongs in, so a ciphertext moved from one file to another does not
+open. The default provider derives an AES-256-GCM key with HKDF-SHA256 from
+`HIVE_SECRETS_KEY` (or a key file), falling back to the per-hive
+`HIVE_HEARTBEAT_KEY` the hub already injects into the Deployment; a distinct
+info string keeps the encryption key separate from the signing key it is
+derived from. The threat this closes is the data volume on its own: a PVC
+snapshot, a backup archive or a copied disk no longer yields the credentials.
+It does not protect against an attacker who also holds the Deployment
+environment or the hub master key. Files written before the keystore existed
+are re-sealed on their first read, and a boot sweep converges the ones
+nothing reads, so an existing hive needs no migration step; a retired key
+generation is accepted for decryption through `HIVE_SECRETS_KEY_PREVIOUS`
+while that happens. A hive with no key material keeps plaintext storage and
+says so once at `WARN`; it never seals with a key stored beside the data.
+OpenBao Transit is available as an opt-in provider
+([#18216](https://github.com/hivecommons/hive/issues/18216)). Agent-facing
+credential files and the read-only `/secrets` Kubernetes mount are not
+touched. Variables: [env-vars.md](env-vars.md#secrets-at-rest-keystore).
 
 **GitHub blast radius.** The recommended authentication is a GitHub App,
 whose reach is limited to the repositories it is installed on. Hive mints a
@@ -176,17 +325,23 @@ process cannot forge. Only `api.github.com` is inspected; other hosts are
 tunnelled without inspection. See
 [net-admin-requirement.md](net-admin-requirement.md).
 
-**Plain-HTTP forwards.** The redirect covers port 443 only, so plain HTTP
-reaches the proxy through its explicit proxy port. Those forwards are
-identified like any other request and dialled only when the resolved address
-is globally routable: loopback services beside the proxy, the link-local
-metadata endpoint, RFC 1918/CGNAT cluster addresses and multicast are refused
-with `403` and counted as violations (loopback excepted — agents are handed
-`NO_PROXY` for it, so it is logged as the client misconfiguration it is). The
-check runs at dial time on the resolved address, so a hostname pointed inward
-is refused on the same evidence as a literal IP. Set
-`HIVE_PROXY_ALLOW_PRIVATE_FORWARD=true` only where a private-network plain-HTTP
-destination is intended.
+**Plain-HTTP forwards and uninspected tunnels.** The redirect covers port 443
+only, so plain HTTP reaches the proxy through its explicit proxy port. Those
+forwards are identified like any other request and dialled only when the
+resolved address is globally routable: loopback services beside the proxy, the
+link-local metadata endpoint, RFC 1918/CGNAT cluster addresses and multicast
+are refused with `403` and counted as violations (loopback excepted — agents
+are handed `NO_PROXY` for it, so it is logged as the client misconfiguration it
+is). The same policy applies to the tunnels the proxy does not inspect: a
+CONNECT to a host other than the inspected API and the transparent-TLS
+passthrough for such a host are dialled through the same guarded dialer, so
+`CONNECT 169.254.169.254:80` or an SNI naming a cluster address is refused on
+the same terms rather than tunnelled from the proxy's own uid. The check runs
+at dial time on the resolved address, so a hostname pointed inward is refused
+on the same evidence as a literal IP. Set
+`HIVE_PROXY_ALLOW_PRIVATE_FORWARD=true` only where a private-network
+destination is intended; it lifts the guard for all three legs at once, and the
+proxy warns at boot when it is set.
 
 **Hub-to-spoke channel.** Heartbeats carry a per-hive bearer key derived from
 the hub master secret and are compared in constant time. The payload is
@@ -240,9 +395,23 @@ do not.
   by two contributors at once. The lease protocol is formally modelled.
 * **Author kind, not author claim.** Pull-request authors are classified
   from GitHub identity (Hive App, trusted bot, human, unknown bot).
-* **Slash commands.** `/hive approve` and `/hive decision` are honoured only
-  from a human with write access or higher. On pull requests they are
-  acknowledged but never consumed; release needs a GitHub Approve review.
+* **Issue commands (045).** A human with repo write/maintain/admin access
+  can use `/hive approve` or `/hive decision <direction>` to release decision
+  parking. The command lifts `needs-human`, whoever applied it, but never
+  `hold`. Label-driven repos use their configured acceptance labels instead.
+* **PR commands (085/070).** Bare `/hive approve` is acknowledged only.
+  On an eligible Hive-authored PR, `/hive decision <instruction>` routes
+  the full text to the author/fixer. `/hive decision approve <rationale>`
+  records approval for the current head and can release `requires_human`:
+  on any PR at 085/070, on a workflow-path PR whose fence it releases, and
+  on any other contributor-lane PR whose verdict asks for a person, when a
+  trusted merger posts it after the head (see the review-verdict gate in
+  [hive-merge.md](hive-merge.md#contributor-lane-auto-merge)). An edited comment
+  never counts. This requires repo write access or higher **and**
+  configured merger trust.
+  Other authors use GitHub reviews/manual merging. Commands do not waive
+  CI, holds, author admission or path fences. See
+  [the exact gate contract](running-at-level-6.md#does-the-hive-reviewer-stop-a-merge).
 * **Owner self-nomination** is a sentinel rule: a pull request adding its
   author to `OWNERS`, `CODEOWNERS` or `MAINTAINERS` is flagged and blocked.
 
@@ -254,6 +423,16 @@ secret exposure, CI gate weakening, test removal, security policy edits, and
 remote code execution patterns. A match applies `sentinel-alert`, posts one
 comment and writes an audit entry. The label blocks Hive approval and every
 automerge lane until a maintainer removes it.
+Whether that label and comment reach GitHub is decided by the **write-back
+containment gate** (`pkg/writeback`): on a PR Hive did not open, sentinel
+writes need ACMM L5 plus the review opt-in label (L6 without it), the repo
+must not be in `issues-only`/`off` mode, and the PR must not predate Hive's
+write access to the repo (backfill guard). Below the gate the finding is
+recorded, audited as `sentinel-finding-suppressed`, and shown in the
+Security tab and `/api/sentinel` — the scan never stops, only the
+unsolicited write does. The same gate fronts hold-gate notices, stage
+labels, supersession and duplicate-fix notices and reporter-trust holds; a
+ratchet test fails on any new direct GitHub write outside the package.
 
 **Trajectory review** runs every 600 seconds by default. A second model
 compares each agent's assigned intent with the last 120 lines of its rendered
@@ -308,6 +487,303 @@ against `X-Hub-Signature-256`. Terminal access uses short-lived signed
 assertions. Systemd units refuse to run code from a directory an
 unprivileged user could have created.
 
+**Sessions.** With `dashboard.sessions.enabled` (default on; Settings →
+Dashboard → Inception (spek) sessions, overridden by `HIVE_SESSIONS_ENABLED`,
+`false` turns it off) the dashboard
+offers interactive CLI terminals (`/api/sessions`, [API
+reference](api-reference/sessions.md)). A session is a plain vendor CLI, never
+a shell, launched with none of the permission-bypass flags agents run with, so
+the CLI's own approval prompts stay on. The isolation model, in order of
+importance:
+
+- **Its own unprivileged uid.** Each session's tmux server and CLI run as a uid
+  from a reserved range (`HIVE_SESSION_UID_BASE`, default 20001, with
+  `HIVE_SESSION_UID_SLOTS` slots) that cannot collide with agent uids
+  (`HIVE_UID_BASE`, 2001 upward) or the hive's own, through the same `su-exec`
+  hop agents use. The slot is allocated by the dashboard store, persisted in
+  the session record and reused on resume; the runtime refuses a range that
+  overlaps the agent uid map and recovers a session's uid from the owner of
+  its home directory, never from the id. The uid has its own gid, is not in
+  group `node` (all agents) and not in `hive-launch` (`su-exec`), so it cannot
+  read `/secrets/*.pem`, `/data/secrets`, `/data/.hive`, the shared vendor
+  logins in `/data/home` (group-only, 2770, re-asserted by the entrypoint), the
+  hive's `/proc/<pid>/environ`, or another session's sandbox, and it cannot
+  reach another session's tmux server.
+- **A private sandbox.** `HIVE_SESSIONS_SANDBOX_DIR` (default
+  `/data/session-sandbox`) holds one `root:hive-launch 0751` directory per
+  session with session-owned `home`, `work` (uploads) and `tmp` below it, so
+  the session cannot replace its own top-level directories and the hive reads
+  transcripts for resume only through the launcher group. Deleting or pruning a
+  session removes the sandbox and the uid's tmux socket directory before the
+  slot can be reused; if removal fails the record and slot are kept and retried.
+- **A shared clone, a worktree per session, no shared credential.** The hive
+  keeps one per-repository clone (`HIVE_SESSIONS_WORKSPACE_DIR`, default
+  `<sandbox root>/workspace/<org>/<repo>`) that it clones once as itself,
+  with a short-lived App token in a one-shot `git -c credential.helper` file
+  removed right after, so neither the clone's config nor its remote holds a
+  credential; root then hands the tree to the sessions-only group
+  (`HIVE_SESSIONS_GID`, default 20000) as `root:<gid> 2770`, group read-write,
+  nothing for "other". That group is every session's single group (su-exec
+  gives a numeric uid exactly one), which is what lets sessions share the
+  clone's objects and branches; it is refused when it is the hive's own group,
+  the reader group or inside the session uid range, and session sandboxes stay
+  `hive-launch` group-only, so sessions still cannot read each other's homes.
+  The hive itself runs as `dev`, which is never in that group, so it cannot
+  look inside the clone or a worktree: every check of what is in them runs in
+  a script as the session's own uid.
+  Each session opens in its own git worktree of that clone,
+  `<workspace>/.sessions/<id>/<org>/<repo>` on branch `hive-session/<id>`: the
+  hive makes the directory under hive-owned `0711` parents, root only hands
+  that one empty directory (never one another session already owns) to
+  `<session uid>:<gid> 2770`, and the session uid itself runs
+  `git worktree add`. Git never runs as root in the clone. `spektacular init`
+  runs in the session's worktree as the session uid.
+- **The shared clone's git config and hooks are locked.** Before any session
+  gets a worktree of a clone, and once per clone at every boot (which fixes a
+  clone made by an earlier release), root rewrites the clone's `.git/config`
+  from scratch, without running git, as `root:<gid> 0644`, and empties
+  `.git/hooks`, `.git/info` and `.git/modules` into `root 0755` directories.
+  `extensions.worktreeConfig` is on, so a person's own settings go in
+  `git config --worktree`, the worktree's own `config.worktree`, which only
+  that session's uid can write. Root-owned placeholders take the names a
+  session could otherwise create to redirect or configure git
+  (`.git/config.worktree`, `.git/commondir`). `objects/`, `refs/` and `logs/`
+  stay setgid group-writable, so commits, branches and fetches work.
+  `.git/worktrees/`, `.git` and the clone directory are `3770`: a session can
+  add its own entry, but the sticky bit stops it from renaming or replacing
+  anything root or another session owns there. A session's entry under
+  `.git/worktrees/` is created with no group write, even while
+  `git worktree add` is still checking it out. A session's pane gets no
+  `safe.directory`, because its worktree is its own; git's ownership check
+  therefore refuses a `.git` that another uid swapped into the
+  group-writable worktree. As a result, **one session can no longer plant a
+  config entry, hook, filter driver, `core.fsmonitor` or alias that runs as
+  another session's uid**, whether in that person's own git or in the git the
+  hive runs for them. The hive's own git always passes
+  `-c core.hooksPath=/dev/null -c core.fsmonitor=false`. Before the
+  add and remove scripts run git in a worktree, they check (as the session
+  uid) that its `.git` file, its entry under `.git/worktrees/` and that
+  entry's `commondir` are the session's own and lead back to the clone; if
+  they don't, the scripts refuse. What stays shared is data, not code: any
+  session can still read, write or delete the shared objects and refs, and a
+  branch another session made. A worktree is group-writable, so another
+  session can edit or delete its files. The worktree keeps one person's
+  working tree, checked-out branch and spek workflow state (`.spektacular/`)
+  apart from another's; it is not a defence against a session that sets out
+  to corrupt shared data. The lock also costs these, by design: writes to the
+  shared config fail (`git push -u` and `git branch --set-upstream-to` warn;
+  use `git config --worktree`), deleting a ref that is still in the clone's
+  `packed-refs` fails (for example a remote-tracking branch that
+  `git fetch --prune` drops; session branches are never packed), gc and
+  maintenance are off, submodules can't be initialised, and hooks only run
+  from a path the session names with `git config --worktree core.hooksPath`.
+- **Deleting a session never silently drops its work.** The removal script
+  runs as the worktree's owner uid. It auto-saves anything uncommitted
+  (untracked files included, ignored ones not) as a commit on the worktree's
+  branch, keeps a detached `HEAD` as `hive-session/<id>-detached`, then
+  deletes the worktree's entry, prunes, and keeps any branch the clone's
+  `HEAD` lacks. If git fails, the removal fails, and the record and uid slot
+  are kept for a retry. The periodic sweep removes the worktrees of sessions
+  whose record is gone. It does not run while the sessions store has failed
+  to load, or while an unreadable copy is set aside for recovery, so an
+  empty-looking store can't remove every worktree. Pushing from a session
+  uses the person's own login; the hive's token never enters a session.
+- **Environment.** Built from an allowlist: no dashboard token, terminal, hub,
+  heartbeat, ttyd or attach-key secret and no GitHub token reaches it.
+- **Logins are read-only copies, not links.** A fixed allowlist of bare login
+  files (`.claude/.credentials.json`, `.copilot/config.json`,
+  `.gemini/oauth_creds.json`, `.gemini/google_accounts.json`,
+  `.codex/auth.json`, `opencode/auth.json`) is copied into the session home
+  mode 0400, session-owned. `settings.json`, hooks, MCP or extension config,
+  `gh`'s `hosts.yml` and `~/.config` are never bridged, so a session can neither
+  rewrite shared configuration nor plant a hook an agent would run.
+- **One refreshable Claude login, and it is not in a session.** A copy of an
+  OAuth login that can refresh is a second holder of the grant: when the CLI
+  in a session refreshed its copy, the refresh rotated the grant, the shared
+  file the agents read was left with a dead refresh token, and every agent on
+  the hive fell to the login prompt until a person signed in again
+  ([#18724](https://github.com/hivecommons/hive/issues/18724)). A session
+  therefore gets the Claude login **without its refresh token**, and only the
+  login's own token block, nothing else stored in that file. It can use the
+  fleet's current access token and cannot rotate or carry away the long-lived
+  grant. Who refreshes it: the hive itself, once, ahead of expiry
+  ([#18731](https://github.com/hivecommons/hive/issues/18731); it redeems the
+  shared refresh token and holds the new grant on disk and in memory until the
+  shared file has it, `HIVE_CLAUDE_SHARED_REFRESH=off` disables it), the
+  agents' credential bridge when a CLI refreshed first anyway, and the
+  dashboard sign-in. A session never refreshes. All writers of the shared file
+  go through one function under one lock that accepts only a usable credential
+  expiring strictly later than the current one. The hive keeps
+  the copies current (it replaces them, atomically and as the session's uid,
+  when the shared login changes), so a session depends on the fleet's login
+  being refreshed by an agent or a sign-in; a session cannot do that itself.
+  The session uid still has no access to `/data/home`: nothing is linked or
+  bound into the session, and the hive reads a session's login file as that
+  session's uid, through a size-bounded helper with the minimal session
+  environment.
+  As a safety net, a complete Claude login that is in a session home anyway (a
+  copy made before this rule, or a person signing in from inside a session)
+  is **adopted** into the shared file when it is usable and strictly newer
+  than the shared login: a later access-token expiry and a file written after
+  the shared one, or a shared login that is not usable at all. Only expiry
+  and modification time decide; token values are never logged. The replaced
+  shared file is kept beside it as `.credentials.json.stale-<UTC time>`, the
+  session is put back on a refresh-less copy, and a
+  `user_session_login_adopted` audit entry names the session and the trigger.
+  This runs at boot, on every credential-bridge poll
+  (`HIVE_CLAUDE_CREDENTIAL_BRIDGE_INTERVAL`), after a dashboard sign-in, when
+  a session starts or resumes, and before a session's sandbox is deleted: if
+  the login cannot be adopted the deletion fails and is retried, so removing
+  a session never removes the only valid login. It runs under the lock the
+  agents' bridge repair holds, so two newer logins settle on the later one.
+  Note what this means: anyone who may use a session's keyboard can sign that
+  session in with an account of their own, and that login becomes the hive's
+  when it is newer. The audit entry is the record of it, and a dashboard
+  sign-in puts the hive back on the operator's account.
+  The other vendors' files are still plain copies, refresh token included
+  where the vendor stores one. Gemini's Google refresh token and the Copilot
+  CLI token do not rotate. Codex's ChatGPT login (`.codex/auth.json`) and an
+  OpenCode OAuth entry (`opencode/auth.json`) do, so a session that refreshes
+  its copy holds the only valid login; for these two the hive **adopts** that
+  login back into the shared file the agents link to
+  ([#18740](https://github.com/hivecommons/hive/issues/18740)). Codex: the
+  session's file was written after the shared one, holds a ChatGPT login
+  with a different refresh token and records a later `last_refresh`, and the
+  shared file itself holds a ChatGPT login (an API-key login does not rotate
+  and is never replaced). OpenCode, per provider entry: both entries are
+  `oauth`, the session's has a different refresh token and a later
+  `expires`, and the session's file was written after the shared one; only
+  those entries are replaced, every other entry of the shared file is kept,
+  and a provider the shared file does not hold is not added. Only those
+  fields and modification times decide; token values are never logged. The
+  replaced file is kept as `auth.json.stale-<UTC time>`, the new one keeps the
+  old one's mode (and owner, where the hive may set it), and
+  `user_session_login_adopted` names the session, trigger, vendor and file.
+  It runs when the Claude check runs, deletion included: a newer login that
+  cannot be adopted keeps the session. Unlike Claude, a session still holds a
+  copy that can refresh, on purpose. Both CLIs keep the refresh token as a
+  field their login file schema requires (from their source, not yet
+  confirmed on a live install) (Codex: `tokens.refresh_token`; OpenCode:
+  `refresh` of an `oauth` entry), so a copy with that field removed is read
+  as a corrupt or logged-out login, and one with a placeholder fails at its
+  first refresh: either would sign the person out of the session, which is
+  worse than the window it closes, and hive has no way to route a CLI's
+  refresh through the shared file. The adoption above is therefore the
+  safety net and the shared file stays the single owner: an adoption only
+  ever writes the shared file, never the session's copy, and the hive never
+  replaces a shared file that changed after it was compared, so a session
+  refresh and an agent refresh of the same token within one poll cannot
+  leave two diverged logins for long; the shared file converges on the newer
+  one at the next poll. If that file is ever needed again, the stale file the
+  adoption kept (`auth.json.stale-<UTC time>`, next to the shared login, same
+  mode) holds the login it replaced.
+  Manual check, needs a person and a real install (not run in CI, so the
+  assumed file formats stay unconfirmed until it is done,
+  [#18740](https://github.com/hivecommons/hive/issues/18740)): on a hive with
+  a signed-in Codex and OpenCode, (1) start a session, confirm
+  `.codex/auth.json` and `opencode/auth.json` in its home match the shared
+  files' shape (compare key names only, never print values); (2) in the
+  session force a refresh (Codex: `codex login status` after setting an
+  older `last_refresh`; OpenCode: wait past `expires`) and confirm the next
+  poll writes the shared file, leaves an `auth.json.stale-*` beside it and
+  audits `user_session_login_adopted` with vendor `codex` or `opencode`;
+  (3) confirm an agent of that vendor is still logged in; (4) remove the
+  session and confirm the shared login still works; (5) grep the hive log
+  for the access and refresh token values: there must be none. Attach a
+  redacted real file, with token values replaced, as the test fixture. For all of these vendors a resume
+  no longer overwrites a file the session's CLI rewrote after the shared one
+  was written.
+- **Terminal access is bound.** ttyd listens on loopback without a secret a
+  session uid could not read (its `-c` credential is visible in `/proc`), so
+  session attaches are gated by a per-session token, HMAC-SHA256 of the tmux
+  session name under a per-boot `HIVE_TTYD_ATTACH_KEY` that only the hive and
+  ttyd hold. The dashboard proxy appends it after authorising the request;
+  `ttyd-tmux.sh` refuses any `hive-sess-*` attach without a valid token,
+  refuses a socket not owned by a reserved session uid and runs the attach
+  with a scrubbed environment. No key means no session terminal. A handoff code
+  minted for a session is bound to that session id and its caller (anyone who
+  may see the session) and opens only `?arg=hive-sess-<id>`; an agent-terminal
+  code never opens a session and still needs owner or read-write.
+- **One keyboard at a time.** Every attach is read-only (`tmux attach-session
+  -r`) unless the proxy also appends the session's *write token*, a second
+  HMAC under the same key (`hive-ttyd-attach-rw-v1`), which it does only for
+  the one user holding the session's keyboard lease. The browser's request
+  carries a single arg, the session name; an extra arg is rejected as
+  malformed before it reaches ttyd, and `ttyd-tmux.sh` treats a missing or
+  wrong write token as read-only, so a viewer cannot promote itself. The
+  creator holds the keyboard from the start; owners and the creator may take
+  it at any time, another read-write user only after it is released or the
+  holder has been idle for `HIVE_SESSIONS_KEYBOARD_GRACE_SEC` (default 60).
+  Taking it detaches the previous holder's writable tmux client immediately.
+- **Ownership.** A session is private by default: only its creator and owners
+  can list, read, watch, type into or upload to it. The creator or an owner may
+  set `shared`, which lists it for every role (the read role gets the
+  token-redacted scrollback and a read-only live terminal, never the keyboard,
+  Send or upload) and lets read-write users Send, upload and take the
+  keyboard. Renaming, closing, resuming, deleting and the `shared` flag stay
+  with the creator and owners. Ids of sessions a caller may not see are never
+  disclosed.
+- **Startup screens only.** When a session starts the hive takes the CLI to
+  its input prompt by answering its startup screens (first-run notice, trust
+  for the session's own working directory, onboarding, an update menu), with
+  the detector agents use restricted to those screens; a Claude Code HOME is
+  also seeded so they do not appear. This does not weaken the posture above:
+  a tool or command permission prompt is classified as refused and is never
+  answered (the refusal is checked before anything else and across every
+  vendor's patterns, and a test fails when a prompt added for agents is not
+  classified), a login or OAuth screen is never answered (the tab says
+  "needs sign-in"), the seed carries no account or credential and never
+  replaces an existing file, and nothing is sent once a person has typed
+  into the session, after the input prompt is reached, or after a bounded
+  window. Trusting the working directory is the one decision made for the
+  person: it is the session's own worktree of the hive's project repository,
+  the directory they asked to work in. Each outcome is audited as
+  `session_autostart`. `dashboard.sessions.autostart: false` or
+  `HIVE_SESSIONS_AUTOSTART=false` turns it off. See
+  [Startup auto-answer](api-reference/sessions.md#startup-auto-answer).
+- **Resume ids** never start with `-` and a resume command may carry only the
+  vendor binary, a fixed set of resume words and a flag-free id, so a planted
+  transcript name cannot add `--dangerously-skip-permissions`.
+- **Voice notes stay in the browser.** The input bar's Voice button (write
+  roles only) uses the browser's Web Speech API, so transcription is done by
+  the browser vendor's speech service (Chrome sends the audio to Google), not
+  by Hive; the audio never reaches the Hive backend. The transcript only fills
+  the Send textarea and goes through the same queued `/input` path as typed
+  text when the user presses Send. To allow it, the gateway's
+  `Permissions-Policy` for the dashboard document is
+  `geolocation=(), camera=(), microphone=(self)` (`src/deploy/nginx.conf`,
+  `map $uri $hive_document_permissions_policy`); the ttyd terminal iframe
+  (`/terminal/`) and `/api/` responses keep `microphone=()`, and no other origin
+  is ever granted the microphone. The same document policy carries
+  `display-capture=(self)` for Inbox ● Record's tab audio
+  ([inbox-recording.md](inbox-recording.md)); `/terminal/` and `/api/` keep
+  `display-capture=()`.
+
+Audit: `user_session_login_adopted` (a newer Claude, Codex or OpenCode login
+found in a session home was adopted into the shared login; session id,
+trigger, the preserved file's path and, for Codex and OpenCode, the vendor and
+file, never token material), `session_created`, `session_started` (the
+outcome of the background start), `session_autostart` (how the startup auto-answer ended and which
+screens it answered), `session_closed`, `session_renamed`, `session_input` and
+`session_upload` record the user and session id (never input text).
+`session_input` is written when a queued Send is actually typed into the pane,
+as the user who queued it, so attribution follows the sender, not the moment
+of delivery. `session_keyboard` records every keyboard hand-over (`from`,
+`to`); since only the holder's attach is writable, keystrokes typed inside the
+terminal are attributable to the holder of record at that time. Keystrokes are
+still not logged individually.
+
+Operator requirements the code cannot enforce: the container needs the
+`su-exec` helper with `CAP_SETUID`, `CAP_SETGID` and `CAP_CHOWN` (the standard
+agent layout; a rootless or single-uid runtime cannot run sessions and they fail
+closed). `/proc` should be mounted `hidepid=2` (or the pod run with a
+non-dumpable, PID-namespaced layout) where possible: `ttyd`'s command line
+exposes its basic-auth credential to every uid, and agent terminals on the same
+loopback ttyd are not covered by the session attach token, so a session user on
+a hive that also runs agents can still reach them there until ttyd moves to a
+credential only the hive can read. Reserve `HIVE_SESSION_UID_BASE` above every
+agent uid and keep `/data` and `/data/home` closed to "other".
+
 **Dashboard headers.** Content Security Policy, `X-Frame-Options` and related
 headers are always set. The metrics endpoint is off unless
 `HIVE_METRICS_ENABLED` is set.
@@ -316,7 +792,10 @@ headers are always set. The metrics endpoint is off unless
 images are pinned by digest. Tools such as tmux, ttyd, `gh`, goose and
 `su-exec` are checksum-verified at build. Third-party Actions are pinned to
 commit SHAs. CI runs `govulncheck`, `gosec` and `golangci-lint` as separate
-jobs, OpenSSF Scorecard, Dependabot, an Action-pin check, a setuid inventory
+jobs; the agent image ships the same pinned `govulncheck` and `gosec` so the
+sec-check lane runs them on Go targets inside the pod without downloading
+anything (`GOVULNCHECK_VERSION`, `GOSEC_VERSION` in `src/Dockerfile`).
+CI also runs OpenSSF Scorecard, Dependabot, an Action-pin check, a setuid inventory
 check, DCO trailer checks, a documentation link check and formal-model
 checks. Image attestations are turned off because they broke
 multi-architecture manifests, and a guard workflow keeps them off. An SPDX
@@ -330,16 +809,25 @@ until code-owner review is required in branch protection.
 * **ACMM** is the autonomy dial. Merge permission is not minted below L6.
   L5 adds a `hold` label on every agent pull request. See
   [acmm-policy-matrix.md](acmm-policy-matrix.md).
-* **Parking.** An agent that needs a decision labels the item `needs-human`
-  and stops. A person with write access answers with `/hive approve` or
-  `/hive decision <text>`.
-* **Pull-request release is a GitHub review.** A `requires_human` verdict is
-  cleared only by a trusted merger's Approve review on the current head.
+* **Issue decision parking is 045.** A person with repository write access or
+  higher answers with `/hive approve` or `/hive decision <text>`, unless the
+  repo uses label-driven acceptance. This releases decision parking and
+  `needs-human`, not `hold`.
+* **PR decision parking is 085.** A trusted merger's GitHub **Approve**
+  review must name the current head to clear the enforcing sweep gate.
+  It can override any swarm outcome, including a request for changes;
+  the audit records who overrode what. A trusted merger's
+  `/hive decision approve` can answer `requires_human` on any PR, while
+  other decision text sends work to the fixer on eligible Hive-authored
+  PRs. Bare `/hive approve` never releases a PR.
+  The detailed [command boundaries](#7-contributor-trust) above still apply.
 * **Owner-only security settings.** Changes to `ioscan`, intent enforcement,
   review requirements and the agent sandbox require the `owner` role.
-* **Emergency stops**, cheapest first: pause one agent, pause one repo,
-  disable automerge per repo, freeze the watchdog fleet-wide, drop the ACMM
-  level.
+* **Emergency stops are not interchangeable.** To stop merging, disable
+  automerge per repo, apply an item hold, or drop below L6. Pausing an agent
+  or freezing the watchdog does not stop the App from merging existing PRs.
+  Use the [L6 emergency-stop table](running-at-level-6.md#stops-smallest-to-largest)
+  to choose the right boundary.
 * **Hooks** run only vetted actions from a fixed set ([hooks.md](hooks.md)).
 * **Advisory digests** are pinned to one analysed commit; findings whose
   file no longer exists are dropped.

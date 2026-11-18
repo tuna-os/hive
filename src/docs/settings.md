@@ -59,9 +59,9 @@ Every inbound surface that can start or steer agent work from outside the dashbo
 - **GitHub @-mentions** — `github.mentions.*`: enable, poll interval (Go duration or seconds, at most 24h), default agent, summoner logins (validated as GitHub logins), minimum dashboard role, ack reaction, per-user/per-repo/per-thread limits, and optional webhook acceleration. Below the fields the tab lists which agents are currently mention-eligible (enabled, converse on, a `mention` channel, governor-kicked) and deep-links every agent name to its own Channels tab, where the per-agent `channels` list is edited. Saving hot-reloads the mention poller.
 - **GitHub Actions trigger** — `github.actions.*`: enable, allowed commands (a closed vocabulary: `status`, `review`, `kick`), allow-apply, source label, trusted comment authors, the author→login identity map, and OIDC dispatch (audience, JWKS URL, max skew). See [GitHub Actions trigger](github-actions-trigger.md#hive-configuration). Hot-reloads with the mention runtime.
 - **Chat surfaces** — the two-way Discord bot (`notifications.discord.bot_token`, `channel_id`, `allowed_users`) and the Slack, Matrix, Telegram and Microsoft Teams bots (`notifications.<surface>.*`). An enabled bot must carry its credentials or the save is rejected. Bots connect at startup, so these apply after a restart.
-- **Dashboard chat** — read-only status. The chat panel and inception-via-chat have no server-side settings of their own; who may post comes from `dashboard.authorized_users` on the Security tab and each agent's converse flag. See [Dashboard chat](dashboard-chat.md).
+- **Dashboard chat** — read-only status. The chat panel has no server-side settings of their own; who may post comes from `dashboard.authorized_users` on the Security tab and each agent's converse flag. See [Dashboard chat](dashboard-chat.md).
 - **Escalation & on-call** — `escalation.email.*` (SMTP host/port/credentials, from, recipients, digest recipients and time) and `escalation.push.*` (minimum severity, ntfy, Pushover, PagerDuty). Saving rebuilds the escalation dispatcher's sinks. The breaker thresholds stay on the Health tab.
-- **Admin MCP** — read-only status of the `/api/admin/mcp` endpoint. It is always registered and has no `hive.yaml` section; writes are enabled with `HIVE_ADMIN_MCP_ENABLE_WRITES` on the hive process. See [Admin MCP](admin-mcp.md#writes).
+- **Admin MCP** — status of the `/api/admin/mcp` endpoint, which is always registered, and the owner's **Allow admin MCP writes** switch (`admin_mcp.writes_enabled`). The switch turns the endpoint's write tools on or off with no restart, and turning it off refuses pending confirmations. Once used it overrides `HIVE_ADMIN_MCP_ENABLE_WRITES` in both directions; until then that variable on the hive process decides, and the tab says which one is in effect. **Use environment default** (shown while the switch is in effect) clears the key so the variable, or the default (off), decides again. Each change is audited as `config_admin_mcp_writes`. The stdio `hive-admin-mcp` binary is not affected; it keeps its own variable. See [Admin MCP](admin-mcp.md#writes).
 
 ## Health
 
@@ -88,7 +88,7 @@ Optional capabilities, each off or inert until you turn it on. Where a feature h
 - Audit publication: [Audit campaign](audit-campaign.md#publication).
 - Token mint: [Token mint](token-mint.md).
 - Spek stage runner: [Spektacular](spektacular.md).
-- Auto-merge: [App self-merge sweep](operator-reference.md#app-self-merge-sweep-auto_merge), [Trusted bot authors](hive-merge.md#trusted-bot-authors), [Trusted-author auto-merge](hive-merge.md#trusted-author-auto-merge), and the per-repository merge policy (`auto_merge.require_current_base`, `auto_merge.squash_only`, `auto_merge.human_merge_paths`).
+- Auto-merge: [App self-merge sweep](operator-reference.md#app-self-merge-sweep-auto_merge), [Trusted bot authors](hive-merge.md#trusted-bot-authors), [Trusted-author auto-merge](hive-merge.md#trusted-author-auto-merge), and the per-repository merge policy (`auto_merge.require_current_base`, `auto_merge.squash_only`, `auto_merge.human_merge_paths`, `auto_merge.human_merge_pin_only`, `auto_merge.human_merge_owner_approval`).
 - Review gate: [Review swarm](review-swarm.md#configuration), [Blocking line and backlog](review-swarm.md#blocking-line-reviewseverity-reviewbacklog), and [external review bot threads](review-bot-threads.md).
 - Trajectory review: [Trajectory-Review Lane](trajectory-review.md#configuration).
 - Linear agent: [Linear agent integration](linear-agent.md).
@@ -99,6 +99,10 @@ The other features on this tab (OpenTelemetry export, external execution, auto-p
 ## Knowledge
 
 Whether the public read-only knowledge MCP endpoint is on, the knowledge pipeline, and the external knowledge connectors. The **Knowledge pipeline** block sets the bead synthesizer (schedule, target layer, minimum confidence, per-cycle fact and GitHub API caps, bead retention), scheduled curator promotion (schedule, threshold, source and target layers), repository code maps (schedule, layer, size cap) and the kick primer's fact and byte caps. Turning the bead synthesizer on or off applies at once; the other pipeline settings apply after a restart, and 0 or empty restores the default. The engine, the vault paths and the primer merge strategy are shown read-only because they are set in `hive.yaml`. The repositories to map and the primer priority list stay yaml-only. See [Knowledge curator](knowledge-curator.md) and [Knowledge connectors](knowledge-connectors.md).
+
+## Meeting attendee
+
+The persona hive attends meetings as (Betty by default): pick a preset or edit its name, display name, aliases, pronouns, voice type, language, accent, Kokoro voice, humor and intro (with a live preview and a **Play sample** button; clicking a preset card also plays that persona's introduction in its own voice, see [Hearing a preset](meetings.md#hearing-a-preset)), set how often she answers room questions unprompted, and see the address people invite her with. Owner or read-write. Changes apply after a restart. See [Meeting attendee settings](meetings.md#meeting-attendee-settings).
 
 ## Advisory
 
@@ -122,6 +126,14 @@ The **Hub settings** block at the bottom of the tab sets explicit task acceptanc
 ## Model Gateways
 
 The OpenAI-compatible gateways (LiteLLM, OpenRouter, vLLM, and others) agents send inference through, and their keys. See [Configure model gateways and keys](hosted-hub.md#configure-model-gateways-and-keys).
+
+## Dashboard
+
+Settings for the dashboard itself (`dashboard.*`): its port and agent poll interval, the Experiment Lab, whether the header also shows the usage gauge, hub-proxied auth, Sessions, the dashboard auth token, the access allowlist, and the issue bands.
+
+**Inception (spek) sessions** (`dashboard.sessions.enabled`, on by default) turns on the [Inception (spek)](dashboard-sections.md#inception-spek) section, named shared CLI-agent terminals inside the dashboard that open in the hive's shared spek workspace, which replaced the removed Inception wizard. Set it to false to hide the section. The `HIVE_SESSIONS_ENABLED` environment variable, when set, overrides the switch, and the dialog says so. Beside it are the three limits, `dashboard.sessions.max_sessions`, `dashboard.sessions.max_per_user` and `dashboard.sessions.idle_ttl_hours`; 0 keeps the built-in default (12, 4 and 72), and `HIVE_SESSIONS_MAX`, `HIVE_SESSIONS_MAX_PER_USER` and `HIVE_SESSIONS_IDLE_TTL_HOURS` override them. **Answer the CLI startup screens** (`dashboard.sessions.autostart`, on by default) lets the hive take a starting session's CLI through its startup screens (first-run notice, trust for the session's folder, onboarding) to its input prompt, so the first request runs without a person; it never answers a permission prompt and never signs in, and `HIVE_SESSIONS_AUTOSTART` overrides the switch. See the [Sessions API](api-reference/sessions.md).
+
+**Also show the usage gauge in the header** (`dashboard.subscription_gauge_header`, off by default) adds a small fuel-dial chip to the header on every page, showing how much is left in the limit closest to running out across the plans the hive's agents spend (Claude, Copilot and others). The full gauge, with a row per provider, is on the Overview by default for the owner and can be hidden there from the Overview settings. Both show the measurements hive already makes; only the owner sees them; and they show the providers' plans, not the hive's token budget. See [Usage gauge](dashboard.md#usage-gauge).
 
 ## Compliance
 

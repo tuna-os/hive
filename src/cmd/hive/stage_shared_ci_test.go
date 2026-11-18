@@ -68,3 +68,43 @@ func TestStageBaseBranchRedIndex(t *testing.T) {
 		t.Fatalf("base-red without an incident reported incident %d", got)
 	}
 }
+
+func TestStageBaseRedRemembered(t *testing.T) {
+	t.Cleanup(func() { stageBaseRedMemory.Store(nil) })
+	if got := stageBaseRedRemembered("acme/widget", "main"); got != nil {
+		t.Fatalf("nothing published: %v", got)
+	}
+	publishStageBaseRedMemory(map[string][]string{github.BaseRedRememberedKey("acme/widget", "main"): {"Tests Passed", "Unit Tests"}})
+	if got := stageBaseRedRemembered("Acme/Widget", "main"); len(got) != 2 || got[0] != "Tests Passed" || got[1] != "Unit Tests" {
+		t.Fatalf("remembered = %v", got)
+	}
+	if got := stageBaseRedRemembered("acme/widget", "release"); len(got) != 0 {
+		t.Fatalf("another base: %v", got)
+	}
+	publishStageBaseRedMemory(nil)
+	if got := stageBaseRedRemembered("acme/widget", "main"); len(got) != 0 {
+		t.Fatalf("after an empty publish: %v", got)
+	}
+}
+
+func TestStageHeldWorkflowRunsIndex(t *testing.T) {
+	t.Cleanup(func() { stageSharedCIIndex.Store(nil) })
+	held := &github.PRWorkflowApproval{Pending: 2, RunIDs: []int64{44261912124, 44257752419}, Denied: true}
+	undecided := &github.PRWorkflowApproval{Pending: 1, RunIDs: []int64{11}}
+	act := &github.ActionableResult{}
+	act.PRs.Items = []github.PullRequest{
+		{Repo: "acme/server", Number: 686, HeadSHA: "aaa", CIActivity: &github.PRCIActivity{Head: "aaa", WorkflowApproval: held}},
+		{Repo: "acme/server", Number: 687, HeadSHA: "bbb", CIActivity: &github.PRCIActivity{Head: "bbb", WorkflowApproval: undecided}},
+	}
+	publishStageSharedCIIncidents(act)
+
+	if got := stageHeldWorkflowRuns("acme/server", 686, "aaa"); len(got) != 2 || got[0] != 44261912124 {
+		t.Fatalf("held runs = %v", got)
+	}
+	if got := stageHeldWorkflowRuns("acme/server", 686, "new-head"); got != nil {
+		t.Fatalf("a new head must not inherit the old head's held runs: %v", got)
+	}
+	if got := stageHeldWorkflowRuns("acme/server", 687, "bbb"); got != nil {
+		t.Fatalf("runs the approval sweep has not decided on read as held: %v", got)
+	}
+}

@@ -36,10 +36,17 @@
 #     CHANGELOG.md edits therefore keep working alongside fragments, which is
 #     what the 7-day transition window relies on.
 #   - A fragment's first non-blank line must start with `- ` (an entry bullet)
-#     or be a `<!-- release: ... -->` marker, so the escape hatch
-#     derive-release-version.sh honours can also ride in a fragment.
+#     or be a `<!-- release: major|minor|patch -->` marker, so the bump escape
+#     hatch derive-release-version.sh honours can also ride in a fragment.
+#     `<!-- release: none -->` is REJECTED in fragments: a fragment persists
+#     until the release that consumes it, and `none` is what prevents that
+#     release, so one such fragment silently freezes every later merge.
 #   - Each fragment is deleted after a successful compile, so `git add -A
 #     changelog.d` in the release commit records the consumption.
+#   - Any fragment (other than README.md) under src/changelog.d/ next to the
+#     changelog is a LOUD failure before anything else runs: that directory
+#     is never compiled, so its entries would otherwise be lost (#18264).
+#     Override the checked path with STRANDED_FRAGDIR.
 #
 # Usage: src/scripts/compile-changelog.sh [changelog-path] [fragments-dir]
 #   changelog-path  default CHANGELOG.md
@@ -71,6 +78,30 @@ category_heading() {
 if [[ ! -f "$CHANGELOG" ]]; then
   echo "::error::changelog not found at ${CHANGELOG}" >&2
   exit 1
+fi
+
+# Release-time backstop for misplaced fragments (#11919, #18264). Only the
+# repo-root changelog.d/ is compiled; a fragment under src/changelog.d/ is
+# never read, so its entry silently never reaches CHANGELOG.md. The PR guard
+# rejects such fragments, but twice PRs merged with it red (161 strays cleaned
+# by #11928, 14 more on v5 and 81 on v6 by #18264). Fail loudly here, before
+# the no-op exits below, so a stray shows up as a red release job on the very
+# next merge instead of disappearing for weeks. The directory is resolved next
+# to the changelog so fixture runs in a temp dir never see the real repo.
+STRANDED_FRAGDIR="${STRANDED_FRAGDIR:-$(dirname -- "$CHANGELOG")/src/changelog.d}"
+if [[ -d "$STRANDED_FRAGDIR" ]]; then
+  stranded=0
+  shopt -s nullglob
+  for f in "$STRANDED_FRAGDIR"/*.md; do
+    [[ "$(basename "$f")" == "README.md" ]] && continue
+    echo "::error file=${f}::fragment is under src/changelog.d/, which is never compiled — run: git mv ${f} ${FRAGDIR}/$(basename "$f")" >&2
+    stranded=1
+  done
+  shopt -u nullglob
+  if [[ "$stranded" -ne 0 ]]; then
+    echo "::error::refusing to compile while fragments sit in ${STRANDED_FRAGDIR}/ — move them to ${FRAGDIR}/ (see ${FRAGDIR}/README.md)." >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -d "$FRAGDIR" ]]; then
@@ -117,7 +148,17 @@ for f in "${fragments[@]}"; do
     echo "::error::${f}: fragment is empty" >&2
     bad=1
   elif ! [[ "$first_line" == "- "* || "$first_line" == "<!-- release:"* || "$first_line" == "<!--release:"* ]]; then
-    echo "::error::${f}: a fragment must start with a '- ' entry bullet (or a '<!-- release: ... -->' marker); it is the entry itself, not a section with its own headings" >&2
+    echo "::error::${f}: a fragment must start with a '- ' entry bullet (or a '<!-- release: major|minor|patch -->' marker); it is the entry itself, not a section with its own headings" >&2
+    bad=1
+  fi
+  # `none` is self-deadlocking in a fragment: the fragment lives until the
+  # release that consumes it, and the marker is what forbids that release.
+  # #12928 landed one on 2026-10-19 and every decide job for the next three
+  # weeks (~1,600 commits) skipped on "explicit human override" while nobody
+  # had asked for a freeze. Fail loudly here so the stall shows up as a red
+  # decide job on the very next merge instead of a quiet skip.
+  if grep -qE '<!-- *release: *none *-->' "$f"; then
+    echo "::error::${f}: '<!-- release: none -->' is not allowed in a fragment — it would veto every release until a human deletes it (see changelog.d/README.md). Delete the fragment instead; only major|minor|patch markers may ride in a fragment." >&2
     bad=1
   fi
 done

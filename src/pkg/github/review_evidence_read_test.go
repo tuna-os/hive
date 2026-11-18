@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -219,6 +220,7 @@ type evidenceMergeFixture struct {
 	postFail  bool
 	comments  []string
 	posts     int
+	edits     int
 	prFetches int
 }
 
@@ -252,10 +254,21 @@ func newEvidenceMergeServer(t *testing.T, f *evidenceMergeFixture) *httptest.Ser
 				return
 			}
 			out := []map[string]any{}
-			for _, c := range f.comments {
-				out = append(out, map[string]any{"body": c})
+			for i, c := range f.comments {
+				out = append(out, map[string]any{"id": i + 1, "body": c, "user": map[string]any{"login": "hive-app[bot]", "type": "Bot"}})
 			}
 			_ = json.NewEncoder(w).Encode(out)
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/repos/o/r/issues/comments/"):
+			f.edits++
+			id, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/repos/o/r/issues/comments/"))
+			var in struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			if id >= 1 && id <= len(f.comments) {
+				f.comments[id-1] = in.Body
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/7/comments":
 			f.posts++
 			if f.postFail {
@@ -275,12 +288,31 @@ func newEvidenceMergeServer(t *testing.T, f *evidenceMergeFixture) *httptest.Ser
 		}
 	}))
 	t.Cleanup(srv.Close)
+	// The process-wide REST 404 negative cache is keyed by host:port, and the
+	// kernel reuses ephemeral ports between httptest servers. A 404 for
+	// o/r#7 cached by an earlier test on the same port would answer this
+	// server's PR fetch without reaching it. Drop any entry for this host.
+	dropREST404NegativeEntriesForHost(srv.Listener.Addr().String())
+	t.Cleanup(func() { dropREST404NegativeEntriesForHost(srv.Listener.Addr().String()) })
 	return srv
+}
+
+func dropREST404NegativeEntriesForHost(host string) {
+	c := sharedREST404NegativeCache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key := range c.entries {
+		if strings.Contains(key, ":"+strings.ToLower(host)+":") {
+			delete(c.entries, key)
+		}
+	}
 }
 
 func evidenceMergeClient(t *testing.T, f *evidenceMergeFixture, settings *ReviewEvidenceSettings) *Client {
 	t.Helper()
 	c := newTestClient(t, newEvidenceMergeServer(t, f), "o", []string{"o/r"})
+	// The fixture stamps comments as hive-app[bot]; make the client own them.
+	c.SetAppBotLogin("hive-app[bot]")
 	if settings != nil {
 		s := *settings
 		c.SetReviewEvidence(func(string) ReviewEvidenceSettings { return s })

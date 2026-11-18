@@ -256,6 +256,8 @@ func sanitizeProbeError(msg string) string {
 }
 
 // MarshalJSON includes the probe error text alongside the exported fields.
+// PlanType is emitted only when a probe reported one, so readings without a
+// plan (Claude's today) serialize exactly as before.
 func (h Headroom) MarshalJSON() ([]byte, error) {
 	type alias struct {
 		Provider      string        `json:"provider"`
@@ -268,6 +270,7 @@ func (h Headroom) MarshalJSON() ([]byte, error) {
 		ProbeErr      string        `json:"probe_error,omitempty"`
 		Error         string        `json:"error,omitempty"`
 		ProbeErrCause string        `json:"probe_error_cause,omitempty"`
+		PlanType      string        `json:"plan_type,omitempty"`
 	}
 	return json.Marshal(alias{
 		Provider:      h.Provider,
@@ -280,6 +283,7 @@ func (h Headroom) MarshalJSON() ([]byte, error) {
 		ProbeErr:      h.ProbeError(),
 		Error:         h.ProbeError(),
 		ProbeErrCause: string(h.ProbeErrCause),
+		PlanType:      h.PlanType,
 	})
 }
 
@@ -379,15 +383,45 @@ var sharedCLIHomePath = sharedCLIHome
 
 type claudeUsageResponse struct {
 	Limits []struct {
-		Kind     string     `json:"kind"`
-		Percent  *float64   `json:"percent"`
-		ResetsAt *time.Time `json:"resets_at"`
+		Kind     string            `json:"kind"`
+		Percent  *float64          `json:"percent"`
+		ResetsAt *time.Time        `json:"resets_at"`
+		Scope    *claudeUsageScope `json:"scope"`
 	} `json:"limits"`
+}
+
+// claudeUsageScope names the model a weekly_scoped window counts, e.g.
+// {"model":{"id":"claude-fable","display_name":"Fable"}}; it is null on the
+// all-models windows.
+type claudeUsageScope struct {
+	Model *struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"display_name"`
+	} `json:"model"`
+}
+
+// modelName is the scoped model's display name, else its id; "" for a window
+// that counts every model.
+func (s *claudeUsageScope) modelName() string {
+	if s == nil || s.Model == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(s.Model.DisplayName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(s.Model.ID)
 }
 
 func (p ClaudeProber) Provider() string { return "anthropic" }
 
 func (p ClaudeProber) Probe(ctx context.Context) Headroom {
+	// Agents on the operator's long-lived token (claude setup-token) run on an
+	// inference-only token that cannot read /api/oauth/usage, and the
+	// credentials file is not what they use, so its expiry says nothing about
+	// them. Headroom is unknown; the error must not read as a logout.
+	if claude.AuthMode() == claude.AuthModeLongLivedToken {
+		return failOpen(p.Provider(), errors.New("claude usage unknown: agents run on the long-lived token, which has no usage scope"))
+	}
 	credPath := p.CredentialsPath
 	if credPath == "" {
 		// The hive main process runs with HOME=/home/dev (Dockerfile), but the
@@ -514,6 +548,11 @@ func claudeHeadroom(provider string, thresholdPct int, body []byte) (Headroom, e
 		}
 		if l.ResetsAt != nil {
 			lw.ResetAt = *l.ResetsAt
+		}
+		if model := l.Scope.modelName(); model != "" {
+			// The usage gauge labels this window with the model Claude Code's
+			// /usage names ("Current week (Fable)").
+			lw.Scope = map[string]string{"model": model}
 		}
 		limits = append(limits, lw)
 		// The binding window is the most-used one; reporting a roomier window
@@ -769,6 +808,16 @@ func codexLimitWindow(id string, w *codexRateLimitWindow) LimitWindow {
 	return lw
 }
 
+// classifyCodexProbeError tags the app-server's "account authentication
+// required" refusal as no_credentials: a host with no codex account is an
+// expected state, not a probe defect.
+func classifyCodexProbeError(err error) error {
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "authentication required") {
+		return withCause(ProbeCauseNoCredentials, err)
+	}
+	return err
+}
+
 func (p CodexProber) Provider() string { return "openai" }
 
 func (p CodexProber) Probe(ctx context.Context) Headroom {
@@ -779,7 +828,7 @@ func (p CodexProber) Probe(ctx context.Context) Headroom {
 		err = errors.New("codex app-server: no rateLimits response")
 	}
 	if err != nil {
-		return failOpen(p.Provider(), err)
+		return failOpen(p.Provider(), classifyCodexProbeError(err))
 	}
 	h, err := codexHeadroomForModel(p.Provider(), p.ThresholdPct, result, p.Model)
 	if err != nil {
@@ -1767,6 +1816,10 @@ func (m *Manager) logProbeFailure(h Headroom) {
 	}
 	m.lastProbeErrLog[h.Provider] = key
 	m.mu.Unlock()
+	if h.ProbeErrCause == ProbeCauseNoCredentials {
+		slog.Info("provider headroom probe unavailable: no credentials", "provider", h.Provider, "cause", h.ProbeErrCause, "error", msg)
+		return
+	}
 	slog.Warn("provider headroom probe failed", "provider", h.Provider, "cause", h.ProbeErrCause, "error", msg)
 }
 

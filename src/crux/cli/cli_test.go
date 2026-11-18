@@ -444,25 +444,6 @@ func TestRunStopErrorAndOutputError(t *testing.T) {
 	}
 }
 
-func TestNewTail(t *testing.T) {
-	cases := []struct {
-		prev, cur, want []string
-	}{
-		{nil, []string{"a", "b"}, []string{"a", "b"}},
-		{[]string{"a", "b"}, []string{"a", "b"}, nil},
-		{[]string{"a", "b"}, []string{"a", "b", "c"}, []string{"c"}},
-		{[]string{"a", "b", "c"}, []string{"b", "c", "d", "e"}, []string{"d", "e"}},
-		{[]string{"a", "b"}, []string{"x", "y"}, []string{"x", "y"}},
-		{[]string{"a", "b"}, []string{"b"}, nil},
-	}
-	for _, c := range cases {
-		got := newTail(c.prev, c.cur)
-		if strings.Join(got, ",") != strings.Join(c.want, ",") {
-			t.Errorf("newTail(%v, %v) = %v, want %v", c.prev, c.cur, got, c.want)
-		}
-	}
-}
-
 func hiveYAML(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -565,6 +546,9 @@ func TestLogsPaneBufferFullAndJSON(t *testing.T) {
 	}
 	if code := h.run("--local", "logs", "--buffer", "--full", "scout"); code != ExitUsage {
 		t.Fatalf("exclusive flags: code %d", code)
+	}
+	if code := h.run("--local", "logs", "-n", "-5", "scout"); code != ExitUsage {
+		t.Fatalf("negative -n: code %d", code)
 	}
 	if code := h.run("--local", "logs", "--bogus"); code != ExitUsage {
 		t.Fatalf("bad flag: code %d", code)
@@ -740,4 +724,69 @@ func TestSignalContextIsCancellable(t *testing.T) {
 	ctx, stop := SignalContext()
 	stop()
 	<-ctx.Done()
+}
+
+// seqRuntime serves the ring buffer by offset, like agent.Manager.
+type seqRuntime struct {
+	crux.Runtime
+	buf *crux.RingBuffer
+}
+
+func (s *seqRuntime) GetBufferSince(_ string, seq uint64) ([]string, uint64, error) {
+	lines, next := s.buf.Since(seq)
+	return lines, next, nil
+}
+
+// streamOutput runs stream over rt, ticking once per step (each step runs
+// before its tick), and returns what was printed.
+func streamOutput(t *testing.T, rt crux.Runtime, steps ...func()) []string {
+	t.Helper()
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		h.env.stream(ctx, rt, "alpha", time.Hour)
+		close(done)
+	}()
+	for _, step := range steps {
+		step()
+		h.ticks <- time.Time{}
+	}
+	// The unbuffered tick proves the previous poll finished.
+	h.ticks <- time.Time{}
+	cancel()
+	<-done
+	return strings.Fields(h.stdout.String())
+}
+
+func TestStreamByOffsetRepeatedLines(t *testing.T) {
+	buf := crux.NewRingBuffer(500)
+	rt := &seqRuntime{buf: buf}
+	got := streamOutput(t, rt,
+		func() {
+			for range streamWindow {
+				buf.Write("x")
+			}
+		},
+		func() { buf.Write("x") },
+	)
+	if len(got) != streamWindow+1 {
+		t.Fatalf("printed %d lines, want %d", len(got), streamWindow+1)
+	}
+}
+
+func TestStreamByOffsetBurst(t *testing.T) {
+	buf := crux.NewRingBuffer(1000)
+	rt := &seqRuntime{buf: buf}
+	got := streamOutput(t, rt,
+		func() { buf.Write("first") },
+		func() {
+			for i := range 3 * streamWindow {
+				buf.Write(fmt.Sprintf("l%d", i))
+			}
+		},
+	)
+	if len(got) != 1+3*streamWindow || got[1] != "l0" || got[len(got)-1] != fmt.Sprintf("l%d", 3*streamWindow-1) {
+		t.Fatalf("printed %d lines, first/last %q/%q", len(got), got[1], got[len(got)-1])
+	}
 }

@@ -30,9 +30,9 @@ wires configured entries at startup.
 knowledge:
   enabled: true
   git_sources:
-    - name: dakota-skills            # required — display name and dedup/lookup key
+    - name: dakota-skills            # required — display name (editable via PUT; identity is url + subpath)
       url: https://github.com/projectbluefin/dakota   # required — https:// only
-      branch: main                   # optional — default "main"
+      branch: main                   # optional — blank resolves the remote's default branch
       subpath: docs/skills           # optional — index only this subdirectory
       layer: project                 # optional — default "project"
 ```
@@ -42,11 +42,11 @@ by the runtime type `GitSourceConfig`, `pkg/knowledge/gitsource.go:33-39`):
 
 | YAML key | Required | Default | Notes |
 |---|---|---|---|
-| `name` | Yes | — | Display name; also the key used to look up/remove the source via the API. |
+| `name` | Yes | — | Display name (editable via `PUT`); the API identifies a source by `url` + `subpath`, not by name. |
 | `url` | Yes | — | Git remote URL. **`https://` only** — see Auth below. |
-| `branch` | No | `main` (`gitsource.go:66-68`) | Branch to shallow-clone (`--depth 1 --branch <branch>`). |
+| `branch` | No | remote default branch (`gitsource.go:384-393`) | Branch to shallow-clone (`--depth 1 --branch <branch>`). A blank branch — whether from `hive.yaml` at boot or from the dashboard/API — is resolved on connect with `git ls-remote --symref <url> HEAD` and the result is recorded in the saved config; `main` is used only when the remote reports no `HEAD` symref, and the source fails to connect if `ls-remote` itself errors. |
 | `subpath` | No | — (whole repo) | When set, only this subdirectory is checked out (git sparse-checkout, `gitsource.go:199-219,232-248`) and indexed. |
-| `layer` | No | `project` when set via the API (`api_knowledge.go:1032-1034`); **required, no code default, when set via `hive.yaml`** | One of `personal`, `project`, `org`, `community` — see Layer semantics below. |
+| `layer` | No | `project` when set via the API (`api_knowledge.go:1175-1177`); **required, no code default, when set via `hive.yaml`** | One of `personal`, `project`, `org`, `community` — see Layer semantics below. |
 
 ### What "indexed" means
 
@@ -117,21 +117,33 @@ source is `Ready` and its current page count.
 
 ### Static config vs. the runtime API
 
-`GET/POST/DELETE /api/knowledge/git-sources` (owner-role only,
-`pkg/dashboard/api_knowledge.go:980-986,988-1070,1072-1114`) manage sources at runtime
+`GET/POST/PUT/DELETE /api/knowledge/git-sources` (mutations owner-role only,
+`pkg/dashboard/api_knowledge.go:1131-1137,1139-1221,1223-1265,1290-1450`) manage sources at runtime
 and are the *same* underlying list as `knowledge.git_sources` in
 `hive.yaml` — not a separate system:
 
 - `POST` connects a source immediately and, if it isn't already present
   (matched by `url`+`subpath`), appends it to `Config.Knowledge.GitSources`
-  and persists the config (`api_knowledge.go:1048-1066`). A `POST` for a source that
+  and persists the config (`api_knowledge.go:1199-1217`). A `POST` for a source that
   is only in `hive.yaml` but not yet connected in the running process (e.g.
   right after editing the file without restarting) will add a duplicate
   config entry once reconnected, since the dedup check is by URL+subpath
   against what's already in `Config`, not against what main.go loaded at
   boot.
 - `DELETE` disconnects the live source and removes matching entries from
-  `Config.Knowledge.GitSources`, then persists (`api_knowledge.go:1100-1110`).
+  `Config.Knowledge.GitSources`, then persists (`api_knowledge.go:1251-1261`).
+- `PUT` edits the live source identified by `url`+`subpath` (the dashboard's
+  **Edit** button). A `name`/`layer` change updates it in place without
+  re-cloning; a `new_url`, `new_subpath` or `branch` change swaps in a fresh
+  clone in the same request. Omitting `branch` keeps the current one; an
+  explicit `"branch": ""` re-resolves the remote's default branch (what the
+  form sends when the field is cleared). An edit that lands on the same clone
+  directory (branch-only, or a URL that differs only by scheme or `.git`
+  suffix) clones into a staging directory beside the live clone and renames it into place only once
+  indexed, so the old source keeps serving throughout and a failed clone
+  leaves it untouched. The replaced source's sync loop is stopped. The
+  matching config entry is rewritten and persisted, and one
+  `knowledge_git_source_update` audit row is written.
 - Editing `git_sources:` directly in `hive.yaml` takes effect on the next
   process restart (main.go's startup loop at `cmd/hive/main.go:2421-2467`);
   it does not hot-reload while the process is running. Use the API for a
@@ -625,9 +637,12 @@ overwritten on the next change, so do not edit these pages.
 Maps an agent name to the `layers`, `repos`, `types`, `tags` and
 `include_states` that agent's kick primer and agent-identified knowledge reads
 are restricted to. A missing agent or an empty field is unrestricted (the
-default). Unknown layer or lifecycle state names fail config load. See
+default). Listing `draft` in `include_states` additionally lets the agent's
+kicks carry the drafts it authored (`author:` frontmatter), marked `(draft)`.
+Unknown layer or lifecycle state names fail config load. See
 [Per-agent scopes](knowledge-toc.md#per-agent-scopes) for the intersection
-rules.
+rules, and [agent-knowledge-and-memory.md](agent-knowledge-and-memory.md) for
+how the scope is applied on the kick path end to end.
 
 ```yaml
 knowledge:
@@ -636,6 +651,108 @@ knowledge:
       layers: [project, org]
       repos: [hivecommons/hive]
 ```
+
+## Mid-task knowledge advisor (`knowledge.advisor`)
+
+The kick primer above runs once, when the kick is typed. The advisor
+(hivecommons/hive#17052) keeps watching after that: every poll tick it
+reads the scopes the agent's pane shows it working in — a directory prefix
+such as `src/crux/agent` from a `Read(...)`/`Edit ...` line, or a `gh pr` /
+`gh issue` / `gh run` command family — and the first time a scope appears
+that was not on screen when the kick landed, it asks the same `Primer`
+(under the same `knowledge.agent_scopes` restriction) for entries about it.
+Each hit is typed into the live session as one line, like a CI-poll nudge:
+
+```
+📚 Knowledge: Re-pin TRUSTED_SCRIPTS_TREE — Any src/scripts edit must … (full: https://…)
+```
+
+Rules, all enforced by the runtime (`crux/agent/knowledge_advisor.go`):
+
+- **Off by default.** `knowledge.advisor: true` turns it on; `knowledge.enabled`
+  must also be on. Flip it once your own hive has run it for a while.
+- **At most `knowledge.advisor_max_per_kick` lines per kick** (default 3),
+  with a two-minute cooldown between lines.
+- **Never an entry the kick already carried.** The primer records which
+  entries survived the byte cap; those are excluded, and a slug is typed at
+  most once per kick.
+- **Never into a tool call, never after the turn.** A line waits while a
+  shell command or tool is running; if the agent reaches an empty prompt
+  first, the pending advice is dropped (the next kick primes afresh). It is
+  also held while a human is attached to the pane and while a kick is
+  being typed.
+- **Never stalls the poll tick.** The adviser is called on its own
+  goroutine, at most one call in flight per agent (hivecommons/hive#17153).
+  Scopes seen while a call runs queue newest first, capped at the lines
+  left in the kick's allowance. The tick waits briefly for a fast matcher
+  so its line still lands on the tick that saw the scope. A slower result
+  is held until a later tick passes the gates above. A result that comes
+  back after the agent's kick changed is dropped.
+- **Each scope is tagged with an action and asked about at most twice per
+  kick.** The pane line a scope comes from gives its `Action`:
+  `⏺ Read(…)` is `read`, `● Edit …` / `Write` / `Update` is `edit`, and a
+  `$ …` shell line (such as `$ gh pr …`) is `run`. The adviser is asked on
+  the scope's first sighting, and once more on the first `edit` in a scope
+  first seen without one, or on the next command in a `gh` family. A third
+  sighting is ignored, and elapsed time never makes a scope eligible again.
+- **No pane text unless the adviser asks.** An adviser whose policy sets
+  `WantsPaneTail` receives the last `PaneLines` (default 80) scrollback
+  lines, passed through `logscrub.RedactPaneTokens` first. Phase 1's
+  matcher never asks, so no pane text leaves the runtime.
+- **Per-agent opt-out:** `knowledge.advisor_exclude_agents: [scanner]`
+  matches an agent name or its replica family base name.
+- **Measurable.** Each delivery is recorded in the dashboard prompt history
+  with trigger `knowledge-advisor` and logged as
+  `knowledge advisor: delivered` with the agent and slug.
+
+```yaml
+knowledge:
+  enabled: true
+  advisor: true
+  advisor_max_per_kick: 3
+  advisor_exclude_agents: [scanner]
+```
+
+### Model-ranked advisor (`knowledge.advisor_llm`)
+
+`knowledge.advisor_llm` configures the model-ranked variant
+(hivecommons/hive#17054): a small model picks one of the matcher's candidates
+or nothing (hivecommons/hive#17155). It is ignored unless `knowledge.advisor`
+is on. The pipeline, modes, budgets, decision log line and rollout steps are
+in [agent-knowledge-and-memory.md](agent-knowledge-and-memory.md#model-ranked-advisor-knowledgeadvisor_llm).
+
+```yaml
+knowledge:
+  advisor: true
+  advisor_llm:
+    mode: off                    # off | shadow | rank
+    model: "<your-small-model>"  # required for shadow/rank
+    endpoint: ""                 # default: governor.litellm endpoint
+    api_key_env: ""              # or api_key_file; default: governor.litellm key
+    candidates: 5
+    pane_lines: 80
+    timeout_s: 15
+    max_calls_per_agent_hour: 6  # hard ceiling without budget_override
+    max_calls_per_day: 300       # hard ceiling without budget_override
+    budget_override: false
+    holdout_percent: 0           # 0..100
+    on_error: silence            # silence | matcher
+```
+
+- `model`, `endpoint` and the key resolve like the governor reviewer:
+  explicit value, then `governor.litellm`, then unset. With no endpoint or key
+  from either place the block is unavailable.
+- `shadow` or `rank` with no model resolves to `off` and logs a warning; it
+  never stops the hive from loading.
+- `max_calls_per_agent_hour` above 6 or `max_calls_per_day` above 300 is a load
+  error naming the key unless `budget_override: true`.
+- `holdout_percent` outside 0..100, an unknown `mode` or `on_error`, and a
+  negative `candidates`, `pane_lines` or `timeout_s` are load errors.
+
+Without `knowledge.advisor_llm` (or with `mode: off`) the advisor is the
+pure phase-1 matcher with no model in the loop. The advisor is
+wired only when the agent runtime runs in-process; the `crux serve` sidecar
+has no adviser in this phase.
 
 ## Open questions
 

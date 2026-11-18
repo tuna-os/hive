@@ -343,6 +343,22 @@ func (h *sidecarHost) SetSandboxMutationBoundary(boundary effects.Boundary) {
 // the runtime's own process); trajectory events do not depend on it.
 func (h *sidecarHost) SetSpanStarter(crux.SpanStarter) { h.inProcessOnly("SetSpanStarter") }
 
+// SetKnowledgeAdviser is in-process-only in phase 1 of hivecommons/hive#17052:
+// the adviser searches the knowledge store that lives in the hive process.
+// A sidecar runtime runs without the mid-task advisor until a callback route
+// carries the scope → advice exchange.
+func (h *sidecarHost) SetKnowledgeAdviser(crux.KnowledgeAdviser) {
+	h.inProcessOnly("SetKnowledgeAdviser")
+}
+
+// SetSandboxGitHubReadRelay is in-process-only (#18865): the relay holds the
+// read credential and Enroll is a Go call into hive's proxy, so neither
+// crosses into a sidecar runtime. A sidecar runtime's Job kicks run without
+// the relay and read GitHub as they did before.
+func (h *sidecarHost) SetSandboxGitHubReadRelay(crux.SandboxGitHubReadRelay, []string) {
+	h.inProcessOnly("SetSandboxGitHubReadRelay")
+}
+
 // SetInferenceRoute and ClearInferenceRoute are cruxhost.InferenceRouter:
 // the callback's end of SetInferenceCallbacks. A route that arrives before
 // boot has installed the closures is dropped and logged; the runtime's

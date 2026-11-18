@@ -284,7 +284,7 @@ func TestMergeCommitRefusalTextManualMergeRuleAndSentinel(t *testing.T) {
 	if got := mergeCommitRefusalText(obs); !strings.Contains(got, "the hive then merges with a merge commit") {
 		t.Fatalf("squash-only: %q", got)
 	}
-	for _, refused := range []string{mergeCommitRefusedRole, mergeCommitRefusedSquashOnly, mergeCommitRefusedHiveOnly, mergeCommitRefusedUnsigned, ""} {
+	for _, refused := range []string{mergeCommitRefusedRole, mergeCommitRefusedSquashOnly, mergeCommitRefusedHiveOnly, mergeCommitRefusedUnsigned, mergeCommitRefusedLabelsSuppressed, ""} {
 		obs.Detail = stageDetail{MergeCommitRefused: refused, SentinelAlert: true}
 		if got := mergeCommitRefusalText(obs); !strings.HasSuffix(got, " A sentinel alert is open on this PR: resolve it and have a maintainer clear its label first.") {
 			t.Fatalf("%q sentinel: %q", refused, got)

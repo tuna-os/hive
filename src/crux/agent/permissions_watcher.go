@@ -139,6 +139,14 @@ func isSharedGroupReadableFile(path string) bool {
 		filepath.Base(geminiDir) == ".gemini"
 }
 
+// isSharedClaudeSettingsFile reports whether path is the shared Claude user
+// settings file (.claude/settings.json directly under a watched home). Matched
+// by name like isAgyCLILog, so the check follows WatchedHomeDirs in tests.
+func isSharedClaudeSettingsFile(path string) bool {
+	return filepath.Base(path) == claudeSettingsFileName &&
+		filepath.Base(filepath.Dir(path)) == claudeHomeDirName
+}
+
 // isAgyCLILog reports whether path is an Antigravity CLI session log
 // (.gemini/antigravity-cli/log/cli-*.log). agy recreates/rewrites these with
 // its own 0640 mode on every run, so widening them to group-write just made
@@ -418,12 +426,43 @@ func ensureWatchedDirs(logger *slog.Logger) {
 			continue
 		}
 		permWarnDedupe.clear(dedupeKey("mkdir", dir))
-		// Always set ownership on the top-level dir at startup.
-		if err := os.Chown(dir, DevUID, NodeGID); err != nil {
-			warnDeduped(logger, "chown watched dir", "permissions watcher: failed to chown directory", dir, err)
-		} else {
-			permWarnDedupe.clear(dedupeKey("chown watched dir", dir))
-		}
+		// A failed stat (the dir vanished after MkdirAll) leaves fi nil and
+		// falls through to the chown, whose own error is then reported.
+		fi, _ := os.Stat(dir)
+		ensureWatchedDirOwner(dir, fi, logger)
+	}
+}
+
+// ensureWatchedDirOwner sets DevUID:NodeGID on a top-level watched dir at
+// startup — unless this process certainly cannot. After the entrypoint's
+// privilege drop the watcher runs as dev without CAP_CHOWN, so a watched root
+// another uid owns (a root-seeded /data/beads on a spoke, #18234) fails with
+// EPERM on every call. ensureWatchedDirs runs at every agent-runtime start and
+// again from any tick that finds a watched root missing, so that unconditional
+// chown was the one call site the #18120 guard in fixEntry did not cover, and
+// it surfaced fleet-wide as a repeated "failed to chown directory" WARN for a
+// condition only root can repair. The skip is logged at DEBUG: the walk in
+// fixPermissions still reports the dir through the per-tick unownable summary
+// when its ownership is actually wrong, with the operator hint attached.
+func ensureWatchedDirOwner(dir string, fi os.FileInfo, logger *slog.Logger) {
+	var stat *syscall.Stat_t
+	if fi != nil {
+		stat, _ = fi.Sys().(*syscall.Stat_t)
+	}
+	if stat != nil && cannotChown(stat.Uid) {
+		permWarnDedupe.clear(dedupeKey("chown watched dir", dir))
+		logger.Debug("permissions watcher: skipping chown of watched directory owned by another uid",
+			"path", dir,
+			"owner_uid", stat.Uid,
+			"watcher_uid", os.Geteuid(),
+			"hint", unownableHint,
+		)
+		return
+	}
+	if err := os.Chown(dir, DevUID, NodeGID); err != nil {
+		warnDeduped(logger, "chown watched dir", "permissions watcher: failed to chown directory", dir, err)
+	} else {
+		permWarnDedupe.clear(dedupeKey("chown watched dir", dir))
 	}
 }
 
@@ -508,78 +547,7 @@ func fixPermissions(logger *slog.Logger) {
 			)
 		}
 	}
-}
-
-// fixModeFiles re-widens the per-agent mode files (ModeFileGlob) to be
-// world-readable. This is the running-pod remediation for #3882/#3679: the
-// Manager only rewrites a mode file on a level change or kick, so a pod whose
-// files are 0600 (written by the #3172 build, or umask-narrowed) stays broken
-// until then; this scan repairs them within one tick.
-//
-// SECURITY: /tmp is sticky and world-writable, so an agent can pre-create a
-// name matching the glob. Only regular files owned by the hive uid are
-// touched, the only change ever made is adding read bits, and the whole
-// check-then-chmod happens on one open descriptor: O_NOFOLLOW refuses a
-// planted symlink at open time, and f.Stat/f.Chmod act on that same inode, so
-// the pathname cannot be swapped between the check and the chmod (CWE-59 /
-// CWE-367 — the same descriptor discipline writeAgentStateFile follows, #3175).
-func fixModeFiles(logger *slog.Logger) {
-	for _, glob := range []string{ModeFileGlob, CapsFileGlob} {
-		paths, err := filepath.Glob(glob)
-		if err != nil {
-			continue
-		}
-		for _, path := range paths {
-			fixModeFile(path, logger)
-		}
-	}
-}
-
-// fixModeFile applies the fixModeFiles policy to a single path.
-func fixModeFile(path string, logger *slog.Logger) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		// ELOOP for a planted symlink, EACCES for a file we do not own: skip.
-		return
-	}
-	defer func() { _ = f.Close() }() // read-only fd; nothing to lose on close error
-	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() {
-		return
-	}
-	stat, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != uint32(os.Getuid()) {
-		return
-	}
-	perm := fi.Mode().Perm()
-	if perm&modeFileReadBits == modeFileReadBits {
-		permWarnDedupe.clear(dedupeKey("chmod mode file", path))
-		return
-	}
-	newPerm := perm | modeFileReadBits
-	if err := f.Chmod(newPerm); err != nil {
-		if warn, _ := permWarnDedupe.shouldWarn(dedupeKey("chmod mode file", path), err.Error(), dedupeClass("chmod mode file", err)); warn {
-			logger.Warn("permissions watcher: chmod mode file failed; agents cannot read their GitHub mode and gh/pushes will be blocked",
-				"path", path,
-				"old_mode", perm.String(),
-				"want_mode", newPerm.String(),
-				"error", err,
-				"note", "identical repeats logged at debug until this changes",
-			)
-		} else {
-			logger.Debug("permissions watcher: chmod mode file failed",
-				"path", path,
-				"error", err,
-			)
-		}
-		return
-	}
-	permWarnDedupe.clear(dedupeKey("chmod mode file", path))
-	logger.Info("permissions watcher: fixed mode file permissions",
-		"path", path,
-		"old_mode", perm.String(),
-		"new_mode", newPerm.String(),
-	)
+	permUnownable.flush(logger)
 }
 
 // fixEntry checks a single file or directory and corrects ownership/mode
@@ -600,6 +568,14 @@ func fixEntry(path string, fi os.FileInfo, logger *slog.Logger) {
 		return
 	}
 
+	// Pin the entry with a descriptor and change it through that descriptor
+	// (see pinEntry), so the entry Walk reported is the entry that is changed.
+	f, mode, chmod, ok := pinEntry(path, fi)
+	if !ok {
+		return
+	}
+	defer func() { _ = f.Close() }() // nothing to lose on close error
+
 	// Fix group ownership if not in the node group — all agents share this group.
 	// Also fix root-owned files (uid 0) to the dev user.
 	needsChown := false
@@ -611,8 +587,18 @@ func fixEntry(path string, fi os.FileInfo, logger *slog.Logger) {
 	if stat.Gid != uint32(NodeGID) {
 		needsChown = true
 	}
+	if needsChown && cannotChown(stat.Uid) {
+		// Unrepairable by construction (#18120): an unprivileged watcher can
+		// never chown an inode it does not own, so do not spend a syscall and
+		// a WARN line per path on it. Tally it for the per-tick summary and
+		// leave the uid alone so the mode arms below skip it as not ours.
+		permUnownable.skipped(path)
+		permWarnDedupe.clear(dedupeKey("chown", path))
+		needsChown = false
+		newUID = int(stat.Uid)
+	}
 	if needsChown {
-		if err := os.Chown(path, newUID, NodeGID); err != nil {
+		if err := entryChown(f, newUID, NodeGID); err != nil {
 			warnDeduped(logger, "chown", "permissions watcher: chown failed", path, err)
 		} else {
 			permWarnDedupe.clear(dedupeKey("chown", path))
@@ -642,7 +628,7 @@ func fixEntry(path string, fi os.FileInfo, logger *slog.Logger) {
 	// these non-DevUID dirs. Only the group r/w/x bits are added — owner and
 	// other bits are preserved — so an already-770 dir is left untouched.
 	if fi.IsDir() && filepath.Base(path) == bobStateDirBase {
-		fixBobStateDirGroupWrite(path, fi.Mode(), logger)
+		fixBobStateDirGroupWrite(path, mode, chmod, logger, stat.Uid)
 	}
 
 	// Shared CLI credentials are the other class the watcher must widen even
@@ -651,11 +637,18 @@ func fixEntry(path string, fi os.FileInfo, logger *slog.Logger) {
 	// exactly the case that breaks the fleet (#5730). Group READ only, ORed in,
 	// so an already-correct file is left byte-identical.
 	if !fi.IsDir() && isSharedGroupReadableFile(path) {
-		fixSharedCredentialGroupRead(path, fi.Mode(), stat.Uid, logger)
+		fixSharedCredentialGroupRead(path, mode, chmod, stat.Uid, logger)
 		return
 	}
 
 	if !fi.IsDir() && isAgyCLILog(path) {
+		return
+	}
+
+	// The shared Claude settings.json is hive-owned and must never be widened
+	// to group write (hivecommons/hive#17059); see
+	// ensureClaudeRemoteControlDefault.
+	if !fi.IsDir() && isSharedClaudeSettingsFile(path) {
 		return
 	}
 
@@ -666,12 +659,13 @@ func fixEntry(path string, fi os.FileInfo, logger *slog.Logger) {
 		return
 	}
 
-	mode := fi.Mode()
 	if fi.IsDir() {
 		// Directories need u+rwx to be usable.
 		if mode.Perm()&DirPerms != DirPerms {
-			newMode := mode.Perm() | DirPerms
-			if err := os.Chmod(path, newMode); err != nil {
+			// Keep setgid and sticky: the entrypoint sets both on the shared
+			// dot-dirs, and a repair of the group bits must not drop them.
+			newMode := mode&(os.ModePerm|os.ModeSetgid|os.ModeSticky) | DirPerms
+			if err := chmod(newMode); err != nil {
 				warnDeduped(logger, "chmod dir", "permissions watcher: chmod dir failed", path, err)
 			} else {
 				permWarnDedupe.clear(dedupeKey("chmod dir", path))
@@ -688,7 +682,7 @@ func fixEntry(path string, fi os.FileInfo, logger *slog.Logger) {
 		// Regular files need u+rw to be readable/writable.
 		if mode.Perm()&FilePerms != FilePerms {
 			newMode := mode.Perm() | FilePerms
-			if err := os.Chmod(path, newMode); err != nil {
+			if err := chmod(newMode); err != nil {
 				warnDeduped(logger, "chmod file", "permissions watcher: chmod file failed", path, err)
 			} else {
 				permWarnDedupe.clear(dedupeKey("chmod file", path))
@@ -702,114 +696,4 @@ func fixEntry(path string, fi os.FileInfo, logger *slog.Logger) {
 			permWarnDedupe.clear(dedupeKey("chmod file", path))
 		}
 	}
-}
-
-// fixBobStateDirGroupWrite ensures a bob state directory (.bob) grants the
-// shared `node` group read+write+execute, so an agent UID reaching it through
-// that group can persist bob's settings, installation_id and .bob-errors/
-// logger target. It ORs bobStateDirGroupRWX into whatever the dir already has —
-// never narrowing owner or other bits — so a dir that is already group-writable
-// (>= 0770) is left byte-identical and the watcher stays idempotent.
-//
-// This is the remediation that verifyBobStateDirsWritable only ever DETECTED:
-// production .bob dirs are created 0755 (r-x for the group) by their
-// hive-<agent> owner, which is why bob logged "error saving your latest
-// settings changes" / "Failed to initialize logger" fleet-wide and ran
-// degraded. The chmod runs on every watcher tick and at startup, so the fix
-// self-heals rather than requiring a hand-chmod on the pod.
-//
-// Safe and non-fatal: a chmod we are not permitted to perform (EPERM — we are
-// neither the owner nor privileged) is logged and swallowed, exactly like the
-// watcher's other chmod/chown arms, so it never blocks or panics.
-func fixBobStateDirGroupWrite(path string, mode os.FileMode, logger *slog.Logger) {
-	perm := mode.Perm()
-	// Nothing to do when the group already has all of r/w/x — this keeps an
-	// already-remediated (>= 0770) dir untouched and the walk idempotent.
-	if perm&bobStateDirGroupRWX == bobStateDirGroupRWX {
-		permWarnDedupe.clear(dedupeKey("chmod bob state dir", path))
-		return
-	}
-	newPerm := perm | bobStateDirGroupRWX
-	if err := os.Chmod(path, newPerm); err != nil {
-		if warn, _ := permWarnDedupe.shouldWarn(dedupeKey("chmod bob state dir", path), err.Error(), dedupeClass("chmod bob state dir", err)); warn {
-			logger.Error("permissions watcher: chmod bob state dir failed; bob will keep reporting 'error saving your latest settings changes' and run degraded",
-				"path", path,
-				"old_mode", perm.String(),
-				"want_mode", newPerm.String(),
-				"error", err,
-				"note", "identical repeats logged at debug until this changes",
-			)
-		} else {
-			logger.Debug("permissions watcher: chmod bob state dir failed",
-				"path", path,
-				"error", err,
-			)
-		}
-		return
-	}
-	permWarnDedupe.clear(dedupeKey("chmod bob state dir", path))
-	logger.Info("permissions watcher: fixed bob state dir permissions",
-		"path", path,
-		"old_mode", perm.String(),
-		"new_mode", newPerm.String(),
-	)
-}
-
-// fixSharedCredentialGroupRead ensures a shared CLI credential file grants the
-// `node` group read, so one operator login keeps serving every agent UID after
-// the CLI rewrites the file 0600 on a token refresh (#5730). It ORs
-// sharedCredentialGroupRead into whatever the file already has — never
-// narrowing owner or other bits — so an already-readable credential is left
-// byte-identical and the walk stays idempotent.
-//
-// WHEN THIS CAN ACTUALLY REPAIR, and when it can only report:
-//
-// chmod(2) requires the caller to own the inode or hold CAP_FOWNER. The hive
-// process drops to `dev` (uid 1001) at the entrypoint's privilege drop, so it
-// CAN fix a credential that dev owns — the state a fresh boot leaves, since the
-// entrypoint chowns the tree to dev:node — and CANNOT fix one a refresh has
-// re-owned to hive-<agent> (uid 2001+). That case is repaired by the
-// entrypoint's root-owned perm guard, which is why #5730 also makes those
-// guards survivable.
-//
-// So the EPERM arm here is not a swallowed nuisance; on the deployment that
-// produced #5730 it is the primary signal. It logs at ERROR with the mode, the
-// owning uid and the exact one-line chmod, because the alternative — what
-// actually happened — is a fleet that drops to login prompts while the credential
-// watchdog reports an expired login that no re-login can fix. Deduped like every
-// other arm, so a standing condition does not flood the log at the tick rate.
-func fixSharedCredentialGroupRead(path string, mode os.FileMode, ownerUID uint32, logger *slog.Logger) {
-	perm := mode.Perm()
-	if perm&sharedCredentialGroupRead == sharedCredentialGroupRead {
-		permWarnDedupe.clear(dedupeKey("chmod shared credential", path))
-		return
-	}
-	newPerm := perm | sharedCredentialGroupRead
-	if err := os.Chmod(path, newPerm); err != nil {
-		if warn, _ := permWarnDedupe.shouldWarn(dedupeKey("chmod shared credential", path), err.Error(), dedupeClass("chmod shared credential", err)); warn {
-			logger.Error("permissions watcher: shared CLI credential is not group-readable and could not be repaired; agents on this backend will drop to a login prompt even though the credential itself is fine",
-				"path", path,
-				"old_mode", perm.String(),
-				"want_mode", newPerm.String(),
-				"owner_uid", ownerUID,
-				"watcher_uid", os.Geteuid(),
-				"error", err,
-				"recovery", "chmod g+r "+path,
-				"note", "identical repeats logged at debug until this changes",
-			)
-		} else {
-			logger.Debug("permissions watcher: chmod shared credential failed",
-				"path", path,
-				"error", err,
-			)
-		}
-		return
-	}
-	permWarnDedupe.clear(dedupeKey("chmod shared credential", path))
-	logger.Info("permissions watcher: reopened shared CLI credential to the node group",
-		"path", path,
-		"old_mode", perm.String(),
-		"new_mode", newPerm.String(),
-		"owner_uid", ownerUID,
-	)
 }

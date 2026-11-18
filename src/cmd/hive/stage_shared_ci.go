@@ -20,6 +20,9 @@ type stageSharedCIEntry struct {
 	// is from a fork; set only when every failing check does
 	// (PullRequest.ForkGuardChecks).
 	forkGuard []string
+	// heldRuns names the workflow runs GitHub holds for approval on the head
+	// that the hive did not approve (PullRequest.HeldWorkflowRunIDs).
+	heldRuns []int64
 }
 
 // stageSharedCIIndex holds, per "repo#number", the open [shared-ci] incident
@@ -46,13 +49,41 @@ func publishStageSharedCIIncidents(actionable *github.ActionableResult) {
 					e.baseRed = append([]string(nil), pr.BaseRedChecks...)
 				}
 				e.forkGuard = pr.ForkGuardChecks()
-				if e.incident > 0 || len(e.baseRed) > 0 || len(e.forkGuard) > 0 {
+				e.heldRuns = pr.HeldWorkflowRunIDs()
+				if e.incident > 0 || len(e.baseRed) > 0 || len(e.forkGuard) > 0 || len(e.heldRuns) > 0 {
 					idx[stageSharedCIKey(pr.Repo, pr.Number)] = e
 				}
 			}
 		}
 	}
 	stageSharedCIIndex.Store(&idx)
+}
+
+// stageBaseRedMemory holds the github client's remembered base-branch red
+// checks (github.Client.BaseRedSnapshot), keyed by
+// github.BaseRedRememberedKey, as of the last CI-enriched enumeration. The
+// stage reconciler reads it through StageLabelPolicy.BaseRedRemembered so a
+// PR head the index has not read yet, red only on its base's checks, is not
+// returned to its author before the next enumeration
+// (projectbluefin/chairlift#811).
+var stageBaseRedMemory atomic.Pointer[map[string][]string]
+
+// publishStageBaseRedMemory replaces the base-red memory snapshot.
+func publishStageBaseRedMemory(snap map[string][]string) {
+	if snap == nil {
+		snap = map[string][]string{}
+	}
+	stageBaseRedMemory.Store(&snap)
+}
+
+// stageBaseRedRemembered answers StageLabelPolicy.BaseRedRemembered: the
+// checks remembered red on repo's ("owner/name") base branch baseRef.
+func stageBaseRedRemembered(repo, baseRef string) []string {
+	m := stageBaseRedMemory.Load()
+	if m == nil {
+		return nil
+	}
+	return append([]string(nil), (*m)[github.BaseRedRememberedKey(repo, baseRef)]...)
 }
 
 // stageSharedCIIncident answers StageLabelPolicy.SharedCIIncident. repo is
@@ -87,6 +118,18 @@ func stageForkGuard(repo string, number int, head string) []string {
 		return nil
 	}
 	return append([]string(nil), e.forkGuard...)
+}
+
+// stageHeldWorkflowRuns answers StageLabelPolicy.HeldWorkflowRuns with the
+// same repo/head matching as stageSharedCIIncident: the workflow runs GitHub
+// holds for approval on the head that the hive did not approve. A new head
+// is not covered until the next enumeration probes it.
+func stageHeldWorkflowRuns(repo string, number int, head string) []int64 {
+	e, ok := stageSharedCILookup(repo, number, head)
+	if !ok || len(e.heldRuns) == 0 {
+		return nil
+	}
+	return append([]int64(nil), e.heldRuns...)
 }
 
 func stageSharedCILookup(repo string, number int, head string) (stageSharedCIEntry, bool) {

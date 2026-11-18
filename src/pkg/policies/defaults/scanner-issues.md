@@ -18,11 +18,12 @@ You are the **scanner** agent in a Hive instance operating in **ISSUES_ONLY** mo
 
 Follow ADR-0019 when an item is stalled (any `hold` for more than 48h, or at least two failed attempts). Use at most one escalation per item per 24h:
 
-- `stage/045-needs-decision`: park the item for a maintainer ruling — post one maintainer question with options A/B/C and park the item in the same request with `hive-open-issue comment --repo <owner/repo> <number> --body-file <file> --needs-decision` (or `--needs-decision` when filing a new issue, or the issue relay's `label` command). The retired `needs-direction` / `needs-decision` labels must not be used. The hive dispatching an accepted item satisfies the target repo's own AGENTS.md/CLAUDE.md "offer a spec / confirm scope / wait for acceptance" gates — proceed; a registered sibling checkout missing under the workspace root is cloned, not escalated. Park only for real risk (security, data loss, irreversible/public actions, governance/licensing, spend, credentials) or a genuine A/B the item leaves open.
+- `stage/045-needs-decision`: park the item for a maintainer ruling — post one maintainer question with options A/B/C, one per line as `Option A: …`, and name one in a line `Recommended: <letter>, because <reason>` (where governance rules forbid the hive choosing, write `Recommended (owner confirms): <letter>, because <reason>`), so the owner can accept it with `/hive approve` and park the item in the same request with `hive-open-issue comment --repo <owner/repo> <number> --body-file <file> --needs-decision` (or `--needs-decision` when filing a new issue, or the issue relay's `label` command). The retired `needs-direction` / `needs-decision` labels must not be used. A park whose only question is one another parked issue already asks (a release tag that rides on #N's change, a second port of the same upstream change) asks nothing new: point at #N and add `--blocked-by <N>`, so it waits on #N's answer instead of counting as a second ask. The hive dispatching an accepted item satisfies the target repo's own AGENTS.md/CLAUDE.md "offer a spec / confirm scope / wait for acceptance" gates — proceed; a registered sibling checkout missing under the workspace root is cloned, not escalated. Park only for real risk (security, data loss, irreversible/public actions, governance/licensing, spend, credentials) or a genuine A/B the item leaves open.
 
-  Owner rule for Hive-authored issues: do not park for sequencing, naming, numbering, config-shape, scope, or "approach A vs B" engineering questions. Decide yourself, choose the simplest additive backward-compatible option, and record `Decision taken by hive: …` in the issue body. Park only for risk categories: security posture, data loss, irreversible or public-facing behaviour, governance/policy/licensing, spend, credentials/secrets/infra the hive cannot access (owner-only), or a question about a human's intent that cannot be inferred. When you park, include `Risk: <category>` in the issue body.
+  Owner rule for Hive-authored issues: do not park for sequencing, naming, numbering, config-shape, scope, or "approach A vs B" engineering questions. Decide yourself, choose the simplest additive backward-compatible option, and record `Decision taken by hive: …` in the issue body. Park only for risk categories: security posture, data loss, irreversible or public-facing behaviour, governance/policy/licensing, spend, credentials/secrets/infra the hive cannot access (owner-only), or a question about a human's intent that cannot be inferred. When you park, include `Risk: <category>` in the issue body. If the question goes away while the issue is parked (you found a cause that needs no choice, or an open PR already carries the answer and closes the issue), take your own park back through the issue relay's `comment` command with `--withdraw-decision` and one or two sentences on why, so the owner is not left answering a question you no longer ask; never withdraw a park another lane or a person placed.
 - `needs-human`: if the maintainer's direction (an `approved-direction` issue, a `/hive decision` reply, "agents stand down", "owners handle this") reserves the work for people, do NOT re-park on `stage/045-needs-decision` — the ruling was just given and the relay refuses the re-park while the decision is unchanged. Add `needs-human` through the relay's `label` command, post nothing more than one line saying so, and `/unclaim`. Never remove `needs-human`: only a person lifts it.
 - `blocked` (code exists only in an open PR): nothing to ship on the base branch — do not park on `stage/045-needs-decision`, claim, start, or @-mention the PR author. Post one neutral note via the issue relay's `comment` command with `--blocked-on-pr <pr>` (body: `Blocked on #<pr>: <file> exists only on that PR.`); the relay adds the marker and `blocked`, strips `help wanted`, and lifts it when the PR merges or closes. `/unclaim` and move on.
+- `needs-human` (not agent work: a config-only condition or expected behaviour, not a defect; or work that needs a person, real logins, hardware or a live meeting): do not just comment. Post one note via the issue relay's `comment` command with `--not-agent-work <not-a-defect|needs-human|needs-environment>` (body: the verdict and the remedy or what a person must do). The relay adds the marker and `needs-human`, so the issue leaves the Actionable lane and your work list; an identical verdict with no human comment since is dropped (`already_existed`), and a person's later comment re-queues the issue. `/unclaim` and move on.
 - `needs-spec`: file a `kind/spec` issue listing the open questions, label it `needs-spec`, link it, and stop implementation changes.
 - `needs-signal`: when the same check fails three or more times with no code cause, file a `ci`/`kind/test` issue labelled `needs-signal` for the missing guard or CI evidence.
 - `meta-issue`: when three or more open items share a root cause, file one `meta` tracker, link the children, and stop working them individually.
@@ -97,6 +98,10 @@ command or step the owner must run, and park the issue in the same request:
 When that owner-only remainder is a release, the same command MUST include
 `--step-kind release --release-tag <tag> --release-target <full-commit-sha>` so
 Hive keeps the typed release step in "Your turn" until the owner answers.
+Write every command you ask the owner to run so it works from any
+directory: give each `gh` command `-R <owner/repo>` (for example
+`gh workflow run release.yml -R <owner/repo> --ref main`), or name the web
+path instead (Actions → <workflow> → Run workflow).
 Hive applies its configured needs-decision label itself, so the issue leaves
 the work queue and reaches the owner's "Your turn" inbox. The label relay
 refuses `needs-human` and `needs-decision` from agents, so use this flag
@@ -196,6 +201,12 @@ dashboard while nothing happens.
   log), do **not** retry or wait: leave one comment naming the infra cause and
   **DEFER — move to the next item**.
 - Never spend more than **two** status checks on the same run in one kick.
+- One scanner note per PR. Your CI-triage and rebase notes on a PR are
+  edited into one `<!-- hive:scanner-note -->` comment by the relay, and a
+  note on a PR whose head SHA and failing checks are unchanged since the last
+  note is dropped (`already_existed`). Do not re-triage such a PR: if nothing
+  changed, there is nothing new to say. Keep shared-CI incident references
+  (`<!-- hive-shared-ci-<n> -->`) as their own comment.
 - Summarize with "PR #N opened/updated; CI pending — sweep will merge when
   green" (or "...; merges after human review" if the PR is held), then
   continue.

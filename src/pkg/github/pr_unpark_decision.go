@@ -17,17 +17,23 @@ import (
 )
 
 // tryUnparkPullRequest answers the newest eligible `/hive …` command on a PR
-// parked at stage/085-needs-decision (hivecommons/hive#13041). A PR is not
+// at stage/085-needs-decision or stage/070-fixing. A PR is not
 // an issue: there is no park label to clear and no "What to reply" notice,
 // because GitHub already gives a maintainer the two levers — an Approve
 // review merges the head, a changes-requested review sends it back. What
 // the sweep adds is the text path:
 //
-//   - `/hive decision <text>` on a hive-authored PR is a changes_requested
+//   - `/hive decision approve <rationale>` records approval for the head;
+//   - other `/hive decision <text>` on a hive-authored PR is a changes_requested
 //     review in comment form: the decision is recorded against the head and
 //     the review planner kicks the author agent with <text> verbatim;
-//   - `/hive decision` on a PR the hive did not open gets one reply naming
-//     the review-side equivalents, since the hive does not push to it;
+//   - a bare `/hive decision approve` on a PR the hive did not open is
+//     recorded for the head the same way: an approval routes nothing to
+//     the author, and on an owner's own PR GitHub refuses the Approve
+//     review it stands in for;
+//   - any other `/hive decision` on a PR the hive did not open gets one
+//     reply naming the review-side equivalents, since the hive does not
+//     push to it;
 //   - `/hive approve` on a hive-authored PR also lifts a `needs-human` the
 //     hive itself added and applies the reviewer hand-off transition
 //     (`reviewer-passed` on, `reviewer-handoff` off), mirroring the issue
@@ -40,12 +46,12 @@ import (
 // never weaker than the review it stands in for. Prose gets no reply.
 func (c *Client) tryUnparkPullRequest(ctx context.Context, displayRepo, owner, repo string, issue *gh.Issue, cutoff time.Time, opts IssueUnparkSweepOptions, result *IssueUnparkSweepResult) (bool, error) {
 	number := issue.GetNumber()
-	comments, err := c.listIssueComments(ctx, owner, repo, number)
+	comments, err := c.unparkComments(ctx, owner, repo, issue, time.Time{})
 	if err != nil {
 		return false, err
 	}
 	answered := c.answeredUnparkCommentIDs(comments)
-	candidate, command, err := c.eligibleUnparkCommand(ctx, owner, repo, comments, answered, cutoff, false)
+	candidate, command, err := c.eligibleUnparkCommand(ctx, owner, repo, comments, answered, cutoff, false, nil)
 	if err != nil {
 		return false, err
 	}
@@ -87,8 +93,9 @@ func (c *Client) tryUnparkPullRequest(ctx context.Context, displayRepo, owner, r
 			return true, nil
 		}
 	}
+	recordsDecision := command.Kind == unparkCommandDecision && head != "" && (selfAuthored || prDecisionModeFor(command) == prDecisionApprove)
 	switch {
-	case command.Kind == unparkCommandDecision && selfAuthored && head != "":
+	case recordsDecision:
 		mode := prDecisionModeFor(command)
 		req := review.HumanChangeRequest{
 			Repo:     owner + "/" + repo,
@@ -135,7 +142,7 @@ func (c *Client) tryUnparkPullRequest(ctx context.Context, displayRepo, owner, r
 	if err := c.postUnparkReply(ctx, owner, repo, number, candidate.GetID(), reply); err != nil {
 		return false, err
 	}
-	if command.Kind != unparkCommandDecision || !selfAuthored || head == "" {
+	if !recordsDecision {
 		result.Replies++
 	}
 	return true, nil
@@ -152,6 +159,34 @@ func isHiveSelfDecisionComment(body string) bool {
 	return delegatedecision.IsDelegatedComment(body)
 }
 
+// ReconcileSelfDecisionChangeRequests is the reconcile pass behind the
+// guard above (run at the start of every un-park sweep; idempotent, so
+// after the first pass it finds nothing): a changes_requested recorded from a `/hive decision`
+// comment the hive itself posted (the delegate's marker in the body, or
+// the hive's own login as actor) predates the guard and still blocks the
+// head it was meant to advance. It is dismissed with a log line naming the
+// PR and head; a store without Dismiss is left alone. Returns what came
+// off.
+func (c *Client) ReconcileSelfDecisionChangeRequests(store review.HumanChangeRequestStore) []review.HumanChangeRequest {
+	d, ok := store.(review.HumanChangeRequestDismisser)
+	if !ok || d == nil {
+		return nil
+	}
+	removed := d.Dismiss(func(r review.HumanChangeRequest) bool {
+		if r.Source != review.HumanChangeRequestSourceDecision || r.Kind == review.HumanChangeRequestKindApprove {
+			return false
+		}
+		return isHiveSelfDecisionComment(r.Body) || (c != nil && c.IsHiveAuthorLogin(r.Actor))
+	})
+	if c != nil && c.logger != nil {
+		for _, r := range removed {
+			c.logger.Info("dismissed self-inflicted changes_requested: source comment is hive's own /hive decision",
+				"repo", r.Repo, "number", r.Number, "head", r.HeadSHA, "actor", r.Actor, "comment_id", r.SourceID)
+		}
+	}
+	return removed
+}
+
 // prDecisionMode is what a `/hive decision` on a PR asks for.
 type prDecisionMode string
 
@@ -159,7 +194,7 @@ const (
 	// prDecisionChangesRequested: the decision carries an instruction; the
 	// PR goes to fixing and the author agent follows it verbatim.
 	prDecisionChangesRequested prDecisionMode = "changes_requested"
-	// prDecisionApprove: a bare `/hive decision approve`; the owner answered
+	// prDecisionApprove: `/hive decision approve` with optional rationale; the owner answered
 	// the swarm's question with "yes" and the merge path takes over.
 	prDecisionApprove prDecisionMode = "approve"
 )
@@ -172,7 +207,7 @@ func (m prDecisionMode) kind() string {
 }
 
 func prDecisionModeFor(cmd unparkCommand) prDecisionMode {
-	if cmd.BareApproval() {
+	if cmd.Approval() {
 		return prDecisionApprove
 	}
 	return prDecisionChangesRequested
@@ -423,6 +458,22 @@ func renderPRDecisionRecordedReply(actor, head string) string {
 		prDecisionHeadMarkerLine(head, prDecisionChangesRequested), actor, prHeadRef(head))
 }
 
+// renderPRDecisionToContributorHiveReply is the reply for a direction
+// recorded on a contributor's clanker PR: the fix is the contributor's
+// hive's to push, not the hive's own author agent's (hivecommons/hive#15159).
+func renderPRDecisionToContributorHiveReply(actor, head, author, decision string) string {
+	who := "the contributor's hive"
+	if a := strings.TrimPrefix(strings.TrimSpace(author), "@"); a != "" {
+		who = "@" + a + "'s hive"
+	}
+	body := fmt.Sprintf("%s\nDirection recorded by @%s for %s. This PR was opened by %s, so the hive treats it as a *changes requested* review on that head: the PR is returned to the contributor and %s is nudged with the instruction below verbatim. When a new head is pushed the review swarm re-reviews it; if it approves, the PR comes back for your merge approval.",
+		prDecisionHeadMarkerLine(head, prDecisionChangesRequested), actor, prHeadRef(head), who, who)
+	if d := strings.TrimSpace(decision); d != "" {
+		body += "\n\n> " + strings.ReplaceAll(d, "\n", "\n> ")
+	}
+	return body
+}
+
 func renderPRDecisionApprovedReply(actor, head string) string {
 	return fmt.Sprintf("%s\nApproval recorded by @%s for %s. The hive is treating it as your answer to the review swarm's question: nothing is sent back to the author, and the PR follows the merge path on the next pass (merged when the merge gates pass, or handed to you at the ready-for-merge stage where a person has to press the button).",
 		prDecisionHeadMarkerLine(head, prDecisionApprove), actor, prHeadRef(head))
@@ -433,7 +484,7 @@ func renderPRDecisionNoHeadReply() string {
 }
 
 func renderPRDecisionNotHiveAuthoredReply(head string) string {
-	return fmt.Sprintf("`/hive decision` routes a fix to the hive's own author agent, and the hive did not open this PR, so it will not push to it. The PR-side equivalents are reviews: **Approve** %s to let it merge as-is, or leave a **changes requested** review and the author is nudged with your text. See <%s>.",
+	return fmt.Sprintf("`/hive decision <text>` routes a fix to the hive's own author agent, and the hive did not open this PR, so it will not push to it. Leave a **changes requested** review instead and the author is nudged with your text. To let it merge as-is, **Approve** %s or reply `/hive decision approve`. See <%s>.",
 		prHeadRef(head), maintainerCommandsDocURL)
 }
 
@@ -479,7 +530,7 @@ func (c *Client) releaseHiveNeedsHumanOnPR(ctx context.Context, owner, repo stri
 		return out, nil
 	}
 	if !labelPresent(labels, escalation.ReviewerPassedLabel) {
-		if _, _, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, number, []string{escalation.ReviewerPassedLabel}); err != nil {
+		if _, _, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, number, []string{escalation.ReviewerPassedLabel}); err != nil { // writeback:solicited trusted merger's /hive approve releases this PR's handoff.
 			return out, fmt.Errorf("adding %s to %s/%s#%d: %w", escalation.ReviewerPassedLabel, owner, repo, number, err)
 		}
 		c.recordWriteAudit(AuditActionHiveLabelApplied, hiveWriteMeta(),

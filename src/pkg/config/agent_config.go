@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	cruxconfig "github.com/hivecommons/hive/crux/config"
 )
 
 func sortedRuntimeNames() []string {
@@ -116,13 +118,23 @@ func SplitCadenceTargetKey(key string) (agent, repo string) {
 // legal config, and refusing to boot on it would turn a diagnostic into an
 // outage.
 func AgentSandboxGateWarnings(cfg *Config) []string {
+	return AgentSandboxGateReport(cfg).Warnings
+}
+
+// AgentSandboxGateReport is AgentSandboxGateWarnings plus the preflight
+// findings kept apart per runtime, so callers can attribute them to the agents
+// on that runtime without parsing strings. Warnings is the same flat list.
+func AgentSandboxGateReport(cfg *Config) SandboxGateReport {
 	if cfg == nil || !cfg.AgentSandbox.Enabled {
 		// The sandbox is off globally. That is the documented default and the
 		// posture the docs describe; it is not a misconfiguration.
-		return nil
+		return SandboxGateReport{}
 	}
 
-	var optedIn, noImage, noClaim, badRuntime []string
+	var noPullSecrets, badPullSecrets, hostnamePinned []string
+	var optedIn, noImage, noClaim, noGateway, noDigest, badRuntime []string
+	var openshellBlocks []SandboxOpenShellConfig
+	var substrateBlocks []SandboxSubstrateConfig
 	for name, a := range cfg.Agents {
 		if !a.SandboxEnabled(cfg.AgentSandbox) {
 			continue
@@ -131,17 +143,52 @@ func AgentSandboxGateWarnings(cfg *Config) []string {
 		if strings.TrimSpace(a.SandboxImage(cfg.AgentSandbox)) == "" {
 			noImage = append(noImage, name)
 		}
+		if a.SandboxRuntime(cfg.AgentSandbox) == SandboxRuntimeJob {
+			job := a.SandboxJob(cfg.AgentSandbox)
+			if _, pinned := job.NodeSelector["kubernetes.io/hostname"]; pinned {
+				hostnamePinned = append(hostnamePinned, name)
+			}
+			if err := ValidateImagePullSecrets(job.ImagePullSecrets); err != nil {
+				badPullSecrets = append(badPullSecrets, name)
+			} else if strings.TrimSpace(job.ServiceAccount) != "" && len(job.ImagePullSecrets) == 0 {
+				noPullSecrets = append(noPullSecrets, name)
+			}
+		}
 		switch rt := a.SandboxRuntime(cfg.AgentSandbox); {
 		case !ValidSandboxRuntimes[rt]:
 			badRuntime = append(badRuntime, name+"="+rt)
 		case rt == SandboxRuntimeJob && strings.TrimSpace(a.SandboxJob(cfg.AgentSandbox).WorkspaceClaim) == "":
 			noClaim = append(noClaim, name)
+		case rt == SandboxRuntimeOpenShell:
+			os := a.SandboxOpenShell(cfg.AgentSandbox)
+			if strings.TrimSpace(os.GatewayURL) == "" {
+				noGateway = append(noGateway, name)
+			}
+			if strings.TrimSpace(os.WorkspaceClaim) == "" {
+				noClaim = append(noClaim, name)
+			}
+			if strings.TrimSpace(os.GatewayURL) != "" {
+				openshellBlocks = append(openshellBlocks, os)
+			}
+		case rt == SandboxRuntimeSubstrate:
+			sb := a.SandboxSubstrate(cfg.AgentSandbox)
+			// Substrate refuses tag-only images; the agent image is usually a
+			// tag, so the substrate block must carry the digest-pinned one.
+			if !strings.Contains(sb.Image, "@sha256:") {
+				noDigest = append(noDigest, name)
+			}
+			substrateBlocks = append(substrateBlocks, sb)
 		}
 	}
 	sort.Strings(optedIn)
 	sort.Strings(noImage)
 	sort.Strings(noClaim)
+	sort.Strings(noGateway)
+	sort.Strings(noDigest)
 	sort.Strings(badRuntime)
+	sort.Strings(noPullSecrets)
+	sort.Strings(badPullSecrets)
+	sort.Strings(hostnamePinned)
 
 	var out []string
 	if len(optedIn) == 0 {
@@ -149,7 +196,7 @@ func AgentSandboxGateWarnings(cfg *Config) []string {
 			"agent_sandbox.enabled is true but NO agent is opted in, so the sandbox is inert and all %d agent(s) still run unconfined on the tmux path — "+
 				"the per-agent gate is separate: set `sandbox: {enabled: true}` on each agent that should be sandboxed (#4918)",
 			len(cfg.Agents)))
-		return out
+		return SandboxGateReport{Warnings: out}
 	}
 	if len(noImage) > 0 {
 		out = append(out, fmt.Sprintf(
@@ -165,16 +212,49 @@ func AgentSandboxGateWarnings(cfg *Config) []string {
 	}
 	if len(noClaim) > 0 {
 		out = append(out, fmt.Sprintf(
-			"agent(s) %s use the job sandbox runtime but resolve no job.workspace_claim; the Job has no way to see the workspace and every kick will fail — "+
-				"set agent_sandbox.job.workspace_claim (or the per-agent sandbox.job.workspace_claim) to the PVC hive's data lives on (#6311)",
+			"agent(s) %s use the job or openshell sandbox runtime but resolve no workspace_claim; the sandbox has no way to see the workspace and every kick will fail — "+
+				"set agent_sandbox.job.workspace_claim / agent_sandbox.openshell.workspace_claim (or the per-agent one) to the PVC hive's data lives on (#6311)",
 			strings.Join(noClaim, ", ")))
+	}
+	if len(badPullSecrets) > 0 {
+		out = append(out, fmt.Sprintf(
+			"agent(s) %s have an invalid sandbox.job.image_pull_secrets (names only, at most %d); sandboxed kicks will be refused (#18819)",
+			strings.Join(badPullSecrets, ", "), MaxJobImagePullSecrets))
+	}
+	if len(noPullSecrets) > 0 {
+		out = append(out, fmt.Sprintf(
+			"agent(s) %s run Jobs under sandbox.job.service_account with no sandbox.job.image_pull_secrets; hive reads that service account's imagePullSecrets only when its Role grants `get serviceaccounts`, and without it a private-registry sandbox image fails ImagePullBackOff (see the launcher warning) — set sandbox.job.image_pull_secrets to the registry Secret names (#18819)",
+			strings.Join(noPullSecrets, ", ")))
+	}
+	if len(hostnamePinned) > 0 {
+		out = append(out, fmt.Sprintf(
+			"agent(s) %s pin sandbox.job.node_selector kubernetes.io/hostname to a single node; if it is cordoned or down the Job may remain Pending until its deadline — consider node affinity instead (#18809)",
+			strings.Join(hostnamePinned, ", ")))
+	}
+	if len(noGateway) > 0 {
+		out = append(out, fmt.Sprintf(
+			"agent(s) %s use the openshell sandbox runtime but resolve no openshell.gateway_url; every kick will fail — "+
+				"set agent_sandbox.openshell.gateway_url (or the per-agent sandbox.openshell.gateway_url) to the OpenShell gateway's gRPC address (ADR-0026)",
+			strings.Join(noGateway, ", ")))
+	}
+	if len(noDigest) > 0 {
+		out = append(out, fmt.Sprintf(
+			"agent(s) %s use the substrate sandbox runtime but resolve no digest-pinned substrate.image; Substrate refuses tag-only images and every kick will fail — "+
+				"set agent_sandbox.substrate.image (or the per-agent sandbox.substrate.image) to the sandbox image's …@sha256:… reference (ADR-0026 phase 2)",
+			strings.Join(noDigest, ", ")))
 	}
 	if len(optedIn) < len(cfg.Agents) {
 		out = append(out, fmt.Sprintf(
 			"agent_sandbox.enabled is true but only %d of %d agent(s) are opted in (%s); the rest still run unconfined on the tmux path (#4918)",
 			len(optedIn), len(cfg.Agents), strings.Join(optedIn, ", ")))
 	}
-	return out
+	// Last, because it may reach the network (bounded and cached): the static
+	// warnings above must not wait on a gateway.
+	openshellWarnings := cruxconfig.OpenShellPreflightWarnings(openshellBlocks)
+	substrateWarnings := cruxconfig.SubstratePreflightWarnings(substrateBlocks)
+	out = append(out, openshellWarnings...)
+	out = append(out, substrateWarnings...)
+	return SandboxGateReport{Warnings: out, OpenShell: openshellWarnings, Substrate: substrateWarnings}
 }
 
 // CadenceIsOperatorOwned reports whether an operator explicitly set the

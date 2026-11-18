@@ -11,8 +11,10 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/hivecommons/hive/crux/egressmark"
 	"github.com/hivecommons/hive/pkg/imageref"
 )
 
@@ -218,6 +220,33 @@ func ImageReleaseChannel(image string) string {
 	return imageref.ReleaseChannel(image)
 }
 
+// upgradeChannelHint pairs the latest UpgradeTo with its UpgradeChannelTag so
+// UpgradeSelfToSHA only trusts the hint for the target it was sent with.
+type upgradeChannelHint struct {
+	target  string
+	channel string
+}
+
+var upgradeChannel atomic.Pointer[upgradeChannelHint]
+
+func setUpgradeChannelTag(target, channel string) {
+	upgradeChannel.Store(&upgradeChannelHint{target: target, channel: channel})
+}
+
+// upgradeChannelTagFor returns the release channel the hub said already
+// carries targetSHA, or "" when it said nothing (or said it about another
+// target).
+func upgradeChannelTagFor(targetSHA string) string {
+	h := upgradeChannel.Load()
+	if h == nil || h.channel == "" || targetSHA == "" || h.target != targetSHA {
+		return ""
+	}
+	if !imageref.IsReleaseChannel(h.channel) {
+		return ""
+	}
+	return h.channel
+}
+
 // UpgradeSelfToSHA moves this pod onto targetSHA and returns whether a restart
 // still has to be triggered by the caller.
 //
@@ -247,13 +276,22 @@ func UpgradeSelfToSHA(logger *slog.Logger, targetSHA string) (needsRestart bool,
 			"error", err)
 		return true, nil
 	}
+	if channel := upgradeChannelTagFor(targetSHA); channel != "" {
+		if handled, needsRestart, err := upgradeSelfOnChannelTag(logger, current, channel, targetSHA); handled {
+			return needsRestart, err
+		}
+	}
 	if imageTagIsMutable(current) {
 		// Release-channel spokes may be instructed to a newer immutable per-SHA
 		// image before the floating channel tag has caught up. A restart of the
 		// channel tag would just pull the old digest again, so patch the image to
 		// the exact published SHA tag. The hub keeps the selected channel in its
 		// hive record, so later channel moves still target this spoke as a channel
-		// follower even while the Deployment is temporarily on a SHA tag.
+		// follower even while the Deployment is temporarily on a SHA tag. When
+		// the channel already carries the target the hub says so
+		// (UpgradeChannelTag) and upgradeSelfOnChannelTag above rolls once on
+		// the channel tag instead; reaching here means the channel lags, or the
+		// hub is too old to say (#17978).
 		if ImageReleaseChannel(current) != "" && imageTagSHAPattern.MatchString(targetSHA) {
 			idx := strings.LastIndex(current, ":")
 			if idx >= 0 {
@@ -289,6 +327,45 @@ func UpgradeSelfToSHA(logger *slog.Logger, targetSHA string) (needsRestart bool,
 	// SwitchImageSelf's patch changes the pod template, which rolls the
 	// deployment on its own — a restart on top would be redundant.
 	return false, nil
+}
+
+// upgradeSelfOnChannelTag is the single-roll path for a release-channel
+// follower whose channel tag the hub says already carries targetSHA (#17978).
+// Pinning to the SHA tag there (the #10719 path) bought nothing — the channel
+// tag pulls the same build or newer — and cost a second roll, because the hub
+// reads a SHA tag on a channel follower as drift and switches it back.
+//
+//   - On the channel tag: annotate the pod template (upgradeSelfMutableToSHA),
+//     one roll, image unchanged.
+//   - On a SHA tag left by an earlier upgrade the channel lagged: switch the
+//     image back to the channel tag. That one roll both lands the target and
+//     restores tracking, so returning to the channel never costs its own roll.
+//
+// Anything else (another channel mid-switch, a branch tag, a digest) is not
+// handled here and falls through to the existing logic.
+func upgradeSelfOnChannelTag(logger *slog.Logger, current, channel, targetSHA string) (handled, needsRestart bool, err error) {
+	if strings.Contains(current, "@") {
+		return false, false, nil
+	}
+	idx := strings.LastIndex(current, ":")
+	if idx < 0 || strings.Contains(current[idx+1:], "/") {
+		return false, false, nil
+	}
+	tag := current[idx+1:]
+	switch {
+	case tag == channel:
+		needsRestart, err = upgradeSelfMutableToSHA(logger, current, targetSHA)
+		return true, needsRestart, err
+	case imageTagSHAPattern.MatchString(tag):
+		newImage := current[:idx+1] + channel
+		logger.Info("returning a release-channel follower to its channel tag, which carries the upgrade target",
+			"from", current, "to", newImage, "target", targetSHA)
+		if err := SwitchImageSelf(logger, newImage); err != nil {
+			return true, false, fmt.Errorf("patching image back to release channel %s: %w", newImage, err)
+		}
+		return true, false, nil
+	}
+	return false, false, nil
 }
 
 // selfUpgradeTargetAnnotation records, on the pod template, which SHA the hub
@@ -674,6 +751,20 @@ func RestartFallbackForPatchFailure(logger *slog.Logger, patchErr error) Restart
 }
 
 func k8sAPIPatchOnce(path string, body []byte) error {
+	return k8sAPIPatchOnceWithContentType(path, body, strategicMergePatchContentType)
+}
+
+// strategicMergePatchContentType is the default PATCH content type.
+const strategicMergePatchContentType = "application/strategic-merge-patch+json"
+
+// k8sAPIPatchWithContentType is k8sAPIPatch for a caller that needs a patch
+// type other than strategic merge (an RFC 6902 JSON patch, for example).
+func k8sAPIPatchWithContentType(path string, body []byte, contentType string) error {
+	return patchWithRetry(selfUpgradePatchAttempts, selfUpgradePatchRetryBackoff, selfUpgradePatchSleep,
+		func() error { return k8sAPIPatchOnceWithContentType(path, body, contentType) })
+}
+
+func k8sAPIPatchOnceWithContentType(path string, body []byte, contentType string) error {
 	token, err := os.ReadFile(k8sTokenPath)
 	if err != nil {
 		return fmt.Errorf("reading service account token: %w", err)
@@ -686,7 +777,7 @@ func k8sAPIPatchOnce(path string, body []byte) error {
 
 	client := &http.Client{
 		Timeout:   selfUpgradePatchTimeout,
-		Transport: &http.Transport{TLSClientConfig: tlsConfig},
+		Transport: &http.Transport{TLSClientConfig: tlsConfig, DialContext: egressmark.Dialer(0).DialContext},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), selfUpgradePatchTimeout)
@@ -697,7 +788,7 @@ func k8sAPIPatchOnce(path string, body []byte) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
-	req.Header.Set("Content-Type", "application/strategic-merge-patch+json")
+	req.Header.Set("Content-Type", contentType)
 
 	resp, err := client.Do(req)
 	if err != nil {

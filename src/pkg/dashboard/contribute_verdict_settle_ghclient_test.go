@@ -35,6 +35,8 @@ type settleGHFixture struct {
 	existingComments []string
 	commentsListErr  bool
 	issueLabels      []string
+	labelsRemoved    []string
+	issueEvents      []map[string]any
 }
 
 func (f *settleGHFixture) server(t *testing.T) *httptest.Server {
@@ -92,6 +94,12 @@ func (f *settleGHFixture) server(t *testing.T) *httptest.Server {
 				"user":   map[string]any{"login": "hive-bot", "type": "Bot"},
 				"labels": labels,
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/7/events":
+			events := f.issueEvents
+			if events == nil {
+				events = []map[string]any{}
+			}
+			_ = json.NewEncoder(w).Encode(events)
 		case r.Method == http.MethodPatch && r.URL.Path == "/repos/o/r/issues/7":
 			var payload struct {
 				State       string `json:"state"`
@@ -104,6 +112,15 @@ func (f *settleGHFixture) server(t *testing.T) *httptest.Server {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": "closed"})
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/o/r/issues/7/labels/"):
+			name := strings.TrimPrefix(r.URL.Path, "/repos/o/r/issues/7/labels/")
+			for i, l := range f.issueLabels {
+				if strings.EqualFold(l, name) {
+					f.issueLabels = append(f.issueLabels[:i], f.issueLabels[i+1:]...)
+					f.labelsRemoved = append(f.labelsRemoved, name)
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+					return
+				}
+			}
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Not Found"})
 		default:
@@ -387,7 +404,7 @@ func TestVerdictSettleGH_UnverifiedAlreadyDone_ExistingCommentIsNotReposted(t *t
 	fx := &settleGHFixture{}
 	hub, _ := settleGHHub(t, fx)
 
-	hub.markAlreadyDoneUnverified("o/r", 7, "ct", "already fixed upstream", nil)
+	hub.markAlreadyDoneUnverified("o/r", 7, "ct", "already fixed upstream", nil, time.Time{})
 	fx.mu.Lock()
 	if len(fx.comments) != 1 {
 		fx.mu.Unlock()
@@ -397,7 +414,7 @@ func TestVerdictSettleGH_UnverifiedAlreadyDone_ExistingCommentIsNotReposted(t *t
 	fx.comments = nil
 	fx.mu.Unlock()
 
-	hub.markAlreadyDoneUnverified("o/r", 7, "ct", "already fixed upstream", nil)
+	hub.markAlreadyDoneUnverified("o/r", 7, "ct", "already fixed upstream", nil, time.Time{})
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
 	if len(fx.comments) != 0 {
@@ -519,5 +536,84 @@ func TestVerdictSettleGH_ContextCancelledDuringVerifyIsUnverified(t *testing.T) 
 	}
 	if got := hub.settleIssueFromVerdictWithEvidence("o/r", 7, "see PR #41", "", nil, time.Now(), "ct"); got != "" {
 		t.Fatalf("non-already-done disposition = %q, want empty", got)
+	}
+}
+
+// projectbluefin/testsuite#1023: a verified already-done takes an earlier
+// hive/verified-open off, so the issue never wears both verdicts.
+func TestVerdictSettleGH_MarkAlreadyDone_RemovesVerifiedOpen(t *testing.T) {
+	fx := &settleGHFixture{issueLabels: []string{"kind/bug", ghpkg.VerifiedOpenLabel}}
+	hub, _ := settleGHHub(t, fx)
+	claim := ghpkg.IssueClaim{PRNumber: 41, PRURL: "https://github.com/o/r/pull/41", MergedPR: true}
+	if err := hub.markAlreadyDoneIssue(context.Background(), "o/r", 7, claim, "danathar", false); err != nil {
+		t.Fatalf("markAlreadyDoneIssue: %v", err)
+	}
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if len(fx.labelsRemoved) != 1 || fx.labelsRemoved[0] != ghpkg.VerifiedOpenLabel {
+		t.Fatalf("labels removed = %v, want hive/verified-open", fx.labelsRemoved)
+	}
+}
+
+// projectbluefin/utah-packages#1175: the relay labelled the issue
+// hive/already-done on "already resolved" alone, then the hub commented "not
+// labelled" and left the label on. The unverified path now takes off a label
+// the hive added since dispatch, and keeps one a person added or one the hive
+// added before this task.
+func TestVerdictSettleGH_UnverifiedAlreadyDoneRemovesTheRelayLabel(t *testing.T) {
+	dispatched := time.Now().Add(-3 * time.Minute)
+	labeled := func(actor string, at time.Time) map[string]any {
+		return map[string]any{
+			"id": 1, "event": "labeled", "created_at": at.UTC().Format(time.RFC3339),
+			"actor": map[string]any{"login": actor},
+			"label": map[string]any{"name": "hive/already-done"},
+		}
+	}
+	for _, tc := range []struct {
+		name        string
+		events      []map[string]any
+		wantRemoved bool
+	}{
+		{name: "hive App label after dispatch is removed", events: []map[string]any{labeled("hive-app[bot]", dispatched.Add(time.Minute))}, wantRemoved: true},
+		{name: "a person's label stays", events: []map[string]any{labeled("maintainer", dispatched.Add(time.Minute))}},
+		{name: "hive label from before this task stays", events: []map[string]any{labeled("hive-app[bot]", dispatched.Add(-time.Hour))}},
+		{name: "a person relabelled after the hive", events: []map[string]any{labeled("hive-app[bot]", dispatched.Add(time.Minute)), labeled("maintainer", dispatched.Add(2*time.Minute))}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := &settleGHFixture{issueLabels: []string{"kind/bug", "hive/already-done"}, issueEvents: tc.events}
+			hub, s := settleGHHub(t, fx)
+			s.deps.GHClient.SetAppBotLogin("hive-app[bot]")
+
+			got := hub.settleIssueFromVerdictWithEvidence("o/r", 7, "external mirror outage already resolved (HTTP 200)", "already_done", nil, dispatched, "kylerankin")
+			if got != verdictDispositionAlreadyDoneUnverified {
+				t.Fatalf("disposition = %q, want unverified", got)
+			}
+			fx.mu.Lock()
+			defer fx.mu.Unlock()
+			removed := len(fx.labelsRemoved) == 1 && fx.labelsRemoved[0] == "hive/already-done"
+			if removed != tc.wantRemoved {
+				t.Fatalf("labelsRemoved = %v, want removed=%v", fx.labelsRemoved, tc.wantRemoved)
+			}
+			if len(fx.comments) != 1 || !strings.Contains(fx.comments[0], "not labelled `hive/already-done`") {
+				t.Fatalf("comments = %v, want the unverified comment", fx.comments)
+			}
+			if len(fx.labelsAdded) != 0 {
+				t.Fatalf("unverified claim must not label: %v", fx.labelsAdded)
+			}
+		})
+	}
+}
+
+// Without a dispatch time the hub cannot tell this task's label from an older
+// one, so it reads nothing and removes nothing.
+func TestVerdictSettleGH_UnverifiedAlreadyDoneWithoutDispatchTimeKeepsLabel(t *testing.T) {
+	fx := &settleGHFixture{issueLabels: []string{"hive/already-done"}}
+	hub, s := settleGHHub(t, fx)
+	s.deps.GHClient.SetAppBotLogin("hive-app[bot]")
+	hub.markAlreadyDoneUnverified("o/r", 7, "ct", "already fixed upstream", nil, time.Time{})
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if len(fx.labelsRemoved) != 0 {
+		t.Fatalf("labelsRemoved = %v, want none", fx.labelsRemoved)
 	}
 }

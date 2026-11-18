@@ -302,6 +302,34 @@ func TestClientErrors(t *testing.T) {
 	}
 }
 
+func TestClientFollowLogsLinesSendsN(t *testing.T) {
+	f := &fakeServer{}
+	c := startUnix(t, f, "")
+	ctx := context.Background()
+	noop := func(LogChunk) error { return nil }
+
+	// A non-negative count is sent as n, including 0 (follow only new
+	// lines); a negative count leaves the server's replay window.
+	for _, lines := range []int{5, 0, -1} {
+		if err := c.FollowLogsLines(ctx, "fixer", lines, noop); err != nil {
+			t.Fatalf("lines %d: %v", lines, err)
+		}
+	}
+	if err := c.FollowLogs(ctx, "fixer", noop); err != nil {
+		t.Fatal(err)
+	}
+	logs := LogsPath("fixer")
+	want := []string{
+		"GET " + logs + "?" + QueryFollow + "=1&" + QueryLines + "=5",
+		"GET " + logs + "?" + QueryFollow + "=1&" + QueryLines + "=0",
+		"GET " + logs + "?" + QueryFollow + "=1",
+		"GET " + logs + "?" + QueryFollow + "=1",
+	}
+	if got := strings.Join(f.seen(), "\n"); got != strings.Join(want, "\n") {
+		t.Fatalf("requests:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+	}
+}
+
 func TestClientStreams(t *testing.T) {
 	f := &fakeServer{}
 	c := startUnix(t, f, "")
@@ -482,5 +510,84 @@ func TestClientStatusTracksReachability(t *testing.T) {
 	}
 	if st := c.Status(); !st.Reachable || st.LastSuccess.IsZero() || st.LastError != "" {
 		t.Fatalf("status after success = %+v", st)
+	}
+}
+
+// A 503 health body carries error/code alongside the health fields, so the
+// client names the cause (the supervisor's WaitReady logs this error).
+func TestClientHealthUnavailableNamesCause(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", ContentTypeJSON)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(Health{
+			Version: Version,
+			Error:   "tmux not found on PATH: exec: \"tmux\": executable file not found in $PATH",
+			Code:    CodeUnavailable,
+		})
+	}))
+	t.Cleanup(srv.Close)
+	c, err := NewClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Health(context.Background())
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != http.StatusServiceUnavailable || se.Body.Code != CodeUnavailable {
+		t.Fatalf("status error: %+v (%v)", se, err)
+	}
+	if !strings.Contains(err.Error(), "tmux not found on PATH") {
+		t.Fatalf("error does not name tmux: %v", err)
+	}
+	// WaitReady returns the 503 unavailable verdict at once.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.WaitReady(ctx, time.Millisecond); !IsUnavailable(err) {
+		t.Fatalf("wait ready: %v", err)
+	}
+}
+
+// WaitReady returns promptly on a 503 unavailable verdict and names its cause.
+func TestWaitReadyUnavailableReturnsPromptly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", ContentTypeJSON)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"tmux not found on PATH: x","code":"unavailable"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c, err := NewClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = c.WaitReady(ctx, time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "tmux not found on PATH") {
+		t.Fatalf("wait ready: %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("wait ready took %v", time.Since(start))
+	}
+}
+
+// A health route that keeps failing is polled until ctx ends, and the final
+// error carries the last answer next to the deadline.
+func TestWaitReadyDeadlineNamesLastAnswer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := NewClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = c.WaitReady(ctx, 5*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait ready: %v", err)
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Fatalf("error does not name the last status: %v", err)
 	}
 }

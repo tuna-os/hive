@@ -8,8 +8,8 @@ import (
 )
 
 // Upgrade progress states. One scheduled upgrade walks
-// scheduled → draining → pulling → rolling → verifying → done, or ends in
-// missed. The hub derives the state from its registry latch plus the spoke's
+// scheduled (or delayed) → draining → pulling → rolling → verifying → done,
+// or ends in missed. The hub derives the state from its registry latch plus the spoke's
 // heartbeat; the spoke derives the same vocabulary from what it knows locally
 // (its drain latch, upgrade marker and the hub's policy), so both dashboards
 // speak the same words about the same upgrade.
@@ -17,6 +17,8 @@ const (
 	// UpgradeStateScheduled — nothing in flight; NextWindowAt says when the
 	// hub will next consider this hive (or "instant"/"next poll").
 	UpgradeStateScheduled = "scheduled"
+	// UpgradeStateDelayed — a scheduled upgrade is waiting for a gate to clear.
+	UpgradeStateDelayed = "delayed"
 	// UpgradeStateDraining — the spoke received the instruction and is
 	// waiting for in-flight agent turns before it restarts.
 	UpgradeStateDraining = "draining"
@@ -34,14 +36,38 @@ const (
 	UpgradeStateDone = "done"
 	// UpgradeStateMissed — the most recent attempt or window did not land;
 	// Reason says why (drain lapsed, hub restarted, unreachable, image pull
-	// failed, held by the schedule gate, …).
+	// failed, …). Temporary schedule holds are delayed, not missed.
 	UpgradeStateMissed = "missed"
+)
+
+// Upgrade phases qualify an in-flight state for rolls the spoke did not run
+// itself (hivecommons/hive#15788): a hub-managed kubectl roll, an operator's
+// `kubectl rollout restart`, a plain SIGTERM. Both render through the same
+// spoke/hub state machine as a self-upgrade.
+const (
+	// UpgradePhaseAnnounced — someone said a roll is coming (POST
+	// /api/upgrade/announce or the heartbeat's upgrade_announce); the pod
+	// has not been killed yet.
+	UpgradePhaseAnnounced = "announced"
+	// UpgradePhaseRestarting — the process received SIGTERM and is exiting;
+	// the dashboard should expect the stream to drop and reconnect.
+	UpgradePhaseRestarting = "restarting"
+)
+
+// Upgrade announce sources recorded in UpgradeProgress.Source.
+const (
+	UpgradeSourceHub      = "hub"
+	UpgradeSourceOperator = "operator"
+	// UpgradeSourceSignal — nobody announced; the SIGTERM itself is the
+	// first the spoke heard of the roll.
+	UpgradeSourceSignal = "signal"
 )
 
 // Upgrade attempt outcomes recorded in UpgradeAttempt.Outcome.
 const (
-	UpgradeOutcomeDone   = "done"
-	UpgradeOutcomeMissed = "missed"
+	UpgradeOutcomeDone    = "done"
+	UpgradeOutcomeMissed  = "missed"
+	UpgradeOutcomeDelayed = "delayed"
 )
 
 // Upgrade attempt triggers recorded in UpgradeAttempt.Trigger.
@@ -100,12 +126,30 @@ type UpgradeProgress struct {
 	// hive's agent count so the UI can say "2/5 agents in turn".
 	AgentsInTurn []UpgradeTurn `json:"agentsInTurn,omitempty"`
 	AgentsTotal  int           `json:"agentsTotal,omitempty"`
-	// Reason explains a missed state, or qualifies an in-flight one.
+	// Reason explains a delayed/missed state, or qualifies an in-flight one.
 	Reason string `json:"reason,omitempty"`
 	// Detail is the one-line human summary the pill shows.
 	Detail string `json:"detail"`
 	// EndedAt is when a done/missed attempt closed (RFC3339 UTC).
 	EndedAt string `json:"endedAt,omitempty"`
+	// Phase qualifies an in-flight roll the spoke did not run itself:
+	// UpgradePhaseAnnounced or UpgradePhaseRestarting (#15788). Empty for
+	// the self-upgrade path, whose State alone says enough.
+	Phase string `json:"phase,omitempty"`
+	// Source says who announced the roll Phase describes: hub, operator or
+	// signal. Empty when Phase is.
+	Source string `json:"source,omitempty"`
+}
+
+// UpgradeAnnounce is a roll intent delivered to a spoke before the kill —
+// by the hub in the heartbeat response or by an operator through POST
+// /api/upgrade/announce (#15788). Target may be a commit SHA or a version
+// tag; empty means "a restart, onto whatever the Deployment now says".
+type UpgradeAnnounce struct {
+	Target string `json:"target,omitempty"`
+	// Source is UpgradeSourceHub or UpgradeSourceOperator.
+	Source string `json:"source,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // InFlight reports whether the state describes an attempt still under way.

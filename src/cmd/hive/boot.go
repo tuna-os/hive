@@ -10,6 +10,7 @@ import (
 
 	"github.com/hivecommons/hive/crux"
 	"github.com/hivecommons/hive/crux/proxy"
+	cruxruntime "github.com/hivecommons/hive/crux/runtime"
 	"github.com/hivecommons/hive/crux/toolapprove"
 	"github.com/hivecommons/hive/crux/trajectory"
 	"github.com/hivecommons/hive/crux/watchdog"
@@ -29,15 +30,23 @@ import (
 	"github.com/hivecommons/hive/pkg/github/automerge"
 	"github.com/hivecommons/hive/pkg/governor"
 	"github.com/hivecommons/hive/pkg/hub/spoke"
+	"github.com/hivecommons/hive/pkg/inbox"
 	"github.com/hivecommons/hive/pkg/knowledge"
 	"github.com/hivecommons/hive/pkg/knowledge/connector"
+	"github.com/hivecommons/hive/pkg/mailallow"
+	"github.com/hivecommons/hive/pkg/meetings"
+	"github.com/hivecommons/hive/pkg/meetings/live"
+	"github.com/hivecommons/hive/pkg/meetings/schedule"
 	"github.com/hivecommons/hive/pkg/mention"
 	"github.com/hivecommons/hive/pkg/mergelane"
 	"github.com/hivecommons/hive/pkg/notify"
+	"github.com/hivecommons/hive/pkg/perspsrc"
 	"github.com/hivecommons/hive/pkg/planning"
 	"github.com/hivecommons/hive/pkg/priorart"
 	"github.com/hivecommons/hive/pkg/promptsrc"
 	"github.com/hivecommons/hive/pkg/questionclose"
+	"github.com/hivecommons/hive/pkg/releasefeed"
+	"github.com/hivecommons/hive/pkg/repoagents"
 	"github.com/hivecommons/hive/pkg/retro"
 	"github.com/hivecommons/hive/pkg/review/eventdispatch"
 	"github.com/hivecommons/hive/pkg/rotation"
@@ -46,6 +55,7 @@ import (
 	"github.com/hivecommons/hive/pkg/snapshot"
 	"github.com/hivecommons/hive/pkg/startrec"
 	"github.com/hivecommons/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // boot is the state main() used to keep in ~40 local variables, made explicit
@@ -79,7 +89,31 @@ type boot struct {
 	// the governor loop's tick bodies that read cfg. Without it, a reload
 	// racing the fast agent-status tick crashed the process with "concurrent
 	// map read and map write" in buildConfiguredAgents.
+	//
+	// The governor loop holds it for a whole tick, so the watcher callback
+	// never waits for it: submitConfigReload parks the reload in
+	// pendingReload and the holder applies it at its next safe point via
+	// lockCfg/unlockCfg (hivecommons/hive#17467).
 	cfgReloadMu sync.Mutex
+	// reloadApply swaps a reloaded config into cfg and re-syncs the
+	// subsystems that cache it. Caller holds cfgReloadMu; it returns the
+	// ACMM level transition to fire once the lock is released.
+	reloadApply func(*config.Config) (prevACMMLevel, nextACMMLevel int)
+	// pendingACMM holds ACMM transitions applied under cfgReloadMu that
+	// unlockCfg fires after releasing it; guarded by cfgReloadMu.
+	pendingACMM [][2]int
+	// pendingReloadMu guards pendingReload, the newest reload the watcher
+	// delivered that has not been applied yet, and parkedSaveSeq, the
+	// config.SaveSeq() seen when the oldest of those reloads was parked.
+	pendingReloadMu sync.Mutex
+	pendingReload   *config.Config
+	parkedSaveSeq   uint64
+	// configSaveSeq and saveConfig default to config.SaveSeq and cfg.Save;
+	// tests replace them.
+	configSaveSeq func() uint64
+	saveConfig    func() error
+	// sweepConfig is an immutable copy published outside long-running eval IO.
+	sweepConfig atomic.Pointer[config.Config]
 
 	// ghClientLive is the GitHub client provider that long-lived consumers
 	// (collectors, the scheduler's triage commenter) read on every use, and
@@ -101,24 +135,31 @@ type boot struct {
 	// rebuilt client after that; forgeStateOnce guards the build. Held in
 	// an atomic because the dashboard's count wiring reads it late, from
 	// the metrics collector goroutine (#13376).
-	forgeState     atomic.Pointer[forgestate.Store]
-	forgeStateOnce sync.Once
-	requestRelays  *requestRelaySupervisor
+	forgeState                        atomic.Pointer[forgestate.Store]
+	forgeStateOnce                    sync.Once
+	requestRelays                     *requestRelaySupervisor
+	integrationEligibility            automerge.IntegrationEligibilityGate
+	integrationPreparationEligibility automerge.IntegrationEligibilityGate
 
 	// bootConfig
 	startTime time.Time
 	// startID ties hive log lines to this start; startRecord is the start
 	// record (#11945), nil when none could be written.
-	startID                       string
-	startRecord                   *startrec.Recorder
-	configPath                    string
-	logger                        *slog.Logger
-	cfg                           *config.Config
-	ctx                           context.Context
-	preShutdownHooks              shutdownHooks
-	ghAuth                        githubAuth
-	ghClient                      *github.Client
-	appAuth                       *github.AppAuth
+	startID          string
+	startRecord      *startrec.Recorder
+	configPath       string
+	logger           *slog.Logger
+	cfg              *config.Config
+	ctx              context.Context
+	preShutdownHooks shutdownHooks
+	ghAuth           githubAuth
+	ghClient         *github.Client
+	appAuth          *github.AppAuth
+	// userSessions is the one Sessions runtime behind /api/sessions; the
+	// dashboard dependencies are rebuilt, the runtime (and its workspace
+	// lock) is not. See userSessionRuntime.
+	userSessions                  *cruxruntime.UserSessions
+	ciFailureKicker               *ciFailureKicker
 	gov                           *governor.Governor
 	sched                         *scheduler.Scheduler
 	notifier                      *notify.Notifier
@@ -132,6 +173,8 @@ type boot struct {
 	dashChat                      *dashchat.Bot
 	issueClaims                   *claims.Ledger
 	dashSrv                       *dashboard.Server
+	writeback                     *writeback.Gate
+	writebackOnce                 sync.Once
 	beadStores                    map[string]*beads.Store
 	beadStoreLoadFailures         int
 	tokenCollector                *tokens.Collector
@@ -146,7 +189,6 @@ type boot struct {
 	knowledgeAPI                  *knowledge.KnowledgeAPI
 	beadSynth                     *knowledge.BeadSynthesizer
 	nousState                     *dashboard.NousState
-	inceptionEngine               *knowledge.InceptionEngine
 	rotationMgr                   *rotation.Manager
 	questionAutoclose             atomic.Pointer[questionclose.Manager]
 	wd                            *watchdog.Reconciler
@@ -181,6 +223,8 @@ type boot struct {
 	promptFetcher              promptsrc.Fetcher
 	defFetcher                 defsrc.Fetcher
 	definitionResolver         *defsrc.Resolver
+	repoAgents                 *repoagents.Discoverer // #18491; nil without a GitHub client
+	perspectivesResolver       *perspsrc.Resolver
 	pendingTokenSeed           []dashboard.TokenSparklineEntry
 	pendingFactSeed            []dashboard.FactHistoryEntry
 	pendingCostSeed            []dashboard.CostHistoryEntry
@@ -205,13 +249,19 @@ type boot struct {
 	saved *snapshot.PersistedState
 
 	// bootKnowledge
-	gitSyncer            *knowledge.GitSyncer
-	knowledgeConnectors  *connector.Syncer
-	knowledgePublish     *connector.Mirror
-	promotionScheduler   *knowledge.PromotionScheduler
-	quotaAccount         string
-	quotaPoolDir         string
-	explicitQuotaPoolDir bool
+	gitSyncer           *knowledge.GitSyncer
+	knowledgeConnectors *connector.Syncer
+	// knowledgeConnectorsMu guards knowledgeConnectors once the dashboard
+	// can hot-load it (#18091); startConnectorSyncer is the boot starter
+	// reused for a syncer first built after boot.
+	knowledgeConnectorsMu sync.Mutex
+	startConnectorSyncer  func(ctx context.Context, s *connector.Syncer)
+	inboxSvc              *inbox.Service
+	knowledgePublish      *connector.Mirror
+	promotionScheduler    *knowledge.PromotionScheduler
+	quotaAccount          string
+	quotaPoolDir          string
+	explicitQuotaPoolDir  bool
 	// knowledgeAPIFallback records that knowledgeAPI is the file-only API
 	// bootKnowledge auto-enables when knowledge.enabled is false, not one
 	// built from the configured layers/engine/curator (#9231).
@@ -229,6 +279,14 @@ type boot struct {
 
 	// bootProxy
 	githubProxy *proxy.GitHubProxy
+	// referenceRepos keeps the derived reference-repo state between the
+	// boot pass, config reloads and the periodic re-derive
+	// (hivecommons/hive#18159); nil until wireReferenceRepos ran.
+	referenceRepos *referenceRepoRuntime
+	// ownerIdentity is the hive owner's connected GitHub account that
+	// write-tier reference repos are written as (hivecommons/hive#18197);
+	// created with the proxy, shared with the dashboard's consent routes.
+	ownerIdentity *github.OwnerIdentityStore
 	// inferenceSink is the one per-agent inference usage ledger; the proxy
 	// records into it in-process and the hive callback's usage capability
 	// records into it for a sidecar runtime (#14138 stage 4).
@@ -244,31 +302,19 @@ type boot struct {
 	trajLane   *trajectory.Lane
 	replanLane *planning.ReplanLane
 	retroLane  *retro.Lane
+	// advisorDecisions is the knowledge-advisor decision store (#17211),
+	// written by the ranking decorator and read by the retro lane; opened
+	// once by knowledgeAdvisorDecisions.
+	advisorDecisions     *retro.AdvisorDecisionStore
+	advisorDecisionsOnce sync.Once
 
-	// runLoop
-	lastAutoMergeSweep     time.Time
-	lastTaskListSweep      time.Time
-	lastDuplicateSweep     time.Time
-	lastSupersessionSweep  time.Time
-	lastDuplicateFixSweep  time.Time
-	lastSharedCIRerunSweep time.Time
-	lastRedMainSweep       time.Time
-	// lastRevertSheriffSweep gates runRevertSheriffSweepIfDue (tuna-os pilot).
-	lastRevertSheriffSweep time.Time
-	lastBlockedIssuesSweep time.Time
-	lastIssueUnparkSweep   time.Time
-	lastClosedIssueSweep   time.Time
-	// lastClarityResumeSweep gates runClarityGateResumeSweepIfDue
-	// (hivecommons/hive#13588).
-	lastClarityResumeSweep time.Time
-	// lastPriorArtResumeSweep gates runPriorArtGateResumeSweepIfDue
-	// (hivecommons/hive#13575).
-	lastPriorArtResumeSweep time.Time
-	lastSentinelSweep       time.Time
-	lastGFISweep            time.Time
-	// lastLegacyFleetReportSweep gates runLegacyFleetReportSweepIfDue
-	// (hivecommons/hive#13470).
-	lastLegacyFleetReportSweep time.Time
+	// matrixIngestSt gates the incremental Matrix ingest pass (#16276),
+	// owned by its independent ticker goroutine.
+	matrixIngestSt      *matrixIngestState
+	matrixIngestStarted bool
+	// releaseFeed is the release-feed watcher (#18494), started once by
+	// startReleaseFeedWatcher.
+	releaseFeed *releasefeed.Watcher
 	// gfi is good-first-issue curation state (good_first_issue.*).
 	gfi *gfiState
 	// firstTimer is first-time contributor welcome state
@@ -308,6 +354,26 @@ type boot struct {
 	// cruxSupervision is the sidecar runtime's child supervisor and probe
 	// loop (hivecommons/hive#14138 stage 4); nil in-process.
 	cruxSupervision *cruxRuntimeSupervision
+
+	// meetingsQuorum is the Quorum child supervisor
+	// (hivecommons/hive#18289); nil when meetings are off.
+	meetingsQuorum quorumSupervisor
+	// meetingsMgr runs meeting lifecycles over the Quorum child
+	// (hivecommons/hive#18290); nil when meetings are off.
+	meetingsMgr *meetings.Manager
+	// meetingsSched is the meeting scheduler behind the Calendar; nil when
+	// meetings are off. The customers sweep reads its events (#18742).
+	meetingsSched *schedule.Scheduler
+	// mailAllow is the calendar email allowlist; nil when it could not be
+	// opened. The customers sweep reads proven emails from it (#18742).
+	mailAllow *mailallow.Store
+	// customers is the people store behind the Customers section
+	// (hivecommons/hive#18742); nil when customers are off.
+	customers *customersDashboard
+	// meetingsLive is the Spektacular live loop (hivecommons/hive#18291).
+	meetingsLive *live.Runner
+	// meetingsInboxSrc lists ended meetings in the inbox (#18293).
+	meetingsInboxSrc inbox.Source
 }
 
 // deferStack stands in for the `defer` statements that used to sit in

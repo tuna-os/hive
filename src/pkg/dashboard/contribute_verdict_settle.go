@@ -10,6 +10,7 @@ import (
 
 	"github.com/hivecommons/hive/pkg/config"
 	ghpkg "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/writeback"
 )
 
 // verdictSettleTimeout bounds the detached GitHub work settleIssueFromVerdict
@@ -24,6 +25,9 @@ const (
 	verdictDispositionAlreadyDoneUnverified = "already-done-unverified"
 	verdictDispositionAlreadyDoneLabeled    = "already-done-labeled"
 	verdictDispositionAlreadyDoneClosed     = "already-done-closed"
+	// The citation verified, but the issue has an open sub-issue, so nothing
+	// was recorded, labelled or closed (contribute_parent_children.go).
+	verdictDispositionAlreadyDoneOpenSubIssues = "already-done-open-sub-issues"
 )
 
 var (
@@ -70,14 +74,14 @@ func (h *ContributeWSHub) settleIssueFromVerdictWithEvidence(repo string, number
 	}
 	if len(refs) == 0 {
 		if alreadyDone {
-			h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence)
+			h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence, dispatchedAt)
 			return verdictDispositionAlreadyDoneUnverified
 		}
 		return ""
 	}
 	if h.server == nil || h.server.deps == nil || h.server.deps.RecordIssueClaim == nil {
 		if alreadyDone {
-			h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence)
+			h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence, dispatchedAt)
 			return verdictDispositionAlreadyDoneUnverified
 		}
 		return ""
@@ -86,7 +90,7 @@ func (h *ContributeWSHub) settleIssueFromVerdictWithEvidence(repo string, number
 	if verify == nil {
 		if h.server.deps.GHClient == nil {
 			if alreadyDone {
-				h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence)
+				h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence, dispatchedAt)
 				return verdictDispositionAlreadyDoneUnverified
 			}
 			return ""
@@ -106,7 +110,7 @@ func (h *ContributeWSHub) settleIssueFromVerdictWithEvidence(repo string, number
 				"repo", repo, "number", number, "ref", ref.String(), "reason", res.Reason, "error", err.Error())
 			if ctx.Err() != nil {
 				if alreadyDone {
-					h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence)
+					h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence, dispatchedAt)
 					return verdictDispositionAlreadyDoneUnverified
 				}
 				return ""
@@ -128,6 +132,13 @@ func (h *ContributeWSHub) settleIssueFromVerdictWithEvidence(repo string, number
 			h.logger.Info("[contribute-ws] verdict settle: open PR is the reporter's own, not an external claim",
 				"repo", repo, "number", number, "ref", ref.String(), "pr_author", claim.PRAuthor, "reporter", reporter)
 			continue
+		}
+		// A parent with an open sub-issue is not done on anyone's word: no
+		// claim, no likely-done, no already-done, no close.
+		if claim.MergedPR {
+			if held, disposition := h.verdictHeldForOpenChildren(ctx, repo, number, ref.String(), alreadyDone); held {
+				return disposition
+			}
 		}
 		claim.Repo, claim.Issue = repo, number
 		claim.Source = ghpkg.ClaimSourceVerdict
@@ -170,7 +181,7 @@ func (h *ContributeWSHub) settleIssueFromVerdictWithEvidence(repo string, number
 		return ""
 	}
 	if alreadyDone {
-		h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence)
+		h.markAlreadyDoneUnverified(repo, number, reporter, reason, evidence, dispatchedAt)
 		return verdictDispositionAlreadyDoneUnverified
 	}
 	return ""
@@ -228,6 +239,39 @@ func (h *ContributeWSHub) markIssuePRClaim(ctx context.Context, repo string, num
 	return h.server.deps.GHClient.AddLabels(ctx, repo, number, []string{label})
 }
 
+// removeUnverifiedAlreadyDoneLabel takes the already-done label off an issue
+// whose verdict did not verify, when the hive itself added it after the task
+// was dispatched (a relay labelling on the task credential). Best-effort: a
+// failure is logged and the comment and hold still go out.
+func (h *ContributeWSHub) removeUnverifiedAlreadyDoneLabel(repo string, number int, dispatchedAt time.Time) {
+	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.GHClient == nil {
+		return
+	}
+	label := config.HubConfig{}.ContributeAlreadyDoneLabelOrDefault()
+	if h.server.deps.Config != nil {
+		label = h.server.deps.Config.Hub.ContributeAlreadyDoneLabelOrDefault()
+	}
+	ctx := h.server.deps.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, verdictSettleTimeout)
+	defer cancel()
+	removed, err := h.server.deps.GHClient.RemoveHiveLabelAddedSince(ctx, repo, number, label, dispatchedAt)
+	if h.logger == nil {
+		return
+	}
+	if err != nil {
+		h.logger.Warn("[contribute-ws] removing the relay's unverified already-done label failed",
+			"repo", repo, "number", number, "label", label, "error", err.Error())
+		return
+	}
+	if removed {
+		h.logger.Info("[contribute-ws] removed the already-done label the relay applied to an unverified verdict",
+			"repo", repo, "number", number, "label", label)
+	}
+}
+
 // noteAlreadyDoneUnverified posts the claim-worded comment for an already-done
 // verdict with no verifiable evidence. It applies no label: the already-done
 // label means verified, and hive/likely-done means an API-verified merged PR
@@ -261,6 +305,16 @@ func (h *ContributeWSHub) markAlreadyDoneIssue(ctx context.Context, repo string,
 	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.GHClient == nil {
 		return ghpkg.ErrNoGitHubClient
 	}
+	if closeIssue {
+		client := h.server.deps.GHClient
+		item, err := client.WritebackItemForNumber(ctx, repo, number)
+		if err != nil {
+			return err
+		}
+		if d := client.WritebackAllowed(repo, item, writeback.KindIssueClose, "close issue already resolved by a merged PR"); !d.Allowed {
+			return fmt.Errorf("%w: %s", writeback.ErrSuppressed, d.Detail)
+		}
+	}
 	label := config.HubConfig{}.ContributeAlreadyDoneLabelOrDefault()
 	if h.server.deps.Config != nil {
 		label = h.server.deps.Config.Hub.ContributeAlreadyDoneLabelOrDefault()
@@ -287,10 +341,14 @@ func (h *ContributeWSHub) markAlreadyDoneIssue(ctx context.Context, repo string,
 	if err := h.server.deps.GHClient.AddLabels(ctx, repo, number, []string{label}); err != nil {
 		return err
 	}
+	// A verified already-done supersedes an earlier hive/verified-open, so
+	// the issue never wears both verdicts.
+	// Best-effort: the stage sweep settles a pair left behind.
+	_ = h.server.deps.GHClient.RemoveLabelsFresh(ctx, repo, number, ghpkg.VerifiedOpenLabel) // writeback:solicited the contributor's verified already-done verdict
 	if !closeIssue {
 		return nil
 	}
-	return h.server.deps.GHClient.CloseIssue(ctx, repo, number, ghpkg.IssueCloseOptions{
+	return h.server.deps.GHClient.CloseIssue(ctx, repo, number, ghpkg.IssueCloseOptions{ // writeback:gated
 		StateReason: ghpkg.IssueStateReasonCompleted,
 	})
 }

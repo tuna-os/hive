@@ -643,6 +643,8 @@ func TestAutoMergeGet_ContributorLaneDefaults(t *testing.T) {
 			AutoPromotionScopes    []string `json:"auto_promotion_scopes"`
 			ApproveHeldRuns        bool     `json:"approve_held_runs_for_registry_trusted"`
 			OwnerApprovalWorkflow  bool     `json:"owner_approval_releases_workflow_fence"`
+			WorkflowFenceScope     string   `json:"workflow_fence_scope"`
+			WorkflowFenceScopes    []string `json:"workflow_fence_scopes"`
 			GrantableTiers         []string `json:"grantable_tiers"`
 		} `json:"contributor_lane"`
 	}
@@ -661,6 +663,9 @@ func TestAutoMergeGet_ContributorLaneDefaults(t *testing.T) {
 	}
 	if cl.AutoPromotionScope != config.ContributorLaneAutoPromotionScopeHive || strings.Join(cl.AutoPromotionScopes, ",") != "hive,repo" {
 		t.Fatalf("contributor_lane auto_promotion_scope defaults wrong: %+v", cl)
+	}
+	if cl.WorkflowFenceScope != config.ContributorLaneWorkflowFenceScopeAll || strings.Join(cl.WorkflowFenceScopes, ",") != "all,human_merge_paths" {
+		t.Fatalf("contributor_lane workflow_fence_scope defaults wrong: %+v", cl)
 	}
 	if strings.Join(cl.ExcludeLabels, ",") != strings.Join(config.DefaultContributorLaneExcludeLabels, ",") {
 		t.Fatalf("contributor_lane default labels wrong: %v", cl.ExcludeLabels)
@@ -681,6 +686,7 @@ func TestAutoMergePut_ContributorLaneValidation(t *testing.T) {
 			"auto_promotion_scope":                   " Repo ",
 			"approve_held_runs_for_registry_trusted": false,
 			"owner_approval_releases_workflow_fence": false,
+			"workflow_fence_scope":                   " Human_Merge_Paths ",
 		},
 	}
 	if rec := doPut(s, "/api/config/auto-merge", valid); rec.Code != http.StatusOK {
@@ -695,6 +701,15 @@ func TestAutoMergePut_ContributorLaneValidation(t *testing.T) {
 	}
 	if rec := doPut(s, "/api/config/auto-merge", map[string]any{"contributor_lane": map[string]any{"auto_promotion_scope": "fleet"}}); rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid auto_promotion_scope: expected 400, got %d", rec.Code)
+	}
+	if cl.WorkflowFenceScope != config.ContributorLaneWorkflowFenceScopeHumanMergePaths {
+		t.Fatalf("contributor_lane workflow_fence_scope not normalized: %q", cl.WorkflowFenceScope)
+	}
+	if rec := doPut(s, "/api/config/auto-merge", map[string]any{"contributor_lane": map[string]any{"workflow_fence_scope": "release_only"}}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid workflow_fence_scope: expected 400, got %d", rec.Code)
+	}
+	if got := s.deps.Config.AutoMerge.ContributorLane.WorkflowFenceScope; got != config.ContributorLaneWorkflowFenceScopeHumanMergePaths {
+		t.Fatalf("rejected workflow_fence_scope write changed the stored value to %q", got)
 	}
 	if strings.Join(cl.Repos, ",") != "widget" || strings.Join(cl.ExcludeLabels, ",") != "hold" {
 		t.Fatalf("contributor_lane lists not normalized: repos=%v labels=%v", cl.Repos, cl.ExcludeLabels)
@@ -796,5 +811,131 @@ func TestReviewConfigGet_ReviewerCandidates(t *testing.T) {
 		if !strings.Contains(html, want) {
 			t.Errorf("index.html missing Review Gate reviewer control piece %q", want)
 		}
+	}
+}
+
+// A hive whose perspectives are linked to a repo file shows the linked set,
+// its source and its provenance, never the inline fallback it overrides
+// (hivecommons/hive#17989).
+func TestReviewConfigGetShowsLinkedPerspectives(t *testing.T) {
+	s := covApiServer(t)
+	s.deps.Config.Review.Perspectives = []string{"correctness"}
+	s.deps.Config.Review.PerspectivePrompts = map[string]string{"correctness": "inline focus"}
+	s.deps.Config.Review.PerspectivesSource = &config.DefinitionSourceConfig{
+		Owner: "acme", Repo: "policy", Path: "review/perspectives.yaml", Ref: "release/v5",
+	}
+	s.deps.Config.Review.LinkedPerspectives = &config.LinkedPerspectives{
+		Names:   []string{"security", "api-compat"},
+		Focus:   map[string]string{"api-compat": "public API breakage"},
+		Source:  "github-cache:acme/policy",
+		Warning: "review perspectives document acme/policy/review/perspectives.yaml is invalid: bad",
+	}
+
+	rec := doGetNoRole(s, "/api/config/review")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET review: expected 200, got %d", rec.Code)
+	}
+	var got struct {
+		Perspectives       []string                      `json:"perspectives"`
+		PerspectivePrompts map[string]string             `json:"perspective_prompts"`
+		Linked             bool                          `json:"perspectives_linked"`
+		Source             config.DefinitionSourceConfig `json:"perspectives_source"`
+		Status             string                        `json:"perspectives_source_status"`
+		Warning            string                        `json:"perspectives_source_warning"`
+		URL                string                        `json:"perspectives_source_url"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.Linked {
+		t.Fatal("perspectives_linked = false with a source set")
+	}
+	if got.Source.Owner != "acme" || got.Source.Repo != "policy" || got.Source.Path != "review/perspectives.yaml" || got.Source.Ref != "release/v5" {
+		t.Fatalf("perspectives_source = %+v", got.Source)
+	}
+	if strings.Join(got.Perspectives, ",") != "security,api-compat" {
+		t.Fatalf("perspectives = %v, want the linked set", got.Perspectives)
+	}
+	if got.PerspectivePrompts["api-compat"] != "public API breakage" || got.PerspectivePrompts["correctness"] != "" {
+		t.Fatalf("perspective_prompts = %v, want the linked focus", got.PerspectivePrompts)
+	}
+	if got.Status != "github-cache:acme/policy" || !strings.Contains(got.Warning, "is invalid") {
+		t.Fatalf("status = %q warning = %q", got.Status, got.Warning)
+	}
+	if got.URL != "https://github.com/acme/policy/blob/release/v5/review/perspectives.yaml" {
+		t.Fatalf("perspectives_source_url = %q", got.URL)
+	}
+
+	// Set but not yet resolved: still linked (and so read-only), but the
+	// inline set is what runs and the status says so.
+	s.deps.Config.Review.LinkedPerspectives = nil
+	got.Perspectives, got.Status, got.Warning = nil, "", ""
+	if err := json.Unmarshal(doGetNoRole(s, "/api/config/review").Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.Linked || got.Status != perspectivesSourceStatusUnresolved || strings.Join(got.Perspectives, ",") != "correctness" {
+		t.Fatalf("unresolved: linked=%v status=%q perspectives=%v", got.Linked, got.Status, got.Perspectives)
+	}
+
+	// Unlinked: the inline set, and no linked metadata at all.
+	s.deps.Config.Review.PerspectivesSource = nil
+	var plain map[string]any
+	if err := json.Unmarshal(doGetNoRole(s, "/api/config/review").Body.Bytes(), &plain); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if plain["perspectives_linked"] != false {
+		t.Fatalf("unlinked perspectives_linked = %v", plain["perspectives_linked"])
+	}
+	for _, k := range []string{"perspectives_source", "perspectives_source_status", "perspectives_source_warning", "perspectives_source_url"} {
+		if _, ok := plain[k]; ok {
+			t.Fatalf("unlinked response carries %s", k)
+		}
+	}
+	if ps, _ := plain["perspectives"].([]any); len(ps) != 1 || ps[0] != "correctness" {
+		t.Fatalf("unlinked perspectives = %v", plain["perspectives"])
+	}
+}
+
+// While linked, a perspective edit is refused with 409 and nothing changes or
+// is pushed to the relay; the operator-owned review knobs stay editable.
+func TestReviewConfigPutRejectsPerspectiveEditWhileLinked(t *testing.T) {
+	s := covApiServer(t)
+	applied := 0
+	s.deps.ReviewConfigApplied = func(config.ReviewConfig) { applied++ }
+	s.deps.Config.Review.Perspectives = []string{"correctness"}
+	s.deps.Config.Review.PerspectivesSource = &config.DefinitionSourceConfig{
+		Owner: "acme", Repo: "policy", Path: "review/perspectives.yaml",
+	}
+
+	for _, body := range []map[string]any{
+		{"perspectives": []string{"security"}},
+		{"perspective_prompts": map[string]string{"security": "x"}},
+		{"perspectives": []string{"security"}, "combined_perspectives": true},
+	} {
+		rec := doPut(s, "/api/config/review", body)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "acme/policy/review/perspectives.yaml") {
+			t.Fatalf("%v: expected 409 naming the source, got %d: %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	rv := s.deps.Config.Review
+	if strings.Join(rv.Perspectives, ",") != "correctness" || rv.PerspectivePrompts != nil || rv.CombinedPerspectives {
+		t.Fatalf("refused PUT changed config: %+v", rv)
+	}
+	if applied != 0 {
+		t.Fatalf("ReviewConfigApplied called %d times for a refused PUT", applied)
+	}
+
+	rec := doPut(s, "/api/config/review", map[string]any{"combined_perspectives": true, "max_perspectives_per_pr": 2})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("combined_perspectives while linked: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !s.deps.Config.Review.CombinedPerspectives || s.deps.Config.Review.MaxPerspectivesPerPR != 2 || applied != 1 {
+		t.Fatalf("operator-owned knobs not applied: %+v applied=%d", s.deps.Config.Review, applied)
+	}
+
+	// A partially filled source is unset, so perspectives stay editable.
+	s.deps.Config.Review.PerspectivesSource = &config.DefinitionSourceConfig{Owner: "acme", Repo: "policy"}
+	if rec := doPut(s, "/api/config/review", map[string]any{"perspectives": []string{"security"}}); rec.Code != http.StatusOK {
+		t.Fatalf("partial source: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

@@ -258,7 +258,6 @@ func (c *Client) handleForgeMergeRequest(ctx context.Context, path string, req M
 		slog.String("repo", req.Repo), slog.Int("number", req.Number),
 		slog.String("head_sha", req.ExpectSHA), slog.String("agent", req.Agent))
 	c.RecordPRMergedAudit(req.Repo, req.Number, method, req.ExpectSHA, PRAuditPathRelay)
-	c.clearMergeFailureAlertsForRepo(req.Repo)
 }
 
 // isRequiredCheckMergeBlocker classifies a merge-attempt error string as
@@ -285,6 +284,20 @@ func isRequiredCheckMergeBlocker(errMsg string) bool {
 		}
 	}
 	return false
+}
+
+// mergeQueueRequiredReason is the classified reason recorded when the base
+// branch's ruleset only accepts merges through GitHub's merge queue.
+const mergeQueueRequiredReason = "repo requires merge queue; direct merge not possible — enqueue via merge queue or merge by hand"
+
+// isMergeQueueRequiredMergeBlocker reports the 405 GitHub returns for a direct
+// REST merge on a base branch whose ruleset requires a merge queue
+// ("Repository rule violations found ... Changes must be made through the
+// merge queue"). No retry of PUT /merge can succeed there
+// (hivecommons/hive#16229); the automerge sweep classifies the same error as
+// a skip reason (hivecommons/hive#14018).
+func isMergeQueueRequiredMergeBlocker(errMsg string) bool {
+	return strings.Contains(strings.ToLower(errMsg), "must be made through the merge queue")
 }
 
 func isConflictMergeBlocker(errMsg string) bool {
@@ -445,13 +458,25 @@ func (c *Client) handleOneMergeRequest(ctx context.Context, path string, nowFn f
 
 	// Durable per-PR+SHA state (/data, survives restarts and re-requests).
 	// A request for a head that already exhausted its budget is refused with
-	// the recorded reason instead of starting another poll cycle, and a head
+	// the recorded reason instead of starting another poll cycle, except that
+	// a CI-gate exhaustion is re-evaluated once first (below), and a head
 	// parked on pending CI is not re-evaluated before its backoff elapses.
 	now := nowFn()
 	prState, tracked := c.mergeRequestState(req.Repo, req.Number, req.ExpectSHA)
 	if tracked && prState.Exhausted && now.Sub(prState.At) < mergeRequestExhaustedRefusal {
-		c.refuseExhaustedMergeRequest(path, req, prState, nowFn)
-		return
+		// A CI-gate verdict can be a gate false positive fixed since, or an
+		// advisory check re-run green on the same head; a fork PR cannot get
+		// a new SHA from the hive (#17606). Re-evaluate the gate once and
+		// refuse only if it still blocks; other reasons refuse outright.
+		fresh, reevaluated := c.reevaluateExhaustedCIGate(ctx, req, prState, now)
+		if !reevaluated || fresh != "" {
+			if fresh != "" {
+				prState.Reason += "; re-evaluated: " + fresh
+			}
+			c.refuseExhaustedMergeRequest(path, req, prState, nowFn)
+			return
+		}
+		c.clearMergeRequestState(req.Repo, req.Number)
 	}
 	if tracked && !prState.Exhausted && now.Before(prState.NextPollAt) {
 		return
@@ -470,11 +495,11 @@ func (c *Client) handleOneMergeRequest(ctx context.Context, path string, nowFn f
 		c.handleForgeMergeRequest(ctx, path, req, attempts, merge, nowFn)
 		return
 	}
-
 	// Human-merge paths (#11039): a PR touching a path listed in
-	// auto_merge.human_merge_paths for its repo is never merged by the App,
-	// whatever agent asks. A match is terminal (the request is refused, the
-	// PR gets `hold` and one marker comment); an unknown changed-file list on
+	// auto_merge.human_merge_paths for its repo requires a person, whatever
+	// agent asks, unless auto_merge.human_merge_pin_only is proven (#16265).
+	// A match is terminal (the request is refused, the PR gets `hold` and one
+	// marker comment); an unknown changed-file list on
 	// a configured repo fails closed through the bounded retry path. Checked
 	// before the optional branch-update so a refused PR receives no push.
 	if refusal, err := c.mergeRequestHumanMergePathRefusal(ctx, req); err != nil {
@@ -496,6 +521,20 @@ func (c *Client) handleOneMergeRequest(ctx context.Context, path string, nowFn f
 		c.denyMergeRequest(path, req, refusal, nowFn)
 		return
 	}
+	owner, repoName := c.SplitRepo(req.Repo)
+	destination, _, err := c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:merge_destination"), owner, repoName, req.Number)
+	if err != nil {
+		c.recordMergeFailure(path, req, attempts, err.Error(), nowFn)
+		return
+	}
+	ctx, releaseDestination, err := AcquireDestinationMerge(ctx, DestinationMergeDirectory(), owner+"/"+repoName, destination.GetBase().GetRef())
+	if err != nil {
+		if !errors.Is(err, ErrDestinationMergeBusy) {
+			c.recordMergeFailure(path, req, attempts, err.Error(), nowFn)
+		}
+		return
+	}
+	defer releaseDestination()
 
 	// Lane policy: the contributor-lane gates the sweep enforces — tier,
 	// soak, min_head_age, review verdict — apply to a relayed merge too
@@ -528,9 +567,15 @@ func (c *Client) handleOneMergeRequest(ctx context.Context, path string, nowFn f
 	serialized := SerializedStrategy(laneStrategy, req.Repo)
 
 	// Optional branch-update-first (resolves "behind main"). A failure here is
-	// not fatal — the merge attempt below will surface the real blocker.
+	// not fatal — the merge attempt below will surface the real blocker. A
+	// dependency bot's branch is never updated: the bot rebases it itself,
+	// and a hive merge commit would stop it doing so (DependencyBotBranch).
 	if req.UpdateBranch && !serialized {
-		if err := c.UpdateBranch(ctx, req.Repo, req.Number); err != nil {
+		headRef, author := destination.GetHead().GetRef(), SafeGetLogin(destination.GetUser())
+		if DependencyBotBranch(headRef, author) {
+			c.logger.Info("merge-request watcher: update-branch skipped; the branch belongs to a dependency bot (continuing to merge attempt)",
+				slog.String("repo", req.Repo), slog.Int("number", req.Number), slog.String("head_ref", headRef), slog.String("author", author))
+		} else if err := c.UpdateBranch(ctx, req.Repo, req.Number); err != nil {
 			c.logger.Info("merge-request watcher: update-branch failed (continuing to merge attempt)",
 				slog.String("repo", req.Repo), slog.Int("number", req.Number), slog.String("error", err.Error()))
 		}
@@ -544,7 +589,7 @@ func (c *Client) handleOneMergeRequest(ctx context.Context, path string, nowFn f
 	// the request without consuming an attempt; red and unverified verdicts
 	// are failed attempts that go through the same retry / exhaust /
 	// re-engage path a GitHub-side refusal does.
-	verdict, why, err := c.verifyMergeRequestCI(ctx, req.Repo, req.Number, req.ExpectSHA, now)
+	verdict, why, err := c.verifyMergeRequestCI(ctx, req.Repo, req.Number, req.ExpectSHA, now, prState.PendingSince)
 	if err != nil {
 		c.logCIVerdict(req, verdict, err.Error())
 		c.recordMergeFailure(path, req, attempts, err.Error(), nowFn)
@@ -589,6 +634,10 @@ func (c *Client) handleOneMergeRequest(ctx context.Context, path string, nowFn f
 
 	res, err := c.MergePR(ctx, req.Repo, req.Number, req.Method, req.ExpectSHA)
 	if err != nil {
+		if isMergeQueueRequiredMergeBlocker(err.Error()) {
+			c.quarantineMergeQueueRequired(path, req, attempts, err.Error(), nowFn)
+			return
+		}
 		c.recordMergeFailure(path, req, attempts, err.Error(), nowFn)
 		return
 	}
@@ -599,7 +648,6 @@ func (c *Client) handleOneMergeRequest(ctx context.Context, path string, nowFn f
 	c.logger.Info("merge-request watcher: PR merged by App bot",
 		slog.String("repo", req.Repo), slog.Int("number", req.Number),
 		slog.String("sha", res.SHA), slog.String("agent", req.Agent))
-	c.clearMergeFailureAlertsForRepo(req.Repo)
 }
 
 // mergeThroughLane hands a request that passed every relay gate to the
@@ -636,7 +684,7 @@ func (c *Client) mergeThroughLane(ctx context.Context, path string, req MergeReq
 		c.logger.Info("merge-request watcher: PR merged by App bot through the serialized lane",
 			slog.String("repo", req.Repo), slog.Int("number", req.Number),
 			slog.String("sha", res.SHA), slog.String("agent", req.Agent))
-		c.clearMergeFailureAlertsForRepo(req.Repo)
+		c.clearMergeFailureAlertsAfterMerge(req.Repo, req.Number, res.Method)
 	default:
 		c.writeMergeResult(path, MergeResponse{Number: req.Number, Attempts: attempts - 1, Error: res.Reason, At: nowFn().UTC().Format(time.RFC3339)})
 		c.logger.Info("merge-request watcher: request waiting in the serialized lane",
@@ -653,7 +701,7 @@ func (c *Client) recordMergeFailure(path string, req MergeRequest, attempts int,
 	now := nowFn()
 	c.writeMergeResult(path, MergeResponse{Number: req.Number, Attempts: attempts, OK: false, Error: errMsg, At: now.UTC().Format(time.RFC3339)})
 	c.putMergeRequestState(req.Repo, req.Number, mergeRequestPRState{SHA: req.ExpectSHA, Attempts: attempts, Exhausted: attempts >= mergeRequestMaxAttempts, Reason: errMsg, At: now})
-	c.raiseMergeFailureAlert(req.Repo, req.Number, errMsg)
+	c.raiseMergeFailureAlert(req.Repo, req.Number, errMsg, req.ExpectSHA, req.Method)
 	if attempts >= mergeRequestMaxAttempts {
 		// Terminal: a PR that still won't merge after N tries is blocked by
 		// something a retry can't fix. Fix #2: classify WHY. If the blocker
@@ -706,24 +754,75 @@ func (c *Client) quarantineMergeRequest(path string, req MergeRequest, attempts 
 	now := nowFn()
 	c.writeMergeResult(path, MergeResponse{Number: req.Number, Attempts: attempts, OK: false, Error: reason, At: now.UTC().Format(time.RFC3339)})
 	c.putMergeRequestState(req.Repo, req.Number, mergeRequestPRState{SHA: req.ExpectSHA, Attempts: attempts, Exhausted: true, Reason: reason, At: now})
-	c.raiseMergeFailureAlert(req.Repo, req.Number, reason)
+	c.raiseMergeFailureAlert(req.Repo, req.Number, reason, req.ExpectSHA, req.Method)
 	_ = os.Rename(path, path+".exhausted")
 	c.logger.Warn("merge-request watcher: merge cannot proceed on this head, quarantined without retry",
 		slog.String("repo", req.Repo), slog.Int("number", req.Number),
 		slog.String("sha", req.ExpectSHA), slog.String("reason", reason))
 }
 
+// quarantineMergeQueueRequired sets a request aside on the first
+// merge-queue-required refusal, without spending the retry budget. Like
+// quarantineMergeRequest it records the exhaustion against the PR+SHA, so a
+// re-request for the same head is refused quietly and the classified message
+// is logged once per head. It logs at INFO: the blocker is the target repo's
+// configuration, not a hive defect, and a WARN per head would surface as an
+// unclassified_error_repeated selfreport. It still raises the operator alert
+// (merge-queue-required) so the dashboard tells the operator to enqueue or
+// reconfigure.
+func (c *Client) quarantineMergeQueueRequired(path string, req MergeRequest, attempts int, errMsg string, nowFn func() time.Time) {
+	now := nowFn()
+	reason := mergeQueueRequiredReason + ": " + errMsg
+	c.writeMergeResult(path, MergeResponse{Number: req.Number, Attempts: attempts, OK: false, Error: reason, At: now.UTC().Format(time.RFC3339)})
+	c.putMergeRequestState(req.Repo, req.Number, mergeRequestPRState{SHA: req.ExpectSHA, Attempts: attempts, Exhausted: true, Reason: reason, At: now})
+	c.raiseMergeFailureAlert(req.Repo, req.Number, reason, req.ExpectSHA, req.Method)
+	_ = os.Rename(path, path+".exhausted")
+	c.logger.Info("merge-request watcher: "+mergeQueueRequiredReason,
+		slog.String("repo", req.Repo), slog.Int("number", req.Number),
+		slog.String("sha", req.ExpectSHA), slog.Int("attempts", attempts),
+		slog.String("error", errMsg))
+}
+
 // refuseExhaustedMergeRequest answers a new request for a PR+SHA whose earlier
 // request was already exhausted with the recorded reason, instead of starting
 // another wait/retry cycle on a head that has not changed.
 func (c *Client) refuseExhaustedMergeRequest(path string, req MergeRequest, prev mergeRequestPRState, nowFn func() time.Time) {
-	reason := fmt.Sprintf("refused: an earlier merge request for this PR was exhausted on the same head %s at %s (%s); push a new commit or merge it manually",
-		shortSHA(prev.SHA), prev.At.UTC().Format(time.RFC3339), prev.Reason)
+	hint := "push a new commit or merge it manually"
+	if strings.HasPrefix(prev.Reason, mergeRequestCIGateReasonPrefix) {
+		hint = "re-run the failing check and re-request, push a new commit, or merge it manually"
+	}
+	reason := fmt.Sprintf("refused: an earlier merge request for this PR was exhausted on the same head %s at %s (%s); %s",
+		shortSHA(prev.SHA), prev.At.UTC().Format(time.RFC3339), prev.Reason, hint)
 	c.writeMergeResult(path, MergeResponse{Number: req.Number, Attempts: prev.Attempts, OK: false, Error: reason, At: nowFn().UTC().Format(time.RFC3339)})
 	_ = os.Rename(path, path+".exhausted")
 	c.logger.Info("merge-request watcher: refused re-request for a head already exhausted",
 		slog.String("repo", req.Repo), slog.Int("number", req.Number),
 		slog.String("sha", prev.SHA), slog.String("agent", req.Agent))
+}
+
+// reevaluateExhaustedCIGate re-runs the CI gate once for a PR+SHA exhausted
+// on a CI-gate reason. reevaluated is false when the recorded reason is not a
+// CI-gate verdict (conflict, permission, merge-queue-required) or the repo is
+// on a non-GitHub forge. blocking is the fresh gate reason when the gate
+// still does not pass, empty when it is now green.
+func (c *Client) reevaluateExhaustedCIGate(ctx context.Context, req MergeRequest, prev mergeRequestPRState, now time.Time) (blocking string, reevaluated bool) {
+	if !strings.HasPrefix(prev.Reason, mergeRequestCIGateReasonPrefix) || c.forgeMergeFor(req.Repo) != nil {
+		return "", false
+	}
+	verdict, why, err := c.verifyMergeRequestCI(ctx, req.Repo, req.Number, req.ExpectSHA, now, time.Time{})
+	if err != nil {
+		c.logCIVerdict(req, verdict, err.Error())
+		return err.Error(), true
+	}
+	verdict, why = c.maybeDowngradeNoCIVerdict(req, verdict, why)
+	c.logCIVerdict(req, verdict, why)
+	if verdict != mergeCIGreen {
+		return why, true
+	}
+	c.logger.Info("merge-request watcher: exhausted head re-evaluated green, clearing the CI-gate exhaustion",
+		slog.String("repo", req.Repo), slog.Int("number", req.Number),
+		slog.String("sha", prev.SHA), slog.String("recorded_reason", prev.Reason))
+	return "", true
 }
 
 func (c *Client) denyMergeRequest(path string, req MergeRequest, reason string, nowFn func() time.Time) {

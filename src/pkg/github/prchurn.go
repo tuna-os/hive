@@ -111,6 +111,11 @@ func (r IssuePRRecord) terminal() bool {
 type ClaimScan struct {
 	Claims  []IssueClaim
 	History []IssuePRRecord
+	// StartedAt is when the scan began listing. A claim the webhook path
+	// recorded at or after this instant describes a PR the listing may not
+	// have contained yet, so an authoritative reconcile must not treat its
+	// absence from Claims as evidence the PR is gone (hivecommons/hive#15559).
+	StartedAt time.Time
 }
 
 // PRTerminalObservation reports a terminal PR state seen by the regular PR
@@ -281,6 +286,7 @@ func (l *ClaimLedger) insertHistoryLocked(r IssuePRRecord) {
 	if r.ObservedAt.IsZero() {
 		r.ObservedAt = l.now()
 	}
+	r.Repo = l.repoLocked(r.Repo)
 	if l.history == nil {
 		l.history = make(map[string]map[int]IssuePRRecord)
 	}
@@ -330,7 +336,7 @@ func (l *ClaimLedger) Churn(repo string, issue int) (IssueChurn, bool) {
 	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	byPR, ok := l.history[claimKey(repo, issue)]
+	byPR, ok := l.history[l.keyLocked(repo, issue)]
 	if !ok || len(byPR) == 0 {
 		return IssueChurn{}, false
 	}

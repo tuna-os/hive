@@ -83,25 +83,127 @@ var inviteTrustTiers = map[string]bool{"trusted": true, "merger": true, "advisor
 // the inviter username. An empty string means the token is invalid, tampered,
 // or expired — the caller must treat that as "no attribution" (a plain
 // self-registration), never as an error.
+// ContributorPoolStatus summarizes the Contributors roster. Online uses the
+// same presence predicate the stage tracker's waiting-on captions read
+// (ContributeWSHub.Presence): a registered contributor whose relay
+// heartbeat landed within governor.labels.stage.presence_window (15m by
+// default). Active is the older "has a live socket" count kept for callers
+// that still read it.
 type ContributorPoolStatus struct {
-	Active     int            `json:"active"`
-	Registered int            `json:"registered"`
-	ByRole     map[string]int `json:"by_role,omitempty"`
+	Active     int `json:"active"`
+	Online     int `json:"online"`
+	Registered int `json:"registered"`
+	// OnlineIDs contains the ClankeR contributor IDs counted by Online.
+	OnlineIDs []string `json:"online_ids"`
+	// OnlineLogins names the people whose contributor relays are online.
+	OnlineLogins []string `json:"online_logins"`
+	// PresenceWindow is the window Online was judged against ("15m").
+	PresenceWindow string         `json:"presence_window"`
+	ByRole         map[string]int `json:"by_role,omitempty"`
+	// Abandoned totals adopted PRs across all registered profiles, including
+	// offline and revoked contributors. Login keys are canonical lowercase.
+	Abandoned        int            `json:"abandoned"`
+	AbandonedByLogin map[string]int `json:"abandoned_by_login"`
 }
 
 func (s *Server) BuildContributorPoolStatus() *ContributorPoolStatus {
 	profiles := listContributorProfiles()
+	var heartbeats map[string]time.Time
+	window := config.DefaultPresenceWindow
+	if s.contributeHub != nil {
+		heartbeats = s.contributeHub.LastHeartbeats()
+		window = s.contributeHub.presenceWindow()
+	}
+	now := time.Now()
+	for i := range profiles {
+		profiles[i].Online = countOnlineContributors(profiles[i:i+1], heartbeats, window, now) == 1
+	}
+	return s.contributorPoolStatus(profiles, window)
+}
+
+func (s *Server) contributorPoolStatus(profiles []ContributorProfile, window time.Duration) *ContributorPoolStatus {
 	active := 0
+	onlineIDs := []string{}
+	onlineLogins := []string{}
+	seenLogins := make(map[string]bool)
 	var byRole map[string]int
 	if s.contributeHub != nil {
 		active = s.contributeHub.ActiveCount()
 		byRole = s.contributeHub.RoleBreakdown()
 	}
-	return &ContributorPoolStatus{
-		Active:     active,
-		Registered: len(profiles),
-		ByRole:     byRole,
+	for _, p := range profiles {
+		if !p.Online {
+			continue
+		}
+		onlineIDs = append(onlineIDs, p.ContributorID)
+		login := strings.ToLower(strings.TrimSpace(p.GitHubUsername))
+		if login != "" && !seenLogins[login] {
+			seenLogins[login] = true
+			onlineLogins = append(onlineLogins, login)
+		}
 	}
+	sort.Strings(onlineIDs)
+	sort.Strings(onlineLogins)
+	abandoned, abandonedByLogin := contributorAbandonedCounts(profiles)
+	return &ContributorPoolStatus{
+		Abandoned:        abandoned,
+		AbandonedByLogin: abandonedByLogin,
+		Active:           active,
+		Online:           len(onlineIDs),
+		OnlineIDs:        onlineIDs,
+		OnlineLogins:     onlineLogins,
+		Registered:       len(profiles),
+		PresenceWindow:   stageTrackerShortDuration(window),
+		ByRole:           byRole,
+	}
+}
+
+// contributorAbandonedCounts reads the persisted counters, not the size of
+// the recent-PR tooltip. Presence and trust tier do not filter historical cost.
+func contributorAbandonedCounts(profiles []ContributorProfile) (int, map[string]int) {
+	total := 0
+	byLogin := make(map[string]int)
+	for _, p := range profiles {
+		total += p.Abandoned
+		login := strings.ToLower(strings.TrimSpace(p.GitHubUsername))
+		if login != "" {
+			byLogin[login] += p.Abandoned
+		}
+	}
+	return total, byLogin
+}
+
+// countOnlineContributors counts the registered profiles whose freshest
+// relay heartbeat is within window of now — the tracker's presence
+// predicate (liveConnectionsFor) applied across the registry, so the
+// sidebar pill and the "(offline 13m)" caption never disagree. A profile
+// with no heartbeat, or one exactly older than the window, is offline;
+// a heartbeat landing exactly at the window edge still counts, as in
+// liveConnectionsFor.
+func countOnlineContributors(profiles []ContributorProfile, lastSeen map[string]time.Time, window time.Duration, now time.Time) int {
+	return len(onlineContributorIDs(profiles, lastSeen, window, now))
+}
+
+func onlineContributorIDs(profiles []ContributorProfile, lastSeen map[string]time.Time, window time.Duration, now time.Time) []string {
+	ids := []string{}
+	if len(profiles) == 0 || len(lastSeen) == 0 {
+		return ids
+	}
+	byUser := make(map[string]time.Time, len(lastSeen))
+	for user, t := range lastSeen {
+		login := strings.ToLower(strings.TrimSpace(user))
+		if t.After(byUser[login]) {
+			byUser[login] = t
+		}
+	}
+	for _, p := range profiles {
+		t, ok := byUser[strings.ToLower(strings.TrimSpace(p.GitHubUsername))]
+		if ok && !t.IsZero() && now.Sub(t) <= window {
+			ids = append(ids, p.ContributorID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (s *Server) registerContributeRoutes() {
@@ -999,6 +1101,13 @@ func (s *Server) handleContributeFleet(w http.ResponseWriter, r *http.Request) {
 // is both a JSON fallback for browsers without EventSource and the same payload
 // the SSE "hello" frame carries, so the queue renders even if the stream drops.
 func (s *Server) handleContributeQueue(w http.ResponseWriter, r *http.Request) {
+	// ?controls=1 adds the stored pinned order and hold set the queue controls
+	// edit. They are the controls' own state, so they take the controls' own
+	// gate (owner/read-write); without the parameter the GET stays public.
+	controls := contributeQueueControlsRequested(r)
+	if controls && !s.requireContributorWrite(w, r) {
+		return
+	}
 	queue := []ReadyQueueItem{}
 	resp := map[string]any{
 		"queue_total": 0,
@@ -1045,6 +1154,9 @@ func (s *Server) handleContributeQueue(w http.ResponseWriter, r *http.Request) {
 			// editor pre-filled without a second round-trip.
 			resp["interests"] = profile.LabelInterests
 		}
+	}
+	if controls {
+		resp["controls"] = s.contributeQueueControls()
 	}
 	jsonResponse(w, resp)
 }
@@ -1911,6 +2023,14 @@ a{color:var(--cc-accent)}
 </div>
 
 <div class="endpoint">
+<span class="method">PUT</span><span class="path">/api/knowledge/git-sources</span>
+<div class="desc">Edit a git source identified by url+subpath — a name/layer change updates in place; a new_url/new_subpath/branch change re-clones</div>
+<pre>curl -X PUT -H "Authorization: ******" -H "Content-Type: application/json" \
+  -d '{"url":"https://github.com/org/repo","subpath":"docs","name":"team-docs","layer":"org"}' \
+  %s/api/knowledge/git-sources</pre>
+</div>
+
+<div class="endpoint">
 <span class="method">DELETE</span><span class="path">/api/knowledge/git-sources</span>
 <div class="desc">Remove a git source</div>
 <pre>curl -X DELETE -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -1986,7 +2106,7 @@ a{color:var(--cc-accent)}
 <pre>curl -X POST -d '{"github_username":"you"}' %s/api/contribute/register</pre>
 </div>
 
-</body></html>`, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL)
+</body></html>`, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL)
 }
 
 func (s *Server) contributorsDirOrDefault() string {

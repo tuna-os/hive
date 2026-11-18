@@ -70,4 +70,15 @@ type Host interface {
 	SetAuditSink(sink AuditSink)
 	SetConditionReporter(r ConditionReporter)
 	SetSpanStarter(fn SpanStarter)
+	// SetKnowledgeAdviser installs the hive-side matcher the mid-task
+	// knowledge advisor asks when an agent's work enters a new scope
+	// (hivecommons/hive#17052). In-process-only in phase 1: the knowledge
+	// store lives in the hive process and the adviser is a Go call into it.
+	SetKnowledgeAdviser(adviser KnowledgeAdviser)
+	// SetSandboxGitHubReadRelay installs (nil removes) the relay that carries
+	// sandbox Job GitHub reads (hivecommons/hive#18865); noProxy adds hosts
+	// Jobs reach directly. In-process-only: Enroll is a Go call into hive's
+	// proxy, and the relay holds the read credential, which must not cross
+	// into a runtime process.
+	SetSandboxGitHubReadRelay(relay SandboxGitHubReadRelay, noProxy []string)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/hivecommons/hive/pkg/celtrigger"
@@ -69,7 +70,8 @@ func celEngineFor(cfg *config.Config, logger *slog.Logger) *celtrigger.Engine {
 	if cfg == nil {
 		return nil
 	}
-	sig := triggersSignature(cfg.Triggers)
+	triggers := cfg.TriggerRulesSnapshot()
+	sig := triggersSignature(triggers)
 
 	globalCELEngine.mu.Lock()
 	defer globalCELEngine.mu.Unlock()
@@ -82,12 +84,12 @@ func celEngineFor(cfg *config.Config, logger *slog.Logger) *celtrigger.Engine {
 	globalCELEngine.sig = sig
 	globalCELEngine.built = true
 
-	if len(cfg.Triggers) == 0 {
+	if len(triggers) == 0 {
 		globalCELEngine.engine = nil
 		return nil
 	}
 
-	engine, err := celtrigger.CompileFromConfig(cfg)
+	engine, err := celtrigger.CompileFromConfig(&config.Config{Triggers: triggers})
 	if err != nil {
 		// Fail-closed: a malformed rule must never crash the fleet or silently
 		// change routing. Log once (per triggers change) and run with no CEL
@@ -129,8 +131,9 @@ func issueToEvent(iss github.Issue) celtrigger.NormalizedEvent {
 // transition, so Kind is KindPROpened. is_draft/base/head come from the PR when
 // available.
 //
-// TODO(celtrigger transitions): finer PR kinds (pr.labeled, pr.ready_for_review,
-// pr.merged) need a webhook event source; map them once that path exists.
+// pr.labeled is derived from label changes between evals (prLabeledEvent).
+// TODO(celtrigger transitions): pr.ready_for_review and pr.merged need a
+// webhook event source; map them once that path exists.
 func prToEvent(pr github.PullRequest) celtrigger.NormalizedEvent {
 	return celtrigger.NormalizedEvent{
 		Kind:    celtrigger.KindPROpened,
@@ -144,7 +147,93 @@ func prToEvent(pr github.PullRequest) celtrigger.NormalizedEvent {
 	}
 }
 
-// celMatchedAgents returns the set of agent names that operator-defined CEL rules
+// prLabeledEvent is the pr.labeled edge for an already-seen PR that gained
+// added since the previous eval. Labels carries the full current set.
+func prLabeledEvent(pr github.PullRequest, added []string) celtrigger.NormalizedEvent {
+	ev := prToEvent(pr)
+	ev.Kind = celtrigger.KindPRLabeled
+	ev.AddedLabels = added
+	return ev
+}
+
+// celSeenSet remembers which repo#number items have already been surfaced as
+// "opened", so issue.opened / pr.opened are edge-triggered per hive process
+// instead of re-matching every eval cycle while the item stays actionable.
+// For PRs it also keeps the label set last seen, so a label added between
+// evals surfaces once as pr.labeled (hivecommons/hive#18538).
+type celSeenSet struct {
+	mu     sync.Mutex
+	seen   map[string]struct{}
+	labels map[string][]string
+}
+
+// observeLabels records labels for key and reports whether key is new and,
+// when it is not, which labels it gained since the last call. A label that
+// was removed and added back counts as added again.
+func (s *celSeenSet) observeLabels(key string, labels []string) (first bool, added []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seen == nil {
+		s.seen = make(map[string]struct{})
+	}
+	if s.labels == nil {
+		s.labels = make(map[string][]string)
+	}
+	prev, known := s.labels[key]
+	_, seenBefore := s.seen[key]
+	s.seen[key] = struct{}{}
+	s.labels[key] = append([]string(nil), labels...)
+	if !seenBefore {
+		return true, nil
+	}
+	if !known {
+		// Seen through firstSight before labels were tracked: take this
+		// snapshot as the baseline rather than reporting every label.
+		return false, nil
+	}
+	had := make(map[string]struct{}, len(prev))
+	for _, l := range prev {
+		had[strings.ToLower(strings.TrimSpace(l))] = struct{}{}
+	}
+	for _, l := range labels {
+		if _, ok := had[strings.ToLower(strings.TrimSpace(l))]; !ok {
+			added = append(added, l)
+		}
+	}
+	return false, added
+}
+
+// firstSight reports whether key is new, recording it as seen.
+func (s *celSeenSet) firstSight(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seen == nil {
+		s.seen = make(map[string]struct{})
+	}
+	if _, ok := s.seen[key]; ok {
+		return false
+	}
+	s.seen[key] = struct{}{}
+	return true
+}
+
+// globalCELSeen is the process-wide seen-set used by the eval cycle.
+var globalCELSeen celSeenSet
+
+// celMatchedAgents is the level-triggered form of celMatchedAgentsOnce: every
+// enumerated item is evaluated every call.
+func celMatchedAgents(
+	engine *celtrigger.Engine,
+	actionable *github.ActionableResult,
+	cfg *config.Config,
+	gov *governor.Governor,
+	isPaused func(string) bool,
+	logger *slog.Logger,
+) []string {
+	return celMatchedAgentsOnce(engine, actionable, cfg, gov, isPaused, logger, nil)
+}
+
+// celMatchedAgentsOnce returns the set of agent names that operator-defined CEL rules
 // select for the items enumerated this cycle, after applying the governor's own
 // gating. The result is intended to be UNIONED into the governor's due-agents set
 // — it is strictly additive and never removes a governor-selected agent.
@@ -154,15 +243,19 @@ func prToEvent(pr github.PullRequest) celtrigger.NormalizedEvent {
 // (cadence-pause / budget / on-demand / kick-channel). A CEL match therefore
 // never bypasses a paused agent or an exhausted budget.
 //
+// When seen is non-nil, an issue or PR is evaluated only the first time it is
+// enumerated; later cycles skip it. A nil seen evaluates every item every call.
+//
 // Cheap and nil-safe: a nil engine, nil actionable, or empty rules returns an
 // empty result with zero per-item work.
-func celMatchedAgents(
+func celMatchedAgentsOnce(
 	engine *celtrigger.Engine,
 	actionable *github.ActionableResult,
 	cfg *config.Config,
 	gov *governor.Governor,
 	isPaused func(string) bool,
 	logger *slog.Logger,
+	seen *celSeenSet,
 ) []string {
 	if engine == nil || engine.Len() == 0 || actionable == nil || cfg == nil {
 		return nil
@@ -178,7 +271,7 @@ func celMatchedAgents(
 
 	consider := func(ev celtrigger.NormalizedEvent, source string) {
 		for _, agentName := range engine.MatchAgents(ev) {
-			if _, seen := candidates[agentName]; seen {
+			if _, dup := candidates[agentName]; dup {
 				continue
 			}
 			candidates[agentName] = candidate{source: source, number: ev.Number}
@@ -186,10 +279,24 @@ func celMatchedAgents(
 	}
 
 	for _, iss := range actionable.Issues.Items {
+		if seen != nil && !seen.firstSight(fmt.Sprintf("issue:%s#%d", iss.Repo, iss.Number)) {
+			continue
+		}
 		consider(issueToEvent(iss), celSourceIssue)
 	}
 	for _, pr := range actionable.PRs.Items {
-		consider(prToEvent(pr), celSourcePR)
+		if seen == nil {
+			consider(prToEvent(pr), celSourcePR)
+			continue
+		}
+		first, added := seen.observeLabels(fmt.Sprintf("pr:%s#%d", pr.Repo, pr.Number), pr.Labels)
+		if first {
+			consider(prToEvent(pr), celSourcePR)
+			continue
+		}
+		if len(added) > 0 {
+			consider(prLabeledEvent(pr, added), celSourcePR)
+		}
 	}
 
 	if len(candidates) == 0 {

@@ -17,14 +17,24 @@ import (
 )
 
 type Scheduler struct {
-	surgeDuration             func() (time.Duration, bool)
-	cfg                       *config.Config
-	primer                    *knowledge.Primer
-	inception                 *knowledge.InceptionEngine
-	lastActionable            *github.ActionableResult
-	logger                    *slog.Logger
-	primerCapLogged           sync.Map // agent|cap_bytes -> omitted fact count last logged at INFO
-	promptResolver            *promptsrc.Resolver
+	surgeDuration   func() (time.Duration, bool)
+	cfg             *config.Config
+	primer          *knowledge.Primer
+	lastActionable  *github.ActionableResult
+	logger          *slog.Logger
+	primerCapLogged sync.Map // agent|cap_bytes -> omitted fact count last logged at INFO
+	primedSlugs     sync.Map // agent -> []string slugs the last kick's knowledge block rendered (#17052)
+	kickSummaries   sync.Map // agent -> KickSummary of the last primed kick (#17155)
+	kickSeq         atomic.Uint64
+	promptResolver  *promptsrc.Resolver
+	agentsMdFetcher AgentsMdFetcher
+	// remoteAgents caches the materialised AGENTS.md root per "owner/repo"
+	// for the GitHub fallback in remoteAgentsRepoRoot (#17090).
+	remoteAgents   map[string]remoteAgentsMd
+	remoteAgentsMu sync.Mutex
+	// agentsMdWarned is root -> "<sha256 of AGENTS.md>|<cap>" last warned
+	// about, so a truncated file is logged once per change, not per kick.
+	agentsMdWarned            sync.Map
 	auditFunc                 AuditFunc
 	advisoryFunc              AdvisoryFunc
 	classifierUnavailableFunc func(error)
@@ -38,21 +48,29 @@ type Scheduler struct {
 	// logged, so it is logged once per day.
 	classifierQuotaWarnedDay string
 	inflight                 InflightLookup
-	runAdmitter              RunAdmitter
-	triageCommenter          TriageCommenter
-	clarity                  clarityGateState
-	priorArt                 priorArtGateState
-	priorArtSearcher         PriorArtSearcher
-	questionAutocloser       QuestionAutocloser
-	lifecycle                timeline.Recorder
-	taskMCPURL               string
-	laneDepths               map[string]int
-	scanned                  bool
-	deferredKicks            map[string]func(string)
-	firstScanDeferred        map[string]bool
-	ioscanWarned             sync.Map
-	lastClassifierErr        atomic.Value // string: latest fail-closed classifier error
-	mu                       sync.RWMutex
+	prLease                  PRLeaseLookup
+	maintainerNotes          MaintainerNotesLookup
+	customerContext          CustomerContextLookup
+	topicClaims              TopicClaimLookup
+	// newReleases feeds ${NEW_RELEASES} (new_releases.go); atomic because
+	// template substitution may run with s.mu held.
+	newReleases        atomic.Pointer[newReleasesHolder]
+	runAdmitter        RunAdmitter
+	triageCommenter    TriageCommenter
+	clarity            clarityGateState
+	priorArt           priorArtGateState
+	priorArtSearcher   PriorArtSearcher
+	questionAutocloser QuestionAutocloser
+	lifecycle          timeline.Recorder
+	taskMCPURL         string
+	agentBackend       AgentBackendLookup
+	laneDepths         map[string]int
+	scanned            bool
+	deferredKicks      map[string]func(string)
+	firstScanDeferred  map[string]bool
+	ioscanWarned       sync.Map
+	lastClassifierErr  atomic.Value // string: latest fail-closed classifier error
+	mu                 sync.RWMutex
 }
 
 // SetRunTriageDeps attaches the narrow surfaces the scheduler needs for the
@@ -125,6 +143,9 @@ func New(cfg *config.Config, logger *slog.Logger) *Scheduler {
 	}
 }
 
+// SetTaskMCPURL records the task MCP endpoint hub-launched agents can really
+// use. The host leaves it empty when it cannot mint the per-launch token the
+// endpoint requires, and kicks then carry no task MCP pointer for any agent.
 func (s *Scheduler) SetTaskMCPURL(raw string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,6 +156,20 @@ func (s *Scheduler) hasTaskMCPURL() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return strings.TrimSpace(s.taskMCPURL) != ""
+}
+
+// AgentBackendLookup reports the backend an agent launches on once runtime
+// overrides are applied. ok is false when the runtime does not know the agent.
+type AgentBackendLookup func(agentName string) (backend string, ok bool)
+
+// SetAgentBackendLookup attaches the agent runtime's view of each agent's
+// backend, where a backend override (provider rotation, a restored switch)
+// wins over the configured one. Without it the scheduler reads the configured
+// backend only.
+func (s *Scheduler) SetAgentBackendLookup(fn AgentBackendLookup) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.agentBackend = fn
 }
 
 // SetGitHubPromptResolver attaches a resolver used to fetch an agent's kick
@@ -166,21 +201,6 @@ func (s *Scheduler) GetPrimer() *knowledge.Primer {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.primer
-}
-
-// SetInception attaches an inception engine so kick templates can inject
-// ideation state via ${INCEPTION_*} variables.
-func (s *Scheduler) SetInception(ie *knowledge.InceptionEngine) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.inception = ie
-}
-
-// GetInception returns the attached inception engine, or nil if none is set.
-func (s *Scheduler) GetInception() *knowledge.InceptionEngine {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.inception
 }
 
 // SetLastActionable caches the latest actionable result so manual kicks

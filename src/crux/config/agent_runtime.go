@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -60,17 +58,17 @@ func (p *PromptSourceConfig) IsSet() bool {
 // user-writable dashboard overlay can neither widen the allowlist nor point an
 // agent at an arbitrary repo the App happens to be installed on.
 type DefinitionSourceConfig struct {
-	// Type selects the source kind. Only "github" is currently supported; an
-	// empty type defaults to "github" when a repo is set.
+	// Type selects the source kind; only "github" (the default) is supported.
 	Type  string `yaml:"type,omitempty" json:"type,omitempty"`
 	Owner string `yaml:"owner,omitempty" json:"owner,omitempty"`
 	Repo  string `yaml:"repo,omitempty" json:"repo,omitempty"`
 	Path  string `yaml:"path,omitempty" json:"path,omitempty"`
 	Ref   string `yaml:"ref,omitempty" json:"ref,omitempty"`
-	// URL is the human-facing source URL the operator pasted in the import UI
-	// (e.g. the github.com blob URL). Informational only — Owner/Repo/Path/Ref
-	// are authoritative for fetching. Kept so the UI can round-trip it.
+	// URL is the import UI's pasted source URL, kept only so the UI can
+	// round-trip it; Owner/Repo/Path/Ref are authoritative for fetching.
 	URL string `yaml:"url,omitempty" json:"url,omitempty"`
+	// Discovered: owner-approved from a repo's .hive/agents/ (#18491); owner keeps backend/model/mode/tools.
+	Discovered bool `yaml:"discovered,omitempty" json:"discovered,omitempty"`
 }
 
 // Slug returns the "owner/repo" identifier used for allowlist matching, or ""
@@ -252,6 +250,7 @@ const ClaudeBackend = "claude"
 // here have no effort flag; a configured effort is ignored for them rather
 // than breaking their launch command.
 var ReasoningEffortsByBackend = map[string][]string{
+	"cline":       {"none", "low", "medium", "high", "xhigh"},
 	"codex":       {"minimal", "low", "medium", "high", "xhigh"},
 	"agy":         {"low", "medium", "high"},
 	ClaudeBackend: {ClaudeEffortLow, ClaudeEffortMedium, ClaudeEffortHigh, ClaudeEffortXHigh, ClaudeEffortMax},
@@ -770,106 +769,6 @@ const (
 	GatewayKindCustom     = "custom"
 )
 
-// ResolveAPIKey returns this gateway's key value, preferring the env var when
-// set and falling back to the file. Returns "" when neither yields a value
-// (a keyless endpoint). Mirrors LiteLLMConfig key resolution.
-// secretFileRoots are the ONLY directories an api_key_file may live under.
-//
-//   - /secrets      — the read-only Kubernetes Secret projection
-//   - /data/secrets — the PVC-backed dir the dashboard writes UI-entered keys to
-//
-// Anything else is refused. See SecretFilePathAllowed.
-//
-// A package var, not a const slice, so tests can point it at a t.TempDir()
-// (production never reassigns it). Use SetSecretFileRootsForTest.
-var secretFileRoots = []string{"/secrets", WritableSecretsDir}
-
-// SecretFileRoots returns the directories hive reads secret files from, so a
-// reader can redact their contents (the admin log read, #11942).
-func SecretFileRoots() []string {
-	return append([]string(nil), secretFileRoots...)
-}
-
-// SetSecretFileRootsForTest overrides the allowed secret-file roots and returns
-// a function restoring the previous value. Intended for tests, which must write
-// key files into a t.TempDir() rather than the real /secrets.
-//
-// This is not a security hole: it is compiled into the binary but never called
-// outside tests, and anyone able to call it already has in-process code
-// execution — at which point they can read the files directly.
-func SetSecretFileRootsForTest(roots ...string) func() {
-	prev := secretFileRoots
-	secretFileRoots = roots
-	return func() { secretFileRoots = prev }
-}
-
-// AllowSecretFileRoot registers an ADDITIONAL directory whose files may be read
-// as a secret, returning a function that removes it again.
-//
-// This exists so a component that WRITES key files keeps its write location and
-// this package's READ gate in lockstep. pkg/dashboard writes per-gateway keys to
-// its own gatewaySecretsDir — a package var tests repoint at a temp dir — and
-// without this the two seams disagree: the dashboard writes a key it can then
-// never read back. Callers register the same directory they write to, so the
-// gate stays a real confinement rather than something each test disables.
-func AllowSecretFileRoot(dir string) func() {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return func() {}
-	}
-	prev := secretFileRoots
-	secretFileRoots = append(append([]string(nil), secretFileRoots...), dir)
-	return func() { secretFileRoots = prev }
-}
-
-// SecretFilePathAllowed reports whether p is a path hive may read a secret from.
-//
-// SECURITY (audit N8, CWE-200/918): api_key_file is attacker-controllable — the
-// gateway upsert stores whatever absolute path it is given, and the save-time
-// probe then reads that file and ships its contents to the gateway endpoint as
-// an `Authorization: Bearer` header. Without confinement that is an arbitrary
-// file read wired directly to an arbitrary outbound request: /data/secrets/*.pem
-// (the GitHub App key), /proc/self/environ, token caches.
-//
-// The check is a prefix test against secretFileRoots, applied AFTER resolving
-// symlinks, so a symlink inside an allowed directory cannot point out of it. A
-// path that does not exist yet is still validated lexically — the dashboard
-// legitimately writes a key file before anything reads it.
-func SecretFilePathAllowed(p string) bool {
-	p = strings.TrimSpace(p)
-	if p == "" || !filepath.IsAbs(p) {
-		return false
-	}
-	clean := filepath.Clean(p)
-	// Resolve symlinks when the path (or its parent) exists, so a link planted
-	// inside an allowed root cannot escape it. EvalSymlinks fails on a
-	// not-yet-created file, in which case the lexical check below still applies.
-	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
-		clean = resolved
-	} else if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(clean)); err == nil {
-		clean = filepath.Join(resolvedDir, filepath.Base(clean))
-	}
-	for _, root := range secretFileRoots {
-		rootClean := filepath.Clean(root)
-		// Resolve the ROOT too. On macOS /var is a symlink to /private/var, so a
-		// resolved path under a temp dir would never prefix-match an unresolved
-		// root — the comparison has to be symlink-resolved on both sides or it
-		// is inconsistent.
-		if resolvedRoot, err := filepath.EvalSymlinks(rootClean); err == nil {
-			rootClean = resolvedRoot
-		}
-		if clean == rootClean {
-			continue // the directory itself is not a key file
-		}
-		// The separator suffix keeps "/data/secrets-evil" from matching the
-		// "/data/secrets" root.
-		if strings.HasPrefix(clean, rootClean+string(filepath.Separator)) {
-			return true
-		}
-	}
-	return false
-}
-
 // APIKeySHA256 returns the lowercase SHA-256 hex digest of the exact key
 // string Hive will present to an inference gateway. It returns empty for an
 // empty key so callers can expose presence/hash without leaking the secret.
@@ -879,27 +778,6 @@ func APIKeySHA256(key string) string {
 	}
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
-}
-
-func (gw GatewayConfig) ResolveAPIKey() string {
-	if gw.APIKeyEnv != "" {
-		if v := os.Getenv(gw.APIKeyEnv); v != "" {
-			return v
-		}
-	}
-	if gw.APIKeyFile != "" {
-		// SECURITY (audit N8): confine the read to the managed secrets dirs. This
-		// gate lives HERE, not only in the HTTP handler, so every caller is
-		// covered — including a path that reached hive.yaml some other way (a
-		// hand-edited config, an older build, a restored backup).
-		if !SecretFilePathAllowed(gw.APIKeyFile) {
-			return ""
-		}
-		if b, err := os.ReadFile(gw.APIKeyFile); err == nil {
-			return strings.TrimSpace(string(b))
-		}
-	}
-	return ""
 }
 
 // IsEnabled reports whether the trajectory-review lane is on. Default is ON:
@@ -918,7 +796,7 @@ func (c *InferenceAuthConfig) ResolveAPIKey(defaultEnv string) string {
 	// SECURITY (audit N8): same confinement as GatewayConfig.ResolveAPIKey — an
 	// api_key_file is only ever read from the managed secrets dirs.
 	if c.APIKeyFile != "" && SecretFilePathAllowed(c.APIKeyFile) {
-		if data, err := os.ReadFile(c.APIKeyFile); err == nil {
+		if data, err := readSecretFile(c.APIKeyFile); err == nil {
 			if key := strings.TrimSpace(string(data)); key != "" {
 				return key
 			}
@@ -1128,119 +1006,6 @@ const (
 	BobStateDirName = ".bob"
 )
 
-// ResolveAPIKey returns the bob API key, or "" when none is configured.
-// Key FILES are consulted in priority order — the configured api_key_file,
-// then the k8s Secret mount (DefaultBobAPIKeyFile), then the PVC file
-// (WritableBobAPIKeyFile) — followed by the env var named by api_key_env and
-// finally DefaultBobAPIKeyEnv. This mirrors LiteLLMConfig.ResolveAPIKey so a
-// key stays working if hive.yaml is re-seeded and the api_key_file pointer is
-// lost, or if the PVC copy is wiped but an admin Secret exists.
-func (c *BobConfig) ResolveAPIKey() string {
-	key, _ := c.resolveAPIKeyWithSource()
-	return key
-}
-
-// ResolveAPIKeySource reports WHERE the key was found without exposing the
-// value: "file:<path>", "env:<NAME>", or "" when unconfigured. Safe to log
-// and safe to return from APIs.
-func (c *BobConfig) ResolveAPIKeySource() string {
-	_, source := c.resolveAPIKeyWithSource()
-	return source
-}
-
-func (c *BobConfig) resolveAPIKeyWithSource() (string, string) {
-	if c == nil {
-		return "", ""
-	}
-	files := []string{c.APIKeyFile, DefaultBobAPIKeyFile, WritableBobAPIKeyFile}
-	seen := map[string]bool{"": true}
-	for _, f := range files {
-		if seen[f] {
-			continue
-		}
-		seen[f] = true
-		if data, err := os.ReadFile(f); err == nil {
-			if key := strings.TrimSpace(string(data)); key != "" {
-				return key, "file:" + f
-			}
-		}
-	}
-	// TrimSpace the env-var sources too, matching the file branch above. bob
-	// does NO trimming of its own — bundle/bob.js reads
-	// `process.env.BOBSHELL_API_KEY` verbatim into the Authorization header —
-	// and hive delivers the value through `tmux set-environment`, which passes
-	// it as a raw exec argument with no shell word-splitting to strip a stray
-	// newline. So any trailing whitespace here reaches IBM's API inside the
-	// header and 401s, which bob surfaces as a fallback to the SSO flow rather
-	// than as an auth error. Cheap to normalize; impossible to debug from the
-	// symptom.
-	if c.APIKeyEnv != "" {
-		if key := strings.TrimSpace(os.Getenv(c.APIKeyEnv)); key != "" {
-			return key, "env:" + c.APIKeyEnv
-		}
-	}
-	if key := strings.TrimSpace(os.Getenv(DefaultBobAPIKeyEnv)); key != "" {
-		return key, "env:" + DefaultBobAPIKeyEnv
-	}
-	return "", ""
-}
-
-// ResolveAPIKey returns the LiteLLM API key. Key FILES are consulted in
-// priority order — the configured api_key_file, then the k8s Secret mount
-// (DefaultLiteLLMAPIKeyFile), then the dashboard-written PVC file
-// (WritableLiteLLMAPIKeyFile) — followed by the env var named by
-// api_key_env and finally DefaultLiteLLMAPIKeyEnv. Returns "" when no key
-// is configured. The key value itself is never stored in hive.yaml.
-//
-// Consulting all three file locations means a key saved via the dashboard
-// keeps working even if hive.yaml is reset (e.g. re-seeded from a
-// ConfigMap) and the api_key_file pointer is lost, and an admin-managed
-// Secret key keeps working if the PVC copy is wiped.
-func (c *LiteLLMConfig) ResolveAPIKey() string {
-	key, _ := c.resolveAPIKeyWithSource()
-	return key
-}
-
-// ResolveAPIKeySource reports where ResolveAPIKey found the key without
-// exposing the value: "file:<path>", "env:<NAME>", or "" when no key is
-// configured. Safe to return from APIs (the dashboard shows it as the
-// "Key detected" store).
-func (c *LiteLLMConfig) ResolveAPIKeySource() string {
-	_, source := c.resolveAPIKeyWithSource()
-	return source
-}
-
-func (c *LiteLLMConfig) resolveAPIKeyWithSource() (string, string) {
-	files := []string{c.APIKeyFile, DefaultLiteLLMAPIKeyFile, WritableLiteLLMAPIKeyFile}
-	seen := map[string]bool{"": true}
-	for _, f := range files {
-		if seen[f] {
-			continue
-		}
-		seen[f] = true
-		// SECURITY (audit N8): only the managed secrets dirs. The two defaults
-		// appended above already satisfy this; the gate is for c.APIKeyFile,
-		// which is operator/API-supplied.
-		if !SecretFilePathAllowed(f) {
-			continue
-		}
-		if data, err := os.ReadFile(f); err == nil {
-			if key := strings.TrimSpace(string(data)); key != "" {
-				return key, "file:" + f
-			}
-		}
-	}
-	if c.APIKeyEnv != "" {
-		if key := os.Getenv(c.APIKeyEnv); key != "" {
-			return key, "env:" + c.APIKeyEnv
-		}
-	}
-	if key := os.Getenv(DefaultLiteLLMAPIKeyEnv); key != "" {
-		return key, "env:" + DefaultLiteLLMAPIKeyEnv
-	}
-	return "", ""
-}
-
 // ResolveEndpoint returns the effective LiteLLM base URL: the
 // HIVE_LITELLM_ENDPOINT env var when set, otherwise the YAML endpoint.
 func (c *LiteLLMConfig) ResolveEndpoint() string {
@@ -1322,7 +1087,7 @@ func IsInferenceBackend(backend string) bool {
 // a backend here without also updating the shell side (or, if it genuinely
 // belongs on only one side, documenting why in cliBackendExceptions) fails
 // that test.
-var CLIBackends = []string{"claude", "copilot", "goose", "codex", "pi", "bob", "aider", "gemini", "agy", "opencode", "kilo", "muse", "omp", "openhands", "omnigent"}
+var CLIBackends = []string{"claude", "copilot", "goose", "codex", "pi", "bob", "aider", "gemini", "agy", "opencode", "kilo", "muse", "omp", "openhands", "omnigent", "cline"}
 
 // IsCLIBackend returns true if the backend launches an agentic CLI binary.
 func IsCLIBackend(backend string) bool {
@@ -1343,48 +1108,6 @@ func SupportedBackends() []string {
 	out = append(out, CLIBackends...)
 	out = append(out, InferenceBackends...)
 	return out
-}
-
-// WildcardMatch checks if text matches a pattern supporting:
-// - * wildcards (match any substring)
-// - /regex/ syntax for full regex
-// - plain substring match (case-insensitive)
-func WildcardMatch(text, pattern string) bool {
-	text = strings.ToLower(text)
-	pattern = strings.TrimSpace(pattern)
-
-	if strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/") {
-		re, err := regexp.Compile("(?i)" + pattern[1:len(pattern)-1])
-		if err != nil {
-			return false
-		}
-		return re.MatchString(text)
-	}
-
-	pattern = strings.ToLower(pattern)
-	if strings.Contains(pattern, "*") {
-		parts := strings.Split(pattern, "*")
-		idx := 0
-		for _, part := range parts {
-			if part == "" {
-				continue
-			}
-			found := strings.Index(text[idx:], part)
-			if found < 0 {
-				return false
-			}
-			idx += found + len(part)
-		}
-		if !strings.HasPrefix(pattern, "*") && !strings.HasPrefix(text, parts[0]) {
-			return false
-		}
-		if !strings.HasSuffix(pattern, "*") && !strings.HasSuffix(text, parts[len(parts)-1]) {
-			return false
-		}
-		return true
-	}
-
-	return strings.Contains(text, pattern)
 }
 
 // SelfMergeMinACMMLevel is the lowest ACMM level at which the App is allowed

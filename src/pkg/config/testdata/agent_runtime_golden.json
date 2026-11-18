@@ -11,8 +11,7 @@
     "Forge": "",
     "IssueFilter": {
       "hard_suppress_labels": {},
-      "reporter_trust": {},
-      "agent_proposal": {}
+      "reporter_trust": {}
     },
     "CheckoutsDir": "",
     "AgentsMdMaxBytes": 0,
@@ -151,6 +150,7 @@
     "pr_follow_up": {}
   },
   "Governor": {
+    "ci": {},
     "Modes": {
       "busy": {
         "Threshold": 16,
@@ -172,6 +172,9 @@
     "EvalIntervalWebhookS": 900,
     "WebhookWakeDebounceS": 10,
     "WebhookWakeMinGapS": 30,
+    "CIFailureWebhookKick": null,
+    "CIFailureKickCooldownS": 0,
+    "MergeTrainStallWarnS": 0,
     "ConserveIntervalMultiplier": 2,
     "OptionalSweepEveryNCycles": 1,
     "ExplainMode": "",
@@ -191,7 +194,8 @@
         "Dwell": null,
         "ContributorNudge": {
           "Enabled": null,
-          "RenudgeInterval": ""
+          "RenudgeInterval": "",
+          "CIFailureCooldown": ""
         },
         "PresenceWindow": "",
         "ContributorGraceOnline": "",
@@ -200,10 +204,13 @@
           "Enabled": null,
           "AfterOffline": "",
           "AfterUnregistered": "",
+          "OfflineGrace": "",
+          "RebaseAttemptTimeout": "",
           "InPlace": null,
           "StrictAttribution": null,
           "AutoMerge": null,
           "MaintainerPolicy": "",
+          "CloseSuperseded": "",
           "Supersede": {
             "CloseFirst": null
           }
@@ -222,7 +229,9 @@
         "Human": "",
         "Clanker": "",
         "Hive": ""
-      }
+      },
+      "ReadyForReview": "",
+      "DecisionNeeded": ""
     },
     "Sensing": {
       "GHRatePatterns": [
@@ -259,7 +268,8 @@
       "ProbeIntervalS": 45,
       "Liveness": {
         "StuckOverlayAfter": "10m",
-        "ShellPromptAfter": "3m"
+        "ShellPromptAfter": "3m",
+        "LoginStreak": 0
       },
       "Restart": {
         "Backoff": [
@@ -384,6 +394,7 @@
       "StallThresholdS": 0,
       "MaxReplans": 0
     },
+    "reroute": {},
     "AttributionTrailer": null,
     "first_timer_welcome": {},
     "advisory": {
@@ -394,6 +405,7 @@
       "queue_health": {}
     },
     "auto_close_superseded": true,
+    "review": {},
     "project_observability": {},
     "work_source": {
       "type": "",
@@ -437,6 +449,8 @@
     "BaseURL": "",
     "AppAuthoredPRs": null,
     "AppSignedCommits": null,
+    "notifications": {},
+    "attention": {},
     "OAuthBaseURLOverride": "",
     "OAuthAPIURLOverride": ""
   },
@@ -461,6 +475,7 @@
     "Port": 8080,
     "AuthToken": "",
     "AgentPollIntervalS": 10,
+    "matrix": {},
     "AuthorizedUsers": null,
     "AuthorizedUserNames": null,
     "HubProxied": false,
@@ -471,7 +486,8 @@
       }
     },
     "issue_bands": {},
-    "stage_tracker": {}
+    "stage_tracker": {},
+    "sessions": {}
   },
   "Data": {
     "MetricsDir": "/data/metrics",
@@ -481,6 +497,7 @@
     "BobSessionsDir": "/data/home/.bob",
     "AgentsDir": "/data/agent-configs",
     "NousDir": "/data/nous",
+    "WorkflowsDir": "",
     "SessionRetentionDays": null
   },
   "deployment": {},
@@ -547,7 +564,29 @@
       "MaxBytes": 0,
       "Repos": null
     },
-    "AgentScopes": null
+    "AgentScopes": null,
+    "Advisor": false,
+    "AdvisorMaxPerKick": 0,
+    "AdvisorExcludeAgents": null,
+    "AdvisorLLM": {
+      "Mode": "",
+      "Model": "",
+      "Endpoint": "",
+      "APIKeyEnv": "",
+      "APIKeyFile": "",
+      "Candidates": 0,
+      "PaneLines": 0,
+      "TimeoutS": 0,
+      "MaxCallsPerAgentHour": 0,
+      "MaxCallsPerDay": 0,
+      "BudgetOverride": false,
+      "HoldoutPercent": 0,
+      "OnError": ""
+    }
+  },
+  "inbox": {
+    "spek": {},
+    "dibs": {}
   },
   "Hub": {
     "Enabled": false,
@@ -561,6 +600,7 @@
     "AutoUpgrade": false,
     "AutoUpgradeMode": "",
     "ContributeSuspended": false,
+    "activity": {},
     "ContributeWallEnabled": false,
     "ContributeWallRetentionDays": 0,
     "NPSEnabled": null,
@@ -652,7 +692,12 @@
     "rfc_existing_check": {}
   },
   "fleet": {},
+  "dedupe": {},
   "contribute": {},
+  "workflow": {
+    "enabled": false,
+    "marketplace": {}
+  },
   "HiveID": "",
   "acmm_level": null,
   "advisor": {},
@@ -664,13 +709,17 @@
       "ExecTimeoutS": 0,
       "HTTPTimeoutS": 0,
       "AllowGitHubPrompt": false,
-      "GitHubPromptAllowlist": null
+      "GitHubPromptAllowlist": null,
+      "OwnerGitHubPromptRepos": null
     },
     "Defs": null
   },
   "otel": {},
   "Tracing": {},
   "debug": {},
+  "network": {
+    "upstream_proxy": {}
+  },
   "Mint": {
     "Enabled": false,
     "KeyPath": "",
@@ -690,6 +739,14 @@
   },
   "intent": {},
   "sentinel": {},
+  "security": {},
+  "evidence": {
+    "complexity": {}
+  },
+  "benchmarks": {},
+  "compliance": {
+    "posture_checks": {}
+  },
   "escalation": {
     "email": {
       "smtp": {},
@@ -701,9 +758,6 @@
       "pagerduty": {}
     }
   },
-  "evidence": {
-    "complexity": {}
-  },
   "jev": {},
   "runs": {
     "checkpoints": {},
@@ -712,10 +766,7 @@
       "prior_art": {}
     },
     "spektacular": {
-      "hub_executor": {},
-      "recheck": {
-        "discovery": {}
-      }
+      "hub_executor": {}
     },
     "external": {
       "flue": {
@@ -733,6 +784,13 @@
     }
   },
   "retro": {},
+  "meetings": {
+    "quorum": {},
+    "vexa": {},
+    "discord": {},
+    "budget": {},
+    "llm": {}
+  },
   "swarm": {},
   "autonomy": {},
   "review": {
@@ -742,21 +800,29 @@
     "recommendations": {},
     "plan_match": {}
   },
-  "compliance": {
-    "posture_checks": {}
-  },
   "auto_merge": {
     "bot_takeover": {},
+    "dependency_bot_adopt": {},
     "trusted_authors": {},
     "contributor_lane": {},
     "contributor_tier": {},
-    "merge_train": {}
+    "merge_train": {},
+    "native_merge_queue": {},
+    "hive_superseding": {}
   },
   "decisions": {
     "delegate": {}
   },
+  "writeback": {
+    "unsolicited": {}
+  },
   "chat": {
     "grounded_answers": {}
+  },
+  "customers": {
+    "inference": {},
+    "avatars": {},
+    "mention_search": {}
   },
   "duplicate_sweep": {},
   "good_first_issue": {},
@@ -765,7 +831,33 @@
   "search": {},
   "scanner": {},
   "upstream_watch": {},
+  "code_scanning": {},
   "convergence": {},
+  "integration_orchestration": {
+    "mode": "",
+    "scopes": null,
+    "lease_ttl": 0,
+    "window": 0,
+    "max_active": 0,
+    "max_runner_minutes": 0,
+    "max_jobs": 0,
+    "max_attempts": 0,
+    "max_observation_age": 0,
+    "admission_runner_minutes": 0,
+    "admission_jobs": 0,
+    "policies": null,
+    "execution": {
+      "mode": "",
+      "scopes": null,
+      "max_active": 0,
+      "max_runner_minutes": 0,
+      "max_jobs": 0,
+      "max_attempts": 0,
+      "observation_age": 0,
+      "window": 0,
+      "cooldown": 0
+    }
+  },
   "sla": {
     "targets": {}
   },
@@ -783,5 +875,6 @@
   "classification": {
     "review_bots": {}
   },
-  "task_mcp": {}
+  "task_mcp": {},
+  "config": {}
 }

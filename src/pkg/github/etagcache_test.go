@@ -244,8 +244,20 @@ func TestETagCache_EvictsLeastRecentlyUsed(t *testing.T) {
 			t.Errorf("oldest entry %d survived eviction", i)
 		}
 	}
-	if cache.totalBytes != 3*len(`{}`) {
-		t.Errorf("totalBytes = %d, want %d", cache.totalBytes, 3*len(`{}`))
+	// The bound counts what each surviving entry holds: its body and the
+	// headers remembered with it.
+	held := 0
+	for _, e := range cache.entries {
+		if e.size < len(`{}`) {
+			t.Errorf("entry size %d does not cover its body", e.size)
+		}
+		held += e.size
+	}
+	if cache.totalBytes != held {
+		t.Errorf("totalBytes = %d, want %d (the surviving entries' sizes)", cache.totalBytes, held)
+	}
+	if got := cache.evictions.Load(); got != 2 {
+		t.Errorf("evictions = %d, want 2", got)
 	}
 }
 
@@ -322,6 +334,9 @@ func TestETagCache_ThroughGoGithub(t *testing.T) {
 // post-reset wave is paced — the projectbluefin spoke re-exhausted a 6650/hr
 // quota within one second of every reset (#7430).
 func TestSlowStart_PrimaryLimitEngagesCaution(t *testing.T) {
+	// Keep this test's rate-limit readings out of the shared core snapshot.
+	resetRESTAccountingForTest(t, time.Now())
+
 	reset := time.Now().Add(30 * time.Minute).Truncate(time.Second)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-RateLimit-Limit", "6650")

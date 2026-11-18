@@ -2,11 +2,21 @@
 
 ## Audience
 
-This page is for tool authors who want to understand Hive's Project Inception and long-running-run seam. It distinguishes what is actually pluggable from what is simply a Spektacular-compatible CLI contract.
+Use this page to choose between operating the existing runner and implementing a compatible planning CLI. A run turns a triaged issue into a specification, a plan, then implementation work.
+
+## Operator path: use the existing runner
+
+Follow [Using Spektacular with Hive](https://docs.hivecommons.dev/docs/hive/spektacular-runs) for installation, project visibility, enablement, and a first run. Before enabling it, the Spektacular binary and the project/artifacts must be reachable **from the Hive process**, not just a contributor's clone.
+
+The `runs:` and `governor:` settings belong to **Hive's configuration** (the file selected by `--config`/`HIVE_CONFIG`, normally `hive.yaml`), not Spektacular's project `config.yaml`. Use the deployment's supported settings path; see [configuration ownership](../agent-configuration.md#where-configuration-lives). The runner is installed **at boot**, so restart after enabling it and check for `[spektacular] stage runner installed`. Then verify a known artifact with `spektacular spec status <name>` in Hive's own working directory and environment.
+
+Operators do not need to implement the interface below. Keep the tool's version compatible with the commands and JSON fields Hive consumes.
 
 ## Concepts
 
-Project Inception can admit an approved issue into a long-running `spec` run when Spektacular support is enabled. The approval handler checks `runs.spektacular.enabled` before admission (`src/pkg/dashboard/inception_handlers.go:269`). The stage runner is installed at boot only when that same config flag is true (`src/cmd/hive/spektacularwire.go:19`).
+A **lease** records temporary ownership of one workflow stage. An **artifact** is the resulting specification or plan; a **receipt** records stage completion. The **planner** imports plan tasks into work that an owner must approve before implementation. For example, a final specification can finish the `spec` stage without granting permission to implement its unapproved plan.
+
+Run triage admits a `spec`-classified issue into a long-running run when Spektacular support is enabled (Inception approval was a second admission path until the inception API was retired). The stage runner is installed at boot only when that same config flag is true (`src/cmd/hive/spektacularwire.go:19`).
 
 Spektacular owns artifact state; Hive owns the workflow lease. Hive polls Spektacular for `spec` and `plan` artifacts, advances leases on final documents, and imports final plan tasks into Hive's planner (`src/pkg/planengine/adapter.go:114`). The dashboard side stays decoupled through the stage lease interface and `SetStageRunner` (`src/pkg/dashboard/stage_leases.go:87`).
 
@@ -26,7 +36,7 @@ runs:
 - Each engine reads its own `runs.<engine>` block; the `spektacular` engine is
   built from `runs.spektacular.binary` (`src/pkg/spektacular/register.go:17`),
   and the selected engine's `enabled` switch still gates the runner
-  (`src/cmd/hive/spektacularwire.go:114`).
+  (`src/cmd/hive/spektacularwire.go:56`).
 - An unknown name fails config validation rather than silently falling back:
   `ValidateEngine` rejects any name no engine registered
   (`src/pkg/config/runs_config.go:201`). If an unregistered name does reach
@@ -39,6 +49,9 @@ Adding an engine is a Go change, not a config one: see [Writing a planning
 engine](../spektacular.md#writing-a-planning-engine).
 
 ## Interface
+
+<details>
+<summary>CLI-author contract, payloads, and implementation references</summary>
 
 Hive talks to a CLI executable, configured by `runs.spektacular.binary` with default `spektacular` (`src/pkg/config/runs_config.go:137`). The runner executes commands through `BinaryExec`, which runs the configured binary with arguments and captures stdout (`src/pkg/spektacular/runner.go:249`).
 
@@ -77,6 +90,10 @@ spektacular plan export <name> --format json
 
 The response maps to `Plan`/`PlanTask` (`src/pkg/spektacular/runner.go:225`). Spektacular 0.23+ identifies each task by a UUID `id` (there is no plan-local `ref`) and emits `repo` and `execution` as objects:
 
+This is a **fragment**, not a complete importable plan: the task identified by
+`8f1c2b7e-0000-4000-8000-000000000000` must also exist in the full plan before
+the shown task can depend on it.
+
 ```json
 {
   "kind": "plan",
@@ -97,7 +114,11 @@ The pinned 0.22 release has no `export` verb (it swallows `export` as a position
 
 If export is unavailable, Hive falls back to `spektacular plan file read <name>/tasks.json` and then `<name>/plan.md` (`src/pkg/spektacular/runner.go:429`, `src/pkg/spektacular/runner.go:445`).
 
+</details>
+
 ## Step-by-step: use or emulate Spektacular
+
+**For CLI authors:** these are compatibility requirements, not additional operator setup. For an existing installation, use the operator route above.
 
 1. Enable the runner:
 
@@ -110,7 +131,7 @@ If export is unavailable, Hive falls back to `spektacular plan file read <name>/
        poll_interval_s: 30
    ```
 
-   These fields are `SpektacularConfig` and default off (`src/pkg/config/runs_config.go:137`).
+   Put these in the Hive configuration described above. These fields are `SpektacularConfig` and default off (`src/pkg/config/runs_config.go:137`); restart Hive to install the runner.
 2. Ensure the binary prints JSON for `spec status`, `plan status`, and preferably `plan export --format json`; Hive passes no `--json` flag.
 3. Use the bare artifact name as the CLI address. Hive normalizes `<name>.md` and `<name>/plan.md` to `<name>` with `ArtifactKey` (`src/pkg/spektacular/runner.go:65`).
 4. Let Hive own stage leases. `RunStageLeaseAccessor` lists pending stages as work items when `run_stages: true` is enabled (`src/pkg/worksource/run_stage.go:37`).
@@ -118,7 +139,7 @@ If export is unavailable, Hive falls back to `spektacular plan file read <name>/
 
 ## Example flow
 
-1. An operator approves an Inception run with an issue URL; when Spektacular is enabled, Hive admits the issue as a `spec` run (`src/pkg/dashboard/inception_handlers.go:269`).
+1. Run triage classifies an issue as `spec`; when Spektacular is enabled, Hive admits it as a `spec` run (see [Runs](../runs.md)).
 2. The runner polls `spektacular spec status <name>` until the spec is final (`src/pkg/spektacular/runner.go:359`).
 3. Hive writes a stage receipt and advances the lease to `plan` (`src/pkg/planengine/adapter.go:114`).
 4. The runner polls `plan status`; on final it imports the structured plan (`src/pkg/spektacular/runner.go:403`).
@@ -133,7 +154,7 @@ Use `pkg/spektacular/testdata/spektacular-fake/spektacular`, which implements th
 - Auth and secrets: Hive invokes a local binary; any Spektacular backend credentials belong to that tool's own environment, not to Hive's dashboard token.
 - Rate limits: tune `poll_interval_s`; every active `spec` or `plan` stage is polled at that cadence (`src/pkg/config/runs_config.go:145`).
 - Failure modes: missing artifacts become typed not-found errors; stale/replaced documents are refused rather than silently rebound; expired leases retry until `max_stage_retries` then escalate (`src/pkg/spektacular/runner.go:300`, `src/pkg/spektacular/runner.go:520`).
-- What is exposable: status JSON, plan export JSON, run-stage work items, stage receipts, and campaign projections through `/api/campaigns`.
+- What is exposable: status JSON, plan export JSON, run-stage work items and stage receipts. (The `/api/campaigns` projection was retired with inception campaigns.)
 - What is not exposable: Hive does not open Spektacular files directly, and no engine may mutate Hive's leases — an engine only answers questions about documents (`src/pkg/planengine/engine.go:20`). Engines are registered in-process; there is no remote/HTTP engine transport.
 
 ## Gaps

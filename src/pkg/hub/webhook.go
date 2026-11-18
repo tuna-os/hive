@@ -103,7 +103,7 @@ func (s *HubServer) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) 
 	switch event {
 	case "installation", "installation_repositories":
 		s.handleInstallationEvent(body)
-	case "pull_request", "pull_request_review", "pull_request_review_comment", "check_suite", "check_run", "status", "issue_comment", "issues", "push":
+	case "pull_request", "pull_request_review", "pull_request_review_comment", "check_suite", "check_run", "workflow_run", "workflow_job", "status", "issue_comment", "issues", "push":
 		s.relayWebhookToSpoke(event, r.Header, body)
 	default:
 		s.logger.Debug("ignoring webhook event", "event", event)
@@ -137,8 +137,11 @@ var spokeWebhookRelayClient = &http.Client{
 
 // relayWebhookToSpoke forwards a verified PR-shaped delivery, byte for byte
 // and with its original signature, to the hive that manages the repository so
-// the spoke can invalidate its cached PR state (hivecommons/hive#11177). The
-// spoke re-verifies X-Hub-Signature-256 with the same App webhook secret.
+// the spoke can invalidate its cached PR state (hivecommons/hive#11177). A
+// self-hosted spoke re-verifies X-Hub-Signature-256 with its own copy of the
+// App webhook secret; a hosted spoke never holds that secret, so the hub also
+// signs each relay with the target hive's own relay key
+// (signWebhookRelayHeaders) and the spoke verifies that instead.
 // Best effort and asynchronous: GitHub's delivery must not wait on a spoke.
 func (s *HubServer) relayWebhookToSpoke(event string, header http.Header, body []byte) {
 	var evt struct {
@@ -192,8 +195,13 @@ func (s *HubServer) relayWebhookToSpoke(event string, header http.Header, body [
 	for _, t := range targets {
 		hiveID, dashboardURL := t.hiveID, t.dashboardURL
 		spokeURL := strings.TrimRight(dashboardURL, "/") + spokeWebhookPath
-		s.logger.Info("relaying webhook to spoke", "hive_id", hiveID, "spoke_url", spokeURL, "event", event, "delivery", delivery)
+		relayKey := webhookRelayKeyForHive(hiveID)
+		s.logger.Info("relaying webhook to spoke", "hive_id", hiveID, "spoke_url", spokeURL, "event", event, "delivery", delivery, "relay_signed", relayKey != "")
 		payload := append([]byte(nil), body...)
+		hdr := forward.Clone()
+		if relayKey != "" {
+			signWebhookRelayHeaders(hdr, relayKey, time.Now(), delivery, payload)
+		}
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), webhookPushTimeout)
 			defer cancel()
@@ -206,7 +214,7 @@ func (s *HubServer) relayWebhookToSpoke(event string, header http.Header, body [
 				s.logger.Warn("failed to build spoke webhook relay request", "hive_id", hiveID, "error", err)
 				return
 			}
-			req.Header = forward.Clone()
+			req.Header = hdr
 			resp, err := spokeWebhookRelayClient.Do(req)
 			if err != nil {
 				s.logger.Warn("spoke webhook relay failed", "hive_id", hiveID, "event", event, "error", err)

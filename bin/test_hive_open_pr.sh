@@ -144,7 +144,7 @@ check "--body-file body reaches the request" \
 reset_reqs
 
 check_exit "--body-file - reads stdin" 0 \
-  bash -c 'printf "stdin body" | "$@"' _ env HIVE_AGENT=a3 HIVE_OPEN_PR_REQ_DIR="$REQ_DIR" \
+  bash -c 'printf "stdin body" | "$@"' _ env HIVE_AGENT=a3 HIVE_OPEN_PR_REQ_DIR="$REQ_DIR" HIVE_OPEN_PR_SKIP_REMOTE_CHECK=1 \
     bash "$MODIFIED_SCRIPT" --repo o/r --title T --head h --body-file -
 REQ="$(find_req a3)"
 check "stdin body reaches the request" "stdin body" "$(json_field "$REQ" body)"
@@ -213,6 +213,18 @@ reset_reqs
 check_exit "non-numeric --issues token exits 2" 2 \
   run_script a5 --repo o/r --head h --title T --body B --issues 'twelve'
 check_exit "rejected --issues writes no request" 0 \
+  test -z "$(find_req a5)"
+
+# "0" is digits-only but is not an issue GitHub can have: it is the "<N>"
+# placeholder left unsubstituted. Refuse it here so the watcher never sees a
+# declared #0 (whose "re-run with the full body" remedy cannot fix it).
+check_exit "--issues 0 exits 2" 2 \
+  run_script a5 --repo o/r --head h --title T --body B --issues 0
+check_exit "--issues '#0' exits 2" 2 \
+  run_script a5 --repo o/r --head h --title T --body B --issues '#0'
+check_exit "--issues with a 0 among real numbers exits 2" 2 \
+  run_script a5 --repo o/r --head h --title T --body B --issues '12,0'
+check_exit "rejected --issues 0 writes no request" 0 \
   test -z "$(find_req a5)"
 
 # --- Section 6: Flag tolerance ---
@@ -361,7 +373,64 @@ else
 fi
 reset_reqs
 
+# --- Section 10: head-on-remote preflight (#16969) ---
+echo ""
+echo "--- head-on-remote preflight ---"
+
+BARE="$TMPDIR_ROOT/remote.git"
+git init --quiet --bare "$BARE"
+PUSHED_REPO="$TMPDIR_ROOT/pushed"
+git clone --quiet "$BARE" "$PUSHED_REPO" 2>/dev/null
+( cd "$PUSHED_REPO" && git checkout --quiet -b pushed/branch 2>/dev/null && touch f && git add f &&
+  git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit --quiet -m seed &&
+  git push --quiet -u origin pushed/branch 2>/dev/null &&
+  git checkout --quiet -b local/only && touch g && git add g &&
+  git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit --quiet -m local )
+
+STDERR_OUT="$( (cd "$PUSHED_REPO" && env HIVE_AGENT=a10 HIVE_OPEN_PR_REQ_DIR="$REQ_DIR"   bash "$MODIFIED_SCRIPT" --repo o/r --head pushed/branch --title T --body B) 2>&1 >/dev/null )"
+check "pushed branch produces no warning" "" "$STDERR_OUT"
+reset_reqs
+
+STDERR_OUT="$( (cd "$PUSHED_REPO" && env HIVE_AGENT=a10 HIVE_OPEN_PR_REQ_DIR="$REQ_DIR"   bash "$MODIFIED_SCRIPT" --repo o/r --head local/only --title T --body B) 2>&1 >/dev/null )"
+case "$STDERR_OUT" in
+  *"branch 'local/only' is NOT on remote 'origin'"*"hive-push-branch --repo o/r"*) check "unpushed branch warns and names branch, remote and the push step" ok ok;;
+  *) check "unpushed branch warns and names branch, remote and the push step" "warning naming local/only, origin and hive-push-branch" "$STDERR_OUT";;
+esac
+check_exit "unpushed branch still queues the request (watcher retries once it lands)" 0   test -n "$(find_req a10)"
+reset_reqs
+
+STDERR_OUT="$( (cd "$PUSHED_REPO" && env HIVE_AGENT=a10 HIVE_OPEN_PR_REQ_DIR="$REQ_DIR" HIVE_OPEN_PR_SKIP_REMOTE_CHECK=1   bash "$MODIFIED_SCRIPT" --repo o/r --head local/only --title T --body B) 2>&1 >/dev/null )"
+check "HIVE_OPEN_PR_SKIP_REMOTE_CHECK silences the preflight" "" "$STDERR_OUT"
+reset_reqs
+
 # --- Summary ---
+echo ""
+echo "--- detached HEAD ---"
+
+reset_reqs
+# Detach the throwaway repo's checkout: the one branch still points here.
+git -C "$GIT_REPO" checkout --quiet --detach
+check_exit "detached HEAD with one local branch at it exits 0" 0 \
+  run_script d1 --repo o/r --title T --body B
+check "detached HEAD resolves to the real branch, not HEAD" "feature/from-branch" "$(json_field "$(find_req d1)" head)"
+check_exit "explicit --head HEAD while detached exits 0 via the same recovery" 0 \
+  run_script d2 --repo o/r --title T --body B --head HEAD
+check "explicit --head HEAD resolves to the real branch" "feature/from-branch" "$(json_field "$(find_req d2)" head)"
+
+# Two branches at the commit: ambiguous, so refuse instead of guessing.
+git -C "$GIT_REPO" branch other-branch
+check_exit "detached HEAD with two candidate branches exits 2" 2 \
+  run_script d3 --repo o/r --title T --body B
+check_exit "ambiguous detached HEAD writes no request" 0 \
+  test -z "$(find_req d3)"
+
+# No branch at the commit at all.
+git -C "$GIT_REPO" branch -D other-branch feature/from-branch >/dev/null 2>&1
+check_exit "detached HEAD with no branch exits 2" 2 \
+  run_script d4 --repo o/r --title T --body B
+check_exit "detached HEAD with no branch writes no request" 0 \
+  test -z "$(find_req d4)"
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1

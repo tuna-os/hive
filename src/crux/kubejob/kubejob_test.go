@@ -11,12 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hivecommons/hive/crux/config"
 	"github.com/hivecommons/hive/crux/sandbox"
 )
 
@@ -24,19 +26,53 @@ import (
 // was sent, serves a scripted sequence of Job statuses, one pod, its log and
 // its terminated exit code, and records deletes.
 type fakeAPI struct {
-	mu        sync.Mutex
-	created   map[string]any
-	statuses  []string // JSON bodies served to successive GET job calls
-	getCalls  int
-	deleted   bool
-	podName   string
-	exitCode  int
-	noPod     bool
-	logBody   string
-	podStatus string // "terminated" or "running"
-	failCode  int    // when >0, every request fails with this status
-	createErr int    // when >0, POST fails with this status
-	onJobGet  func() // called (under mu) on every GET job, after it is counted
+	mu                    sync.Mutex
+	created               map[string]any
+	statuses              []string // JSON bodies served to successive GET job calls
+	getCalls              int
+	deleted               bool
+	podName               string
+	exitCode              int
+	noPod                 bool
+	logBody               string
+	podStatus             string         // "terminated" or "running"
+	failCode              int            // when >0, every request fails with this status
+	createErr             int            // when >0, POST fails with this status
+	onJobGet              func()         // called (under mu) on every GET job, after it is counted
+	onPodLogAfterComplete func()         // called (under mu) on pod log request after Job Complete
+	jobCompleted          bool           // tracks whether job status shows Complete
+	policy                map[string]any // the NetworkPolicy manifest, when one was created
+	policyErr             int            // when >0, the NetworkPolicy POST fails with this status
+	policyDeleted         bool
+	order                 []string // "policy", "job" in creation order
+	selfPod               string   // JSON body of hive's own pod (testSelfPod), "" = 404
+	selfPodGets           int
+	serviceAccounts       map[string]string // SA name -> JSON body; absent = 404
+	saForbidden           bool              // SA reads answer 403
+
+	// Scripted per-call behavior for the node preflight and scheduling tests
+	// (#18811). Each slice is indexed by how many such calls came before and
+	// its last entry repeats; empty keeps the single-value fields above.
+	createdAll   []map[string]any // every Job manifest POSTed, in order
+	exitCodes    []int            // terminated exit code per pod GET
+	podNodes     []string         // spec.nodeName per pod GET ("" = none)
+	logs         []string         // pod log per log GET
+	podLists     []string         // body per pods-list GET (the schedule watch)
+	podGets      int
+	logGets      int
+	podListGets  int
+	jobCreations int
+}
+
+// pick returns the i-th entry of a script, repeating the last.
+func pick[T any](script []T, i int, def T) T {
+	if len(script) == 0 {
+		return def
+	}
+	if i >= len(script) {
+		i = len(script) - 1
+	}
+	return script[i]
 }
 
 func newFakeAPI() *fakeAPI {
@@ -53,6 +89,24 @@ func (f *fakeAPI) handler(t *testing.T) http.HandlerFunc {
 			return
 		}
 		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/networkpolicies"):
+			if f.policyErr > 0 {
+				w.WriteHeader(f.policyErr)
+				_, _ = w.Write([]byte(`{"kind":"Status","message":"networkpolicies.networking.k8s.io is forbidden"}`))
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			var m map[string]any
+			if err := json.Unmarshal(body, &m); err != nil {
+				t.Errorf("policy is not JSON: %v", err)
+			}
+			f.policy = m
+			f.order = append(f.order, "policy")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write(body)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/networkpolicies/"):
+			f.policyDeleted = true
+			_, _ = w.Write([]byte(`{"kind":"Status","status":"Success"}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/jobs"):
 			if f.createErr > 0 {
 				w.WriteHeader(f.createErr)
@@ -65,6 +119,9 @@ func (f *fakeAPI) handler(t *testing.T) http.HandlerFunc {
 				t.Errorf("manifest is not JSON: %v", err)
 			}
 			f.created = m
+			f.createdAll = append(f.createdAll, m)
+			f.jobCreations++
+			f.order = append(f.order, "job")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write(body)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/jobs/"):
@@ -73,10 +130,14 @@ func (f *fakeAPI) handler(t *testing.T) http.HandlerFunc {
 				i = len(f.statuses) - 1
 			}
 			f.getCalls++
+			statusBody := f.statuses[i]
+			if strings.Contains(statusBody, `"type":"Complete"`) {
+				f.jobCompleted = true
+			}
 			if f.onJobGet != nil {
 				f.onJobGet()
 			}
-			_, _ = w.Write([]byte(f.statuses[i]))
+			_, _ = w.Write([]byte(statusBody))
 		case r.Method == http.MethodDelete:
 			f.deleted = true
 			_, _ = w.Write([]byte(`{"kind":"Status","status":"Success"}`))
@@ -85,15 +146,57 @@ func (f *fakeAPI) handler(t *testing.T) http.HandlerFunc {
 				_, _ = w.Write([]byte(`{"items":[]}`))
 				return
 			}
+			if len(f.podLists) > 0 {
+				body := pick(f.podLists, f.podListGets, "")
+				f.podListGets++
+				_, _ = w.Write([]byte(body))
+				return
+			}
 			_, _ = w.Write([]byte(`{"items":[{"metadata":{"name":"` + f.podName + `"}}]}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/log"):
-			_, _ = w.Write([]byte(f.logBody))
+			if f.jobCompleted && f.onPodLogAfterComplete != nil {
+				f.onPodLogAfterComplete()
+			}
+			body := f.logBody
+			if len(f.logs) > 0 {
+				body = pick(f.logs, f.logGets, "")
+				f.logGets++
+			}
+			_, _ = w.Write([]byte(body))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/serviceaccounts/"):
+			if f.saForbidden {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"kind":"Status","message":"serviceaccounts is forbidden"}`))
+				return
+			}
+			body, ok := f.serviceAccounts[r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"kind":"Status","message":"not found"}`))
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pods/"+testSelfPod):
+			f.selfPodGets++
+			if f.selfPod == "" {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"kind":"Status","message":"pods \"` + testSelfPod + `\" not found"}`))
+				return
+			}
+			_, _ = w.Write([]byte(f.selfPod))
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/pods/"):
-			state := `{"terminated":{"exitCode":` + itoa(f.exitCode) + `}}`
+			code := pick(f.exitCodes, f.podGets, f.exitCode)
+			node := pick(f.podNodes, f.podGets, "")
+			f.podGets++
+			state := `{"terminated":{"exitCode":` + itoa(code) + `}}`
 			if f.podStatus != "terminated" {
 				state = `{"running":{}}`
 			}
-			_, _ = w.Write([]byte(`{"status":{"containerStatuses":[{"name":"kick","state":` + state + `}]}}`))
+			spec := ""
+			if node != "" {
+				spec = `"spec":{"nodeName":"` + node + `"},`
+			}
+			_, _ = w.Write([]byte(`{` + spec + `"status":{"containerStatuses":[{"name":"kick","state":` + state + `}]}}`))
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL)
 			w.WriteHeader(http.StatusNotFound)
@@ -123,6 +226,7 @@ func newLauncher(srv *httptest.Server, opts Options) *Launcher {
 		HTTPClient: srv.Client(),
 		TokenPath:  filepath.Join("/nonexistent", "token"),
 		Now:        func() time.Time { return time.Unix(1700000000, 0) },
+		PodName:    testSelfPod,
 	}
 }
 
@@ -210,7 +314,7 @@ func TestRunContextTimeoutDeletesTheJob(t *testing.T) {
 	}
 }
 
-func TestRunCompleteWithNoPodStillSucceeds(t *testing.T) {
+func TestRunCompleteWithNoPodKeepsExitCodeUnknown(t *testing.T) {
 	api := newFakeAPI()
 	api.statuses = []string{statusComplete}
 	api.noPod = true
@@ -221,8 +325,33 @@ func TestRunCompleteWithNoPodStillSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.ExitCode != 0 || res.Stdout != "" {
-		t.Errorf("result = %+v, want exit 0 (Complete) and no log", res)
+	if res.ExitCode != exitCodeUnknown || res.Stdout != "" {
+		t.Errorf("result = %+v, want unknown exit code (Complete, pod unreadable) and no log", res)
+	}
+}
+
+func TestRunSuccessDeletesJobEvenIfContextExpiresDuringLogCollection(t *testing.T) {
+	api := newFakeAPI()
+	api.statuses = []string{statusPending, statusComplete}
+	srv := httptest.NewServer(api.handler(t))
+	defer srv.Close()
+	l := newLauncher(srv, Options{})
+
+	// Cancel context during pod log collection, after Job is Complete.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api.onPodLogAfterComplete = cancel
+
+	res, err := l.Run(ctx, specFor("/data/agents/sandbox/deps-123"))
+	// Run should succeed: context expires during collection but cleanup uses a fresh context.
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0", res.ExitCode)
+	}
+	if !api.deleted {
+		t.Error("Job must be deleted even if context expires during log collection")
 	}
 }
 
@@ -276,6 +405,7 @@ func TestRunValidation(t *testing.T) {
 		{"no claim", Options{WorkspaceClaim: " "}, specFor("/data/x"), "workspace_claim"},
 		{"negative ttl", Options{WorkspaceClaim: "c", TTLSeconds: -1}, specFor("/data/x"), "ttl_seconds"},
 		{"bad volume", Options{WorkspaceClaim: "c", ExtraVolumes: []VolumeMount{{Claim: "x"}}}, specFor("/data/x"), "volumes[0]"},
+		{"bad network", Options{WorkspaceClaim: "c", Network: "bridge"}, specFor("/data/x"), "network must be"},
 		{"no image", Options{WorkspaceClaim: "c"}, sandbox.LaunchSpec{Workspace: "/data/x"}, "image"},
 		{"no workspace", Options{WorkspaceClaim: "c"}, sandbox.LaunchSpec{Image: "i"}, "workspace is required"},
 		{"workspace outside claim", Options{WorkspaceClaim: "c"}, specFor("/tmp/elsewhere"), "not under the workspace claim mount"},
@@ -325,6 +455,10 @@ func TestManifestShape(t *testing.T) {
 		`"tolerations":[{"effect":"NoSchedule","key":"spyre","operator":"Exists"}]`,
 		`"limits":{"ibm.com/spyre_pf":"2"}`,
 		`"serviceAccountName":"hive"`,
+		`"automountServiceAccountToken":false`,
+		`"allowPrivilegeEscalation":false`,
+		`"capabilities":{"drop":["ALL"]}`,
+		`"seccompProfile":{"type":"RuntimeDefault"}`,
 		`"envFrom":[{"secretRef":{"name":"artifact-registry"}}]`,
 		`"claimName":"hive-data"`,
 		`"subPath":"agents/sandbox/deps-123"`,
@@ -348,6 +482,47 @@ func TestManifestShape(t *testing.T) {
 	}
 }
 
+func TestManifestAffinity(t *testing.T) {
+	const affinityJSON = `{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"accelerator","operator":"In","values":["spyre","gpu"]}]}]},"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":50,"preference":{"matchExpressions":[{"key":"zone","operator":"In","values":["east"]}]}}]}}`
+	var affinity config.SandboxJobAffinity
+	if err := json.Unmarshal([]byte(affinityJSON), &affinity); err != nil {
+		t.Fatal(err)
+	}
+	var want any
+	if err := json.Unmarshal([]byte(affinityJSON), &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		selector map[string]string
+	}{
+		{name: "affinity alone"},
+		{name: "affinity and node selector", selector: map[string]string{"accelerator": "spyre"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newFakeAPI()
+			api.statuses = []string{statusComplete}
+			srv := httptest.NewServer(api.handler(t))
+			defer srv.Close()
+			l := newLauncher(srv, Options{WorkspaceClaim: "hive-data", Affinity: &affinity, NodeSelector: tc.selector})
+			if _, err := l.Run(context.Background(), specFor("/data/agents/sandbox/deps-123")); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			spec := api.created["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+			if !reflect.DeepEqual(spec["affinity"], want) {
+				t.Errorf("serialized affinity = %#v, want %#v", spec["affinity"], want)
+			}
+			if tc.selector == nil {
+				if _, ok := spec["nodeSelector"]; ok {
+					t.Errorf("unexpected nodeSelector: %#v", spec["nodeSelector"])
+				}
+			} else if !reflect.DeepEqual(spec["nodeSelector"], map[string]any{"accelerator": "spyre"}) {
+				t.Errorf("serialized nodeSelector = %#v", spec["nodeSelector"])
+			}
+		})
+	}
+}
+
 func TestManifestDefaultsAndCustomTTLAndMount(t *testing.T) {
 	l := &Launcher{Options: Options{WorkspaceClaim: "c", TTLSeconds: 60}}
 	m := l.manifest("ns", "job", "sub", sandbox.LaunchSpec{Image: "i", WorkspaceMount: "/w", WorkDir: "/w/sub"})
@@ -358,7 +533,7 @@ func TestManifestDefaultsAndCustomTTLAndMount(t *testing.T) {
 			t.Errorf("manifest missing %s\n%s", want, s)
 		}
 	}
-	for _, absent := range []string{"nodeSelector", "tolerations", "serviceAccountName", `"resources"`, `"command"`} {
+	for _, absent := range []string{"nodeSelector", `"affinity"`, "tolerations", "serviceAccountName", `"resources"`, `"command"`} {
 		if strings.Contains(s, absent) {
 			t.Errorf("manifest must omit %s when unset\n%s", absent, s)
 		}
@@ -627,6 +802,107 @@ func TestManifestCopiesAllowlistedEnv(t *testing.T) {
 	for _, leak := range []string{"HIVE_TEST_UNLISTED", "HIVE_TEST_API_TOKEN", "GITHUB_TOKEN", "leak", "from-process"} {
 		if strings.Contains(m, leak) {
 			t.Errorf("%q reached the Job manifest:\n%s", leak, m)
+		}
+	}
+}
+
+func TestNetworkNoneWrapsTheJobInADenyAllPolicy(t *testing.T) {
+	api := newFakeAPI()
+	api.statuses = []string{statusPending, statusComplete}
+	srv := httptest.NewServer(api.handler(t))
+	defer srv.Close()
+	l := newLauncher(srv, Options{Network: NetworkNone})
+	if _, err := l.Run(context.Background(), specFor("/data/agents/sandbox/deps-123")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Join(api.order, ",") != "policy,job" {
+		t.Fatalf("creation order = %v, want the policy before the job", api.order)
+	}
+	if !api.deleted || !api.policyDeleted {
+		t.Fatalf("after success job deleted=%v policy deleted=%v", api.deleted, api.policyDeleted)
+	}
+	name := api.created["metadata"].(map[string]any)["name"].(string)
+	meta := api.policy["metadata"].(map[string]any)
+	spec := api.policy["spec"].(map[string]any)
+	if api.policy["kind"] != "NetworkPolicy" || meta["name"] != name || meta["namespace"] != "hive" {
+		t.Fatalf("policy = %+v", api.policy)
+	}
+	selector := spec["podSelector"].(map[string]any)["matchLabels"].(map[string]any)
+	if selector[jobLabel] != name {
+		t.Fatalf("podSelector = %+v, want %s=%s", selector, jobLabel, name)
+	}
+	types := spec["policyTypes"].([]any)
+	if len(types) != 2 || types[0] != "Ingress" || types[1] != "Egress" || spec["ingress"] != nil || spec["egress"] != nil {
+		t.Fatalf("policy spec = %+v, want deny-all ingress and egress", spec)
+	}
+	template := api.created["spec"].(map[string]any)["template"].(map[string]any)
+	labels := template["metadata"].(map[string]any)["labels"].(map[string]any)
+	if labels[jobLabel] != name {
+		t.Fatalf("pod labels = %+v lack %s", labels, jobLabel)
+	}
+	if podSpec := template["spec"].(map[string]any); podSpec["hostNetwork"] != nil {
+		t.Fatalf("network none set hostNetwork: %+v", podSpec)
+	}
+}
+
+func TestNetworkNoneRefusesToRunWithoutItsPolicy(t *testing.T) {
+	api := newFakeAPI()
+	api.policyErr = http.StatusForbidden
+	srv := httptest.NewServer(api.handler(t))
+	defer srv.Close()
+	l := newLauncher(srv, Options{Network: NetworkNone})
+	_, err := l.Run(context.Background(), specFor("/data/agents/sandbox/deps-123"))
+	if err == nil || !strings.Contains(err.Error(), "deny-all NetworkPolicy") || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("Run = %v, want the policy refusal", err)
+	}
+	if api.created != nil {
+		t.Fatal("the Job was created without its policy")
+	}
+}
+
+func TestNetworkNonePolicyIsRemovedWhenTheJobCannotBeCreatedOrFails(t *testing.T) {
+	api := newFakeAPI()
+	api.createErr = http.StatusForbidden
+	srv := httptest.NewServer(api.handler(t))
+	defer srv.Close()
+	l := newLauncher(srv, Options{Network: NetworkNone})
+	if _, err := l.Run(context.Background(), specFor("/data/agents/sandbox/deps-123")); err == nil {
+		t.Fatal("Run succeeded without a Job")
+	}
+	if api.policy == nil || !api.policyDeleted {
+		t.Fatalf("policy created=%v deleted=%v after a failed job create", api.policy != nil, api.policyDeleted)
+	}
+
+	api = newFakeAPI()
+	api.statuses = []string{statusFailed}
+	srv2 := httptest.NewServer(api.handler(t))
+	defer srv2.Close()
+	l = newLauncher(srv2, Options{Network: NetworkNone})
+	if _, err := l.Run(context.Background(), specFor("/data/agents/sandbox/deps-123")); err == nil {
+		t.Fatal("failed Job reported success")
+	}
+	if api.deleted || !api.policyDeleted {
+		t.Fatalf("failed job deleted=%v (want kept) policy deleted=%v (want gone)", api.deleted, api.policyDeleted)
+	}
+}
+
+func TestNetworkHostAndDefaultManifests(t *testing.T) {
+	for _, network := range []string{NetworkHost, NetworkDefault, ""} {
+		api := newFakeAPI()
+		api.statuses = []string{statusComplete}
+		srv := httptest.NewServer(api.handler(t))
+		l := newLauncher(srv, Options{Network: network})
+		_, err := l.Run(context.Background(), specFor("/data/agents/sandbox/deps-123"))
+		srv.Close()
+		if err != nil {
+			t.Fatalf("network %q: %v", network, err)
+		}
+		if api.policy != nil {
+			t.Fatalf("network %q created a policy", network)
+		}
+		podSpec := api.created["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+		if host := network == NetworkHost; (podSpec["hostNetwork"] == true) != host || (podSpec["dnsPolicy"] == "ClusterFirstWithHostNet") != host {
+			t.Fatalf("network %q: hostNetwork=%v dnsPolicy=%v", network, podSpec["hostNetwork"], podSpec["dnsPolicy"])
 		}
 	}
 }

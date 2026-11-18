@@ -565,6 +565,88 @@ _extract_author() {
   return 1
 }
 
+# `gh pr list` asking for MERGED pull requests only. Nothing merged is work to
+# pick, so the enumeration gate below has nothing to protect there, and the
+# same set is already readable to every agent through an authorless
+# `gh search prs --merged` or a GET of `repos/<owner>/<repo>/pulls`. What only
+# `gh pr list` gives is the `--json` shape a repo's own scripts read: Danathar's
+# weekly agent audit pipes `gh pr list --state merged --json ...` into
+# scripts/ai-audit-report.mjs, and ci-maintainer, refused that one command,
+# parked "open the run summary and say which PR it flags" for the owner
+# (Danathar/dns-failover#152, Danathar/openaudible-autoupdate#169). The last
+# --state wins, as in gh. A --search query is refused here: it reaches the
+# search API, where its own is:/state: qualifiers could reach open PRs.
+_pr_list_merged_only() {
+  [[ "$subcmd" = "pr" && "$action" = "list" ]] || return 1
+  local i a state=""
+  for ((i=0; i<${#args[@]}; i++)); do
+    a="${args[$i]}"
+    case "$a" in
+      --search|--search=*|-S|-S?*) return 1 ;;
+      --state=*) state="${a#--state=}" ;;
+      -s=*) state="${a#-s=}" ;;
+      --state|-s) state="${args[$((i+1))]:-}" ;;
+      -s?*) state="${a#-s}" ;;
+    esac
+  done
+  [[ "$(_lower "$state")" = "merged" ]]
+}
+
+# The one `gh pr list` that bin/hive-baseline-check.sh makes for its sibling-PR
+# lookup (#17835): the kick mandates that helper before any check is retried,
+# and names that lookup as the sanctioned exception to the enumeration ban. The
+# helper marks its call with HIVE_BASELINE_CHECK=1. That marker is a caller-set
+# hint, not a trust boundary — any agent can set it, exactly as with
+# HIVE_CONTRIBUTOR_MODE above — so what makes the exception safe is that only
+# the helper's exact projection is let through, checked as an allowlist that a
+# forgotten flag cannot widen: the sole flags accepted are --repo/-R, --state/-s
+# (must resolve to open), --limit/-L (at most 100, what the helper sends) and
+# --json whose every field is one of number, headRefOid, isCrossRepository,
+# statusCheckRollup. Any other flag or positional (--label, --search, --author,
+# --base, -q, ...) refuses, since each would turn it into a general work queue.
+_pr_list_baseline_check() {
+  [[ "${HIVE_BASELINE_CHECK:-}" = "1" ]] || return 1
+  [[ "$subcmd" = "pr" && "$action" = "list" ]] || return 1
+  local i a state="" json="" limit="" seen_sub=0 seen_act=0
+  for ((i=0; i<${#args[@]}; i++)); do
+    a="${args[$i]}"
+    case "$a" in
+      --repo=*|-R=*|-R?*) ;;
+      --repo|-R) i=$((i+1)) ;;
+      --state=*) state="${a#--state=}" ;;
+      -s=*) state="${a#-s=}" ;;
+      -s?*) state="${a#-s}" ;;
+      --state|-s) i=$((i+1)); state="${args[$i]:-}" ;;
+      --limit=*) limit="${a#--limit=}" ;;
+      -L=*) limit="${a#-L=}" ;;
+      -L?*) limit="${a#-L}" ;;
+      --limit|-L) i=$((i+1)); limit="${args[$i]:-}" ;;
+      # gh accumulates repeated --json values, so every occurrence must be
+      # validated, not just the last one.
+      --json=*) json="${json:+${json},}${a#--json=}" ;;
+      --json) i=$((i+1)); json="${json:+${json},}${args[$i]:-}" ;;
+      -*) return 1 ;;
+      pr) [[ "$seen_sub" = 0 ]] || return 1; seen_sub=1 ;;
+      list) [[ "$seen_sub" = 1 && "$seen_act" = 0 ]] || return 1; seen_act=1 ;;
+      *) return 1 ;;
+    esac
+  done
+  [[ "$(_lower "$state")" = "open" ]] || return 1
+  if [[ -n "$limit" ]]; then
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -le 100 ]] || return 1
+  fi
+  [[ -n "$json" ]] || return 1
+  local f _fields
+  IFS=',' read -ra _fields <<<"$json"
+  for f in "${_fields[@]}"; do
+    case "$f" in
+      number|headRefOid|isCrossRepository|statusCheckRollup) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
 # Resolve the authenticated GitHub login. Initialize the cache internally so a
 # caller-controlled environment cannot seed a trusted identity (#3982).
 #
@@ -697,6 +779,10 @@ if [ "$_gh_author_scoped" = true ]; then
     # enumeration ban for staff agents is stated in their prompt, not enforced
     # by this branch, and widening the --author check must not quietly move it.
     :
+  elif _pr_list_merged_only; then
+    : # Merged PRs only: history, not a work queue (see _pr_list_merged_only).
+  elif _pr_list_baseline_check; then
+    : # hive-baseline-check.sh's sibling lookup (see _pr_list_baseline_check).
   else
     # Root-caused in a live hive (2026-08-20): agents read this two-line
     # message as "all gh $subcmd commands are blocked" and silently skipped
@@ -708,7 +794,12 @@ if [ "$_gh_author_scoped" = true ]; then
     # and point at whichever work-queue snapshot actually exists here.
     _actionable_hint="/var/run/hive-metrics/actionable.json"
     [ -f /data/last-actionable.json ] && _actionable_hint="/data/last-actionable.json"
-    _deny enumeration_disabled "gh $subcmd list is disabled for agents — ONLY listing/enumeration is blocked, writes like 'gh issue create' and 'hive-open-pr' are still ALLOWED; for the pre-filtered queue run 'cat ${_actionable_hint}' (a shell command, not a workspace file-read tool)."
+    #
+    # The message also names the reads that still work. Without them an agent
+    # took "listing is blocked" to mean it could not look up merged PRs at all,
+    # and parked a red audit-trail check for the owner instead of diagnosing it
+    # (Danathar/dns-failover#152).
+    _deny enumeration_disabled "gh $subcmd list is disabled for agents — ONLY listing/enumeration is blocked, writes like 'gh issue create' and 'hive-open-pr' are still ALLOWED; for the pre-filtered queue run 'cat ${_actionable_hint}' (a shell command, not a workspace file-read tool). Reads that still work: 'gh pr list --state merged' (merged PRs only, any --json fields, no --search), 'gh search prs|issues --repo <owner/repo> <terms>' without --author, 'gh api repos/<owner/repo>/pulls?state=closed' (GET), and 'gh pr view' / 'gh issue view <n>'."
   fi
 fi
 
@@ -1196,6 +1287,46 @@ _identity_footer() {
   echo -e "$parts"
 }
 
+# Structured blocker marker for needs-human reports (hivecommons/hive#15099).
+#
+# A report that says the App / token / hive *cannot* do something (push to
+# .github/workflows without the `workflows` permission, change branch
+# protection, set a secret, sign a CLA) describes a capability gap no
+# "Let hive decide" can clear. pkg/blocker reads `<!-- hive:blocker kind=… -->`
+# and parks the item on that blocker instead of a bare needs-human, so the
+# dashboard says what is missing and the delegated decision answers
+# "no-effect" with the real options. Prose is classified here with the same
+# narrow rules as pkg/blocker.Infer (mirrored, not shared: this file runs
+# where no Go binary is guaranteed). Only bodies that cite needs-human are
+# marked, a body that already carries a marker is left alone, and anything
+# the rules do not match stays unmarked — a wrong kind is worse than none.
+_blocker_kind() {
+  local body
+  body="$(printf '%s' "$1" | tr '\n' ' ' | tr '[:upper:]' '[:lower:]')"
+  [[ "$body" == *"hive:blocker"* ]] && return 1
+  [[ "$body" =~ needs[-\ ]human|needs\ a\ (human|person|maintainer)|a\ maintainer\ must|a\ person\ must ]] || return 1
+  local cannot="(cannot|can\'t|can not|unable to|not able to|no permission to|not permitted to|is not allowed to)"
+  if [[ "$body" =~ (no|lacks?|lacking|missing|without)\ (the\ )?\`?workflows?\`?(:\ ?write)?\ permission ]] \
+     || [[ "$body" =~ $cannot\ (push|modify|change|edit|write|update|touch|commit)[^.]{0,80}(\.github/workflows|workflow\ files?|workflows?/) ]] \
+     || [[ "$body" =~ workflows?\ permission[^.]{0,40}(missing|lacking|not\ granted|needed|required) ]]; then
+    echo "capability:workflows-permission"; return 0
+  fi
+  if [[ "$body" =~ $cannot[^.]{0,60}(branch[\ -]protection|rulesets?|protected\ branch) ]]; then
+    echo "capability:branch-protection"; return 0
+  fi
+  if [[ "$body" =~ $cannot\ (set|add|create|read|rotate|update|configure)[^.]{0,60}(secrets?|credentials?) ]]; then
+    echo "capability:secret"; return 0
+  fi
+  if [[ "$body" =~ $cannot\ (push|write|commit)[^.]{0,60}(repository|repo|branch|fork) ]] \
+     || [[ "$body" =~ (no|lacks?|missing|without)\ (the\ )?\`?(contents|write|push)\`?(:\ ?write)?\ (permission|access) ]]; then
+    echo "capability:repo-write"; return 0
+  fi
+  if [[ "$body" =~ (sign|signing|signed)[^.]{0,30}(cla|contributor\ license\ agreement) ]]; then
+    echo "human-only:cla"; return 0
+  fi
+  return 1
+}
+
 # Guard Markdown thematic breaks against becoming setext heading underlines.
 #
 # A line of `---` placed DIRECTLY under a paragraph is not a rule in Markdown —
@@ -1366,6 +1497,11 @@ _inject_identity() {
     # the gap is exactly one blank line regardless of how the file ended.
     body_val="$(printf '%s\n' "${body_val}" | _guard_markdown_rules)"
     body_val="${body_val%"${body_val##*[![:space:]]}"}"
+    local blocker_kind
+    if blocker_kind="$(_blocker_kind "$body_val")"; then
+      body_val="${body_val}
+<!-- hive:blocker kind=${blocker_kind} -->"
+    fi
     new_args+=("--body" "${body_val}
 
 ${footer}")
@@ -1602,6 +1738,56 @@ if [[ -n "$AGENT_NAME" ]]; then
     fi
   }
 
+  # _keep_pr_attribution keeps the `— hive: agent=… backend=… model=…` line on
+  # a body edit of the hive's OWN PR. The PR-request watcher appends that line
+  # when it opens the PR, and `gh pr edit --body` replaces the whole body, so
+  # an agent that rewrote its description a few seconds later deleted it
+  # (Danathar/arch-bootc#625, Danathar/atomic-image-builder#795). The line is
+  # the audit trail's "opened by the hive" record and the clanker test
+  # (pkg/github.HasAttributionTrailer); nothing put it back, and the repos'
+  # monthly Agent audit trail then failed on those PRs. The PR's current line
+  # is re-appended, the way ReconcilePRAttribution appends one: only when the
+  # new body carries no `— hive:` line of its own, and nothing when the
+  # current body has none. Callers run it after _settle_edit_body, so a file
+  # or stdin body is already a `--body <text>`, and only on a PR
+  # _pr_labels_csv said the hive owns.
+  _keep_pr_attribution() {
+    local i arg idx=-1 n=0 form="" val="" old trailer
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      arg="${args[$i]}"
+      case "$arg" in
+        --body|-b)
+          ((i + 1 < ${#args[@]})) || return 0
+          idx=$i; form=sep; val="${args[$((i + 1))]}"; n=$((n + 1)); i=$((i + 1)) ;;
+        --body=*) idx=$i; form=eq; val="${arg#--body=}"; n=$((n + 1)) ;;
+        -b?*)     idx=$i; form=short; val="${arg#-b}"; n=$((n + 1)) ;;
+        # An unreadable body file is left for gh to report.
+        --body-file|--body-file=*|-F|-F?*) return 0 ;;
+        -*) if gh_flag_takes_value "$arg"; then i=$((i + 1)); fi ;;
+      esac
+    done
+    ((n == 1)) || return 0
+    # Only a line that starts with `— hive:` is a signature, as the repos'
+    # agent audit reads it; a new body that merely mentions the prefix in its
+    # text (a PR about that audit) still gets the PR's line back.
+    [[ $'\n'"$val" == *$'\n— hive:'* ]] && return 0
+    _extract_item
+    local view_args=(pr view)
+    [[ -n "$item_num" ]] && view_args+=("$item_num")
+    [[ -n "$item_repo" ]] && view_args+=(--repo "$item_repo")
+    old="$("$REAL_GH" "${view_args[@]}" --json body --jq '.body' 2>/dev/null)" || return 0
+    trailer="$(printf '%s\n' "$old" | tr -d '\r' | sed -n 's/^[[:space:]]*\(— hive: [^[:space:]].*\)$/\1/p' | tail -n 1)"
+    trailer="${trailer%"${trailer##*[![:space:]]}"}"
+    [[ -n "$trailer" ]] || return 0
+    val="${val%"${val##*[![:space:]]}"}"
+    val="${val}"$'\n\n'"${trailer}"
+    case "$form" in
+      sep)   args[idx + 1]="$val" ;;
+      eq)    args[idx]="--body=$val" ;;
+      short) args[idx]="-b$val" ;;
+    esac
+  }
+
   case "$subcmd/$action" in
     issue/create|pr/create)
       _inject_identity true
@@ -1779,6 +1965,7 @@ if [[ -n "$AGENT_NAME" ]]; then
         if [[ -z "$edit_labels" ]]; then
           exec "$REAL_GH" "${args[@]}"
         fi
+        _keep_pr_attribution
       fi
       _ensure_labels
       # Label injection is provenance metadata, not a security gate. gh applies

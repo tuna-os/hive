@@ -12,7 +12,9 @@ import (
 // knowledgeTOCScope parses the scope query shared by the TOC and full-read
 // endpoints: layers, repos, types and tags (comma-separated allow-lists) plus
 // include_states for owners who need draft/deprecated/superseded entries.
-// The default is approved knowledge only (#11102).
+// The default is approved knowledge only (#11102). A request naming an agent
+// with ?agent= never sees a drained CLI-memory draft, whatever include_states
+// says (#17058); only owner reads list them for review.
 func knowledgeTOCScope(r *http.Request) (knowledge.TOCScope, error) {
 	q := r.URL.Query()
 	include, err := knowledgeIncludeStates(r)
@@ -20,13 +22,22 @@ func knowledgeTOCScope(r *http.Request) (knowledge.TOCScope, error) {
 		return knowledge.TOCScope{}, err
 	}
 	scope := knowledge.TOCScope{
-		Repos:         splitCSV(q.Get("repos")),
-		Types:         splitCSV(q.Get("types")),
-		Tags:          splitCSV(q.Get("tags")),
-		IncludeStates: include,
+		Repos:                splitCSV(q.Get("repos")),
+		Types:                splitCSV(q.Get("types")),
+		Tags:                 splitCSV(q.Get("tags")),
+		IncludeStates:        include,
+		HideAutoMemoryDrafts: strings.TrimSpace(q.Get("agent")) != "",
 	}
 	for _, l := range splitCSV(q.Get("layers")) {
 		scope.Layers = append(scope.Layers, knowledge.LayerType(strings.ToLower(l)))
+	}
+	// An untyped fact is listed as "general" (knowledge tocEntry), so a types
+	// list naming general has to match the empty type as well.
+	for _, t := range scope.Types {
+		if strings.EqualFold(t, "general") {
+			scope.Types = append(scope.Types, "")
+			break
+		}
 	}
 	return scope, nil
 }

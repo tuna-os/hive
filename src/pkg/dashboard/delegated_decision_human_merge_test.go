@@ -92,8 +92,17 @@ func TestDelegatedDecisionUntrustedReadyForHumanMergeDecides(t *testing.T) {
 			if len(mock.merges) != 0 {
 				t.Fatalf("the dashboard merges nothing itself: %v", mock.merges)
 			}
-			if len(mock.comments) == 0 || !strings.Contains(mock.comments[0], tc.wantRule) {
+			decisionComment := false
+			for _, comment := range mock.comments {
+				if job.Marker != "" && strings.Contains(comment, tc.wantRule) && strings.Contains(comment, job.Marker) {
+					decisionComment = true
+				}
+			}
+			if !decisionComment {
 				t.Fatalf("decision comment must carry rule %q: %v", tc.wantRule, mock.comments)
+			}
+			if !tc.wantAdopt && job.ApprovalRecordedAt == nil {
+				t.Fatal("approved native decision must be recorded before optional comments")
 			}
 
 			// The ✓ hover reads the ledger detail: recorded from the response
@@ -110,6 +119,105 @@ func TestDelegatedDecisionUntrustedReadyForHumanMergeDecides(t *testing.T) {
 				if a.Action != operatorActionLetHiveDecide || a.Detail != tc.wantDetail {
 					t.Errorf("✓ detail = %+v, want %q", a, tc.wantDetail)
 				}
+			}
+		})
+	}
+}
+
+// hivecommons/hive#15202: a person's 090 PR (owner or author/human) is never
+// adopted. A conflicting, red or unsigned head is returned to its author with
+// the fix spelled out; a clean head is still approved; and a DCO-less clanker
+// head still adopts (the one branch folded from hivecommons/hive#15191).
+func TestDelegatedHumanMergeDecisionPersonAuthoredNeverAdopts(t *testing.T) {
+	srv := newDelegatedServer(t, &repoItemDecisionMock{})
+	srv.deps.Config.Governor.Labels.Stage.Adoption.Enabled = boolPtr(true)
+	base := delegatedecision.Input{
+		Repo: "testorg/testrepo", Number: 15157, Kind: delegatedecision.KindPR, Author: "clubanderson",
+		Labels: []string{stagelabels.ReadyForHumanMerge.Label(), "role/newcomer"}, CIGreen: true,
+	}
+	req := delegatedDecisionRequest{Type: "pr", Reason: "contributor-lane:author-association"}
+	cases := []struct {
+		name     string
+		mutate   func(in *delegatedecision.Input)
+		wantRule string
+		wantNote string
+		wantText string
+	}{
+		{name: "owner conflicting returns to author", mutate: func(in *delegatedecision.Input) { in.OwnerAuthor = true; in.Conflicting = true },
+			wantRule: delegatedecision.RuleReturnToAuthor, wantNote: "hive decided: return to author · the branch conflicts with the base and needs a rebase",
+			wantText: "@clubanderson: rebase onto the base branch on #15157; then it merges"},
+		{name: "author/human red CI returns to author", mutate: func(in *delegatedecision.Input) { in.HumanAuthor = true; in.CIGreen = false },
+			wantRule: delegatedecision.RuleReturnToAuthor, wantNote: "hive decided: return to author · CI is not green on its head",
+			wantText: "make CI green"},
+		{name: "owner DCO missing returns to author", mutate: func(in *delegatedecision.Input) { in.OwnerAuthor = true; in.DCOMissing = true },
+			wantRule: delegatedecision.RuleReturnToAuthor, wantNote: "hive decided: return to author · the DCO sign-off is missing from its commits",
+			wantText: "add the DCO sign-off"},
+		{name: "owner clean head approves", mutate: func(in *delegatedecision.Input) { in.OwnerAuthor = true },
+			wantRule: delegatedHumanMergeApproveRule, wantNote: "hive decided: approve · review passed, CI green"},
+		{name: "clanker DCO missing adopts", mutate: func(in *delegatedecision.Input) { in.DCOMissing = true },
+			wantRule: delegatedHumanMergeAdoptDCORule, wantNote: "hive decided: adopt · DCO sign-off missing"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := base
+			in.Labels = append([]string(nil), base.Labels...)
+			tc.mutate(&in)
+			d, notes, ok := srv.delegatedHumanMergeDecision(in, req, "writer", true)
+			if !ok || d.Rule != tc.wantRule {
+				t.Fatalf("ok=%v decision=%+v, want rule %q", ok, d, tc.wantRule)
+			}
+			if len(notes) != 1 || notes[0] != tc.wantNote {
+				t.Fatalf("notes = %q, want %q", notes, tc.wantNote)
+			}
+			if tc.wantText != "" && !strings.Contains(d.Text, tc.wantText) {
+				t.Fatalf("text = %q, want it to contain %q", d.Text, tc.wantText)
+			}
+			for _, a := range d.Actions {
+				if in.PersonAuthored() && a.Kind == delegatedecision.ActionAdoptSupersede {
+					t.Fatalf("a person's PR must never carry an adopt action: %+v", d)
+				}
+			}
+			if d.Rule == delegatedHumanMergeAdoptDCORule && d.Verdict != delegatedecision.VerdictAdoptSupersede {
+				t.Fatalf("clanker DCO-less head should adopt: %+v", d)
+			}
+		})
+	}
+}
+
+// TestDelegatedHumanMergeGatedPRIsNotDecided: a sentinel alert or a hold
+// label is a gate riding the PR's real stage (hivecommons/hive#17327), so a
+// green, reviewed PR wears the 090 label while held. Neither human-merge
+// shortcut may approve, admit or adopt it on "Let hive decide": both step
+// aside and the policy (sentinel question, rail-hold) answers as it did
+// when the gate pinned 085.
+func TestDelegatedHumanMergeGatedPRIsNotDecided(t *testing.T) {
+	srv := newDelegatedServer(t, &repoItemDecisionMock{})
+	srv.deps.Config.Governor.Labels.Stage.Adoption.Enabled = boolPtr(true)
+	base := delegatedecision.Input{
+		Repo: "testorg/testrepo", Number: 17327, Kind: delegatedecision.KindPR, Author: "clubanderson", OwnerAuthor: true,
+		Labels: []string{stagelabels.ReadyForHumanMerge.Label(), "role/newcomer"}, CIGreen: true,
+	}
+	req := delegatedDecisionRequest{Type: "pr", Reason: "contributor-lane:author-association"}
+	if d, _, ok := srv.delegatedHumanMergeDecision(base, req, "writer", true); !ok || d.Rule != delegatedHumanMergeApproveRule {
+		t.Fatalf("clean owner 090 PR should approve: ok=%v %+v", ok, d)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(in *delegatedecision.Input)
+	}{
+		{"sentinel alert", func(in *delegatedecision.Input) { in.SentinelAlert = true }},
+		{"hold label", func(in *delegatedecision.Input) { in.Labels = append(in.Labels, "hold") }},
+		{"do-not-merge label", func(in *delegatedecision.Input) { in.Labels = append(in.Labels, "do-not-merge/wip") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := base
+			in.Labels = append([]string(nil), base.Labels...)
+			tc.mutate(&in)
+			if d, notes, ok := srv.delegatedHumanMergeDecision(in, req, "writer", true); ok {
+				t.Fatalf("gated 090 PR decided by the human-merge path: %+v notes=%q", d, notes)
+			}
+			if out, ok := srv.delegatedHumanMergeOutcome("testorg/testrepo", in.Number, "pr", "writer", true, in, req); ok {
+				t.Fatalf("gated 090 PR answered by the human-merge outcome: %+v", out)
 			}
 		})
 	}

@@ -58,6 +58,7 @@ type EvalSnapshot struct {
 	SuppressedLanes  []string                  `json:"suppressed_lanes,omitempty"`
 	LaneQueueDepths  map[string]int            `json:"lane_queue_depths,omitempty"`
 	LanePauseReasons map[string]string         `json:"lane_pause_reasons,omitempty"`
+	CoveredLanes     map[string]LaneCoverage   `json:"covered_lanes,omitempty"`
 }
 
 type RepoSnapshot struct {
@@ -75,6 +76,10 @@ type KickRecord struct {
 	// Empty while the turn is running or when the manager never classified it.
 	Outcome       string `json:"outcome,omitempty"`
 	OutcomeReason string `json:"outcomeReason,omitempty"`
+	// Reason is why an event-driven kick went out (for example "new release
+	// requests 2.32.0 -> 2.33.0"), set by RecordKickWithReason. Empty for
+	// cadence kicks, whose reason is the schedule itself.
+	Reason string `json:"reason,omitempty"`
 }
 
 type AgentReportRecord struct {
@@ -199,6 +204,11 @@ type State struct {
 	BudgetExhaustedUnit string            `json:"budget_exhausted_unit,omitempty"`
 	SuppressedLanes     []string          `json:"suppressed_lanes,omitempty"`
 	LanePauseReasons    map[string]string `json:"lane_pause_reasons,omitempty"`
+	// CoveredLanes are the contributor-first lanes whose kicks are withheld
+	// because a contributor relay covers the role (contributor_first.go).
+	// Kept separate from SuppressedLanes on purpose: that list means "paused
+	// for budget" to standby dispatch.
+	CoveredLanes map[string]LaneCoverage `json:"covered_lanes,omitempty"`
 }
 
 // ContinuousState is the governor's in-memory schedule/backoff for one agent
@@ -262,6 +272,7 @@ type Governor struct {
 	modeHistory                   []ModeChange
 	evalHistory                   []EvalSnapshot
 	kickHistory                   []KickRecord
+	deferredFixKicks              []deferredFixKick
 	agentReports                  map[string]AgentReportRecord
 	kickOutcomes                  map[string]KickOutcomeRecord
 	budget                        BudgetInfo
@@ -298,6 +309,11 @@ type Governor struct {
 	// window rolls so each window alerts at most once per threshold.
 	budgetWarned           bool
 	budgetExhaustedAlerted bool
+
+	// coverage is the governor's memory of which agent roles connected
+	// contributor relays are covering (contributor_first.go). Fed by
+	// SetContributorCoverage once per eval tick; lazily allocated.
+	coverage map[string]coverageRecord
 }
 
 func New(cfg config.GovernorConfig, agents map[string]config.AgentConfig, logger *slog.Logger) *Governor {
@@ -384,6 +400,23 @@ func (g *Governor) SetModeChangeObserver(obs ModeChangeObserver) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.modeChangeObserver = obs
+}
+
+// AddModeChangeObserver preserves the existing local observer while attaching
+// an optional participant. Both callbacks still run outside the governor lock.
+func (g *Governor) AddModeChangeObserver(obs ModeChangeObserver) {
+	if obs == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	previous := g.modeChangeObserver
+	g.modeChangeObserver = func(change ModeChange) {
+		if previous != nil {
+			previous(change)
+		}
+		obs(change)
+	}
 }
 
 func (g *Governor) Evaluate(queueIssues, queuePRs, queueHold, slaViolations int) []string {
@@ -500,6 +533,7 @@ func (g *Governor) EvaluateWithRepoDepths(queueIssues, queuePRs, queueHold, slaV
 	g.state.PendingKicks = agentNamesFromKickKeys(due)
 	g.state.SuppressedLanes = kickReport.suppressedLanes
 	g.state.LanePauseReasons = kickReport.pauseReasons
+	g.state.CoveredLanes = kickReport.coveredLanes
 
 	snap := EvalSnapshot{
 		Timestamp:        time.Now().UnixMilli(),
@@ -515,6 +549,7 @@ func (g *Governor) EvaluateWithRepoDepths(queueIssues, queuePRs, queueHold, slaV
 		OpenPRs:          queuePRs,
 		SuppressedLanes:  cloneStrings(kickReport.suppressedLanes),
 		LanePauseReasons: cloneStringMap(kickReport.pauseReasons),
+		CoveredLanes:     cloneLaneCoverage(kickReport.coveredLanes),
 	}
 	g.appendEvalHistory(snap)
 
@@ -933,6 +968,7 @@ type kickReport struct {
 	due             []string
 	suppressedLanes []string
 	pauseReasons    map[string]string
+	coveredLanes    map[string]LaneCoverage
 }
 
 const budgetExhaustedPauseReason = "budget_exhausted"
@@ -1033,6 +1069,14 @@ func (g *Governor) agentsDueForKickReport() kickReport {
 			suppressedSet[agentName] = struct{}{}
 			continue
 		}
+		// Contributor-first: a connected contributor relay is acting as this
+		// role, so the resident agent's kick is withheld (contributor_first.go).
+		// Checked AFTER the budget gate so a lane that is both out of budget
+		// and covered still reads as paused for budget, which is what standby
+		// dispatch keys on.
+		if _, covered := g.contributorCoveredLocked(agentName); covered {
+			continue
+		}
 
 		lastKick := g.state.LastKick[cadenceKey]
 		due := false
@@ -1094,7 +1138,7 @@ func (g *Governor) agentsDueForKickReport() kickReport {
 	}
 	sort.Strings(suppressedLanes)
 
-	return kickReport{due: due, suppressedLanes: suppressedLanes, pauseReasons: pauseReasons}
+	return kickReport{due: due, suppressedLanes: suppressedLanes, pauseReasons: pauseReasons, coveredLanes: g.coveredLanesLocked()}
 }
 
 // armContinuousIfIdleLocked seeds the first continuous re-kick when continuous
@@ -1212,6 +1256,9 @@ func (g *Governor) continuousBlockerLocked(agentName string) (string, AgentCaden
 	if g.continuousBudgetBlockedLocked(ac) {
 		return cadenceKey, cadence, "budget"
 	}
+	if _, covered := g.contributorCoveredLocked(agentName); covered {
+		return cadenceKey, cadence, contributorCoveringPauseReason
+	}
 	return cadenceKey, cadence, ""
 }
 
@@ -1280,6 +1327,12 @@ func (g *Governor) AgentEligibleForCELKick(agentName string) bool {
 	// Budget gate: when the weekly budget is exhausted, only budget-exempt
 	// agents may still be kicked — identical to agentsDueForKick.
 	if g.budgetExhausted() && !g.budgetExempt(agentName) {
+		return false
+	}
+
+	// Contributor-first gate: identical to agentsDueForKick, so an event
+	// kick cannot bypass a lane a contributor relay is covering.
+	if _, covered := g.contributorCoveredLocked(agentName); covered {
 		return false
 	}
 
@@ -1407,6 +1460,9 @@ func (g *Governor) resumeKickVerdictLocked(agentName string) (string, time.Durat
 	if g.budgetExhausted() && !g.budgetExempt(agentName) {
 		return cadenceKey, interval, ResumeRefusalBudgetExhausted
 	}
+	if _, covered := g.contributorCoveredLocked(agentName); covered {
+		return cadenceKey, interval, ResumeRefusalContributorCovering
+	}
 	if cadence.Schedule.Mode() != config.CadenceModeInterval {
 		return cadenceKey, interval, ResumeRefusalNotInterval
 	}
@@ -1446,6 +1502,17 @@ func (g *Governor) RecordKickForRepo(agentName, repo string) {
 // — the hosted scanner sat at its prompt for 45 minutes this way after a
 // 3-minute turn. In that case the kick is counted but the schedule is kept.
 func (g *Governor) RecordKickForRepoAt(agentName, repo string, kickedAt time.Time) {
+	g.recordKick(agentName, repo, "", kickedAt)
+}
+
+// RecordKickWithReason records an event-driven kick of agentName and keeps
+// reason on its kick-history entry, so the dashboard and persisted history
+// say why the kick went out (the release-feed watcher, #18494).
+func (g *Governor) RecordKickWithReason(agentName, reason string) {
+	g.recordKick(agentName, "", reason, time.Time{})
+}
+
+func (g *Governor) recordKick(agentName, repo, reason string, kickedAt time.Time) {
 	report, hasReport := g.validateAgentReportIfPresent(agentName)
 
 	g.mu.Lock()
@@ -1479,7 +1546,7 @@ func (g *Governor) RecordKickForRepoAt(agentName, repo string, kickedAt time.Tim
 		}
 		g.state.Continuous[agentName] = st
 	}
-	g.appendKickHistory(KickRecord{Timestamp: kickedAt, Agent: agentName, Repo: repo})
+	g.appendKickHistory(KickRecord{Timestamp: kickedAt, Agent: agentName, Repo: repo, Reason: reason})
 	if hasReport {
 		g.agentReports[agentName] = report
 	}
@@ -1581,6 +1648,7 @@ func (g *Governor) GetState() State {
 		BudgetExhaustedUnit: g.state.BudgetExhaustedUnit,
 		SuppressedLanes:     cloneStrings(g.state.SuppressedLanes),
 		LanePauseReasons:    cloneStringMap(g.state.LanePauseReasons),
+		CoveredLanes:        cloneLaneCoverage(g.state.CoveredLanes),
 	}
 }
 

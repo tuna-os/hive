@@ -67,7 +67,17 @@ type taskLease struct {
 	// double-assignment guard's hold on the item to a post-restart grace window;
 	// since #7773 every unexpired lease is a hold (leasedIssueKeys), so this is
 	// diagnostic — it says where a lease came from, not what it does.
-	restored      bool
+	restored bool
+	// assignedAt is when the hub issued this task to its holder — the
+	// `now` recordLease was given, which selectTask and the standby
+	// dispatcher pass as the assignment's own timestamp. It is the run
+	// log's duration anchor for a task adopted on the resume path: the new
+	// connection has no assignment of its own, and without this the
+	// finished run's duration_s was simply dropped (see runStartedAt on
+	// ContributorConnection). Persisted, so the anchor survives a restart;
+	// zero for a lease written before it was recorded, or one minted
+	// outside recordLease, which means "start unknown".
+	assignedAt    time.Time
 	expiresAt     time.Time
 	mcpTokenID    string
 	mcpTokenHash  string
@@ -285,11 +295,28 @@ func (h *ContributeWSHub) recordLeaseForKeyStage(identity, taskID, repo string, 
 		triageVerdict:   triageVerdict,
 		triageRationale: triageRationale,
 		workItem:        workItem.Normalized(),
+		assignedAt:      now,
 		expiresAt:       now.Add(leaseTTL),
 		stageRetries:    stageRetries,
 	}
 	// #5681: a lease the hub issued must outlive the process that issued it.
+	if h.server != nil {
+		if err := h.server.integrationLease(key, repo, identity, gen, now.Add(leaseTTL), now, false); err != nil {
+			if prev != nil {
+				h.leases[k] = prev
+			} else {
+				delete(h.leases, k)
+			}
+			for admissionKey, l := range removedAdmissions {
+				h.leases[admissionKey] = l
+			}
+			return err
+		}
+	}
 	if err := h.saveLeasesLocked(); err != nil {
+		if h.server != nil {
+			h.server.integrationRelease(key, "contributor/"+identity, gen, "authoritative lease persistence failed")
+		}
 		if prev != nil {
 			h.leases[k] = prev
 		} else {
@@ -759,6 +786,9 @@ func (h *ContributeWSHub) postCompletionPRComment(ctx context.Context, task *WST
 		return
 	}
 	body := "Hive completed the Spektacular implement stage.\n\nPull request: " + prURL
+	if _, epic := h.server.findRunEpic(runKey); epic != nil {
+		ctx = designWritebackContext(ctx, epic)
+	}
 	if err := commenter.AddComment(ctx, ref, body); err != nil {
 		h.logger.Warn("[contribute-ws] work item completion comment failed", "run", runKey, "error", err)
 	}
@@ -862,7 +892,8 @@ func (h *ContributeWSHub) renewLease(identity, taskID string, now time.Time) err
 	var saveErr error
 	if l := h.leaseForLocked(identity, taskID); l != nil {
 		l.expiresAt = now.Add(leaseTTL)
-		renewed = l
+		copyLease := *l
+		renewed = &copyLease
 		// #5681: persist the EXTENDED window. Without this a restart would restore
 		// the window as it stood at assignment, so a task that had been progressing
 		// for longer than leaseTTL — the exact case #4260 fixed in memory — would
@@ -872,6 +903,11 @@ func (h *ContributeWSHub) renewLease(identity, taskID string, now time.Time) err
 		}
 	}
 	h.leaseMu.Unlock()
+	if renewed != nil && h.server != nil {
+		if err := h.server.integrationLease(renewed.key, renewed.repo, identity, renewed.gen, renewed.expiresAt, now, true); err != nil {
+			h.logger.Warn("integration reservation renewal failed; existing lease retained", "task", taskID, "error", err)
+		}
+	}
 	// #8380: the worker claim travels with the lease — renew it too, outside
 	// leaseMu, so a task that outlives the 30m claim TTL stays visibly held.
 	if renewed != nil && renewed.number > 0 {
@@ -919,10 +955,12 @@ func (h *ContributeWSHub) revokeLease(identity, taskID string) {
 	revoked := false
 	// #8380: remember which items went so their worker claims go with them.
 	var releasedKeys []string
+	var releasedLeases []taskLease
 	if taskID != "" {
 		if l, ok := h.leases[leaseKey(identity, taskID)]; ok {
 			if l != nil {
 				releasedKeys = append(releasedKeys, leaseClaimKey(l))
+				releasedLeases = append(releasedLeases, *l)
 			}
 			delete(h.leases, leaseKey(identity, taskID))
 			revoked = true
@@ -931,6 +969,7 @@ func (h *ContributeWSHub) revokeLease(identity, taskID string) {
 		for k, l := range h.leases {
 			if l != nil && l.identity == identity {
 				releasedKeys = append(releasedKeys, leaseClaimKey(l))
+				releasedLeases = append(releasedLeases, *l)
 				delete(h.leases, k)
 				revoked = true
 			}
@@ -950,6 +989,11 @@ func (h *ContributeWSHub) revokeLease(identity, taskID string) {
 		}
 	}
 	h.leaseMu.Unlock()
+	for _, l := range releasedLeases {
+		if h.server != nil {
+			h.server.integrationRelease(leaseClaimKey(&l), "contributor/"+identity, l.gen, "lease revoked")
+		}
+	}
 	for _, key := range releasedKeys {
 		h.releaseClaimForLease(identity, key, "lease revoked")
 	}
@@ -1058,6 +1102,10 @@ type persistedLease struct {
 	// record unchanged.
 	StageRetries     int        `json:"stage_retries,omitempty"`
 	StageEscalatedAt *time.Time `json:"stage_escalated_at,omitempty"`
+	// AssignedAt is the task's original assignment time, the run log's
+	// duration anchor after a resume. omitempty and a pointer, so a lease
+	// written before it existed loads with the start unknown.
+	AssignedAt *time.Time `json:"assigned_at,omitempty"`
 	// Retirement tombstones share the atomic lease ledger, but never expire.
 	RetiredReason string `json:"retired_reason,omitempty"`
 }
@@ -1179,6 +1227,10 @@ func (h *ContributeWSHub) saveLeasesLocked() error {
 		if !l.stageEscalatedAt.IsZero() {
 			at := l.stageEscalatedAt
 			rec.StageEscalatedAt = &at
+		}
+		if !l.assignedAt.IsZero() {
+			at := l.assignedAt
+			rec.AssignedAt = &at
 		}
 		records = append(records, rec)
 	}
@@ -1345,6 +1397,9 @@ func (h *ContributeWSHub) loadLeases() {
 		}
 		if rec.StageEscalatedAt != nil {
 			l.stageEscalatedAt = *rec.StageEscalatedAt
+		}
+		if rec.AssignedAt != nil {
+			l.assignedAt = *rec.AssignedAt
 		}
 		h.leases[leaseKey(rec.Identity, rec.TaskID)] = l
 		if rec.Gen > maxGen {

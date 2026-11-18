@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -714,6 +715,15 @@ func (s *HubServer) StartLatestSHAPoller(ctx context.Context) {
 	// rate-limited to perHiveEnvMaxPatchesPerCycle patches per cycle, because
 	// each patch rolls that hive's pod. See perhive_env_reconcile.go.
 	s.reconcilePerHiveEnvIfDue()
+	// Converge per-cluster host_aliases (clusters.json) onto existing hive
+	// Deployments so GHE-behind-reverse-proxy clusters never need a manual
+	// kubectl patch again (#17801). Throttled and rate-limited like the lane
+	// above because each patch rolls a pod.
+	s.reconcileHostAliasesIfDue()
+	// Converge the template startupProbe (#9692) and current init image repo
+	// onto hive Deployments provisioned before them, so a slow boot is not a
+	// permanent liveness kill-loop (#17827). Throttled and rate-limited.
+	s.reconcileStartupProbeIfDue()
 	// Put #7457's auth-url / auth-response-headers onto the hive-contribute
 	// Ingress of every hosted spoke provisioned before that fix, so
 	// /api/contribute/me learns who is calling there too (#7517). The
@@ -788,6 +798,8 @@ func (s *HubServer) pollLatestSHAsTick(ctx context.Context, now time.Time) {
 	s.reconcileNetAdminIfDue()
 	s.reconcileNodeHealthRBACIfDue()
 	s.reconcilePerHiveEnvIfDue()
+	s.reconcileHostAliasesIfDue()
+	s.reconcileStartupProbeIfDue()
 	s.reapOrphanedPodsIfDue()
 	s.retireExpiredGenerationsIfDue()
 	s.sweepExpiredAccessIfDue()
@@ -1057,6 +1069,9 @@ func fetchImageBuildState(client *http.Client, fullSHA string, logger *slog.Logg
 // non-200 parks the SHA for commitMsgBackoff. The back-off is keyed on the
 // short SHA so the poll path (full SHA) and the backfill path (short SHA) share
 // one entry per commit.
+// A 403/429 is a client-wide throttle, not a per-SHA failure: it parks every
+// SHA until the rate limit resets and warns once per window, otherwise N
+// branches with distinct SHAs would emit N warns and trip the fleet report.
 func fetchCommitMessage(client *http.Client, fullSHA string, logger *slog.Logger) string {
 	backoffKey := shortSHA(fullSHA)
 	if commitMsgBackedOff(backoffKey) {
@@ -1075,6 +1090,12 @@ func fetchCommitMessage(client *http.Client, fullSHA string, logger *slog.Logger
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		markCommitMsgBackoff(backoffKey)
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+			wait := commitMsgThrottleWait(resp.Header, githubWarnNow())
+			markCommitMsgGlobalBackoff(wait)
+			warnGitHubFetchOnce(logger, fmt.Sprintf("sha-msg:throttled:%d", resp.StatusCode), "SHA poll: commit message fetch non-200", "sha", fullSHA[:7], "status", resp.StatusCode, "retry_in", wait.String())
+			return ""
+		}
 		warnGitHubFetchOnce(logger, fmt.Sprintf("sha-msg:%s:%d", fullSHA[:7], resp.StatusCode), "SHA poll: commit message fetch non-200", "sha", fullSHA[:7], "status", resp.StatusCode)
 		return ""
 	}
@@ -1091,6 +1112,25 @@ func fetchCommitMessage(client *http.Client, fullSHA string, logger *slog.Logger
 		msg = msg[:idx]
 	}
 	return msg
+}
+
+// commitMsgThrottleWait derives the global back-off from Retry-After first,
+// then X-RateLimit-Reset, falling back to commitMsgBackoff; capped at
+// commitMsgGlobalBackoffMax. Retry-After wins because GitHub sends
+// X-RateLimit-Reset on every response, so a secondary-rate-limit 403 with
+// Retry-After: 60 must park fetches for ~60s, not until the primary window
+// resets.
+func commitMsgThrottleWait(h http.Header, now time.Time) time.Duration {
+	wait := commitMsgBackoff
+	if secs, err := strconv.Atoi(h.Get("Retry-After")); err == nil && secs > 0 {
+		wait = time.Duration(secs) * time.Second
+	} else if reset, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil && time.Unix(reset, 0).After(now) {
+		wait = time.Unix(reset, 0).Sub(now)
+	}
+	if wait > commitMsgGlobalBackoffMax {
+		wait = commitMsgGlobalBackoffMax
+	}
+	return wait
 }
 
 // backfillCommitMessage fills in a missing commit message for an already-cached SHA.

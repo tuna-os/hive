@@ -20,10 +20,9 @@ type ProjectConfig struct {
 	// GitHub-only configs are unaffected. Use ForgeKind() to read it with the
 	// default applied.
 	Forge string `yaml:"forge,omitempty"`
-	// IssueFilter gates which open issues agents may initiate work on: the
-	// require_labels allow-list ("only work issues labeled X"). The exclude
-	// polarity is Governor.Labels.Exempt, which wins on conflict. Absent/empty
-	// = no filtering, the pre-existing behavior. See IssueFilterConfig.
+	// IssueFilter controls admission by label, reporter, and agent proposal
+	// markers. The require_labels allow-list is optional; the proposal gate
+	// defaults to strategist/outreach markers. See IssueFilterConfig.
 	IssueFilter IssueFilterConfig `yaml:"issue_filter,omitempty"`
 	// AgentIssueDecisionPolicy is "resolve" (default) or "escalate". Resolve
 	// keeps Hive-authored issues actionable when the only parking reason is a
@@ -47,8 +46,10 @@ type ProjectConfig struct {
 	// (#12129). The block is cut at heading boundaries — whole sections are
 	// kept or dropped, never clipped mid-rule — and when anything is dropped
 	// the kick carries a one-line warning naming the omitted sections and the
-	// scheduler logs it. Zero means the agentsmd default (8192); values below
-	// 2048 are raised to 2048.
+	// scheduler logs it. Zero means the agentsmd default (32768, or
+	// HIVE_AGENTS_MD_MAX_BYTES when set); values below 2048 are raised to
+	// 2048 and values above the 262144 hard ceiling are lowered to it.
+	// repos.<repo>.agents_md_max_bytes overrides this per repo (#18495).
 	AgentsMdMaxBytes int `yaml:"agents_md_max_bytes,omitempty"`
 
 	// Style is the hive-wide house style: a short list of how-to-change rules
@@ -75,10 +76,28 @@ type ProjectConfig struct {
 	// Optional and additive. Absent — the state of every existing config —
 	// means nothing is paused and the hive behaves exactly as before.
 	PausedRepos []RepoPause `yaml:"paused_repos,omitempty"`
+	// ReferenceRepos are repositories agents may STUDY but do not manage
+	// (hivecommons/hive#18015): explicit owner/name entries, read-only by
+	// default, with a rare per-entry opt-in for opening issues/PRs. They are
+	// NOT in Repos: no work is enumerated from them, no ACMM eval runs on
+	// them, and writes to them are refused unless opted in. See
+	// reference_repos.go.
+	ReferenceRepos []ReferenceRepo `yaml:"reference_repos,omitempty" json:"reference_repos,omitempty"`
+	// RemoteWriteIdentity picks which GitHub identity the hive writes to its
+	// write-tier reference repos as (hivecommons/hive#18196 follow-up):
+	// "bot" (the default when empty) posts as the hive's GitHub App on a
+	// granted repo whose owner installed that App themselves and as the hive
+	// owner's connected account elsewhere; "bot_only" posts as the App where
+	// it is installed and is read-only elsewhere; "owner" always posts as the
+	// hive owner's connected account. See remote_write_identity.go.
+	RemoteWriteIdentity string `yaml:"remote_write_identity,omitempty" json:"remote_write_identity,omitempty"`
 	// RepoPolicies stores optional per-repository policy overrides keyed by
 	// repo name. project.repos remains the watched-repo identity list; this
 	// sidecar list lets existing string-list configs keep round-tripping.
 	RepoPolicies []RepoPolicy `yaml:"repo_policies,omitempty" json:"repo_policies,omitempty"`
+	// WorkflowBindings assigns stored workflow models to repositories
+	// (hivecommons/hive#17620). Unbound repositories use hive-default.
+	WorkflowBindings []WorkflowBinding `yaml:"workflow_bindings,omitempty" json:"workflow_bindings,omitempty"`
 	// MergeFrontTimeout is the hive-wide front timeout of the serialized merge
 	// lane (hivecommons/hive#12952) as a Go duration ("90m", "2h"); empty
 	// keeps the lane default of 60 minutes. repo_policies[].merge_front_timeout

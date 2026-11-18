@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/hivecommons/hive/crux"
+	"github.com/hivecommons/hive/crux/claude"
 	"github.com/hivecommons/hive/crux/paneclass"
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/notify"
@@ -30,9 +31,35 @@ func CommandForBackend(backend string) string {
 		return "Run: gemini auth login"
 	case "goose":
 		return "Run: goose auth login"
+	case "codex":
+		return "Run: codex login"
 	default:
 		return "Run the login command for " + backend
 	}
+}
+
+// PauseNotice renders the notification title, body and login hint for an
+// agent paused at a login prompt. A claude agent running on the operator's
+// long-lived token (longLivedToken) is at that prompt because Claude answered
+// 401 to the token itself: `/login` would only start a sign-in the agent does
+// not use, so the hint is claude.TokenRejectedMessage instead.
+func PauseNotice(name, backend string, longLivedToken bool) (title, body, hint string) {
+	if backend == "claude" && longLivedToken {
+		return fmt.Sprintf("\U0001F511 Claude token rejected: %s", name),
+			fmt.Sprintf("Agent '%s' was paused. %s, update the configured secret source "+
+				"(%s, or the file named by %s) with it, and restart the hive. "+
+				"See the backend auth recovery runbook, \"Replace a Claude operator token\".",
+				name, claude.TokenRejectedMessage, claude.OperatorTokenEnvVar, claude.OperatorTokenFileEnvVar),
+			claude.TokenRejectedMessage
+	}
+	hint = CommandForBackend(backend)
+	return fmt.Sprintf("\U0001F511 Login required: %s", name),
+		fmt.Sprintf(
+			"Agent '%s' needs authentication. Open the agent's terminal "+
+				"(tmux attach -t hive-%s) and run the login command for the CLI (%s). %s",
+			name, name, backend, hint,
+		),
+		hint
 }
 
 // Action is what the detector should do about one agent this cycle.
@@ -73,10 +100,44 @@ const PauseMinSightings = 2
 type SightingTracker struct {
 	mu     sync.Mutex
 	streak map[string]int
+	// revokedAlerted records which agents the operator has already been
+	// notified about for the current "login revoked" episode (#18732), so the
+	// page goes out once per episode rather than once per governor cycle.
+	revokedAlerted map[string]bool
 }
 
 func NewSightingTracker() *SightingTracker {
-	return &SightingTracker{streak: map[string]int{}}
+	return &SightingTracker{streak: map[string]int{}, revokedAlerted: map[string]bool{}}
+}
+
+// MarkRevokedAlerted reports whether this is the FIRST cycle the operator is
+// told about this agent's revoked credential; later cycles return false until
+// ClearRevokedAlert. A nil tracker alerts every cycle.
+func (t *SightingTracker) MarkRevokedAlerted(agent string) bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.revokedAlerted == nil {
+		t.revokedAlerted = map[string]bool{}
+	}
+	if t.revokedAlerted[agent] {
+		return false
+	}
+	t.revokedAlerted[agent] = true
+	return true
+}
+
+// ClearRevokedAlert re-arms the once-per-episode page for an agent whose
+// credential is no longer reported revoked.
+func (t *SightingTracker) ClearRevokedAlert(agent string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.revokedAlerted, agent)
 }
 
 // observe records this cycle's reading for one agent and returns the resulting
@@ -124,6 +185,11 @@ func (t *SightingTracker) Retain(present map[string]bool) {
 	for name := range t.streak {
 		if !present[name] {
 			delete(t.streak, name)
+		}
+	}
+	for name := range t.revokedAlerted {
+		if !present[name] {
+			delete(t.revokedAlerted, name)
 		}
 	}
 }
@@ -208,6 +274,40 @@ type AgentManager interface {
 	Pause(name, trigger, reason string) error
 }
 
+// ClaudeAuthModeReporter is the optional AgentManager extension that says
+// whether claude agents run on the operator's long-lived token. The in-process
+// agent.Manager implements it from the token it captured at construction,
+// which is the same snapshot its AgentHasValidCredential verdict uses, so the
+// pause verdict and the notice text in Scan come from one source.
+type ClaudeAuthModeReporter interface {
+	ClaudeLongLivedToken() bool
+}
+
+// claudeLongLivedToken answers the mode from the manager when it can say,
+// falling back to the live claude.AuthMode() read (remote runtimes).
+func claudeLongLivedToken(agentMgr AgentManager) bool {
+	if r, ok := agentMgr.(ClaudeAuthModeReporter); ok {
+		return r.ClaudeLongLivedToken()
+	}
+	return claude.AuthMode() == claude.AuthModeLongLivedToken
+}
+
+// CredentialRevocationReporter is the optional manager extension the detector
+// consults before trusting the file-level credential answer (#18732). A
+// manager that verified the credential against the provider and was told 401
+// reports it here; a runtime without the capability simply does not implement
+// it and the detector behaves as before.
+type CredentialRevocationReporter interface {
+	AgentCredentialRevoked(agentName string) (revoked bool, detail string)
+}
+
+func credentialRevoked(agentMgr AgentManager, name string) (bool, string) {
+	if r, ok := agentMgr.(CredentialRevocationReporter); ok {
+		return r.AgentCredentialRevoked(name)
+	}
+	return false, ""
+}
+
 type Notifier interface {
 	Send(title, message string, priority notify.Priority)
 }
@@ -284,6 +384,41 @@ func Scan(
 		re := Match(backend, joined, compiled)
 		streak := sightings.Observe(name, re != nil)
 
+		// #18732: the file-level answer above is positive evidence only, and a
+		// REVOKED grant passes it — the file is intact, the tokens are dead.
+		// When the manager has asked the provider and been refused, this is
+		// the operator's case: not the token-restart heal's (it cannot work
+		// and would spend the restart budget) and not a pause's (a paused
+		// agent would not self-heal after the sign-in). Page once, leave the
+		// agent running at its prompt, and let the dashboard banner and hub
+		// verdict carry the state from the manager's BackendAuth mark.
+		revoked, revokedDetail := credentialRevoked(agentMgr, name)
+		if !revoked {
+			sightings.ClearRevokedAlert(name)
+		}
+		if re != nil && revoked {
+			logger.Warn("login revoked detected: the provider rejected the stored credential — operator sign-in needed, no restart will be attempted",
+				"agent", name,
+				"backend", backend,
+				"login_hint", "Sign in again from the dashboard",
+				"pattern", re.String(),
+				"detail", revokedDetail,
+			)
+			if sightings.MarkRevokedAlerted(name) {
+				notifier.Send(
+					fmt.Sprintf("\U0001F511 Claude login revoked: %s", name),
+					fmt.Sprintf(
+						"Agent '%s' is at a login prompt and the provider rejected the stored %s credential (%s). "+
+							"Restarting cannot fix this, so no restart is attempted. Sign in again from the dashboard; "+
+							"agents still at the prompt are restarted once afterwards.",
+						name, backend, revokedDetail,
+					),
+					notify.PriorityHigh,
+				)
+			}
+			continue
+		}
+
 		switch Verdict(re != nil, credentialValid, streak) {
 		case ActionIgnore:
 			continue
@@ -300,8 +435,18 @@ func Scan(
 				"sightings", streak, "required", PauseMinSightings)
 			continue
 		case ActionPause:
+			// Determine the login instruction based on the agent's backend
+			title, body, loginCmd := PauseNotice(name, backend, claudeLongLivedToken(agentMgr))
+
+			// This WARN is what the fleet selfreport for class
+			// agent_login_required is built from (hivecommons/hive#16953):
+			// without the backend and the login hint the report cannot say
+			// WHICH provider the operator has to re-authenticate.
 			logger.Warn("login required detected",
 				"agent", name,
+				"backend", backend,
+				"login_hint", loginCmd,
+				"credential_valid", credentialValid,
 				"pattern", re.String(),
 				"sightings", streak,
 			)
@@ -326,18 +471,7 @@ func Scan(
 				dashSrv.AuditLog("system", "pause", "trigger=login-detector", name)
 			}
 
-			// Determine the login instruction based on the agent's backend
-			loginCmd := CommandForBackend(backend)
-
-			notifier.Send(
-				fmt.Sprintf("\U0001F511 Login required: %s", name),
-				fmt.Sprintf(
-					"Agent '%s' needs authentication. Open the agent's terminal "+
-						"(tmux attach -t hive-%s) and run the login command for the CLI (%s). %s",
-					name, name, backend, loginCmd,
-				),
-				notify.PriorityHigh,
-			)
+			notifier.Send(title, body, notify.PriorityHigh)
 		}
 	}
 	// Agents that vanished (removed from config, stopped) must not keep a
