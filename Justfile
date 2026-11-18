@@ -256,6 +256,12 @@ contribute-check backend="claude": (contribute-check-backend backend)
 backend-smoke backends="claude codex":
     HIVE_SMOKE_BACKENDS="{{backends}}" bash bin/test_backend_smoke.sh
 
+# Contract tests for bin/issue-classifier.sh (tier, tracker, lane, cluster
+# rules that route actionable issues). Hermetic: no network, no /var writes.
+# Usage: just test-issue-classifier
+test-issue-classifier:
+    bash bin/test_issue_classifier.sh
+
 # One-time setup: register with hub + authenticate GitHub + authenticate CLI
 # Ordering note (#2543): the backend-readiness preflight runs FIRST, before
 # any credential is written to disk or a contributor slot is registered —
