@@ -96,9 +96,7 @@ var inheritedCredentialEnvVars = []string{
 	upstreamproxy.HostsEnv,
 	upstreamproxy.NoProxyEnv,
 	"HIVE_NO_PROXY",
-	// Further hive credentials. agentExecEnv already keeps every hive
-	// credential out of the tmux server's environment; removing these here as
-	// well hides them from panes of a server started before that change.
+	// Hive credentials agentExecEnv also keeps out; hidden here for older servers.
 	"HIVE_SESSION_KEY",
 	"HIVE_MIRROR_HUB_HEARTBEAT_KEY",
 }
@@ -354,26 +352,6 @@ func validateTmuxKillSessionArgs(args []string) error {
 		return fmt.Errorf("target %q is not hive-namespaced", target)
 	}
 	return nil
-}
-
-// tmuxServerStartCmd is the command ensureTmuxSession runs to create the
-// agent's session, which also starts the agent's tmux server. The server
-// keeps this command's environment for its whole life, in its global
-// environment and in its own /proc/<pid>/environ, both readable by the agent.
-// So it gets agentExecEnv, never the hive's environment.
-func (m *Manager) tmuxServerStartCmd(agent *AgentProcess, agentDir string) *exec.Cmd {
-	var cmd *exec.Cmd
-	if agent.UID > 0 {
-		suExecArgs := []string{"su-exec", m.agentExecUserSpec(agent)}
-		tmuxArgs := append(m.tmuxBaseArgs(agent), newSessionCommands(agent.tmuxSession, agentDir)...)
-		cmd = exec.Command(suExecArgs[0], append(suExecArgs[1:], tmuxArgs...)...)
-	} else {
-		base := m.tmuxBaseArgs(agent)
-		tmuxArgs := append(base[1:], newSessionCommands(agent.tmuxSession, agentDir)...)
-		cmd = exec.Command(base[0], tmuxArgs...)
-	}
-	cmd.Env = agentExecEnv()
-	return cmd
 }
 
 func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
