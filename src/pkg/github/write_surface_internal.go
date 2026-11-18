@@ -28,6 +28,11 @@ const (
 	// filing pass that filed or updated at least one item, in any
 	// destination (GitHub issue, Projects, Linear, Jira). Target is the PR.
 	AuditActionReviewBacklogBatchRouted = "review_backlog_batch_routed"
+	// AuditActionReviewBacklogIssueClosed is recorded when the block sweep
+	// closes a backlog issue as completed because its source PR merged and
+	// the finding's file or symbol is gone from the base
+	// (review_backlog_selfcheck.go). Target is the backlog issue.
+	AuditActionReviewBacklogIssueClosed = "review_backlog_issue_closed"
 	// AuditActionHiveLabelApplied is recorded when the hive applies an
 	// existing repo label to a PR: the human-decision label and the review
 	// priority labels (human_decision_label.go).
@@ -67,6 +72,10 @@ const (
 	// AuditActionReporterTrustWaitCleared is recorded when the core poller
 	// removes a needs-triage label that its wait marker proves Hive added.
 	AuditActionReporterTrustWaitCleared = "reporter_trust_wait_cleared"
+	// AuditActionReferenceRepoReadOnlyNoticed is recorded when boot or a
+	// config reload posts the one-shot notice that derived reference repos
+	// are served read-only (reference_repo_request.go, hivecommons/hive#18158).
+	AuditActionReferenceRepoReadOnlyNoticed = "reference_repos_read_only_noticed"
 )
 
 // Outcome values for the internal-writer audit entries' "outcome" pair.
@@ -91,6 +100,7 @@ func InternalWriteAuditActions() []string {
 		AuditActionReviewBacklogIssueFiled,
 		AuditActionReviewBacklogSummaryPosted,
 		AuditActionReviewBacklogBatchRouted,
+		AuditActionReviewBacklogIssueClosed,
 		AuditActionHiveLabelApplied,
 		AuditActionRecommendationsPosted,
 		AuditActionFleetReportPosted,
@@ -100,5 +110,7 @@ func InternalWriteAuditActions() []string {
 		AuditActionHiveIDLabelRetired,
 		AuditActionReporterTrustWaitNoticed,
 		AuditActionReporterTrustWaitCleared,
+		AuditActionDependencyBotRebaseRequested,
+		AuditActionReferenceRepoReadOnlyNoticed,
 	}
 }

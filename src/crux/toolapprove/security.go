@@ -107,7 +107,11 @@ func NewDefaultSecurityScanner() *DefaultSecurityScanner {
 }
 
 var (
-	destructiveCmdRe  = regexp.MustCompile(`(?i)\b(rm\s+-[rRfF]+\s+(/|\*|/\*|\$HOME|~)|mkfs\b|dd\s+if=/dev/zero|:\(\)\{\s*:\|:&\s*\};:)\b`)
+	// destructiveCmdRe matches the non-rm destructive commands: mkfs, dd
+	// from /dev/zero and the fork bomb, which needs no word boundary. A
+	// recursive rm of a protected directory is decided by analyzeRmCommand
+	// (shellrm.go), which reads the command the way the shell does.
+	destructiveCmdRe  = regexp.MustCompile(`(?i)(\bmkfs\b|\bdd\s+if=/dev/zero\b|:\(\)\{\s*:\|:&\s*\};:)`)
 	credentialExfilRe = regexp.MustCompile(`(?i)\b(cat\s+~/\.ssh/|cat\s+/var/run/secrets/|printenv\s+.*TOKEN|echo\s+\$GH_TOKEN|echo\s+\$GITHUB_TOKEN)\b`)
 )
 
@@ -156,8 +160,12 @@ func (s *DefaultSecurityScanner) Scan(ctx context.Context, req ToolRequest) (Sca
 	if IsBash(req.Tool) || req.GetCommand() != "" {
 		cmd := req.GetCommand()
 		if cmd != "" {
-			if destructiveCmdRe.MatchString(cmd) {
+			destructive, overBound := analyzeRmCommand(cmd)
+			switch {
+			case destructive || destructiveCmdRe.MatchString(cmd):
 				violations = append(violations, fmt.Sprintf("destructive shell command detected: %q", cmd))
+			case overBound:
+				violations = append(violations, fmt.Sprintf("shell command exceeds destructive-command analysis bounds: %q", cmd))
 			}
 			if credentialExfilRe.MatchString(cmd) {
 				violations = append(violations, fmt.Sprintf("credential exfiltration attempt detected: %q", cmd))
@@ -165,11 +173,19 @@ func (s *DefaultSecurityScanner) Scan(ctx context.Context, req ToolRequest) (Sca
 		}
 	}
 
-	// 3. Guardrail path protection for local write tools
-	if IsLocalWrite(req.Tool) {
-		filePath := req.GetFilePath()
-		if filePath != "" && s.touchesGuardrailPath(filePath) {
-			violations = append(violations, fmt.Sprintf("tampering with guardrail-critical path: %q", filePath))
+	// 3. Guardrail path protection. Every tool not classified read-only
+	// that names a file is held to it, not just the IsLocalWrite allowlist:
+	// a write tool the allowlist does not spell (create, apply_patch,
+	// str_replace_editor, an agent's own name for it) must not reach the
+	// guardrail paths unseen. The gate fails closed — a read tool IsReadOnly
+	// does not spell is denied on these paths until it is added there.
+	// Every path is checked, not just the first: an apply_patch body can
+	// name a harmless file first and OWNERS second.
+	if req.IsSideEffectful() {
+		for _, filePath := range req.GetFilePaths() {
+			if s.touchesGuardrailPath(filePath) {
+				violations = append(violations, fmt.Sprintf("tampering with guardrail-critical path: %q", filePath))
+			}
 		}
 	}
 
@@ -198,7 +214,12 @@ func (s *DefaultSecurityScanner) touchesGuardrailPath(path string) bool {
 
 func matchPattern(pattern, path string) bool {
 	pattern = filepath.ToSlash(strings.TrimSpace(pattern))
-	path = filepath.ToSlash(strings.TrimPrefix(strings.TrimSpace(path), "./"))
+	path = strings.TrimSpace(path)
+	if path != "" {
+		// Collapse redundant separators and ./.. components so they cannot dodge the patterns.
+		path = filepath.Clean(path)
+	}
+	path = filepath.ToSlash(strings.TrimPrefix(filepath.ToSlash(path), "./"))
 
 	if ok, _ := filepath.Match(pattern, path); ok {
 		return true

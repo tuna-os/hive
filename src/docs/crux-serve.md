@@ -7,7 +7,9 @@ Stage 3 process boundary of the Crux design record
 [#13536](https://github.com/hivecommons/hive/issues/13536), stage 2/3 tracker
 [#14138](https://github.com/hivecommons/hive/issues/14138)): a harness other
 than hive drives agents through it, and the `crux` CLI has a remote mode that
-talks to it. Hive itself does not use the API yet; that is a later decision.
+talks to it. Hive's optional [durable lane participant](crux-lanes.md) uses
+separate project-authenticated lane RPCs on this server; that does not change
+its agent-control hosting mode or grant lane tokens agent-control authority.
 
 The wire contract is the stdlib-only package `crux/api`
 (`src/crux/api`), which a client can import without pulling in the runtime.
@@ -31,6 +33,13 @@ runtime and every agent must arrive as a definition on `POST /v1/agents`.
 | `--socket PATH`, `CRUX_SOCKET` | unix socket to serve on. Default `$XDG_RUNTIME_DIR/crux/crux.sock`, else `<tmp>/crux-<uid>/crux.sock`. The directory is created `0700`, the socket `0600`, and it is never reachable at that path with wider permissions (it is bound under a temporary name, chmod'ed, then renamed). A socket somebody already answers on is refused; a stale one is replaced. |
 | `--listen HOST:PORT` | also serve on TCP. **Refused without a token.** |
 | `--token T`, `CRUX_TOKEN` | bearer token every request must carry. When set it gates the socket too. |
+| `--operator-name NAME`, `CRUX_OPERATOR_NAME` | the name the control token's caller is recorded under on work-services routes (see [Caller principals](#caller-principals)). Default `operator`. |
+| `--checkout-allow PREFIX,…`, `CRUX_CHECKOUT_ALLOWLIST` | repository URL prefixes `POST /v1/checkouts` may clone; unset means no checkout service ([design](design/crux-work-services.md)). |
+| `--checkout-dir PATH`, `CRUX_CHECKOUT_DIR` | where pinned checkouts live. Default `<workdir>/checkouts`. |
+| `--checkout-max-bytes N`, `CRUX_CHECKOUT_MAX_BYTES` | ceiling on a checkout request's `max_bytes`; asking for more is `400`, asking for nothing gets the ceiling. Default 5 GiB. |
+| `CRUX_CHECKOUT_TOKEN` | HTTPS token for private repositories, passed to git via a credential helper and never logged ([design](design/crux-work-services.md)). |
+| `--lanes-config PATH`, `CRUX_LANES_CONFIG` | opt into [durable event/work lanes](crux-lanes.md) on this same server, backed by NATS JetStream. Lane project credentials are separate from agent-control credentials. |
+| `--runs-config PATH`, `CRUX_RUNS_CONFIG` | contained-run configuration file that supplies the sandbox backend for `POST /v1/runs`. Without it the server still serves saved run records under `<workdir>/runs` (`GET /v1/runs/{id}`), and `POST /v1/runs` answers `501`; runs left in flight by an earlier process are marked unfinished at startup ([design](design/crux-work-services.md)). |
 | `--hive-callback ADDR`, `CRUX_HIVE_SOCKET` (+ `CRUX_HIVE_TOKEN`) | dial hive's callback endpoint (`crux/api/callback`) for the capabilities hive owns — scoped GitHub tokens, PR creation, Linear credentials, text/canary scanners, conditions — and feed the runtime's seams from it instead of leaving them nil. Health reports it under `hive_callback`; an unreachable endpoint raises the `hive_callback_unavailable` condition. (#14246) When the runtime is a manager it also polls hive's host policy from the same endpoint; see [Host policy from hive](#host-policy-from-hive-14138-stage-4). |
 
 `serve` does not use the per-work-dir control socket that a foreground
@@ -52,10 +61,30 @@ runtime and every agent must arrive as a definition on `POST /v1/agents`.
   world-readable `<tmp>/crux-<uid>` is an error, not a trust.
 - Request bodies are capped at 1 MiB and unknown JSON fields are rejected.
 
+### Caller principals
+
+Every request that passes the auth gate carries a *principal* in its
+context, readable by a route handler with `serve.CallerFrom(ctx)`
+(hivecommons/crux#114, S0). It is the identity the work services record and
+enforce ownership by; nothing on the agent-RPC routes reads it.
+
+| Credential presented | Principal | Where accepted |
+|---|---|---|
+| the control token (`--token`/`CRUX_TOKEN`), or no token on a token-less server's own unix socket | `{"kind":"operator","name":"<--operator-name>"}` | every route |
+| a lane project credential (`--lanes-config` principals) | `{"kind":"project","name":"<project id>"}` | work-services routes only (families registered as such, e.g. `/v1/checkouts`); on every agent RPC it is still `401 unauthorized`, as before |
+| anything else | — | `401 unauthorized` |
+
+The operator may act on every record regardless of who owns it; a project
+principal only on its own. Lane routes (`/v1/lanes…`) keep their separate
+project-only gate and are not affected.
+
 ## The API
 
-All routes are under `/v1`. Bodies and responses are JSON; errors are
+All routes are under `/v1`. Bodies and responses are JSON; agent-control errors are
 `{"error": "...", "code": "unauthorized|bad_request|not_found|conflict|runtime_error"}`.
+Opt-in lane routes require a separate project bearer credential and capability
+ACLs; see the [lane routes and request types](crux-lanes.md#public-http-and-go-api)
+and [lane error codes and failure behavior](crux-lanes.md#bounds-and-failure-behavior).
 
 | Route | Body | Runtime method | Returns |
 |---|---|---|---|
@@ -64,10 +93,16 @@ All routes are under `/v1`. Bodies and responses are JSON; errors are
 | `POST /v1/agents` | `{"name":…, "definition":{…}}` | `Definitions.AddAgent` (when `definition` is present), `Lifecycle.Start` | `201 {"agent":…, "process":Process}`; `400` bad name, `409` the name already has a definition, `422` the runtime refused it |
 | `GET /v1/agents/{name}` | | `Observer.GetStatus` | `Process` |
 | `GET /v1/agents/{name}/logs?source=pane\|buffer\|full&n=N` | | `GetOutput` / `GetBufferOutput` / `FullLogHeader`+`CaptureFullLog` | `{"agent","source","lines":[…]}` or `{"header","content"}` for `full` |
-| `GET /v1/agents/{name}/logs?follow=1` | | `GetBufferOutput`, polled | `text/event-stream` of `agent.log` records `{"agent","lines":[…]}` |
+| `GET /v1/agents/{name}/logs?follow=1&n=N` | | `GetBufferOutput`, polled | `text/event-stream` of `agent.log` records `{"agent","lines":[…]}`; the first replays the last `n` buffered lines (none for `n=0`; the 200-line follow window when `n` is absent) |
 | `POST /v1/agents/{name}/kick` | `{"message":…}` | `Kicker.SendKick` | `{"agent","process"}` |
 | `POST /v1/agents/{name}/stop` | | `Lifecycle.Stop` | `{"agent","process"}` |
 | `GET /v1/events` | | watcher + `Kicker.SetKickObserver` + the `crux.Host` observers | `text/event-stream` of `Event` records |
+| `POST /v1/checkouts`, `GET /v1/checkouts[?owner=]`, `GET`/`DELETE /v1/checkouts/{id}` | `{"repo","commit","owner"?,"branches"?,"max_bytes"?,"ttl"?}` | `checkout.Service` | Work service (S1): a worktree pinned at a full SHA, owned by the caller principal; `501` without `--checkout-allow`; [routes, codes and semantics](design/crux-work-services.md) |
+| `POST /v1/runs`, `GET /v1/runs[?status=&limit=]`, `GET /v1/runs/{id}`, `POST /v1/runs/{id}/cancel`, `POST /v1/runs/{id}/restart`, `GET /v1/runs/{id}/history` | contained-run request (see `ContainedRunRequest` in `crux/api/runs.go`) | `runs.Service` | Work service (S2/S7): run an untrusted command in a sandbox and read the saved record whatever the process state; cancel after completion returns the result; `501` on `POST` without `--runs-config`; listing is owner-scoped (the operator sees all), restart re-runs the saved request and is audited, refused with `409` while the run is live; [S7 routes, codes and semantics](design/crux-work-services.md#s7-saved-run-results) |
+| `POST /v1/gates`, `GET /v1/gates[?status=]`, `GET /v1/gates/{id}`, `POST /v1/gates/{id}/answer`, `GET /v1/gates/{id}/wait[?timeout=]` | `{"subject","context"?,"choices"?,"timeout"?,"opened_by"?,"idempotency_key"?,"run"?}`; answer `{"answer","note"?,"as_operator"?}` | `gates.Service` | Work service (S3): human gates under `<workdir>/gates`, always on; re-opening the same gate returns the same id and recorded answer; only the operator answers, the opener only with the audited `as_operator` override; a gate opened with `run` becomes that run's turn signals (S5); [routes, codes and semantics](design/crux-work-services.md#s3-human-gate) |
+| `GET /v1/runs/{id}/signals[?since_seq=&limit=]`, `POST /v1/runs/{id}/signals` | `{"kind","message"?,"data"?}` | `runs.Service` + `signals.Book` | Work service (S5): a run's append-only turn signals (`started`, `thinking`, `tool`, `blocked`, `needs-input`, `input`, `done`), owner-visible; the owner posts the middle kinds, the runner writes `started` and `done`; [routes, codes and semantics](design/crux-work-services.md#s5-turn-signals) |
+| `GET /v1/agents/{name}/kick-outcome` | | `signals.AgentOutcomes` + `Observer.GetStatusFast` | S5: the saved outcome of the agent's last kicked turn with `settled_for_last_kick`; [semantics](design/crux-work-services.md#s5-turn-signals) |
+| `GET /v1/lanes` and lane/group subroutes | Publish/recovery/receipt JSON; [request shapes](crux-lanes.md#public-http-and-go-api) | `lanes.Broker` | Opt-in only; lane-project credential and capability ACLs; JSON or `204`; [full routes and responses](crux-lanes.md#public-http-and-go-api) |
 
 ### Runtime families (#14138 stage 3)
 
@@ -81,7 +116,7 @@ it or are the CLI routes above under another method.
 | Family | Route | Runtime method(s) | Notes |
 |---|---|---|---|
 | Lifecycle | `POST /v1/agents/{name}/start` ⚑ | `Start` | |
-| | `POST /v1/agents/{name}/restart` ⚑ | `Restart`, `RestartWithBootstrap` (`{"bootstrap":…}`) | |
+| | `POST /v1/agents/{name}/restart` ⚑ | `Restart`, `RestartWithBootstrap` (`{"bootstrap":…}`), `RestartAfterModelChange` (`{"model_change":true,"by":…}`) | body selects the variant |
 | | `POST /v1/agents/{name}/pause` ⚑ | `Pause`, `PauseBy`, `Supervisor.PauseByCause` | body selects the variant |
 | | `POST /v1/agents/{name}/resume` ⚑ | `Resume` | |
 | | `DELETE /v1/agents/{name}/restart-count` ⚑ | `ResetRestartCount` | |
@@ -144,6 +179,8 @@ every 15 s. `Event` is `{"time","type","agent","state","detail","data"}`.
 | `agent.started`, `agent.stopped`, `agent.kicked` | the API performed the action |
 | `agent.state` | the server's watcher (polls `AllStatuses` every second) saw an agent change state for any reason: crash, restart, pause; `state` is the new state, `detail` the last restart reason when there is one |
 | `agent.kick` | the runtime's kick observer fired (`Kicker.SetKickObserver`); `detail` is the observer's event name |
+| `gate.opened`, `gate.answered`, `gate.expired` | a human gate (S3) was opened, answered or expired; `data` is the `api.Gate` record without its `context`. An `as_operator` answer also emits `runtime.audit` with action `gate.operator_override` |
+| `run.signal` | a turn signal (S5) became durable; `data` is `api.RunSignalEvent`, the `api.RunSignal` with its `run` id |
 | `agent.kick_outcome`, `agent.pause_transition`, `agent.relaunch`, `agent.pause_persist`, `agent.prompt`, `agent.sandbox_audit`, `runtime.audit`, `runtime.condition` | the `crux.Host` observers, relayed when the runtime is a Host; `data` carries the typed payload (`api.KickOutcome`, `api.PauseTransition`, …). A sidecar hive demuxes these into the observers its boot sequence installs (`cmd/hive`'s `sidecarHost`) |
 
 A subscriber that stops reading is dropped after 64 buffered events so one
@@ -255,10 +292,13 @@ export CRUX_SERVER=/run/user/$(id -u)/crux/crux.sock
 crux run examples/agents/customized-agent.yaml   # definition parsed here, sent as JSON; follows output; Ctrl-C stops
 crux run --detach fixer                          # a name already defined on the server
 crux ps
-crux logs fixer -n 50 --buffer
-crux logs fixer -f                               # follow the ring buffer over SSE
+crux logs -n 50 --buffer fixer
+crux logs -f fixer                               # follow the ring buffer over SSE
 crux kick fixer "look at the failing build on main"
 crux stop fixer
+crux checkout add -repo https://github.com/hivecommons/hive -commit <40-hex sha>   # S1 pinned checkout, owned by the caller
+crux checkout list
+crux checkout rm chk_0123456789ab
 ```
 
 In remote mode nothing is built in this process: no runtime, no control
@@ -287,7 +327,13 @@ link the runtime. Errors from the server are `*api.StatusError`;
 
 ## What this is not
 
-It is not tenancy, quotas or hive-as-a-client: the server trusts whoever can
-reach the socket or holds the token, and hive still constructs
+For agent control it is not tenancy, quotas or hive-as-a-client: those routes
+trust whoever can reach the socket or holds the token, and hive still constructs
 `*agent.Manager` in-process. Those are the rest of Stage 3 in
 [design/crux.md](design/crux.md#after-the-cut).
+
+The opt-in [durable lanes](crux-lanes.md) are a separate project-authenticated
+surface with explicit capability ACLs, configured per-lane retention/storage
+bounds and per-group lease/ledger limits. Hive uses them as an ordinary lane
+client. This does not provide general multi-tenant isolation, change Hive's
+agent hosting model or grant lane credentials agent-control privileges.

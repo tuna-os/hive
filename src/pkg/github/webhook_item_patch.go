@@ -54,7 +54,7 @@ func (c *Client) classifyWebhookIssue(repo string, issue *gh.Issue, blockedBy in
 	issueFilter := c.getIssueFilter()
 	author := safeGetLogin(issue.GetUser())
 	sidelined := func(bucket, reason string) WebhookItemPatch {
-		row := c.repoWorkIssue(repo, issue, labels, bucket, reason)
+		row := c.workIssue(repo, issue, labels, bucket, reason)
 		return WebhookItemPatch{Bucket: WebhookBucketSidelined, WorkIssue: &row}
 	}
 	switch standingMetaIssueKindFor(issue.GetTitle(), author, labels) {
@@ -86,12 +86,15 @@ func (c *Client) classifyWebhookIssue(repo string, issue *gh.Issue, blockedBy in
 		return sidelined("filtered", trackingFilterReason)
 	}
 	if hasBlockedLabel(labels) {
-		row := c.repoWorkIssue(repo, issue, labels, "filtered", blockedFilterReason(issue.GetBody()))
+		row := c.workIssue(repo, issue, labels, "filtered", blockedFilterReasonFor(repo, issue.GetNumber(), issue.GetBody()))
 		setBlockedRowFacts(&row, issue.GetBody(), blockedBy)
 		return WebhookItemPatch{Bucket: WebhookBucketSidelined, WorkIssue: &row}
 	}
 	if labelPresent(labels, issueNeedsReporterConfirmationLabel) {
 		return sidelined("filtered", issueNeedsReporterConfirmationLabel)
+	}
+	if label := c.needsSHALabelOn(labels); label != "" {
+		return sidelined("filtered", label)
 	}
 	if suppress := hardSuppressIssueBucket(issueFilter, labels); suppress != "" {
 		return sidelined("filtered", suppress)
@@ -112,12 +115,12 @@ func (c *Client) classifyWebhookIssue(repo string, issue *gh.Issue, blockedBy in
 	if !issueFilter.Admits(labels) {
 		return sidelined("filtered", issueFilterReason)
 	}
-	// Admission-side #5117. Parent acknowledgement needs the list-wide pass,
-	// so an unacknowledged proposal is left to the reconcile pass rather than
-	// admitted (or sidelined) on what this single item shows.
+	// Parent acknowledgement needs the list-wide pass. Defer placement, but
+	// provide a display row for a newly observed proposal.
 	if c.isKnownNonHumanAuthor(issue.GetUser()) && !c.issueHasCheapHumanAcknowledgement(issue) {
-		if gate, ok := issueFilter.(AgentProposalGate); ok && gate.HoldsAgentProposal(issue.GetTitle(), labels) {
-			return WebhookItemPatch{Bucket: WebhookBucketUnknown}
+		if gate, ok := issueFilter.(AgentProposalGate); ok && gate.IsAgentProposal(labels, issue.GetTitle()) {
+			row := c.workIssue(repo, issue, labels, "filtered", agentProposalFilterReason)
+			return WebhookItemPatch{Bucket: WebhookBucketUnknown, WorkIssue: &row}
 		}
 	}
 	return WebhookItemPatch{Bucket: WebhookBucketActionable, Issue: &Issue{
@@ -169,10 +172,12 @@ func (c *Client) classifyWebhookPR(repo string, pr *gh.PullRequest, labels []str
 		HiveAgent:           attrMeta.Agent,
 		HiveBackend:         attrMeta.Backend,
 		HiveModel:           attrMeta.Model,
+		HiveEffort:          attrMeta.Effort,
 		HiveRun:             runKey,
 		HivePlan:            planRef,
 		ScopeContract:       scopeContract,
 		BodyDigest:          review.PullRequestBodyDigest(pr.GetTitle(), pr.GetBody()),
+		Supersedes:          prSupersedesNumberOrZero(pr.GetBody()),
 		MergeableState:      pr.GetMergeableState(),
 		HeadSHA:             prHeadSHA(pr),
 		HeadRef:             headRef,
@@ -481,6 +486,8 @@ func (r *ActionableResult) applyWebhookItem(snap WebhookItemSnapshot) bool {
 	p := snap.Patch
 	if snap.IsPR {
 		p = p.withLinkedIssues(prev.linkedIssues)
+	} else {
+		p = p.withIssueChildren(nil, prev.issueChildren())
 	}
 	added := false
 	switch p.Bucket {

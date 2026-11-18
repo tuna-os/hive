@@ -87,11 +87,19 @@ type forgeGitHubSettings struct {
 	AgentReserveFloor      int  `json:"agent_reserve_floor"`
 	APIReserve             int  `json:"api_reserve"`
 	APICritical            int  `json:"api_critical"`
+	ETagCacheMaxMB         int  `json:"etag_cache_max_mb"`
+	ETagCacheMaxEntries    int  `json:"etag_cache_max_entries"`
 	PRDetailTTLS           int  `json:"pr_detail_ttl_s"`
 	GraphQLPRBatch         bool `json:"graphql_pr_batch"`
 	GraphQLPRBatchPageSize int  `json:"graphql_pr_batch_page_size"`
 	AppAuthoredPRs         bool `json:"app_authored_prs"`
 	AppSignedCommits       bool `json:"app_signed_commits"`
+	// AgentGitHubAPIHourlyCap is agents.github_api_hourly_cap as the proxy
+	// applies it (the default when unset; 0 = no cap). It is not a github.*
+	// key but is edited here beside agent_reserve_floor; _set says whether
+	// the key is written, so the field shows blank for the default.
+	AgentGitHubAPIHourlyCap    int  `json:"agent_github_api_hourly_cap"`
+	AgentGitHubAPIHourlyCapSet bool `json:"agent_github_api_hourly_cap_set"`
 
 	Defaults map[string]int `json:"defaults"`
 }
@@ -99,24 +107,31 @@ type forgeGitHubSettings struct {
 func forgeGitHubSettingsFor(cfg *config.Config, hubManaged bool) forgeGitHubSettings {
 	g := cfg.GitHub
 	return forgeGitHubSettings{
-		Forge:                  strings.TrimSpace(g.Forge_),
-		APIURL:                 strings.TrimSpace(g.APIURL),
-		DocsInstallationID:     g.DocsInstallationID,
-		OAuthClientID:          g.OAuthClientID,
-		TokenSet:               strings.TrimSpace(g.Token) != "",
-		HubManaged:             hubManaged,
-		AgentReserveFloor:      cfg.GitHubAgentReserveFloor(),
-		APIReserve:             g.APIReserve,
-		APICritical:            g.APICritical,
-		PRDetailTTLS:           g.PRDetailTTLS,
-		GraphQLPRBatch:         g.GraphQLPRBatchEnabled(),
-		GraphQLPRBatchPageSize: g.GraphQLPRBatchPageSize,
-		AppAuthoredPRs:         g.AppAuthoredPRsEnabled(),
-		AppSignedCommits:       g.AppSignedCommitsEnabled(),
+		Forge:                      strings.TrimSpace(g.Forge_),
+		APIURL:                     strings.TrimSpace(g.APIURL),
+		DocsInstallationID:         g.DocsInstallationID,
+		OAuthClientID:              g.OAuthClientID,
+		TokenSet:                   strings.TrimSpace(g.Token) != "",
+		HubManaged:                 hubManaged,
+		AgentReserveFloor:          cfg.GitHubAgentReserveFloor(),
+		APIReserve:                 g.APIReserve,
+		APICritical:                g.APICritical,
+		ETagCacheMaxMB:             g.ETagCacheMaxMB,
+		ETagCacheMaxEntries:        g.ETagCacheMaxEntries,
+		PRDetailTTLS:               g.PRDetailTTLS,
+		GraphQLPRBatch:             g.GraphQLPRBatchEnabled(),
+		GraphQLPRBatchPageSize:     g.GraphQLPRBatchPageSize,
+		AppAuthoredPRs:             g.AppAuthoredPRsEnabled(),
+		AppSignedCommits:           g.AppSignedCommitsEnabled(),
+		AgentGitHubAPIHourlyCap:    cfg.FleetAgentGitHubAPIHourlyCap(),
+		AgentGitHubAPIHourlyCapSet: cfg.AgentsGitHubAPIHourlyCapSet,
 		Defaults: map[string]int{
-			"agent_reserve_floor":        config.DefaultGitHubAgentReserveFloor,
-			"pr_detail_ttl_s":            int(config.DefaultGitHubPRDetailTTL / time.Second),
-			"graphql_pr_batch_page_size": config.DefaultGraphQLPRBatchPageSize,
+			"agent_reserve_floor":         config.DefaultGitHubAgentReserveFloor,
+			"agent_github_api_hourly_cap": config.DefaultAgentsGitHubAPIHourlyCap,
+			"etag_cache_max_mb":           config.DefaultGitHubETagCacheMaxMB,
+			"etag_cache_max_entries":      config.DefaultGitHubETagCacheMaxEntries,
+			"pr_detail_ttl_s":             int(config.DefaultGitHubPRDetailTTL / time.Second),
+			"graphql_pr_batch_page_size":  config.DefaultGraphQLPRBatchPageSize,
 		},
 	}
 }

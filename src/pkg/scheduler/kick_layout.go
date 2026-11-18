@@ -22,16 +22,21 @@ import (
 //	5. workflow push ceiling                 static per agent mode
 //	6. formal quality capability             static per role + config
 //	7. work tracker section                  static per work-source config
-//	7b. task context MCP pointer             static per agent task_mcp config
+//	7b. task context MCP pointer             static per agent backend + task_mcp config
 //	8. <resolved policy body>                static text, then ${ISSUE_LIST}/${PR_LIST}/… where the template puts them
 //	9. REPO-SCOPED CADENCE TARGET            semi-static (repo-scoped kicks only)
 //	10. AUTHORIZED REPOS                     semi-static (include_repos)
+//	10a. 📚 REFERENCE REPOS                  semi-static (project.reference_repos; rendered inside 10, after
+//	                                         the authorized/paused lists and before its ⛔ scope lines, so
+//	                                         "repos not listed above" covers them — #18015/#18020)
 //	11. hold-gated PR coordination           dynamic (held PR snapshot)
 //	12. red-PR fix-before-new                dynamic (ci-failing.json)
 //	13. review-thread fix-before-new         dynamic (review-threads.json)
 //	14. PR follow-up handoff                 dynamic (pr-followup/)
+//	14a. topic claims                        dynamic (bd topic claims, #18493)
 //	15. guide flow line                      dynamic (guide only)
 //	16. in-flight note                       dynamic (session claims)
+//	16a. maintainer notes                    dynamic (dashboard notes on listed items)
 //	17. question answer contract             dynamic (scanner only)
 //	18. in-progress claim rule               static, present whenever the kick lists issues
 //	19. closing instruction                  static, always last
@@ -90,13 +95,11 @@ func (s *Scheduler) assembleKick(a kickAssembly, message string) string {
 		func(m string) string { return s.addWorkflowPushCeiling(a.agent, m) },
 		func(m string) string { return s.addFormalQualityCapability(a.agent, m) },
 		s.addWorkTrackerSection,
-		func(m string) string { return s.addTaskMCPPointer(m, a.elideStuffed) },
+		func(m string) string { return s.addTaskMCPPointer(a.agent, m, a.elideStuffed) },
 	}
-	for i := len(staticSeams) - 1; i >= 0; i-- {
-		message = staticSeams[i](message)
-		if message == "" {
-			return message
-		}
+	message = applyStaticSeams(message, staticSeams)
+	if message == "" {
+		return message
 	}
 
 	// Semi-static: changes when the operator pauses/scopes repos, not per kick.
@@ -117,12 +120,30 @@ func (s *Scheduler) assembleKick(a kickAssembly, message string) string {
 	message = s.addRedPRFixFirst(a.agent, message)
 	message = s.addReviewThreadFixFirst(a.agent, message)
 	message = s.addPRFollowUpHandoff(a.agent, message)
+	message = s.addRemoteItemHandoff(a.agent, message)
+	message = s.addTopicClaims(a.agent, message)
 	message = s.addGuideFlow(a.agent, a.actionable, message)
 	message = s.addInflightNote(message, a.issues)
+	message = s.addMaintainerNotes(message, a.issues)
+	message = s.addCustomerContext(message, a.issues)
 	message = s.addQuestionAnswerContract(a.agent, message, a.issues)
 	message = addInProgressClaimRule(message, a.issues)
 	if a.idleReason == "" {
 		message = addConcreteKickClosingInstruction(message)
+	}
+	return message
+}
+
+// applyStaticSeams splices each static seam in directly under the kick header.
+// Each one lands right after the header line, so the LAST one applied ends up
+// FIRST: seams is written in reading order and applied in reverse. A seam that
+// fails closed empties the message and stops the chain.
+func applyStaticSeams(message string, seams []func(string) string) string {
+	for i := len(seams) - 1; i >= 0; i-- {
+		message = seams[i](message)
+		if message == "" {
+			return message
+		}
 	}
 	return message
 }

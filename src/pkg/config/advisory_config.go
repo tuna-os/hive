@@ -49,6 +49,17 @@ type AdvisoryConfig struct {
 	// so a user-lengthened interval never false-alarms as a wedge — pinned by
 	// TestAdvisoryStaleThresholdCoversMaxUpdateInterval in pkg/hub.
 	UpdateIntervalS int `yaml:"update_interval_s,omitempty" json:"update_interval_s,omitempty"`
+	// DigestMinInterval is the minimum time between two writes of a CHANGED
+	// digest to the same pinned comment (hivecommons/hive#17435). The
+	// update_interval_s throttle above paces post ATTEMPTS; this one bounds
+	// how often a materially different body may actually be written, so a
+	// digest whose live counts drift every eval cycle is rewritten at most
+	// once per window instead of every ~5 minutes. An unchanged digest never
+	// writes regardless. The baseline is the existing comment's updated_at
+	// on GitHub, so a restart does not repost inside the window. A Go
+	// duration; empty resolves to DefaultAdvisoryDigestMinInterval, "0" or a
+	// negative value disables the gate.
+	DigestMinInterval string `yaml:"digest_min_interval,omitempty" json:"digest_min_interval,omitempty"`
 	// PostRetryBackoffS is how long, in seconds, the digest write is paused
 	// after GitHub refuses it with 403 "Resource not accessible by
 	// integration" (#11791). 0/unset uses DefaultAdvisoryPostRetryBackoffS;
@@ -68,6 +79,17 @@ type AdvisoryConfig struct {
 	// post — the digest is never redirected to GitHub without being asked.
 	// Authentication reuses governor.work_source.linear.api_key.
 	LinearIssue string `yaml:"linear_issue,omitempty" json:"linear_issue,omitempty"`
+	// PerRepo opts a multi-repo hive into one Hive Advisory Report in EVERY
+	// monitored repo (#18448), not just project.primary_repo. Off by default:
+	// the one report in the primary repo covers all repos (#18568). When on,
+	// each other repo in project.repos gets exactly one report, found by its
+	// title plus the hive/advisory label or the hive marker before anything is
+	// created, so a restart never files a second one; a report a human closed
+	// stays closed. Turning it off stops updating those reports but leaves
+	// them in place. *bool so absent is distinct from an explicit false:
+	// absent falls back to AdvisoryPerRepoEnvVar, then off. Resolve it
+	// through PerRepoEnabled.
+	PerRepo *bool `yaml:"per_repo,omitempty" json:"per_repo,omitempty"`
 	// QueueHealth tunes the owner-advice queue-health rules (#9103): the
 	// thresholds at which the weekly advice tells the owner to reduce the
 	// blocked PR queue, clear the human gate, and so on. Every field is a
@@ -124,6 +146,27 @@ func (a AdvisoryConfig) PRAutoCloseEnabled() bool {
 	return a.PRAutoClose == nil || *a.PRAutoClose
 }
 
+// AdvisoryPerRepoEnvVar overrides the default of governor.advisory.per_repo
+// when the key is absent from hive.yaml: a strconv.ParseBool value ("true",
+// "1", "false", ...). An explicit per_repo in hive.yaml or a dashboard edit
+// always wins.
+const AdvisoryPerRepoEnvVar = "HIVE_ADVISORY_PER_REPO"
+
+// PerRepoEnabled resolves AdvisoryConfig.PerRepo: an explicit value wins,
+// otherwise AdvisoryPerRepoEnvVar, otherwise off (one report, in the primary
+// repo). An unparseable env value is ignored and resolves to off.
+func (a AdvisoryConfig) PerRepoEnabled() bool {
+	if a.PerRepo != nil {
+		return *a.PerRepo
+	}
+	if v := strings.TrimSpace(os.Getenv(AdvisoryPerRepoEnvVar)); v != "" {
+		if on, err := strconv.ParseBool(v); err == nil {
+			return on
+		}
+	}
+	return false
+}
+
 func (g GovernorConfig) AutoCloseSupersededEnabled() bool {
 	return g.AutoCloseSuperseded == nil || *g.AutoCloseSuperseded
 }
@@ -161,6 +204,29 @@ func (a AdvisoryConfig) UpdateInterval() time.Duration {
 		s = MaxAdvisoryUpdateIntervalS
 	}
 	return time.Duration(s) * time.Second
+}
+
+// DefaultAdvisoryDigestMinInterval is governor.advisory.digest_min_interval's
+// default: a changed digest is rewritten at most hourly.
+const DefaultAdvisoryDigestMinInterval = time.Hour
+
+// EffectiveDigestMinInterval resolves DigestMinInterval: empty or unparseable
+// → DefaultAdvisoryDigestMinInterval; an explicit zero or negative duration →
+// 0, which disables the gate so an operator can restore per-cycle rewrites
+// deliberately.
+func (a AdvisoryConfig) EffectiveDigestMinInterval() time.Duration {
+	raw := strings.TrimSpace(a.DigestMinInterval)
+	if raw == "" {
+		return DefaultAdvisoryDigestMinInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return DefaultAdvisoryDigestMinInterval
+	}
+	if d <= 0 {
+		return 0
+	}
+	return d
 }
 
 const (

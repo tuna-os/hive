@@ -48,10 +48,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/hivecommons/hive/crux/internal/frontmatter"
 )
 
 const (
@@ -63,10 +66,6 @@ const (
 
 	// SkillFileExt is the extension for standalone skill files.
 	SkillFileExt = ".md"
-
-	// frontMatterDelim is the line (trimmed) that opens and closes the optional
-	// YAML front-matter block.
-	frontMatterDelim = "---"
 
 	// skillHeadingPrefix marks an inline skill section. A heading of the form
 	// "## Skill: <name>" begins a named skill snippet.
@@ -163,25 +162,23 @@ func ParseNearest(repoRoot, relPath string, lg *slog.Logger) (*AgentsConfig, err
 
 	// Normalize and confine relPath to the repo. A path escaping the root falls
 	// back to the root file.
-	clean := filepath.Clean(relPath)
-	dir := filepath.Dir(filepath.Join(repoRoot, clean))
-
 	rootAbs, err := filepath.Abs(repoRoot)
 	if err != nil {
 		rootAbs = repoRoot
 	}
+	dir := filepath.Dir(filepath.Join(repoRoot, filepath.Clean(relPath)))
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil || (dirAbs != rootAbs && !strings.HasPrefix(dirAbs, rootAbs+string(filepath.Separator))) {
+		return Parse(repoRoot, lg)
+	}
+	dir = dirAbs
 
 	for {
 		candidate := filepath.Join(dir, AgentsFileName)
 		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
 			return parseAt(dir, candidate, lg)
 		}
-
-		dirAbs, absErr := filepath.Abs(dir)
-		if absErr != nil {
-			break
-		}
-		if dirAbs == rootAbs || !strings.HasPrefix(dirAbs, rootAbs) {
+		if dir == rootAbs {
 			break
 		}
 		parent := filepath.Dir(dir)
@@ -214,7 +211,7 @@ func parseAt(baseDir, agentsPath string, lg *slog.Logger) (*AgentsConfig, error)
 	content := string(raw)
 
 	// 1. Strip and parse optional front-matter.
-	fm, rest := splitFrontMatter(content)
+	fm, rest := frontmatter.Split(content)
 	if fm != "" {
 		var meta frontMatter
 		if yErr := yaml.Unmarshal([]byte(fm), &meta); yErr != nil {
@@ -241,30 +238,6 @@ func parseAt(baseDir, agentsPath string, lg *slog.Logger) (*AgentsConfig, error)
 	}
 
 	return cfg, nil
-}
-
-// splitFrontMatter returns the YAML front-matter (without delimiters) and the
-// remaining document. If no front-matter block is present, front-matter is ""
-// and the whole content is returned as rest.
-func splitFrontMatter(content string) (fm, rest string) {
-	// Front-matter must be at the very top (after an optional BOM/leading
-	// whitespace-free start). Tolerate a leading newline only.
-	trimmed := strings.TrimLeft(content, "\r\n")
-	lines := strings.Split(trimmed, "\n")
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) != frontMatterDelim {
-		return "", content
-	}
-
-	for i := 1; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == frontMatterDelim {
-			fm = strings.Join(lines[1:i], "\n")
-			rest = strings.Join(lines[i+1:], "\n")
-			return fm, rest
-		}
-	}
-
-	// Opening delimiter with no close: not valid front-matter, treat as body.
-	return "", content
 }
 
 // extractSkillSections splits a Markdown body into (body-without-skills, skills).
@@ -361,10 +334,10 @@ func (c *AgentsConfig) Resolve(names []string) string {
 // block ready to prepend to an agent kick. requestedSkills are the skills the
 // caller wants included; when nil, the config's own RequestedSkills (from
 // front-matter) are used. Returns "" when there is nothing to inject. The
-// block is bounded to DefaultMaxInjectionBytes; see Render for the cap
-// contract and for a configurable cap.
+// block is bounded to the default cap (DefaultMaxBytes); see Render for the
+// cap contract and for a configurable cap.
 func (c *AgentsConfig) InjectionText(requestedSkills []string) string {
-	out, _ := c.Render(requestedSkills, DefaultMaxInjectionBytes)
+	out, _ := c.Render(requestedSkills, 0)
 	return out
 }
 
@@ -374,10 +347,20 @@ func (c *AgentsConfig) InjectionText(requestedSkills []string) string {
 // says so where the agent will read it, naming the sections, so the agent
 // knows to open the file itself and the repo owner knows to shorten it.
 const (
-	// DefaultMaxInjectionBytes caps the rendered AGENTS.md block when no
-	// project.agents_md_max_bytes is configured. It matches the skills cap
-	// (scheduler maxSkillsInjectionBytes), which is the model this follows.
-	DefaultMaxInjectionBytes = 8192
+	// DefaultMaxInjectionBytes caps the rendered AGENTS.md block when neither
+	// repos.<repo>.agents_md_max_bytes nor project.agents_md_max_bytes is
+	// configured and MaxBytesEnv is unset. It was 8192 until #18495; real
+	// repositories' files outgrew that (a 13 KB AGENTS.md lost whole
+	// sections), so the default now holds a large file in full.
+	DefaultMaxInjectionBytes = 32 * 1024
+	// MaxInjectionBytesCeiling is the hard ceiling every cap is lowered to,
+	// whatever its source (per-repo, project, env), so one misconfigured
+	// repo cannot crowd the rest of the kick out of the model's context.
+	MaxInjectionBytesCeiling = 256 * 1024
+	// MaxBytesEnv overrides DefaultMaxInjectionBytes hive-wide, for operators
+	// who set defaults by environment (hosted spokes). A value that is not a
+	// positive integer is ignored. Config keys still win over it.
+	MaxBytesEnv = "HIVE_AGENTS_MD_MAX_BYTES"
 	// minInjectionBytes is the floor a configured cap is raised to: the header,
 	// precedence sentence and warning reserve alone take ~1 KiB, so anything
 	// lower could never carry a rule.
@@ -490,13 +473,32 @@ func (c *AgentsConfig) skillSections(names []string) []injectionSection {
 	return out
 }
 
-// injectionMaxBytes applies the default and floor to a configured cap.
+// DefaultMaxBytes is the cap that applies when no config key sets one:
+// MaxBytesEnv when it holds a positive integer, else DefaultMaxInjectionBytes.
+func DefaultMaxBytes() int {
+	if v := strings.TrimSpace(os.Getenv(MaxBytesEnv)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultMaxInjectionBytes
+}
+
+// EffectiveMaxBytes is the cap Render applies for a configured value n: the
+// default (DefaultMaxBytes) when n is zero or negative, raised to the floor
+// and lowered to MaxInjectionBytesCeiling.
+func EffectiveMaxBytes(n int) int { return injectionMaxBytes(n) }
+
+// injectionMaxBytes applies the default, floor and ceiling to a configured cap.
 func injectionMaxBytes(n int) int {
 	if n <= 0 {
-		n = DefaultMaxInjectionBytes
+		n = DefaultMaxBytes()
 	}
 	if n < minInjectionBytes {
 		n = minInjectionBytes
+	}
+	if n > MaxInjectionBytesCeiling {
+		n = MaxInjectionBytesCeiling
 	}
 	return n
 }
@@ -536,8 +538,8 @@ func injectionWarning(capBytes int, o InjectionOmitted) string {
 	return b.String()
 }
 
-// Render is InjectionText bounded to maxBytes (DefaultMaxInjectionBytes when
-// zero, never below minInjectionBytes). The header and precedence statement
+// Render is InjectionText bounded to maxBytes (DefaultMaxBytes when zero,
+// never below minInjectionBytes nor above MaxInjectionBytesCeiling). The header and precedence statement
 // always render. Body sections (split at "#"/"##" headings) and then resolved
 // skills are visited in document order and each is kept only if it fits the
 // remaining budget whole; one that does not fit is dropped whole and later,

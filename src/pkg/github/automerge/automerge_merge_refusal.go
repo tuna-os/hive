@@ -10,6 +10,7 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 
+	"github.com/hivecommons/hive/pkg/effects"
 	"github.com/hivecommons/hive/pkg/stageengine/prstage"
 )
 
@@ -41,6 +42,20 @@ const mergeRefusalPruneAt = 1024
 // "At least 2 approving reviews are required ...", and the ruleset form
 // "1 review requesting changes by reviewers with write access.".
 var mergeRefusedReviewRE = regexp.MustCompile(`(?i)\d+ approving reviews? (?:is|are) required|\d+ reviews? requesting changes`)
+
+// "Pull Request has merge conflicts": the base and head conflict at the
+// time of the call, whatever the PR read before it said.
+var mergeConflictRE = regexp.MustCompile(`(?i)pull request has merge conflicts`)
+
+// mergeConflictMergeError reports GitHub's 405 for a merge call on a PR
+// that has merge conflicts.
+func mergeConflictMergeError(err error) bool {
+	var ghErr *gh.ErrorResponse
+	if !errors.As(err, &ghErr) || ghErr.Response == nil || ghErr.Response.StatusCode != http.StatusMethodNotAllowed {
+		return false
+	}
+	return mergeConflictRE.MatchString(ghErr.Message) || mergeConflictRE.MatchString(ghErr.Error())
+}
 
 // "Merge commits are not allowed on this repository." and the squash and
 // rebase forms.
@@ -94,6 +109,56 @@ func mergeRefusalReviewKey(a mergeAttempt) string {
 	return "review|" + strings.ToLower(a.owner+"/"+a.repo) + "#" + strconv.Itoa(a.number)
 }
 
+// mergeRefusalChecksKey remembers a "required status checks are expected"
+// 405 per PR: the head's required checks have not reported yet.
+func mergeRefusalChecksKey(a mergeAttempt) string {
+	return "checks|" + strings.ToLower(a.owner+"/"+a.repo) + "#" + strconv.Itoa(a.number)
+}
+
+// autoMergeReasonChecksExpected is the skip reason while GitHub has told the
+// sweep the head's required checks are still expected.
+const autoMergeReasonChecksExpected = "check-pending"
+
+// requiredChecksExpected reports whether err is GitHub's 405 "N of M
+// required status checks are expected" and, when it is, remembers the head
+// and the mergeable_state it was refused in so knownMergeRefusal skips the
+// merge call on the following passes while GitHub still reports that state
+// (hivecommons/docs#512: the sweep put /merge on every pass, each refusal
+// lighting "Merge failed" on the tracker for a PR whose checks had simply
+// not started). A check run reporting moves mergeable_state (blocked →
+// clean, or clean → unstable/blocked when GitHub had called the head clean
+// before its required checks were even created, hivecommons/hive#15419),
+// which re-arms the call, as does a new head or the recheck window.
+func (c *Engine) requiredChecksExpected(a mergeAttempt, err error) bool {
+	if !requiredChecksExpectedMergeError(err) {
+		return false
+	}
+	if c == nil {
+		return true
+	}
+	c.rememberMergeRefusal(mergeRefusalChecksKey(a), mergeRefusal{head: strings.TrimSpace(a.head), state: comparableMergeableState(a.state)})
+	return true
+}
+
+// checksExpectedKnown reports whether the head of a is remembered as
+// waiting on required checks and GitHub still reports the mergeable_state
+// it was refused in. It does not require that state to be "blocked": the
+// queued lane only reaches the merge call for a head GitHub already calls
+// mergeable, so a "blocked"-only memory was never consulted there and the
+// merge was re-PUT every pass (hivecommons/hive#15419).
+func (c *Engine) checksExpectedKnown(a mergeAttempt, now time.Time) bool {
+	m := c.memory()
+	r, ok := m.mergeRefusals[mergeRefusalChecksKey(a)]
+	if !ok {
+		return false
+	}
+	if now.Sub(r.at) >= mergeRefusalRecheck || !strings.EqualFold(r.head, strings.TrimSpace(a.head)) || comparableMergeableState(a.state) != r.state {
+		delete(m.mergeRefusals, mergeRefusalChecksKey(a))
+		return false
+	}
+	return true
+}
+
 func mergeRefusalMethodKey(a mergeAttempt) string {
 	return "method|" + strings.ToLower(a.owner+"/"+a.repo) + "|" + strings.ToLower(strings.TrimSpace(a.method))
 }
@@ -123,24 +188,28 @@ func (c *Engine) knownMergeRefusal(a mergeAttempt) string {
 		return autoMergeReasonMergeQueueRequired
 	}
 	now := c.clock()
-	c.mergeRefusalsMu.Lock()
-	defer c.mergeRefusalsMu.Unlock()
+	m := c.memory()
+	m.mergeRefusalsMu.Lock()
+	defer m.mergeRefusalsMu.Unlock()
+	if c.checksExpectedKnown(a, now) {
+		return autoMergeReasonChecksExpected
+	}
 	if key := mergeRefusalMethodKey(a); strings.TrimSpace(a.method) != "" {
-		if r, ok := c.mergeRefusals[key]; ok {
+		if r, ok := m.mergeRefusals[key]; ok {
 			if now.Sub(r.at) < mergeRefusalRecheck {
 				return autoMergeReasonMergeRefusedMethod
 			}
-			delete(c.mergeRefusals, key)
+			delete(m.mergeRefusals, key)
 		}
 	}
 	key := mergeRefusalReviewKey(a)
-	r, ok := c.mergeRefusals[key]
+	r, ok := m.mergeRefusals[key]
 	if !ok {
 		return ""
 	}
 	state := comparableMergeableState(a.state)
 	if now.Sub(r.at) >= mergeRefusalRecheck || !strings.EqualFold(r.head, strings.TrimSpace(a.head)) || (state != "" && state != r.state) {
-		delete(c.mergeRefusals, key)
+		delete(m.mergeRefusals, key)
 		return ""
 	}
 	return autoMergeReasonMergeRefusedReview
@@ -154,12 +223,19 @@ func (c *Engine) refusedMerge(a mergeAttempt, err error) string {
 		c.noteMergeQueueBase(a.owner, a.repo, a.base)
 		return autoMergeReasonMergeQueueRequired
 	}
+	if mergeConflictMergeError(err) {
+		// Not remembered: GitHub's mergeable_state says dirty on the next
+		// read, and the lanes skip on that. Reported as the conflict it is,
+		// not merge-failed, which parked the PR at 080 for a pass
+		// (projectbluefin/utah-packages#633).
+		return "conflicting"
+	}
 	reason := mergeRefusalReason(err)
 	if reason == "" || c == nil {
 		return reason
 	}
 	var key string
-	r := mergeRefusal{at: c.clock()}
+	var r mergeRefusal
 	switch reason {
 	case autoMergeReasonMergeRefusedReview:
 		key, r.head, r.state = mergeRefusalReviewKey(a), strings.TrimSpace(a.head), comparableMergeableState(a.state)
@@ -169,19 +245,78 @@ func (c *Engine) refusedMerge(a mergeAttempt, err error) string {
 		}
 		key = mergeRefusalMethodKey(a)
 	}
-	c.mergeRefusalsMu.Lock()
-	defer c.mergeRefusalsMu.Unlock()
-	if c.mergeRefusals == nil {
-		c.mergeRefusals = make(map[string]mergeRefusal)
+	c.rememberMergeRefusal(key, r)
+	return reason
+}
+
+// rememberMergeRefusal stores r under key, stamped now, pruning expired
+// entries once the map is large.
+func (c *Engine) rememberMergeRefusal(key string, r mergeRefusal) {
+	r.at = c.clock()
+	m := c.memory()
+	m.mergeRefusalsMu.Lock()
+	defer m.mergeRefusalsMu.Unlock()
+	if m.mergeRefusals == nil {
+		m.mergeRefusals = make(map[string]mergeRefusal)
 	}
-	if len(c.mergeRefusals) >= mergeRefusalPruneAt {
+	if len(m.mergeRefusals) >= mergeRefusalPruneAt {
 		// Entries for PRs that merged or closed are never read again.
-		for k, old := range c.mergeRefusals {
+		for k, old := range m.mergeRefusals {
 			if r.at.Sub(old.at) >= mergeRefusalRecheck {
-				delete(c.mergeRefusals, k)
+				delete(m.mergeRefusals, k)
 			}
 		}
 	}
-	c.mergeRefusals[key] = r
-	return reason
+	m.mergeRefusals[key] = r
+}
+
+func nativeQueueMethodRefusalKey(claim effects.Claim) string {
+	return "queue-method|" + strings.ToLower(claim.Repo) + "#" + claim.Target
+}
+
+// knownNativeQueueMethodRefusal reports whether this PR's head was already
+// refused by a queue whose merge method cannot keep mixed authorship, so the
+// sweep does not re-read the queue's method every pass. Like a remembered
+// merge-method 405 it re-arms after mergeRefusalRecheck, and on a new head.
+func (c *Engine) knownNativeQueueMethodRefusal(claim effects.Claim, head string) bool {
+	if c == nil {
+		return false
+	}
+	key := nativeQueueMethodRefusalKey(claim)
+	now := c.clock()
+	m := c.memory()
+	m.mergeRefusalsMu.Lock()
+	defer m.mergeRefusalsMu.Unlock()
+	r, ok := m.mergeRefusals[key]
+	if !ok {
+		return false
+	}
+	if now.Sub(r.at) >= mergeRefusalRecheck || !strings.EqualFold(r.head, strings.TrimSpace(head)) {
+		delete(m.mergeRefusals, key)
+		return false
+	}
+	return true
+}
+
+// noteNativeQueueMethodRefusal remembers a queue-method refusal for
+// knownNativeQueueMethodRefusal.
+func (c *Engine) noteNativeQueueMethodRefusal(claim effects.Claim, head string) {
+	if c == nil {
+		return
+	}
+	r := mergeRefusal{head: strings.TrimSpace(head), at: c.clock()}
+	m := c.memory()
+	m.mergeRefusalsMu.Lock()
+	defer m.mergeRefusalsMu.Unlock()
+	if m.mergeRefusals == nil {
+		m.mergeRefusals = make(map[string]mergeRefusal)
+	}
+	if len(m.mergeRefusals) >= mergeRefusalPruneAt {
+		for k, old := range m.mergeRefusals {
+			if r.at.Sub(old.at) >= mergeRefusalRecheck {
+				delete(m.mergeRefusals, k)
+			}
+		}
+	}
+	m.mergeRefusals[nativeQueueMethodRefusalKey(claim)] = r
 }

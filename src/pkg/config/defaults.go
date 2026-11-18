@@ -30,9 +30,15 @@ const (
 	DefaultEvalIntervalWebhookS       = 900
 	DefaultWebhookWakeDebounceS       = 10
 	DefaultWebhookWakeMinGapS         = 30
+	DefaultCIFailureKickCooldownS     = 600
+	DefaultMergeTrainStallWarnS       = 3600
 	DefaultConserveIntervalMultiplier = 2
 	DefaultOptionalSweepEveryNCycles  = 1
 )
+
+// DefaultDependencyBotRebaseAfterS is governor.dependency_bot_rebase_after_s
+// when unset: 4 hours.
+const DefaultDependencyBotRebaseAfterS = 4 * 60 * 60
 
 const (
 	MaxAgentReplicas = 5
@@ -140,6 +146,7 @@ func (c *Config) applyDefaults() {
 	// value, after which this is a no-op for the life of the hive.
 	c.MigrateReviewFixHumanPRs()
 	c.WarnDeprecatedReviewAllAuthors()
+	c.WarnDeprecatedSpektacularRecheck()
 	c.applyUpstreamWatchDefaults()
 	// Repo targets are built as org + "/" + repo, so an entry that already
 	// carries the org resolves to "org/org/repo" and every agent fails. Strip a
@@ -490,6 +497,9 @@ func (c *Config) applyDefaults() {
 		}
 		if c.Knowledge.Primer.MaxBytes == 0 {
 			c.Knowledge.Primer.MaxBytes = defaultKnowledgeMaxBytes
+		}
+		if c.Knowledge.AdvisorMaxPerKick == 0 {
+			c.Knowledge.AdvisorMaxPerKick = DefaultKnowledgeAdvisorMaxPerKick
 		}
 		if c.Knowledge.Primer.MergeStrategy == "" {
 			c.Knowledge.Primer.MergeStrategy = DefaultKnowledgePrimerMergeStrategy

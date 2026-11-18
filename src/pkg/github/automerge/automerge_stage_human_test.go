@@ -3,6 +3,9 @@ package automerge
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -12,6 +15,7 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 	hgithub "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
@@ -146,19 +150,22 @@ func TestHumanHandoffRoutesByEvidence(t *testing.T) {
 		t.Fatalf("conflict: %+v", rec)
 	}
 
-	// Sentinel alone (head otherwise mergeable) → 085, decision comment.
+	// Sentinel alone (head otherwise mergeable) → 090 held: the gate is a
+	// pill on the PR's real stage, not a stage of its own
+	// (hivecommons/hive#17327), and the 090 comment says what holds it.
 	clock.at = clock.at.Add(time.Hour)
 	sweep("role/contributor", "author/human", "stage/071-needs-author", "sentinel-alert")
-	if got := stageOf(t, store, 9); got != stagelabels.NeedsDecision {
+	if got := stageOf(t, store, 9); got != stagelabels.ReadyForHumanMerge {
 		t.Fatalf("sentinel: stage=%v", got)
 	}
-	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.DecisionCommentMarker) || !strings.Contains(api.comments[0], "a sentinel alert is open on this PR") {
-		t.Fatalf("085 comment = %q", api.comments)
+	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.ReadyCommentMarker) || !strings.Contains(api.comments[0], "Held: a sentinel alert is open on this PR.") || strings.Contains(api.comments[0], "Blocked only by") {
+		t.Fatalf("held 090 comment = %q", api.comments)
 	}
-	// 085 → 090 when the alert clears is a flip, not a regression, and the
-	// 090 comment is posted for this new visit.
-	sweep("role/contributor", "author/human", "stage/085-needs-decision")
-	if got := stageOf(t, store, 9); got != stagelabels.ReadyForHumanMerge || len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.ReadyCommentMarker) {
+	// The alert clearing keeps 090; the plain ready cause was already
+	// explained on this head (the first 090 visit above), so no repost —
+	// TestReadyEntryRewritesWhenGateLifts covers the rewrite.
+	sweep("role/contributor", "author/human", "stage/090-ready-for-human-merge")
+	if got := stageOf(t, store, 9); got != stagelabels.ReadyForHumanMerge || len(api.comments) != 0 {
 		t.Fatalf("alert cleared: stage=%v comments=%q", got, api.comments)
 	}
 
@@ -334,7 +341,11 @@ func TestRequiresHumanLandsAt085WithEntryComment(t *testing.T) {
 	sweep := func(labels ...string) {
 		t.Helper()
 		api.reset()
-		e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", stagePR(13, labels...), contributorLaneReasonNoVerdict, false, nil)
+		// A clanker PR (attribution trailer): a person's requires_human
+		// routes to 071 instead (hivecommons/hive#15202).
+		pr := stagePR(13, labels...)
+		pr.Body = gh.Ptr("Fixes the widget.\n\n— hive: backend=pi model=gpt-6\n")
+		e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
 		e.noteStageVerdict("acme", "widget", 13, *verdict)
 		e.noteStageRole("acme", "widget", 13, stagelabels.RoleContributor)
 		if _, err := e.ApplyStageLabels(ctx); err != nil {
@@ -349,7 +360,7 @@ func TestRequiresHumanLandsAt085WithEntryComment(t *testing.T) {
 		t.Fatal("verdict reason must not be rendered twice in the 085 comment")
 	}
 
-	sweep("role/contributor", "author/human", "stage/050-review-pending")
+	sweep("role/contributor", "author/clanker", "stage/050-review-pending")
 	if got := stageOf(t, store, 13); got != stagelabels.NeedsDecision {
 		t.Fatalf("stage=%v want 085", got)
 	}
@@ -373,7 +384,7 @@ func TestRequiresHumanLandsAt085WithEntryComment(t *testing.T) {
 	}
 
 	// Same state again: no second entry comment, no writes.
-	sweep("role/contributor", "author/human", "stage/085-needs-decision")
+	sweep("role/contributor", "author/clanker", "stage/085-needs-decision")
 	if len(api.comments) != 0 || api.writes() != 0 {
 		t.Fatalf("085 dedupe: comments=%q writes=%d", api.comments, api.writes())
 	}
@@ -393,6 +404,7 @@ func TestEntryCommentOncePerStageAndHead(t *testing.T) {
 		api.reset()
 		pr := stagePR(13, labels...)
 		pr.Head.SHA = gh.Ptr(head)
+		pr.Body = gh.Ptr("Fixes the widget.\n\n— hive: backend=pi model=gpt-6\n")
 		e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
 		e.noteStageVerdict("acme", "widget", 13, *verdict)
 		e.noteStageRole("acme", "widget", 13, stagelabels.RoleContributor)
@@ -438,7 +450,9 @@ func TestDecisionRequestedLandsAt085WithQuestion(t *testing.T) {
 	e, store := humanStageEngine(t, api.url, clock, verdict, 0)
 	ctx := context.Background()
 
-	e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", stagePR(17, "role/contributor", "author/human", "stage/050-review-pending"), contributorLaneReasonNoVerdict, false, nil)
+	pr := stagePR(17, "role/contributor", "author/human", "stage/050-review-pending")
+	pr.Body = gh.Ptr("Fixes the widget.\n\n— hive: backend=pi model=gpt-6\n")
+	e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
 	e.noteStageVerdict("acme", "widget", 17, *verdict)
 	e.noteStageRole("acme", "widget", 17, stagelabels.RoleContributor)
 	if _, err := e.ApplyStageLabels(ctx); err != nil {
@@ -468,7 +482,9 @@ func TestRequiresHumanLandsAt085WithSummary(t *testing.T) {
 	e, store := humanStageEngine(t, api.url, clock, verdict, 0)
 	ctx := context.Background()
 
-	e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", stagePR(17, "author/contributor", "stage/050-review-pending"), contributorLaneReasonNoVerdict, false, nil)
+	pr := stagePR(17, "author/contributor", "stage/050-review-pending")
+	pr.Body = gh.Ptr("Fixes the widget.\n\n— hive: backend=pi model=gpt-6\n")
+	e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
 	e.noteStageVerdict("acme", "widget", 17, *verdict)
 	if _, err := e.ApplyStageLabels(ctx); err != nil {
 		t.Fatal(err)
@@ -479,6 +495,77 @@ func TestRequiresHumanLandsAt085WithSummary(t *testing.T) {
 	}
 	if len(api.comments) != 1 || !strings.Contains(api.comments[0], "reviewer summary: security requires human: Trust-surface file by location") {
 		t.Fatalf("085 entry comment = %q", api.comments)
+	}
+}
+
+// TestRequiresHumanOnPersonPRRoutesToAuthor: a requires_human verdict on a
+// PR a person pushed themselves is the author's question to answer, not a
+// maintainer's decision (hivecommons/hive#15202). It lands at 071, the
+// author is told what the reviewer asked whatever their role, and nothing
+// ever queues adoption. A hive-authored PR has nobody to ask and keeps 085.
+func TestRequiresHumanOnPersonPRRoutesToAuthor(t *testing.T) {
+	api, closeAPI := seededStageAPI(t)
+	defer closeAPI()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 28, 20, 24, 0, 0, time.UTC)}
+	verdict := &ContributorLaneVerdict{
+		Configured:        true,
+		Verdict:           "requires_human",
+		DecisionRequested: true,
+		DecisionQuestion:  "should this groundwork land before its consumer?",
+	}
+	e, store := humanStageEngine(t, api.url, clock, verdict, 0)
+	ctx := context.Background()
+	sweep := func(number int, role stagelabels.Role, labels ...string) {
+		t.Helper()
+		api.reset()
+		pr := stagePR(number, labels...)
+		pr.User = &gh.User{Login: gh.Ptr("clubanderson")}
+		if number == 23 {
+			pr.User = &gh.User{Login: gh.Ptr(testHiveAppBotLogin)}
+		}
+		e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
+		e.noteStageVerdict("acme", "widget", number, *verdict)
+		e.noteStageRole("acme", "widget", number, role)
+		if _, err := e.ApplyStageLabels(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sweep(21, stagelabels.RoleContributor, "role/contributor", "author/human", "stage/050-review-pending")
+	if got := stageOf(t, store, 21); got != stagelabels.NeedsAuthor {
+		t.Fatalf("stage=%v want 071", got)
+	}
+	if !reflect.DeepEqual(api.added, [][]string{{"stage/071-needs-author"}}) {
+		t.Fatalf("added=%v", api.added)
+	}
+	if rec, _ := store.Get(stageKey("acme", "widget", 21)); rec.Reason != stagelabels.LaneReasonReviewerQuestion {
+		t.Fatalf("recorded reason = %q", rec.Reason)
+	}
+	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], "<!-- hive:human-071-note") ||
+		!strings.Contains(api.comments[0], "@clubanderson") ||
+		!strings.Contains(api.comments[0], "the reviewer asked you: should this groundwork land before its consumer?") ||
+		strings.Contains(api.comments[0], stagelabels.DecisionCommentMarker) {
+		t.Fatalf("071 note = %q", api.comments)
+	}
+	// Same head again: told once.
+	sweep(21, stagelabels.RoleContributor, "role/contributor", "author/human", "stage/071-needs-author")
+	if len(api.comments) != 0 || api.writes() != 0 {
+		t.Fatalf("071 dedupe: comments=%q writes=%d", api.comments, api.writes())
+	}
+
+	// An owner (trusted role) gets the same route and note.
+	sweep(22, stagelabels.RoleTrusted, "role/trusted", "author/human", "stage/050-review-pending")
+	if got := stageOf(t, store, 22); got != stagelabels.NeedsAuthor {
+		t.Fatalf("owner stage=%v want 071", got)
+	}
+	if len(api.comments) != 1 || !strings.Contains(api.comments[0], "the reviewer asked you:") {
+		t.Fatalf("owner 071 note = %q", api.comments)
+	}
+
+	// A hive-authored PR has no person to ask: still a decision.
+	sweep(23, stagelabels.RoleTrusted, "role/trusted", "author/hive", "stage/050-review-pending")
+	if got := stageOf(t, store, 23); got != stagelabels.NeedsDecision {
+		t.Fatalf("hive-authored stage=%v want 085", got)
 	}
 }
 
@@ -512,10 +599,65 @@ func TestWorkflowApprovalSnippetRendersSelfContainedWorkflowForOwnAppLogin(t *te
 	}
 }
 
-// TestDecisionEntryRepostsWhenCauseChanges: a PR parked at 085 for a
-// sentinel alert whose maintainer clears the alert, only for the lane's
-// workflow-path fence to hold it, gets the new cause explained on the same
-// head — once — instead of sitting under a stale "sentinel alert" comment.
+// TestReadyEntryRewritesWhenGateLifts: a green, reviewed PR whose only
+// stop is a sentinel alert sits at 090 held (hivecommons/hive#17327); the
+// 090 comment names the gate, and when a person clears the alert on the
+// same head the comment is re-explained — once — without the "Held:" line,
+// so nobody reads a stale hold on a PR that is now theirs to merge.
+func TestReadyEntryRewritesWhenGateLifts(t *testing.T) {
+	api, closeAPI := seededStageAPI(t)
+	defer closeAPI()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)}
+	verdict := &ContributorLaneVerdict{Configured: true, Approved: true, Verdict: "approve"}
+	e, store := humanStageEngine(t, api.url, clock, verdict, 0)
+	ctx := context.Background()
+	sweep := func(reason string, labels ...string) {
+		t.Helper()
+		api.reset()
+		e.recordStage(stageLaneTrusted, "acme/widget", "acme", "widget", stagePR(9, labels...), "untrusted-author-role", false, nil)
+		e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", stagePR(9, labels...), reason, false, nil)
+		e.noteStageRole("acme", "widget", 9, stagelabels.RoleContributor)
+		if _, err := e.ApplyStageLabels(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sweep(contributorLaneReasonSentinelBlocked, "role/contributor", "author/human", "stage/050-review-pending", "sentinel-alert")
+	if got := stageOf(t, store, 9); got != stagelabels.ReadyForHumanMerge {
+		t.Fatalf("sentinel: stage=%v", got)
+	}
+	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.ReadyCommentMarker) || !strings.Contains(api.comments[0], "Held: a sentinel alert is open on this PR.") {
+		t.Fatalf("held comment = %q", api.comments)
+	}
+	if !reflect.DeepEqual(api.added, [][]string{{"stage/090-ready-for-human-merge"}}) {
+		t.Fatalf("held 090 wears the 090 label: added=%v", api.added)
+	}
+	// Same gate again: quiet.
+	sweep(contributorLaneReasonSentinelBlocked, "role/contributor", "author/human", "stage/090-ready-for-human-merge", "sentinel-alert")
+	if len(api.comments) != 0 {
+		t.Fatalf("same gate reposted: %q", api.comments)
+	}
+	// Alert cleared on the same head: still 090, the comment re-explained
+	// with the trust cause and without the hold line.
+	sweep(contributorLaneReasonClaimTier, "role/contributor", "author/human", "stage/090-ready-for-human-merge")
+	if got := stageOf(t, store, 9); got != stagelabels.ReadyForHumanMerge {
+		t.Fatalf("alert cleared: stage=%v", got)
+	}
+	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.ReadyCommentMarker) || strings.Contains(api.comments[0], "Held:") || !strings.Contains(api.comments[0], "Blocked only by") {
+		t.Fatalf("cleared comment = %q", api.comments)
+	}
+	sweep(contributorLaneReasonClaimTier, "role/contributor", "author/human", "stage/090-ready-for-human-merge")
+	if len(api.comments) != 0 {
+		t.Fatalf("explained cause reposted: %q", api.comments)
+	}
+}
+
+// TestDecisionEntryRepostsWhenCauseChanges: a PR parked at 085 for the
+// lane's tests-removed rule whose cause changes — the tests come back, the
+// workflow-path fence now holds it — gets the new cause explained on the
+// same head — once — instead of sitting under a stale comment. (A sentinel
+// alert no longer parks 085 — hivecommons/hive#17327 — so the tests-removed
+// rule stands in for it here.)
 func TestDecisionEntryRepostsWhenCauseChanges(t *testing.T) {
 	api, closeAPI := seededStageAPI(t)
 	defer closeAPI()
@@ -534,25 +676,25 @@ func TestDecisionEntryRepostsWhenCauseChanges(t *testing.T) {
 		}
 	}
 
-	sweep(contributorLaneReasonSentinelBlocked, "role/trusted", "author/clanker", "stage/050-review-pending", "sentinel-alert")
+	sweep(contributorLaneReasonTestsRemoved, "role/trusted", "author/human", "stage/050-review-pending")
 	if got := stageOf(t, store, 9); got != stagelabels.NeedsDecision {
-		t.Fatalf("sentinel: stage=%v", got)
+		t.Fatalf("tests removed: stage=%v", got)
 	}
-	if len(api.comments) != 1 || !strings.Contains(api.comments[0], "a sentinel alert is open on this PR") {
-		t.Fatalf("sentinel comment = %q", api.comments)
+	if len(api.comments) != 1 || !strings.Contains(api.comments[0], "removes tests") {
+		t.Fatalf("tests-removed comment = %q", api.comments)
 	}
 	// Same cause again: no repost.
-	sweep(contributorLaneReasonSentinelBlocked, "role/trusted", "author/clanker", "stage/085-needs-decision", "sentinel-alert")
+	sweep(contributorLaneReasonTestsRemoved, "role/trusted", "author/human", "stage/085-needs-decision")
 	if len(api.comments) != 0 {
 		t.Fatalf("same cause reposted: %q", api.comments)
 	}
-	// Alert cleared, workflow-path fence now the blocker: still 085, new cause explained.
-	sweep(contributorLaneReasonWorkflowPath, "role/trusted", "author/clanker", "stage/085-needs-decision")
+	// Tests back, workflow-path fence now the blocker: still 085, new cause explained.
+	sweep(contributorLaneReasonWorkflowPath, "role/trusted", "author/human", "stage/085-needs-decision")
 	if got := stageOf(t, store, 9); got != stagelabels.NeedsDecision {
 		t.Fatalf("workflow path: stage=%v", got)
 	}
 	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.DecisionCommentMarker) ||
-		!strings.Contains(api.comments[0], "edits CI workflow / action files") || strings.Contains(api.comments[0], "sentinel alert") {
+		!strings.Contains(api.comments[0], "edits CI workflow / action files") || strings.Contains(api.comments[0], "removes tests") {
 		t.Fatalf("workflow-path comment = %q", api.comments)
 	}
 	rec, _ := store.Get(stageKey("acme", "widget", 9))
@@ -560,13 +702,54 @@ func TestDecisionEntryRepostsWhenCauseChanges(t *testing.T) {
 		t.Fatalf("causes not recorded: %+v", rec)
 	}
 	// Flapping back to an already-explained cause stays quiet.
-	sweep(contributorLaneReasonSentinelBlocked, "role/trusted", "author/clanker", "stage/085-needs-decision", "sentinel-alert")
-	sweep(contributorLaneReasonWorkflowPath, "role/trusted", "author/clanker", "stage/085-needs-decision")
+	sweep(contributorLaneReasonTestsRemoved, "role/trusted", "author/human", "stage/085-needs-decision")
+	sweep(contributorLaneReasonWorkflowPath, "role/trusted", "author/human", "stage/085-needs-decision")
 	if len(api.comments) != 0 {
 		t.Fatalf("explained cause reposted: %q", api.comments)
 	}
 	if rec, _ := store.Get(stageKey("acme", "widget", 9)); len(rec.EntryCommentedCauses) != 2 {
 		t.Fatalf("cause list grew: %+v", rec)
+	}
+}
+
+// TestDecisionEntryNotRepostedWhenObservingLaneFlaps: one requires_human
+// verdict on one head reaches 085 through the contributor lane's verdict
+// hand-off on one sweep and the trusted lane's trust hand-off on the next.
+// The lane-rule consequence bullet only the first adds is presentation, not
+// cause: the maintainer is owed one explanation, not one per observing lane
+// (hivecommons/hive#16405).
+func TestDecisionEntryNotRepostedWhenObservingLaneFlaps(t *testing.T) {
+	api, closeAPI := seededStageAPI(t)
+	defer closeAPI()
+	clock := &contributorLaneClock{at: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)}
+	verdict := &ContributorLaneVerdict{Configured: true, Verdict: "requires_human"}
+	e, store := humanStageEngine(t, api.url, clock, verdict, 0)
+	ctx := context.Background()
+	sweep := func(lane, reason string, labels ...string) {
+		t.Helper()
+		pr := stagePR(9, labels...)
+		pr.Body = gh.Ptr("Fixes the widget.\n\n— hive: backend=pi model=gpt-6\n")
+		e.recordStage(lane, "acme/widget", "acme", "widget", pr, reason, false, nil)
+		if lane == stageLaneContributor {
+			e.noteStageVerdict("acme", "widget", 9, *verdict)
+		}
+		e.noteStageRole("acme", "widget", 9, stagelabels.RoleContributor)
+		if _, err := e.ApplyStageLabels(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := stageOf(t, store, 9); got != stagelabels.NeedsDecision {
+			t.Fatalf("%s lane: stage=%v want 085", lane, got)
+		}
+	}
+
+	api.reset()
+	sweep(stageLaneContributor, stageReasonVerdictRequiresHuman, "role/contributor", "author/clanker", "stage/050-review-pending")
+	sweep(stageLaneTrusted, "untrusted-author-role", "role/contributor", "author/clanker", "stage/085-needs-decision")
+	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.DecisionCommentMarker) {
+		t.Fatalf("085 entry comment reposted on the same head when the observing lane changed: %q", api.comments)
+	}
+	if rec, _ := store.Get(stageKey("acme", "widget", 9)); len(rec.EntryCommentedCauses) != 1 || rec.EntryCommentedHead != "sha" {
+		t.Fatalf("one decision recorded as several causes: %+v", rec)
 	}
 }
 
@@ -621,5 +804,191 @@ func TestHumanHandoffAdmissionSkipPendingChecksWaitOnHive(t *testing.T) {
 				t.Fatalf("admission skip blamed the hive after dwell: %+v", rec)
 			}
 		})
+	}
+}
+
+// stageSupersededCloserSpy is supersededCloserSpy that still supplies the
+// stage writer the label pass needs.
+type stageSupersededCloserSpy struct {
+	*supersededCloserSpy
+	stage stageReconcilerTransport
+}
+
+func (s *stageSupersededCloserSpy) StageReconciler(store *stagelabels.Store, opts *stageengine.Options, logger *slog.Logger) stageengine.Reconciler {
+	return s.stage.StageReconciler(store, opts, logger)
+}
+
+// Preserve the underlying transport's optional comment primitive as well
+// as its stage reconciler when wrapping it to observe superseded closes.
+func (s *stageSupersededCloserSpy) CreateIssueComment(ctx context.Context, repo string, number int, body string) error {
+	return s.Transport.(issueCommenter).CreateIssueComment(ctx, repo, number, body)
+}
+
+func newStageSupersededCloserSpy(t *testing.T, e *Engine, result hgithub.HiveSupersededClose) *stageSupersededCloserSpy {
+	t.Helper()
+	stage, ok := e.transport.(stageReconcilerTransport)
+	if !ok {
+		t.Fatal("engine transport provides no stage writer")
+	}
+	spy := &stageSupersededCloserSpy{supersededCloserSpy: &supersededCloserSpy{Transport: e.transport, result: result}, stage: stage}
+	e.transport = spy
+	return spy
+}
+
+// TestApplyStageLabelsHivePRSupersededClosesInsteadOfHumanRoute is
+// hivecommons/hive#15208: the reviewer swarm answered requires_human on a
+// hive-authored PR whose issue #15206 had just merged and closed. The pass
+// asks the superseded rule before routing to a person; a close means no
+// 085 label, no record, and the result counts it.
+func TestApplyStageLabelsHivePRSupersededClosesInsteadOfHumanRoute(t *testing.T) {
+	api := &stageAPI{labels: map[string]string{}}
+	for _, d := range stagelabels.AllLabelDefs() {
+		api.labels[d.Name] = d.Color
+	}
+	var prReads int
+	api.extra = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widget/pulls/15208" {
+			prReads++
+			_, _ = io.WriteString(w, `{"number":15208,"state":"open","user":{"login":"`+testHiveAppBotLogin+`","type":"Bot"},"head":{"sha":"sha"},"base":{"ref":"v5"},"mergeable_state":"clean"}`)
+			return true
+		}
+		return false
+	}
+	srv := newStageAPI(t, api)
+	defer srv.Close()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 21, 2, 41, 0, 0, time.UTC)}
+	e, _, store := newStageEngine(t, srv.URL, clock)
+	requiresHuman := ContributorLaneVerdict{Configured: true, Verdict: "requires_human", HumanSummaries: []string{"intent-alignment requires human: Solves child (b) of #15188; conflicts with #15206 (owner PR for the same issue)"}}
+	e.contributorLaneVerdict = func(string, int, string) ContributorLaneVerdict { return requiresHuman }
+	spy := newStageSupersededCloserSpy(t, e, hgithub.HiveSupersededClose{Closed: true, Superseded: true, CloserPR: 15206, Issue: 15188, Verdict: "close", Reason: hgithub.SupersessionActionClosedDeclared})
+	ctx := context.Background()
+	observe := func() StageLabelResult {
+		pr := stagePR(15208, "stage/050-review-pending", "role/trusted", "author/hive")
+		pr.User = &gh.User{Login: gh.Ptr(testHiveAppBotLogin)}
+		e.recordStage(stageLaneTrusted, "acme/widget", "acme", "widget", pr, "reviewer-verdict:requires_human", false, nil)
+		e.noteStageRole("acme", "widget", 15208, stagelabels.RoleTrusted)
+		e.noteStageVerdict("acme", "widget", 15208, requiresHuman)
+		res, err := e.ApplyStageLabels(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	res := observe()
+	if res.ClosedSuperseded != 1 || len(spy.calls) != 1 || spy.calls[0] != 15208 || prReads != 1 {
+		t.Fatalf("result=%+v calls=%v reads=%d, want one close", res, spy.calls, prReads)
+	}
+	if api.writes() != 0 {
+		t.Fatalf("a closed PR gets no 085 label: added=%v removed=%v", api.added, api.removed)
+	}
+	if _, ok := store.Get(stageKey("acme", "widget", 15208)); ok {
+		t.Fatal("closed PR must leave no stage record")
+	}
+
+	// The rule keeps the PR: the reviewer's ask routes to 085 as before,
+	// and within the TTL the same head is not re-read.
+	spy.result = hgithub.HiveSupersededClose{Verdict: "keep", Reason: "not-superseded"}
+	api.reset()
+	res = observe()
+	if res.ClosedSuperseded != 0 || !reflect.DeepEqual(api.added, [][]string{{"stage/085-needs-decision"}}) {
+		t.Fatalf("kept PR must reach 085: result=%+v added=%v", res, api.added)
+	}
+	if len(spy.calls) != 1 || prReads != 1 {
+		t.Fatalf("same head within the TTL must not be re-read: calls=%v reads=%d", spy.calls, prReads)
+	}
+	clock.advance(supersededCheckTTL + time.Minute)
+	observe()
+	if len(spy.calls) != 2 {
+		t.Fatalf("past the TTL the check runs again: calls=%v", spy.calls)
+	}
+}
+
+// TestApplyStageLabelsHumanPRNeverAskedSupersededCloser: the short-circuit
+// is for the hive's own PRs only; a person's PR at requires_human is routed
+// to a person without a PR read.
+func TestApplyStageLabelsHumanPRNeverAskedSupersededCloser(t *testing.T) {
+	api := &stageAPI{labels: map[string]string{}}
+	for _, d := range stagelabels.AllLabelDefs() {
+		api.labels[d.Name] = d.Color
+	}
+	srv := newStageAPI(t, api)
+	defer srv.Close()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 21, 2, 41, 0, 0, time.UTC)}
+	e, _, _ := newStageEngine(t, srv.URL, clock)
+	requiresHuman := ContributorLaneVerdict{Configured: true, Verdict: "requires_human"}
+	e.contributorLaneVerdict = func(string, int, string) ContributorLaneVerdict { return requiresHuman }
+	spy := newStageSupersededCloserSpy(t, e, hgithub.HiveSupersededClose{Closed: true})
+	pr := stagePR(337, "stage/050-review-pending", "role/contributor", "author/human")
+	pr.User = &gh.User{Login: gh.Ptr("alice")}
+	e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonAuthorAssociation, false, nil)
+	e.noteStageRole("acme", "widget", 337, stagelabels.RoleContributor)
+	e.noteStageVerdict("acme", "widget", 337, requiresHuman)
+	res, err := e.ApplyStageLabels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The reviewer's question on a person's own PR goes to the author
+	// (071, hivecommons/hive#15202); the point here is that the closer is
+	// never asked and no PR read happens.
+	if len(spy.calls) != 0 || res.ClosedSuperseded != 0 || !reflect.DeepEqual(api.added, [][]string{{"stage/071-needs-author"}}) {
+		t.Fatalf("calls=%v result=%+v added=%v", spy.calls, res, api.added)
+	}
+}
+
+// TestEntryCommentUpsertsExistingComment: when the hive's 085 entry comment
+// is still on the PR, a re-entry on a new head rewrites it in place with an
+// "Updated" line instead of posting a second copy (hivecommons/hive#16433).
+// A comment carrying the marker but written by someone else is left alone.
+func TestEntryCommentUpsertsExistingComment(t *testing.T) {
+	api := &stageAPI{labels: map[string]string{}, statefulComments: true}
+	for _, d := range stagelabels.AllLabelDefs() {
+		api.labels[d.Name] = d.Color
+	}
+	srv := newStageAPI(t, api)
+	defer srv.Close()
+	clock := &contributorLaneClock{at: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)}
+	verdict := &ContributorLaneVerdict{Configured: true, Verdict: "requires_human"}
+	e, store := humanStageEngine(t, srv.URL, clock, verdict, 0)
+	ctx := context.Background()
+	sweep := func(head string, labels ...string) {
+		t.Helper()
+		api.reset()
+		pr := stagePR(14, labels...)
+		pr.Head.SHA = gh.Ptr(head)
+		pr.Body = gh.Ptr("Fixes the widget.\n\n— hive: backend=pi model=gpt-6\n")
+		e.recordStage(stageLaneContributor, "acme/widget", "acme", "widget", pr, contributorLaneReasonNoVerdict, false, nil)
+		e.noteStageVerdict("acme", "widget", 14, *verdict)
+		e.noteStageRole("acme", "widget", 14, stagelabels.RoleContributor)
+		if _, err := e.ApplyStageLabels(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := stageKey("acme", "widget", 14)
+
+	// A stranger's comment carrying the marker must never be edited.
+	api.issueComments = map[int][]map[string]any{14: {{"id": int64(5), "body": stagelabels.DecisionCommentMarker + "\nforged", "user": map[string]any{"login": "mallory"}}}}
+
+	sweep("sha", "role/contributor", "author/human", "stage/050-review-pending")
+	if len(api.comments) != 1 || !strings.HasPrefix(api.comments[0], stagelabels.DecisionCommentMarker) {
+		t.Fatalf("first entry comments = %q", api.comments)
+	}
+	if len(api.commentEdits) != 0 {
+		t.Fatalf("a stranger's marker comment was edited: %q", api.commentEdits)
+	}
+
+	store.Observe(key, stagelabels.ReviewPending, "review-requested")
+	clock.advance(time.Hour)
+	sweep("sha2", "role/contributor", "author/human", "stage/050-review-pending")
+	if got := stageOf(t, store, 14); got != stagelabels.NeedsDecision {
+		t.Fatalf("stage=%v want 085", got)
+	}
+	if len(api.comments) != 0 {
+		t.Fatalf("new head must edit the existing entry comment, not post another: %q", api.comments)
+	}
+	if len(api.commentEdits) != 1 || !strings.HasPrefix(api.commentEdits[0], stagelabels.DecisionCommentMarker) || !strings.Contains(api.commentEdits[0], "<sub>Updated 2026-10-20 13:00 UTC.</sub>") {
+		t.Fatalf("entry comment edits = %q", api.commentEdits)
+	}
+	if rec, _ := store.Get(key); !rec.EntryCommented || rec.EntryCommentedHead != "sha2" {
+		t.Fatalf("record after the in-place update: %+v", rec)
 	}
 }

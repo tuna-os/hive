@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hivecommons/hive/pkg/attention"
 )
 
 // AppSignedCommitsEnabled reports whether the PR-request watcher re-authors
@@ -93,6 +95,16 @@ type GitHubConfig struct {
 	APIReserve int `yaml:"api_reserve,omitempty"`
 	// APICritical is the lower core REST quota floor where Hive enters critical mode.
 	APICritical int `yaml:"api_critical,omitempty"`
+	// ETagCacheMaxMB bounds the memory (MiB of gzip-compressed bodies) the
+	// shared GitHub conditional-request (ETag / 304) cache may hold. Zero
+	// uses DefaultGitHubETagCacheMaxMB; HIVE_GITHUB_ETAG_CACHE_MAX_MB
+	// overrides the file. A full cache evicts bodies other pollers are about
+	// to revalidate, turning free 304s back into charged fetches.
+	ETagCacheMaxMB int `yaml:"etag_cache_max_mb,omitempty" json:"etag_cache_max_mb,omitempty"`
+	// ETagCacheMaxEntries bounds how many responses the ETag cache holds
+	// regardless of size. Zero uses DefaultGitHubETagCacheMaxEntries;
+	// HIVE_GITHUB_ETAG_CACHE_MAX_ENTRIES overrides the file.
+	ETagCacheMaxEntries int `yaml:"etag_cache_max_entries,omitempty" json:"etag_cache_max_entries,omitempty"`
 	// BaseURL is the GitHub web base URL. Defaults to DefaultGitHubBaseURL.
 	// For GitHub Enterprise, set to e.g. "https://github.ibm.com".
 	BaseURL string `yaml:"base_url"`
@@ -146,6 +158,13 @@ type GitHubConfig struct {
 	// reporterTrustHoldEnvOverride is set by HIVE_REPORTER_TRUST_HOLD and never
 	// serialized; process env remains the effective override at runtime.
 	reporterTrustHoldEnvOverride *bool `yaml:"-" json:"-"`
+	// Notifications governs how loudly the hive's own PR bookkeeping reaches
+	// people. Every new issue comment and every review submission emails
+	// the author and every watcher; editing an existing comment does not.
+	// See GitHubNotificationsConfig.
+	Notifications GitHubNotificationsConfig `yaml:"notifications,omitempty" json:"notifications,omitempty"`
+	// Attention is an opt-in, single-admitter condition episode ledger.
+	Attention attention.Config `yaml:"attention,omitempty" json:"attention,omitempty"`
 	// OAuthBaseURLOverride and OAuthAPIURLOverride redirect the DEVICE-FLOW LOGIN
 	// endpoints away from public github.com. They are a TEST SEAM ONLY — see the
 	// comment on OAuthBaseURL(). They carry the `-` yaml tag so they can never be
@@ -172,6 +191,31 @@ type GitHubConfig struct {
 // and exited before the HTTP listener bound — invisible from the dashboard.
 const PlaceholderAppID int64 = 999999999
 
+// PlaceholderOrgPrefixes are the project.org prefixes a pooled hosted slot
+// carries before it is claimed: the pool replenisher seeds "available-<id>",
+// and older slots carry the legacy "placeholder" form. An unclaimed slot is
+// NOT org-less — the hub templates this synthetic org into the spoke
+// hive.yaml — so every "is this hive onboarded yet?" test must consult this
+// list rather than only checking for an empty org (#17593).
+var PlaceholderOrgPrefixes = []string{"available-", "placeholder"}
+
+// IsPlaceholderOrg reports whether org is the synthetic project.org of an
+// unclaimed pool slot (case-insensitive, surrounding whitespace ignored). An
+// empty org is NOT a placeholder; callers that also treat "no org at all" as
+// unclaimed must test for that separately.
+func IsPlaceholderOrg(org string) bool {
+	org = strings.ToLower(strings.TrimSpace(org))
+	if org == "" {
+		return false
+	}
+	for _, pre := range PlaceholderOrgPrefixes {
+		if strings.HasPrefix(org, pre) {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	// DefaultGitHubPRDetailTTL is the default freshness window for cached
 	// GET /repos/{owner}/{repo}/pulls/{number} detail responses.
@@ -179,6 +223,52 @@ const (
 	GitHubPRDetailTTLEnv          = "HIVE_GITHUB_PR_DETAIL_TTL"
 	DefaultGraphQLPRBatchPageSize = 50
 )
+
+// GitHub ETag response cache bounds (github.etag_cache_max_mb /
+// github.etag_cache_max_entries). The defaults were raised from 64 MiB /
+// 4096 entries: a busy multi-repo hive filled 64 MiB within hours and the
+// evictions pushed its hourly REST usage back toward the installation limit.
+// Bodies are stored gzip-compressed, so a MiB holds several MiB of JSON.
+const (
+	DefaultGitHubETagCacheMaxMB      = 128
+	MaxGitHubETagCacheMaxMB          = 2048
+	DefaultGitHubETagCacheMaxEntries = 8192
+	MaxGitHubETagCacheMaxEntries     = 1 << 20
+	GitHubETagCacheMaxMBEnv          = "HIVE_GITHUB_ETAG_CACHE_MAX_MB"
+	GitHubETagCacheMaxEntriesEnv     = "HIVE_GITHUB_ETAG_CACHE_MAX_ENTRIES"
+)
+
+// EffectiveETagCacheMaxBytes is the ETag cache byte bound in bytes: the
+// configured MiB, or the default when unset.
+func (g GitHubConfig) EffectiveETagCacheMaxBytes() int {
+	mb := g.ETagCacheMaxMB
+	if mb <= 0 {
+		mb = DefaultGitHubETagCacheMaxMB
+	}
+	return mb << 20
+}
+
+// EffectiveETagCacheMaxEntries is the ETag cache entry bound, or the default
+// when unset.
+func (g GitHubConfig) EffectiveETagCacheMaxEntries() int {
+	if g.ETagCacheMaxEntries <= 0 {
+		return DefaultGitHubETagCacheMaxEntries
+	}
+	return g.ETagCacheMaxEntries
+}
+
+// ValidateETagCacheLimits applies the bounds config.Validate enforces at boot
+// to a (possibly partial) edit, so the Settings dialog cannot save a value the
+// next start would reject.
+func ValidateETagCacheLimits(maxMB, maxEntries int) error {
+	if maxMB < 0 || maxMB > MaxGitHubETagCacheMaxMB {
+		return fmt.Errorf("github.etag_cache_max_mb must be between 1 and %d, or 0 for the default (%d)", MaxGitHubETagCacheMaxMB, DefaultGitHubETagCacheMaxMB)
+	}
+	if maxEntries < 0 || maxEntries > MaxGitHubETagCacheMaxEntries {
+		return fmt.Errorf("github.etag_cache_max_entries must be between 1 and %d, or 0 for the default (%d)", MaxGitHubETagCacheMaxEntries, DefaultGitHubETagCacheMaxEntries)
+	}
+	return nil
+}
 
 func (g GitHubConfig) PRDetailTTL() time.Duration {
 	if raw := strings.TrimSpace(os.Getenv(GitHubPRDetailTTLEnv)); raw != "" {

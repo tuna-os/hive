@@ -1,4 +1,5 @@
-// Package sandbox launches agent work in credential-free rootless Podman sandboxes.
+// Package sandbox launches rootless Podman work with credential-free Git
+// workspaces and an optional opaque selected-provider capability for Cline.
 package sandbox
 
 import (
@@ -10,6 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/hivecommons/hive/crux/cline"
 )
 
 const (
@@ -22,6 +26,7 @@ const (
 var credentialEnvNames = map[string]struct{}{
 	"GITHUB_TOKEN": {}, "GH_TOKEN": {}, "HIVE_GITHUB_TOKEN": {}, "COPILOT_GITHUB_TOKEN": {},
 	"GIT_ASKPASS": {}, "SSH_ASKPASS": {},
+	"HIVE_CLINE_PROVIDERS_B64": {},
 }
 
 type LaunchSpec struct {
@@ -36,12 +41,30 @@ type LaunchSpec struct {
 	NetworkMode    string
 	NetworkNone    bool
 	ReadOnly       bool
+	ClineProvider  *cline.ProviderFile
+	// OnStarted reports that the launcher accepted the run, not merely that
+	// the manager queued it. Called at most once.
+	OnStarted func()
+	// Relays asks the launcher to supply hive's sandbox relays (RelayNames)
+	// on PATH inside the sandbox (#18512). Set for agent kicks only.
+	Relays bool
+	// RelayHostDir is the host directory the Podman launcher bind-mounts
+	// read-only at RelayMountPath. PodmanLauncher.Run stages it when Relays
+	// is set; PodmanArgs mounts it and wraps the command when it is non-empty.
+	RelayHostDir string
 }
 
 type Result struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int
+	// Node is the node the run's pod was scheduled on, when the launcher can
+	// tell (the Job runtime); empty otherwise.
+	Node string
+	// FailReason is set when the run failed for a reason that is the
+	// infrastructure's, not the agent's: FailReasonNodeUnhealthy or
+	// FailReasonWaitingForNode. Empty for every other outcome.
+	FailReason string
 }
 
 type Launcher interface {
@@ -50,7 +73,17 @@ type Launcher interface {
 
 type PodmanLauncher struct{ Binary string }
 
-func (l PodmanLauncher) Run(ctx context.Context, spec LaunchSpec) (Result, error) {
+func (l PodmanLauncher) Run(ctx context.Context, spec LaunchSpec) (res Result, runErr error) {
+	if spec.ClineProvider != nil {
+		defer func() {
+			res.Stdout = spec.ClineProvider.Redact(res.Stdout)
+			res.Stderr = spec.ClineProvider.Redact(res.Stderr)
+			if err := spec.ClineProvider.Close(); err != nil {
+				runErr = errors.Join(runErr, err)
+			}
+		}()
+		spec.Name = "hive-cline-" + spec.ClineProvider.ID()
+	}
 	bin := l.Binary
 	if bin == "" {
 		bin = PodmanBinary
@@ -58,17 +91,78 @@ func (l PodmanLauncher) Run(ctx context.Context, spec LaunchSpec) (Result, error
 	if _, err := exec.LookPath(bin); err != nil {
 		return Result{}, fmt.Errorf("sandbox: podman is required but was not found in PATH: %w", err)
 	}
+	if spec.Relays && spec.RelayHostDir == "" {
+		dir, cleanup, err := StageRelays()
+		if err != nil {
+			return Result{}, err
+		}
+		defer cleanup()
+		spec.RelayHostDir = dir
+	}
 	args, err := PodmanArgs(spec)
 	if err != nil {
 		return Result{}, err
 	}
+	// A started podman process is not evidence that a container was accepted.
+	var cidPath string
+	if spec.OnStarted != nil {
+		dir, err := os.MkdirTemp("", "hive-sandbox-cid-")
+		if err != nil {
+			return Result{}, fmt.Errorf("sandbox: create cidfile directory: %w", err)
+		}
+		defer os.RemoveAll(dir)
+		cidPath = filepath.Join(dir, "cid")
+		args = append(args[:1], append([]string{"--cidfile", cidPath}, args[1:]...)...)
+	}
+	if spec.ClineProvider != nil {
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), clineContainerCleanupTimeout)
+			defer cancel()
+			cleanup := exec.CommandContext(cleanupCtx, bin, "rm", "--force", "--ignore", spec.Name)
+			cleanup.Env = spec.ClineProvider.SanitizeEnv(SanitizedEnv(os.Environ(), spec.EnvAllowlist, spec.Env))
+			if err := cleanup.Run(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("sandbox: Cline container cleanup failed; remove %s before retrying", spec.Name))
+				res.ExitCode = -1
+			}
+		}()
+	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = SanitizedEnv(os.Environ(), spec.EnvAllowlist, spec.Env)
+	if spec.ClineProvider != nil {
+		cmd.Env = spec.ClineProvider.SanitizeEnv(cmd.Env)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	var done, observed chan struct{}
+	if cidPath != "" {
+		done, observed = make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(observed)
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				if id, err := os.ReadFile(cidPath); err == nil && len(strings.TrimSpace(string(id))) != 0 {
+					spec.OnStarted()
+					return
+				}
+				select {
+				case <-done:
+					if id, err := os.ReadFile(cidPath); err == nil && len(strings.TrimSpace(string(id))) != 0 {
+						spec.OnStarted()
+					}
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	err = cmd.Run()
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
+	if done != nil {
+		close(done)
+		<-observed
+	}
+	res = Result{Stdout: stdout.String(), Stderr: stderr.String()}
 	if cmd.ProcessState != nil {
 		res.ExitCode = cmd.ProcessState.ExitCode()
 	}
@@ -109,18 +203,30 @@ func PodmanArgs(spec LaunchSpec) ([]string, error) {
 	}
 	args = append(args, "--userns=keep-id")
 	args = append(args, "-v", filepath.Clean(spec.Workspace)+":"+mount+":Z")
+	if spec.ClineProvider != nil {
+		extra, err := clineProviderArgs(spec, mount, workdir)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, extra...)
+	}
+	command := spec.Command
+	if spec.RelayHostDir != "" {
+		args = append(args, "-v", filepath.Clean(spec.RelayHostDir)+":"+RelayMountPath+":ro,Z")
+		command = RelayCommand(command)
+	}
 	args = append(args, "--workdir", workdir)
 	// Name only: podman takes the value from its own environment, which Run
 	// sets from the same spec.Env. A value on the command line would be
 	// readable by every user on the host through /proc/<pid>/cmdline, and
 	// some values (the review spool key, #14986) are per-run secrets.
 	for k := range spec.Env {
-		if !isCredentialName(k) {
+		if !isCredentialName(k) && (spec.ClineProvider == nil || k != "HOME") {
 			args = append(args, "--env", k)
 		}
 	}
 	args = append(args, spec.Image)
-	args = append(args, spec.Command...)
+	args = append(args, command...)
 	return args, nil
 }
 

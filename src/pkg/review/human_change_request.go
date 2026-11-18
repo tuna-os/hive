@@ -28,6 +28,11 @@ const (
 	// HumanChangeRequestSourceDecision is a trusted human's `/hive decision
 	// <text>` comment on the PR while it sat at stage 085.
 	HumanChangeRequestSourceDecision = "decision"
+	// HumanChangeRequestSourceStageLabel is a trusted human moving the PR
+	// back to its author by hand — adding stage/071-needs-author or
+	// stage/072-returned-to-contributor — while the hive had it parked for
+	// a person (hivecommons/hive#15159). SourceID is the label event.
+	HumanChangeRequestSourceStageLabel = "stage-label"
 )
 
 // Kinds of a HumanChangeRequest.
@@ -53,7 +58,9 @@ type HumanChangeRequest struct {
 	Repo    string `json:"repo"`
 	Number  int    `json:"number"`
 	HeadSHA string `json:"head_sha"`
-	// Source is HumanChangeRequestSourceReview or ...Decision.
+	// BodyDigest binds dashboard approval replay to the validated title/body.
+	BodyDigest string `json:"body_digest,omitempty"`
+	// Source is HumanChangeRequestSourceReview, ...Decision or ...StageLabel.
 	Source string `json:"source"`
 	// SourceID is the review ID or comment ID: with HeadSHA it is the
 	// dedupe key, so the same review is never recorded (or kicked) twice.
@@ -67,6 +74,20 @@ type HumanChangeRequest struct {
 	// URL is the review's or comment's HTML URL, when known.
 	URL        string    `json:"url,omitempty"`
 	RecordedAt time.Time `json:"recorded_at"`
+	// CarriedFromHead is the head the person actually decided on when the
+	// hive moved this record forward over its own base refresh: the new
+	// head is a merge of the base branch into CarriedFromHead that left the
+	// PR's diff untouched (hivecommons/hive#15649 → see CarryOverBaseRefresh).
+	CarriedFromHead string `json:"carried_from_head,omitempty"`
+}
+
+// CarriesOverBaseRefresh reports whether the request may follow the PR onto
+// a head that is a pure base refresh of the one it was recorded on. Only a
+// person's own instruction travels — a `/hive decision`, a dashboard Approve
+// or a hand-applied stage label. A GitHub review names one commit and is
+// never moved to another.
+func (r HumanChangeRequest) CarriesOverBaseRefresh() bool {
+	return r.Source != HumanChangeRequestSourceReview && strings.TrimSpace(r.Actor) != ""
 }
 
 // IsApproval reports whether the request is a bare approval rather than an
@@ -102,6 +123,10 @@ type HumanChangeRequestStore interface {
 	Record(req HumanChangeRequest) error
 	// For returns the newest request recorded against repo#number at head.
 	For(repo string, number int, head string) (HumanChangeRequest, bool)
+	// Forget drops the entry recorded from source/sourceID against
+	// repo#number, leaving every other entry (an older instruction on the
+	// same head included) standing. Unknown entries are a no-op.
+	Forget(repo string, number int, source string, sourceID int64) error
 }
 
 // HumanChangeRequests is the file-backed HumanChangeRequestStore. A zero
@@ -165,10 +190,30 @@ func (s *HumanChangeRequests) persist() error {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 // Record implements HumanChangeRequestStore.
@@ -187,7 +232,8 @@ func (s *HumanChangeRequests) Record(req HumanChangeRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.load()
-	kept := s.items[:0]
+	prior := s.items
+	kept := make([]HumanChangeRequest, 0, len(s.items)+1)
 	for _, item := range s.items {
 		if item.Number == req.Number && strings.EqualFold(item.Repo, req.Repo) {
 			if item.HeadSHA != req.HeadSHA || (item.Source == req.Source && item.SourceID == req.SourceID) {
@@ -197,7 +243,11 @@ func (s *HumanChangeRequests) Record(req HumanChangeRequest) error {
 		kept = append(kept, item)
 	}
 	s.items = append(kept, req)
-	return s.persist()
+	if err := s.persist(); err != nil {
+		s.items = prior
+		return err
+	}
+	return nil
 }
 
 // For implements HumanChangeRequestStore.
@@ -224,6 +274,62 @@ func (s *HumanChangeRequests) For(repo string, number int, head string) (HumanCh
 	return newest, found
 }
 
+// Forget implements HumanChangeRequestStore.
+func (s *HumanChangeRequests) Forget(repo string, number int, source string, sourceID int64) error {
+	if s == nil {
+		return errors.New("human change request store is nil")
+	}
+	repo = strings.TrimSpace(repo)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.load()
+	kept := s.items[:0]
+	dropped := false
+	for _, item := range s.items {
+		if item.Number == number && strings.EqualFold(item.Repo, repo) && item.Source == source && item.SourceID == sourceID {
+			dropped = true
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if !dropped {
+		return nil
+	}
+	s.items = kept
+	return s.persist()
+}
+
+// Newest returns the newest request recorded against repo#number at any
+// head. It is how the base-refresh carry finds the decision the PR's
+// previous head still holds.
+func (s *HumanChangeRequests) Newest(repo string, number int) (HumanChangeRequest, bool) {
+	if s == nil {
+		return HumanChangeRequest{}, false
+	}
+	repo = strings.TrimSpace(repo)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.load()
+	var newest HumanChangeRequest
+	found := false
+	for _, item := range s.items {
+		if item.Number != number || !strings.EqualFold(item.Repo, repo) {
+			continue
+		}
+		if !found || item.RecordedAt.After(newest.RecordedAt) {
+			newest = item
+			found = true
+		}
+	}
+	return newest, found
+}
+
+// HumanChangeRequestNewestStore is the optional store capability the
+// base-refresh carry needs: the PR's newest decision regardless of head.
+type HumanChangeRequestNewestStore interface {
+	Newest(repo string, number int) (HumanChangeRequest, bool)
+}
+
 // Lookup returns the request recorded from source/sourceID against
 // repo#number at any head: the cheap "already seen" test the un-park
 // sweep's restart reconciliation runs before it spends a PR read.
@@ -241,6 +347,41 @@ func (s *HumanChangeRequests) Lookup(repo string, number int, source string, sou
 		}
 	}
 	return HumanChangeRequest{}, false
+}
+
+// Dismiss removes every request match reports true for and returns the
+// removed entries (nil when none). It is the one-time reconcile's lever:
+// a changes_requested whose source is the hive's own `/hive decision`
+// comment (recorded before the self-decision guard existed,
+// hivecommons/hive#14822) comes off the head it was blocking.
+func (s *HumanChangeRequests) Dismiss(match func(HumanChangeRequest) bool) []HumanChangeRequest {
+	if s == nil || match == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.load()
+	var removed []HumanChangeRequest
+	kept := s.items[:0]
+	for _, item := range s.items {
+		if match(item) {
+			removed = append(removed, item)
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	s.items = kept
+	_ = s.persist()
+	return removed
+}
+
+// HumanChangeRequestDismisser is the optional store capability the
+// self-decision reconcile needs.
+type HumanChangeRequestDismisser interface {
+	Dismiss(match func(HumanChangeRequest) bool) []HumanChangeRequest
 }
 
 // Len is the number of recorded requests across all PRs and heads.

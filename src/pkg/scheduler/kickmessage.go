@@ -11,6 +11,8 @@ import (
 	"github.com/hivecommons/hive/pkg/decisionpolicy"
 	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/promptsrc"
+	"github.com/hivecommons/hive/pkg/spekmarker"
+	"github.com/hivecommons/hive/pkg/stagelabels"
 	"github.com/hivecommons/hive/pkg/upstreamwatch"
 )
 
@@ -76,6 +78,34 @@ func (s *Scheduler) upstreamPortLabels() []string {
 		labels = append(labels, label)
 	}
 	return labels
+}
+
+// spekPublishedContext is the Spek hand-off block for an issue carrying the
+// publish marker (pkg/spekmarker, spektacular#114): the RFC link and the spek
+// name/artifact id, so the fixer builds against the spek's acceptance
+// criteria and links its PR to this child with a closing keyword. Values are
+// the parsed marker's own — the RFC URL only survives parsing as http(s) —
+// never free text from the body. Empty for every other issue.
+func spekPublishedContext(issue github.Issue) string {
+	m, ok := spekmarker.Parse(issue.Body)
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("    ↳ specified by Spek: ")
+	if m.RFC != "" {
+		b.WriteString("RFC " + m.RFC + " ")
+	}
+	fmt.Fprintf(&b, "(spek %s, artifact %s", m.Name, m.ArtifactID)
+	if m.Task != "" {
+		b.WriteString(", task " + m.Task)
+	}
+	b.WriteString(") — build against the spek's acceptance criteria for this slice; do not re-spec it")
+	if issue.Number > 0 {
+		fmt.Fprintf(&b, "; the PR body must say `Fixes #%d`", issue.Number)
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 func hasAnyIssueLabel(labels []string, want []string) bool {
@@ -166,6 +196,12 @@ func (s *Scheduler) formatIssueListWithPolicyForAgent(issues []github.Issue, ref
 		}
 		if s.isUpstreamPortIssue(issue) {
 			b.WriteString(fmt.Sprintf("    ↳ if you merge the upstream branch into this fork instead, title the PR `chore: sync upstream <range>` and label it `%s` so hive lands it as a merge commit, not a squash\n", github.UpstreamSyncLabel))
+		}
+		b.WriteString(spekPublishedContext(issue))
+		if hasIssueLabel(issue.Labels, stagelabels.LabelReauthored) {
+			// The hive closed its own earlier PR for this issue after its
+			// fixer gave up; the fresh PR is this kick's to open.
+			b.WriteString("    ↳ re-authoring: the hive's earlier PR for this issue was closed as superseded after its fixer gave up; open a FRESH PR from the current base (do not reuse the old branch) and write `Supersedes #<old PR>` in the body\n")
 		}
 		if issue.ClaimContext != nil && issue.ClaimContext.Decision == github.ClaimDecisionReopenedAfterMerge {
 			prRef := fmt.Sprintf("%s#%d", issue.ClaimContext.PRRepo, issue.ClaimContext.PRNumber)
@@ -296,6 +332,7 @@ func (s *Scheduler) BuildKickMessagesWithSkips(actionable *github.ActionableResu
 	classifiedIssues := classify.ClassifyAll(sweepCtx, actionable.Issues.Items)
 	s.recordClassified(classifiedIssues)
 	classifiedIssues = s.applyRunTriage(sweepCtx, classifiedIssues)
+	classifiedIssues = s.routeWorkflowsLane(classifiedIssues)
 	cancelSweep()
 	s.offerQuestions(classifiedIssues)
 
@@ -513,79 +550,13 @@ func (s *Scheduler) buildAgentMessageFor(agentName, repo string, includeRepos bo
 		}, message)
 	}()
 
+	if msg, ok := s.resolveTemplatedKick(agentName, func(template string) (string, bool) {
+		return s.substituteTemplateWithPolicy(template, actionable, agentName, issues, elideStuffed)
+	}); ok {
+		return msg, ""
+	}
+
 	baseName := s.cfg.BaseAgentName(agentName)
-	// 0. GitHub-sourced prompt: if the agent declares a prompt_source, resolve it
-	//    live at kick time (with allowlist gating + graceful fallback). A miss
-	//    (unset, denied, unreachable with no cache) falls through to the inline
-	//    template chain below, so a bad source never blanks or crashes a kick.
-	if agentCfg, ok := s.cfg.Agents[baseName]; ok && agentCfg.PromptSource.IsSet() {
-		if resolver := s.gitHubPromptResolver(); resolver != nil {
-			src := promptsrc.Source{
-				Owner: agentCfg.PromptSource.Owner,
-				Repo:  agentCfg.PromptSource.Repo,
-				Path:  agentCfg.PromptSource.Path,
-				Ref:   agentCfg.PromptSource.Ref,
-			}
-			if res := resolver.Resolve(context.Background(), src); res.Ok && res.Body != "" {
-				s.logger.Info("using GitHub-sourced kick prompt", "agent", agentName, "source", res.Source)
-				body, failClosed := s.substituteTemplateWithPolicy(res.Body, actionable, agentName, issues, elideStuffed)
-				if failClosed {
-					return "", ""
-				}
-				return fmt.Sprintf("[agent:%s]\n\n%s", agentName, body), ""
-			}
-		}
-	}
-
-	// 1. Config-driven: use kick_template field if set
-	if agentCfg, ok := s.cfg.Agents[baseName]; ok && agentCfg.KickTemplate != "" {
-		template, source, tried := s.resolveNamedTemplate(agentCfg.KickTemplate)
-		if template != "" {
-			s.logger.Info("using config kick_template", "agent", agentName, "template", agentCfg.KickTemplate, "source", source)
-			body, failClosed := s.substituteTemplateWithPolicy(template, actionable, agentName, issues, elideStuffed)
-			if failClosed {
-				return "", ""
-			}
-			return fmt.Sprintf("[agent:%s]\n\n%s", agentName, body), ""
-		}
-		// The configured template does not exist anywhere. Say so — with the
-		// same weight the success path gets — naming what the kick falls back
-		// to. Silence here is what let a dangling kick_template look like a
-		// working one for the life of a spoke (hivecommons/hive#7390).
-		s.logger.Warn("config kick_template not found; falling back",
-			"agent", agentName, "template", agentCfg.KickTemplate,
-			"fallback", s.describeTemplateFallback(baseName),
-			"paths_tried", strings.Join(tried, ", "))
-	}
-
-	// 2. ACMM pack default: if acmm_level is set, use the pack's template for this agent
-	if s.cfg.ACMMLevel != nil && *s.cfg.ACMMLevel > 0 {
-		if pack, err := config.ACMMPackByLevel(*s.cfg.ACMMLevel); err == nil {
-			for _, pa := range pack.Agents {
-				if pa.Name == baseName && pa.KickTemplate != "" {
-					if template := s.loadNamedTemplate(pa.KickTemplate); template != "" {
-						s.logger.Info("using ACMM pack template", "agent", agentName, "level", *s.cfg.ACMMLevel, "template", pa.KickTemplate)
-						body, failClosed := s.substituteTemplateWithPolicy(template, actionable, agentName, issues, elideStuffed)
-						if failClosed {
-							return "", ""
-						}
-						return fmt.Sprintf("[agent:%s]\n\n%s", agentName, body), ""
-					}
-				}
-			}
-		}
-	}
-
-	// 3. Convention: look for <agent>.md template file
-	if template := s.loadPromptTemplate(baseName); template != "" {
-		s.logger.Info("using prompt template for kick", "agent", agentName)
-		body, failClosed := s.substituteTemplateWithPolicy(template, actionable, agentName, issues, elideStuffed)
-		if failClosed {
-			return "", ""
-		}
-		return fmt.Sprintf("[agent:%s]\n\n%s", agentName, body), ""
-	}
-
 	// 3. Legacy hardcoded fallback (removed in Phase 4 when all agents use templates)
 	s.logger.Info("no prompt template found, using hardcoded kick", "agent", agentName)
 	// Role-based routing (#5480): an operator-added agent with `role: reviewer`
@@ -619,7 +590,87 @@ func (s *Scheduler) buildAgentMessageFor(agentName, repo string, includeRepos bo
 	}
 }
 
-const governorWorkSourceRule = "The PRs/issues for this kick are listed in this prompt by the governor. Do not run `gh pr list`, `gh issue list`, or `gh search` to discover work — these are blocked by the hive proxy for agents and only waste a turn. Use `gh pr view <n>` on supplied PR numbers and `gh issue view <n> --comments` only on supplied GitHub issue numbers, so you read each issue with its comments. Prefer the compact form `hive-gh pr view <n>` / `hive-gh pr checks <n>` / `hive-gh issue view <n>` (fixed --json projection that keeps labels, author, head SHA, merge state, review decision and check conclusions; issue comments still come from `gh issue view <n> --comments`); add `--full` only when you need the complete record."
+// resolveTemplatedKick walks the kick template chain — prompt_source, config
+// kick_template, ACMM pack default, convention <agent>.md — and renders the
+// first template that resolves through render, under the `[agent:<name>]`
+// header. ok is false when no template resolves, so the caller falls back to
+// its hardcoded kick. A render that fails closed yields ("", true): the kick is
+// blanked, never replaced by a weaker fallback.
+//
+// render is the only thing that differs between a resident kick (the agent's
+// work lists substituted in) and a contributor's role guidance
+// (BuildAgentGuidance), so both read the same templates in the same order.
+func (s *Scheduler) resolveTemplatedKick(agentName string, render func(template string) (string, bool)) (message string, ok bool) {
+	baseName := s.cfg.BaseAgentName(agentName)
+	// 0. GitHub-sourced prompt: if the agent declares a prompt_source, resolve it
+	//    live at kick time (with allowlist gating + graceful fallback). A miss
+	//    (unset, denied, unreachable with no cache) falls through to the inline
+	//    template chain below, so a bad source never blanks or crashes a kick.
+	if agentCfg, ok := s.cfg.Agents[baseName]; ok && agentCfg.PromptSource.IsSet() {
+		if resolver := s.gitHubPromptResolver(); resolver != nil {
+			src := promptsrc.Source{
+				Owner: agentCfg.PromptSource.Owner,
+				Repo:  agentCfg.PromptSource.Repo,
+				Path:  agentCfg.PromptSource.Path,
+				Ref:   agentCfg.PromptSource.Ref,
+			}
+			if res := resolver.Resolve(context.Background(), src); res.Ok && res.Body != "" {
+				s.logger.Info("using GitHub-sourced kick prompt", "agent", agentName, "source", res.Source)
+				return renderTemplatedKick(agentName, res.Body, render), true
+			}
+		}
+	}
+
+	// 1. Config-driven: use kick_template field if set
+	if agentCfg, ok := s.cfg.Agents[baseName]; ok && agentCfg.KickTemplate != "" {
+		template, source, tried := s.resolveNamedTemplate(agentCfg.KickTemplate)
+		if template != "" {
+			s.logger.Info("using config kick_template", "agent", agentName, "template", agentCfg.KickTemplate, "source", source)
+			return renderTemplatedKick(agentName, template, render), true
+		}
+		// The configured template does not exist anywhere. Say so — with the
+		// same weight the success path gets — naming what the kick falls back
+		// to. Silence here is what let a dangling kick_template look like a
+		// working one for the life of a spoke (hivecommons/hive#7390).
+		s.logger.Warn("config kick_template not found; falling back",
+			"agent", agentName, "template", agentCfg.KickTemplate,
+			"fallback", s.describeTemplateFallback(baseName),
+			"paths_tried", strings.Join(tried, ", "))
+	}
+
+	// 2. ACMM pack default: if acmm_level is set, use the pack's template for this agent
+	if s.cfg.ACMMLevel != nil && *s.cfg.ACMMLevel > 0 {
+		if pack, err := config.ACMMPackByLevel(*s.cfg.ACMMLevel); err == nil {
+			for _, pa := range pack.Agents {
+				if pa.Name == baseName && pa.KickTemplate != "" {
+					if template := s.loadNamedTemplate(pa.KickTemplate); template != "" {
+						s.logger.Info("using ACMM pack template", "agent", agentName, "level", *s.cfg.ACMMLevel, "template", pa.KickTemplate)
+						return renderTemplatedKick(agentName, template, render), true
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Convention: look for <agent>.md template file
+	if template := s.loadPromptTemplate(baseName); template != "" {
+		s.logger.Info("using prompt template for kick", "agent", agentName)
+		return renderTemplatedKick(agentName, template, render), true
+	}
+	return "", false
+}
+
+// renderTemplatedKick renders one resolved template under the kick header; a
+// render that fails closed blanks the kick.
+func renderTemplatedKick(agentName, template string, render func(string) (string, bool)) string {
+	body, failClosed := render(template)
+	if failClosed {
+		return ""
+	}
+	return fmt.Sprintf("[agent:%s]\n\n%s", agentName, body)
+}
+
+const governorWorkSourceRule = "The PRs/issues for this kick are listed in this prompt by the governor. Do not run `gh pr list`, `gh issue list`, or `gh search` to discover work. Use `gh pr view <n>` on supplied PR numbers and `gh issue view <n> --comments` only on supplied GitHub issue numbers, so you read each issue with its comments. For merged PR history only, `gh pr list --state merged` (no `--search` or `-S`) may be used only when the wrapper permits it for your tier; this does not authorize open-work discovery. If refused, do not retry or bypass the restriction. Prefer the compact form `hive-gh pr view <n>` / `hive-gh pr checks <n>` / `hive-gh issue view <n>` (fixed --json projection that keeps labels, author, head SHA, merge state, review decision and check conclusions; issue comments still come from `gh issue view <n> --comments`); add `--full` only when you need the complete record."
 
 func addGovernorWorkSourceRule(message string) string {
 	if message == "" || strings.Contains(message, governorWorkSourceRule) {
@@ -665,7 +716,7 @@ func (s *Scheduler) reposSection() string {
 	b.WriteString(fmt.Sprintf("## Project Repositories\n\nYour role covers these repositories, all on **%s** (this hive is single-host):\n", host))
 	for _, repo := range s.cfg.Project.Repos {
 		full := repo
-		if !strings.Contains(repo, "/") {
+		if s.cfg.Project.Org != "" && !strings.Contains(repo, "/") {
 			full = s.cfg.Project.Org + "/" + repo
 		}
 		b.WriteString(fmt.Sprintf("  %s/%s\n", strings.TrimRight(host, "/"), full))
@@ -675,7 +726,7 @@ func (s *Scheduler) reposSection() string {
 }
 
 func (s *Scheduler) dropStuffedContext(agentName string) bool {
-	if !s.hasTaskMCPURL() {
+	if !s.taskMCPConnected(agentName) {
 		return false
 	}
 	if agentCfg, ok := s.cfg.Agents[agentName]; ok {
@@ -687,8 +738,48 @@ func (s *Scheduler) dropStuffedContext(agentName string) bool {
 	return false
 }
 
-func (s *Scheduler) addTaskMCPPointer(message string, elideStuffed bool) string {
-	if message == "" || !s.hasTaskMCPURL() {
+// taskMCPConnected reports whether agentName's CLI is really launched with the
+// `hive-task` MCP server, which the kick pointer asserts and the elided work
+// lists depend on. The hive must have an endpoint agents can use
+// (SetTaskMCPURL), and the agent must launch as Claude Code: that is the only
+// CLI the launcher builds an MCP configuration for (connectionMCPFlags in
+// crux/agent), and an inference backend or a configured gateway name launches
+// as "claude" too (launchInTmux). An agent on any other backend has no MCP
+// server, so its kick must neither point at one nor drop the lists it replaces.
+func (s *Scheduler) taskMCPConnected(agentName string) bool {
+	if !s.hasTaskMCPURL() {
+		return false
+	}
+	backend := s.launchBackend(agentName)
+	if backend == "" {
+		return false
+	}
+	return backend == "claude" || config.IsInferenceBackend(backend) || s.cfg.Governor.ResolveGateway(backend) != nil
+}
+
+// launchBackend is the backend agentName launches on: the runtime's answer
+// when a lookup is attached and knows the agent, else the configured backend
+// with the same replica fallback as dropStuffedContext.
+func (s *Scheduler) launchBackend(agentName string) string {
+	s.mu.RLock()
+	lookup := s.agentBackend
+	s.mu.RUnlock()
+	if lookup != nil {
+		if backend, ok := lookup(agentName); ok {
+			return backend
+		}
+	}
+	if agentCfg, ok := s.cfg.Agents[agentName]; ok {
+		return agentCfg.Backend
+	}
+	if agentCfg, ok := s.cfg.Agents[s.cfg.BaseAgentName(agentName)]; ok {
+		return agentCfg.Backend
+	}
+	return ""
+}
+
+func (s *Scheduler) addTaskMCPPointer(agentName, message string, elideStuffed bool) string {
+	if message == "" || !s.taskMCPConnected(agentName) {
 		return message
 	}
 	section := "## Task context MCP\n\nThe `hive-task` MCP server is connected for this launch. Call `context_bundle` first for the assigned task, related work, and CI summary instead of re-reading the issue/PR and CI from scratch.\n\n"
@@ -746,6 +837,7 @@ func (s *Scheduler) formatPRListWithPolicyForAgent(actionable *github.Actionable
 	shown := fairShareByRepo(prs, limit, func(pr github.PullRequest) string { return pr.Repo })
 	verdicts := s.loadReviewVerdicts()
 	links := loadReviewLinks()
+	busyCheck := s.busyBranchChecker(s.cfg.BaseAgentName(agentName))
 	if len(refsOnly) > 0 && refsOnly[0] {
 		for _, pr := range shown {
 			_, titleVerdict := s.enforceIssueTextVerdict(pr.Title)
@@ -756,7 +848,7 @@ func (s *Scheduler) formatPRListWithPolicyForAgent(actionable *github.Actionable
 			if skip {
 				continue
 			}
-			annotationText = prKickAnnotation(pr, agentName) + reviewedAnnotation(verdicts, links, pr, s.cfg.Project.Org) + annotationText
+			annotationText = prKickAnnotation(pr, agentName) + reviewedAnnotation(verdicts, links, pr, s.cfg.Project.Org) + annotationText + busyBranchAnnotation(pr, s.cfg.BaseAgentName(agentName), busyCheck)
 			annotation, annotationVerdict := s.enforceIssueTextVerdict(annotationText)
 			failClosed = failClosed || (s.ioscanFailClosed() && annotationVerdict.HasCriticalInjection())
 			b.WriteString(fmt.Sprintf("  %s#%d%s %s\n", pr.Repo, pr.Number, forkAnnotation(pr), annotation))
@@ -785,7 +877,7 @@ func (s *Scheduler) formatPRListWithPolicyForAgent(actionable *github.Actionable
 		if skip {
 			continue
 		}
-		annotationText = prKickAnnotation(pr, agentName) + reviewedAnnotation(verdicts, links, pr, s.cfg.Project.Org) + annotationText
+		annotationText = prKickAnnotation(pr, agentName) + reviewedAnnotation(verdicts, links, pr, s.cfg.Project.Org) + annotationText + busyBranchAnnotation(pr, s.cfg.BaseAgentName(agentName), busyCheck)
 		annotation, annotationVerdict := s.enforceTextFrom(annotationText, src)
 		failClosed = failClosed || (s.ioscanFailClosed() && annotationVerdict.HasCriticalInjection())
 		b.WriteString(fmt.Sprintf("  %s#%d by @%s%s %s %s\n", pr.Repo, pr.Number, author, forkAnnotation(pr), annotation, title))
@@ -877,9 +969,12 @@ func (s *Scheduler) buildReposSectionFor(agentName string) string {
 		b.WriteString(fmt.Sprintf("  %s/%s\n", strings.TrimRight(host, "/"), full))
 	}
 	if len(active) == 0 {
-		if scoped {
+		switch {
+		case scoped:
 			b.WriteString("  (none — this agent is scoped to repos this hive does not watch, or every repo it serves is currently paused; tell the operator)\n")
-		} else {
+		case s.cfg.AgentRequiresRepoScope(agentName):
+			b.WriteString("  (none — this lane serves no repository until the operator sets its repos: scope; the proxy and relays refuse its repository writes, so stand down and say so in your summary)\n")
+		default:
 			b.WriteString("  (none — every repo this hive watches is currently paused)\n")
 		}
 	}
@@ -894,6 +989,19 @@ func (s *Scheduler) buildReposSectionFor(agentName string) string {
 		}
 		b.WriteString(fmt.Sprintf("⏸️ PAUSED BY THE OPERATOR (watched, but OUT OF SCOPE this session): %s\n", strings.Join(pausedFull, ", ")))
 		b.WriteString("   The hive is deliberately quiet on those repos — a release freeze, an incident, a repo declared but not yet onboarded. Writes to them are refused deterministically by the proxy and by the hive-open-pr/hive-merge relays, so retrying cannot succeed. This is an operator decision, NOT an outage and NOT scope loss: do not work them, do not route around it, and do not file an issue about it.\n")
+	}
+	// project.reference_repos (hivecommons/hive#18015): repos outside the
+	// project an agent may STUDY — e.g. a docs-assessment hive reading the
+	// repos it assesses. Without this block the scanner reads any item whose
+	// deliverables name them as out-of-scope/critical, and agents either
+	// refuse the work or try to write to them.
+	if refs := s.cfg.Project.ReferenceRepos; len(refs) > 0 {
+		b.WriteString("📚 REFERENCE REPOS (outside this project — study them, do not work them):\n")
+		for _, rr := range refs {
+			b.WriteString(fmt.Sprintf("  %s/%s  [reference · %s]%s\n", strings.TrimRight(host, "/"), rr.Repo, rr.WriteLabel(), referenceRepoProvenance(rr)))
+		}
+		b.WriteString("   You MAY clone them (public, unauthenticated), read their files, and GET their issues/PRs/API. An authorized-repo item whose deliverables name a reference repo is IN SCOPE, not a scope violation: do NOT classify it out-of-scope, critical, or a security concern. Findings about a reference repo belong in the deliverable inside the AUTHORIZED repo (the assessment document, the report), never as issues or PRs on the reference repo itself — unless its tier above says issues/prs, in which case you may ONLY open an issue, open a PR from your own branch, or comment on an issue/PR you opened; the proxy refuses merges, default-branch pushes, labels, assignments, reviews and closing others' items deterministically, so retrying cannot succeed.\n")
+		b.WriteString(referenceRepoForkInstruction(refs, host))
 	}
 	b.WriteString("⛔ NEVER access, search, list, file issues in, or open PRs on repos not listed above.\n")
 	b.WriteString(fmt.Sprintf("⛔ Every repo above is on %s. This hive is single-host — never touch a repo on a different GitHub host.\n", host))
@@ -946,4 +1054,97 @@ Your workdir is, at most, a checkout of the primary repo — never of the others
 `, len(active), config.QualifyRepo(org, primary), strings.TrimRight(host, "/")))
 	}
 	return b.String()
+}
+
+// derivedReadOnlyNoReason is the kick's fallback when a read-only derived
+// reference repo carries no CredentialReason.
+const derivedReadOnlyNoReason = "no write credential for this repository"
+
+// referenceRepoProvenance is the suffix the REFERENCE REPOS block appends
+// for an entry derived from an accepted request issue
+// (hivecommons/hive#18159): where the grant came from, and for one served
+// read-only, why. Empty for a hand-written entry.
+func referenceRepoProvenance(rr config.ReferenceRepo) string {
+	if rr.CredentialState == config.ReferenceCredentialUnresolved {
+		// hivecommons/hive#18516: the identity could not be resolved this
+		// pass, so the proxy refuses the writes the tier above names.
+		why := strings.TrimSpace(rr.CredentialReason)
+		if why == "" {
+			why = derivedReadOnlyNoReason
+		}
+		if rr.Derived() {
+			return " (from " + rr.DerivedFrom + "; read-only this pass: " + why + ")"
+		}
+		return " (read-only this pass: " + why + ")"
+	}
+	if !rr.Derived() {
+		return ""
+	}
+	if !rr.DerivedReadOnly() {
+		return " (from " + rr.DerivedFrom + ")"
+	}
+	reason := strings.TrimSpace(rr.CredentialReason)
+	if reason == "" {
+		reason = derivedReadOnlyNoReason
+	}
+	return " (from " + rr.DerivedFrom + "; read-only: " + reason + ")"
+}
+
+// referenceRepoForkInstruction is the kick's fork-and-PR paragraph for the
+// prs-tier reference repos (hivecommons/hive#18198). Writes to a reference
+// repo appear under the hive owner's GitHub account, and that account cannot
+// push to a repo it does not own, so a PR goes through the owner's fork: the
+// paragraph names the login and the exact three commands. Empty when no entry
+// has both the prs tier and a resolved credential login.
+//
+// An entry that writes as the hive's GitHub App bot
+// (project.remote_write_identity) is different: the App cannot own a fork,
+// and its token is minted on the repo owner's own installation, so the topic
+// branch is pushed to the reference repo itself; referenceRepoBotInstruction
+// renders that paragraph.
+func referenceRepoForkInstruction(refs []config.ReferenceRepo, host string) string {
+	login := ""
+	for _, rr := range refs {
+		if rr.WritesPRs() && rr.CredentialLogin != "" && rr.CredentialIdentity != config.ReferenceIdentityBot {
+			login = rr.CredentialLogin
+			break
+		}
+	}
+	bot := referenceRepoBotInstruction(refs)
+	if login == "" {
+		return bot
+	}
+	host = strings.TrimRight(host, "/")
+	subject, itself := "a reference repo", "a reference repo itself"
+	if bot != "" {
+		subject, itself = "any other write-tier reference repo", "those repos themselves"
+	}
+	return bot + fmt.Sprintf("   ✍️ Writes to %s appear under the GitHub account %s (the hive owner), not under the hive. You CANNOT push to %s. For a PR: fork it into that account (gh repo fork <owner>/<name> --clone=false; already-forked is fine), push your topic branch to %s/%s/<name> (git remote add fork %s/%s/<name>.git && git push fork <branch>), then open the PR against the reference repo: gh pr create --repo <owner>/<name> --head %s:<branch>. Never push to the fork's default branch; do nothing else on the fork.\n", subject, login, itself, host, login, host, login, login)
+}
+
+// referenceRepoBotInstruction is the kick's paragraph for the write-tier
+// reference repos that write as the hive's GitHub App bot. Empty when there
+// are none.
+func referenceRepoBotInstruction(refs []config.ReferenceRepo) string {
+	var repos []string
+	login := ""
+	prs := false
+	for _, rr := range refs {
+		if rr.ReadOnly() || rr.CredentialIdentity != config.ReferenceIdentityBot || rr.CredentialLogin == "" {
+			continue
+		}
+		repos = append(repos, rr.Repo)
+		if login == "" {
+			login = rr.CredentialLogin
+		}
+		prs = prs || rr.WritesPRs()
+	}
+	if len(repos) == 0 {
+		return ""
+	}
+	line := fmt.Sprintf("   🤖 Writes to %s appear under the hive's GitHub App, %s (the project installed it), not under a person.", strings.Join(repos, ", "), login)
+	if prs {
+		line += " For a PR there, do NOT fork: push your topic branch to the reference repo itself (never its default branch) and open the PR with gh pr create --repo <owner>/<name> --head <branch>."
+	}
+	return line + "\n"
 }

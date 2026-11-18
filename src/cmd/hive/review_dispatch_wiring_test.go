@@ -67,6 +67,37 @@ func reviewSwarmConfig() *config.Config {
 	}
 }
 
+func TestRefreshReviewVerdictsForPRsCollectsOnlySnapshotTargets(t *testing.T) {
+	dir := redirectReviewPaths(t)
+	report := review.PerspectiveReport{
+		AgentReport: outputschema.AgentReport{
+			Lane: "review-swarm", Kind: outputschema.KindReview, Summary: "security review",
+			Findings: []outputschema.Finding{}, PRsOpened: []outputschema.PROpened{}, BeadsFiled: []outputschema.BeadFiled{},
+		},
+		Repo: "hivecommons/dibs", Number: 566, HeadSHA: reviewTestSHA,
+		BodyDigest: "current", Perspective: review.PerspectiveSecurity, Verdict: review.VerdictApprove,
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, review.ReportFilePrefix(report.Repo, report.Number)+"security.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, review.ReportFilePrefix("hivecommons/other", 1)+"bad.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	refreshReviewVerdictsForPRs(reviewSwarmConfig(), []review.PullRequest{{Repo: report.Repo, Number: report.Number}}, restoreTestLogger())
+	artifact, err := review.LoadArtifact("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg, ok := artifact.AggregateForBody(report.Repo, report.Number, report.HeadSHA, report.BodyDigest)
+	if !ok || agg.Perspectives[review.PerspectiveSecurity] != review.VerdictApprove || agg.Verdict != review.VerdictIncomplete {
+		t.Fatalf("target report was not collected with existing policy: %+v", artifact)
+	}
+}
+
 func actionableWithPR(author string) *github.ActionableResult {
 	return &github.ActionableResult{
 		PRs: github.PRResult{Items: []github.PullRequest{{
@@ -355,6 +386,53 @@ func TestPersistReviewDispatchState_KeepsOnlyDeliveredKicks(t *testing.T) {
 	}
 	if state.Pending[0].Perspective != review.PerspectiveSecurity {
 		t.Errorf("persisted perspective = %q, want %q", state.Pending[0].Perspective, review.PerspectiveSecurity)
+	}
+}
+
+// The persist made from onReviewDelivered runs while later kicks of the same
+// pass are still being sent. It must keep their pending rows on disk, or a
+// verdict from one of them finds no dispatch row and binds as advisory
+// (hivecommons/hive#15559).
+func TestPersistReviewDispatchStateInProgress_KeepsKicksStillDelivering(t *testing.T) {
+	redirectReviewPaths(t)
+	now := time.Now().UTC()
+	delivered := review.DispatchKick{
+		Kind: "review", Agent: "reviewer", Repo: "hivecommons/hive",
+		Number: 4321, HeadSHA: reviewTestSHA, Perspective: review.PerspectiveSecurity,
+	}
+	inFlight := review.DispatchKick{
+		Kind: "review", Agent: "decider", Repo: "hivecommons/hive",
+		Number: 4321, HeadSHA: reviewTestSHA, Perspective: review.PerspectiveStyle, Decision: true,
+	}
+	plan := review.DispatchPlan{
+		ReviewKicks: []review.DispatchKick{delivered, inFlight},
+		State: review.DispatchState{
+			GeneratedAt: now,
+			Pending: []review.PendingReview{
+				{Repo: delivered.Repo, Number: delivered.Number, HeadSHA: delivered.HeadSHA, Perspective: delivered.Perspective, Agent: delivered.Agent, Dispatched: now},
+				{Repo: inFlight.Repo, Number: inFlight.Number, HeadSHA: inFlight.HeadSHA, Perspective: inFlight.Perspective, Agent: inFlight.Agent, Decision: true, Dispatched: now},
+			},
+		},
+	}
+
+	persistReviewDispatchStateInProgress(plan, []review.DispatchKick{delivered}, restoreTestLogger())
+
+	state, err := review.LoadDispatchState("")
+	if err != nil {
+		t.Fatalf("load persisted state: %v", err)
+	}
+	if len(state.Pending) != 2 {
+		t.Fatalf("persisted pending = %+v, want both the delivered and the in-flight kick", state.Pending)
+	}
+
+	persistReviewDispatchState(plan, []review.DispatchKick{delivered}, restoreTestLogger())
+
+	state, err = review.LoadDispatchState("")
+	if err != nil {
+		t.Fatalf("load persisted state: %v", err)
+	}
+	if len(state.Pending) != 1 || state.Pending[0].Agent != delivered.Agent {
+		t.Fatalf("end-of-pass pending = %+v, want only the delivered kick", state.Pending)
 	}
 }
 

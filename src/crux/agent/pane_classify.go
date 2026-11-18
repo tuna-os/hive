@@ -226,6 +226,8 @@ func paneShowsTransientAPIError(lines []string) bool {
 type providerErrorMatch struct {
 	Class string
 	Line  string
+	// Model is the rejected model id, set only for ModelRejectedClass.
+	Model string
 }
 
 var (
@@ -274,6 +276,12 @@ func classifyProviderError(pane string) (providerErrorMatch, bool) {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
+		}
+		// Checked first: the CLI refusing the configured model id is not
+		// retryable, and a nudge only repeats the refusal (see
+		// model_rejection.go).
+		if model, ok := lineModelRejection(trimmed); ok {
+			return modelRejectionMatch(model, modelRejectionCLIText(trimmed)), true
 		}
 		lower := strings.ToLower(trimmed)
 		switch {
@@ -632,11 +640,11 @@ func paneShowsLoginPrompt(lines []string) bool {
 		if lineShowsUpstreamAuthorizationError(line) || paneShowsQuotaExhausted([]string{line}) {
 			continue
 		}
-		if lineHasLoginDirective(line) || ompLoginScreenLineRe.MatchString(line) {
+		if (lineHasLoginDirective(line) && !authHitIsSourceText(line, "/login")) || ompLoginScreenLineRe.MatchString(line) {
 			return true
 		}
 		for _, pat := range loginPromptPatterns {
-			if strings.Contains(line, pat) {
+			if strings.Contains(line, pat) && !authHitIsSourceText(line, pat) {
 				return true
 			}
 		}

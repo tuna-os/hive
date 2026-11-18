@@ -1,7 +1,10 @@
 package dashboard
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -30,7 +33,40 @@ type reviewSection struct {
 	// section can offer a pick-list for review.reviewer_agents and warn when a
 	// fan-out would run every review on one engine (#13460).
 	ReviewerCandidates []reviewerCandidate `json:"reviewer_candidates"`
+	// ReviewerAutoscale says which agent review.reviewers.autoscale scales:
+	// the agent as stored, the one it resolves to, and the reason when it
+	// resolves to none.
+	ReviewerAutoscale reviewerAutoscaleResolved `json:"reviewer_autoscale"`
+	// LinkedPerspectiveNames and LinkedPerspectivePrompts shadow the embedded
+	// review.perspectives / review.perspective_prompts with the EFFECTIVE set
+	// (ReviewConfig.EffectivePerspectives), so a hive whose perspectives are
+	// linked to a repo file shows what the reviewer actually runs, not the
+	// inline fallback the linked set overrides (hivecommons/hive#17989).
+	LinkedPerspectiveNames   []string          `json:"perspectives,omitempty"`
+	LinkedPerspectivePrompts map[string]string `json:"perspective_prompts,omitempty"`
+	// PerspectivesLinked is true while review.perspectives_source is set. The
+	// section is then read-only: PUT refuses perspective edits because the
+	// next reload would replace them with the linked set.
+	PerspectivesLinked bool `json:"perspectives_linked"`
+	// PerspectivesSourceStatus is the resolver's provenance for the linked
+	// set (github:owner/repo@ref, github-cache:owner/repo), or "unresolved"
+	// when the source is set but nothing has resolved yet, in which case the
+	// inline perspectives are still in effect. Empty when not linked.
+	PerspectivesSourceStatus string `json:"perspectives_source_status,omitempty"`
+	// PerspectivesSourceWarning is the last fetch or malformed-document
+	// failure while an older set stays in effect.
+	PerspectivesSourceWarning string `json:"perspectives_source_warning,omitempty"`
+	// PerspectivesSourceURL is the GitHub blob URL of the linked document.
+	PerspectivesSourceURL string `json:"perspectives_source_url,omitempty"`
+	// PerspectivesSourceApproved reports whether the linked repo passes
+	// GitHubPromptAllowed (seed allowlist or owner approval). False while
+	// linked means the resolver will refuse to fetch it, so the dialog says so
+	// and points at Settings, Security, Prompt sources (#18797).
+	PerspectivesSourceApproved bool `json:"perspectives_source_approved"`
 }
+
+// perspectivesSourceStatusUnresolved marks a set source with no resolved set.
+const perspectivesSourceStatusUnresolved = "unresolved"
 
 // reviewerCandidate is one row of reviewSection.ReviewerCandidates.
 type reviewerCandidate struct {
@@ -83,7 +119,164 @@ func reviewSectionResponse(cfg *config.Config) reviewSection {
 	if cfg != nil {
 		rc = cfg.Review
 	}
-	return reviewSection{rc, builtin, reviewerCandidates(cfg)}
+	out := reviewSection{ReviewConfig: rc, BuiltinPerspectives: builtin, ReviewerCandidates: reviewerCandidates(cfg), ReviewerAutoscale: reviewerAutoscaleResolution(cfg)}
+	out.LinkedPerspectiveNames, out.LinkedPerspectivePrompts = rc.EffectivePerspectives()
+	if src := rc.PerspectivesSource; src.IsSet() {
+		out.PerspectivesLinked = true
+		out.PerspectivesSourceURL = perspectivesSourceURL(*src)
+		out.PerspectivesSourceApproved = cfg != nil && cfg.GitHubPromptAllowed(src.Slug())
+		out.PerspectivesSourceStatus = perspectivesSourceStatusUnresolved
+		if lp := rc.LinkedPerspectives; lp != nil {
+			if lp.Source != "" {
+				out.PerspectivesSourceStatus = lp.Source
+			}
+			out.PerspectivesSourceWarning = lp.Warning
+		}
+	}
+	return out
+}
+
+// perspectivesSourceURL is the github.com blob URL for a linked perspectives
+// document. An empty ref resolves to the repo's default branch, which
+// GitHub's HEAD alias names without a second API call. Each segment is
+// escaped on its own so a slashed ref (release/v5) or nested path keeps its
+// separators.
+func perspectivesSourceURL(src config.DefinitionSourceConfig) string {
+	ref := src.Ref
+	if ref == "" {
+		ref = "HEAD"
+	}
+	return "https://github.com/" + url.PathEscape(src.Owner) + "/" + url.PathEscape(src.Repo) +
+		"/blob/" + escapePathSegments(ref) + "/" + escapePathSegments(strings.TrimLeft(src.Path, "/"))
+}
+
+func escapePathSegments(p string) string {
+	parts := strings.Split(p, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
+}
+
+// perspectivesSourceLabel names a linked source as owner/repo/path[@ref] for
+// operator-facing messages.
+func perspectivesSourceLabel(src config.DefinitionSourceConfig) string {
+	label := src.Owner + "/" + src.Repo + "/" + strings.TrimLeft(src.Path, "/")
+	if src.Ref != "" {
+		label += "@" + src.Ref
+	}
+	return label
+}
+
+// reviewConfigPutBody is the PUT /api/config/review body. Every field is a
+// pointer, so an absent key leaves that setting untouched. It is a named type
+// so the admin MCP op review.settings can be checked against it: that op
+// refuses a field this body does not have, and a test fails when this body
+// gains a field the op does not know (admin_mcp_review_settings_test.go).
+type reviewConfigPutBody struct {
+	RequireApproval                 *bool     `json:"require_approval"`
+	Shadow                          *bool     `json:"shadow"` // hive.yaml review.shadow
+	FanOut                          *bool     `json:"fan_out"`
+	MaxParallelReviews              *int      `json:"max_parallel_reviews"`
+	MaxPerspectives                 *int      `json:"max_perspectives_per_pr"`
+	ReviewerAgents                  *[]string `json:"reviewer_agents"`
+	FixerAgent                      *string   `json:"fixer_agent"`
+	FixerFallbackAgents             *[]string `json:"fixer_fallback_agents"`
+	FixerFallbackAfterUndeliverable *int      `json:"fixer_fallback_after_undeliverable"`
+	AllAuthors                      *bool     `json:"all_authors"`
+	FixHumanPRs                     *bool     `json:"fix_human_prs"`
+	ContributorPRs                  *struct {
+		BaseSync *bool `json:"base_sync"`
+	} `json:"contributor_prs"`
+	AcknowledgeNoFind  *bool   `json:"acknowledge_no_findings"`
+	HumanDecisionLabel *string `json:"human_decision_label"`
+	SelfDecisionPolicy *string `json:"self_authored_decision_policy"`
+	ConfidenceScore    *bool   `json:"confidence_score"`
+	PriorityLabels     *bool   `json:"priority_labels"`
+	// RequireLabels replaces review.require_labels whole; an empty list
+	// turns the PR review label gate off.
+	RequireLabels *[]string `json:"require_labels"`
+	// VerdictLabels replaces review.verdict_labels whole: its four keys
+	// only mean something together (one label per state), and an empty
+	// object turns the feature off (hivecommons/hive#13833).
+	VerdictLabels     *config.ReviewVerdictLabelsConfig `json:"verdict_labels"`
+	MaxReviewsPerHead *int                              `json:"max_reviews_per_head"`
+	PostComments      *bool                             `json:"post_comments"`
+	// EventDrivenMode is review.event_driven as auto|on|off: the key is a
+	// *bool whose unset value means "on when signed webhooks arrive", which
+	// a JSON bool cannot express. auto clears it back to unset.
+	EventDrivenMode *string `json:"event_driven_mode"`
+	EventDebounceS  *int    `json:"event_debounce_s"`
+	// PendingTTL is a Go duration; empty or "0" uses the default and a
+	// negative value disables expiry, exactly as the loader reads it.
+	PendingTTL                 *string `json:"pending_ttl"`
+	MaxRedispatch              *int    `json:"max_redispatch"`
+	HeadMaxRetries             *int    `json:"head_max_retries"`
+	OutOfScopeBacklogDisabled  *bool   `json:"out_of_scope_backlog_disabled"`
+	MaxOutOfScopeBacklogIssues *int    `json:"max_out_of_scope_backlog_issues"`
+	// Perspectives and PerspectivePrompts travel together: a hive-defined
+	// perspective is only valid once its prompt exists, so validating one
+	// without the other would reject a correct pair sent in two requests.
+	// The dialog always sends both when it sends either.
+	Perspectives *[]string `json:"perspectives"`
+	// PerspectivesSource links the perspective set to a repo file
+	// (hivecommons/hive#18797). A JSON object sets it, null (or an object
+	// missing owner, repo or path) clears it, an absent key leaves it.
+	PerspectivesSource   json.RawMessage    `json:"perspectives_source"`
+	PerspectivePrompts   *map[string]string `json:"perspective_prompts"`
+	CombinedPerspectives *bool              `json:"combined_perspectives"`
+	// ReviseRepos / ReviseVerdictsBefore drive the reviewer's revisit
+	// lane (#7706). Both were config-file-only until now, which left the
+	// pilot switch reachable only by a hand edit that the periodic saver
+	// then overwrote. An empty cutoff clears it; a non-empty one must be
+	// RFC 3339 so a typo is refused here rather than silently ignored by
+	// parseReviseCutoff at dispatch time.
+	ReviseRepos          *[]string `json:"revise_repos"`
+	ReviseVerdictsBefore *string   `json:"revise_verdicts_before"`
+	// Recommendations arrives as a whole object rather than one pointer
+	// per knob: its fields are only meaningful together (enabling it
+	// without a repo list means "every watched repo"), and the Features
+	// dialog always sends the full sub-object it rendered. Absent key
+	// still leaves the block untouched, matching the contract above.
+	Recommendations *config.RecommendationsConfig `json:"recommendations"`
+	// ReviewBots carries the one editable classification.review_bots
+	// field (#10481). Logins are deliberately not accepted: adding one
+	// grants thread-resolution rights and stays a config-file edit.
+	ReviewBots *struct {
+		MinPriority *string `json:"min_priority"`
+	} `json:"review_bots"`
+	// Severity and Backlog are the 'Severity & backlog' settings
+	// (#11088). Pointer fields keep "absent means unchanged".
+	Severity *struct {
+		BlockAt      *string `json:"block_at"`
+		CommentBelow *bool   `json:"comment_below"`
+		BacklogBelow *bool   `json:"backlog_below"`
+	} `json:"severity"`
+	Backlog *struct {
+		Destination     *string   `json:"destination"`
+		ProjectColumnID *string   `json:"project_column_id"`
+		LinearState     *string   `json:"linear_state"`
+		JiraStatus      *string   `json:"jira_status"`
+		Labels          *[]string `json:"labels"`
+		MaxPerPRPerDay  *int      `json:"max_per_pr_per_day"`
+		MaxPerPR        *int      `json:"max_per_pr"`
+		MinSeverity     *string   `json:"min_severity"`
+	} `json:"backlog"`
+	// ReviewerAutoscale is review.reviewers.autoscale
+	// (hivecommons/hive#14685). Pointer fields keep "absent means
+	// unchanged"; the band is validated before anything is mutated.
+	ReviewerAutoscale *struct {
+		Enabled                  *bool    `json:"enabled"`
+		Agent                    *string  `json:"agent"`
+		Min                      *int     `json:"min"`
+		Max                      *int     `json:"max"`
+		TargetBacklogPerReviewer *int     `json:"target_backlog_per_reviewer"`
+		ScaleUpCycles            *int     `json:"scale_up_cycles"`
+		ScaleDownCycles          *int     `json:"scale_down_cycles"`
+		Cooldown                 *string  `json:"cooldown"`
+		CPUPerReviewer           *float64 `json:"cpu_per_reviewer"`
+		MemPerReviewerMB         *int     `json:"mem_per_reviewer_mb"`
+	} `json:"reviewer_autoscale"`
 }
 
 // handleReviewConfigPut updates the review-swarm merge-gate settings from the
@@ -99,105 +292,32 @@ func (s *Server) handleReviewConfigPut(w http.ResponseWriter, r *http.Request) {
 	if !requireOwnerRole(w, r) {
 		return
 	}
-	var body struct {
-		RequireApproval    *bool     `json:"require_approval"`
-		Shadow             *bool     `json:"shadow"` // hive.yaml review.shadow
-		FanOut             *bool     `json:"fan_out"`
-		MaxParallelReviews *int      `json:"max_parallel_reviews"`
-		MaxPerspectives    *int      `json:"max_perspectives_per_pr"`
-		ReviewerAgents     *[]string `json:"reviewer_agents"`
-		FixerAgent         *string   `json:"fixer_agent"`
-		AllAuthors         *bool     `json:"all_authors"`
-		FixHumanPRs        *bool     `json:"fix_human_prs"`
-		ContributorPRs     *struct {
-			BaseSync *bool `json:"base_sync"`
-		} `json:"contributor_prs"`
-		AcknowledgeNoFind  *bool   `json:"acknowledge_no_findings"`
-		HumanDecisionLabel *string `json:"human_decision_label"`
-		SelfDecisionPolicy *string `json:"self_authored_decision_policy"`
-		ConfidenceScore    *bool   `json:"confidence_score"`
-		PriorityLabels     *bool   `json:"priority_labels"`
-		// RequireLabels replaces review.require_labels whole; an empty list
-		// turns the PR review label gate off.
-		RequireLabels *[]string `json:"require_labels"`
-		// VerdictLabels replaces review.verdict_labels whole: its four keys
-		// only mean something together (one label per state), and an empty
-		// object turns the feature off (hivecommons/hive#13833).
-		VerdictLabels     *config.ReviewVerdictLabelsConfig `json:"verdict_labels"`
-		MaxReviewsPerHead *int                              `json:"max_reviews_per_head"`
-		PostComments      *bool                             `json:"post_comments"`
-		// EventDrivenMode is review.event_driven as auto|on|off: the key is a
-		// *bool whose unset value means "on when signed webhooks arrive", which
-		// a JSON bool cannot express. auto clears it back to unset.
-		EventDrivenMode *string `json:"event_driven_mode"`
-		EventDebounceS  *int    `json:"event_debounce_s"`
-		// PendingTTL is a Go duration; empty or "0" uses the default and a
-		// negative value disables expiry, exactly as the loader reads it.
-		PendingTTL                 *string `json:"pending_ttl"`
-		MaxRedispatch              *int    `json:"max_redispatch"`
-		HeadMaxRetries             *int    `json:"head_max_retries"`
-		OutOfScopeBacklogDisabled  *bool   `json:"out_of_scope_backlog_disabled"`
-		MaxOutOfScopeBacklogIssues *int    `json:"max_out_of_scope_backlog_issues"`
-		// Perspectives and PerspectivePrompts travel together: a hive-defined
-		// perspective is only valid once its prompt exists, so validating one
-		// without the other would reject a correct pair sent in two requests.
-		// The dialog always sends both when it sends either.
-		Perspectives         *[]string          `json:"perspectives"`
-		PerspectivePrompts   *map[string]string `json:"perspective_prompts"`
-		CombinedPerspectives *bool              `json:"combined_perspectives"`
-		// ReviseRepos / ReviseVerdictsBefore drive the reviewer's revisit
-		// lane (#7706). Both were config-file-only until now, which left the
-		// pilot switch reachable only by a hand edit that the periodic saver
-		// then overwrote. An empty cutoff clears it; a non-empty one must be
-		// RFC 3339 so a typo is refused here rather than silently ignored by
-		// parseReviseCutoff at dispatch time.
-		ReviseRepos          *[]string `json:"revise_repos"`
-		ReviseVerdictsBefore *string   `json:"revise_verdicts_before"`
-		// Recommendations arrives as a whole object rather than one pointer
-		// per knob: its fields are only meaningful together (enabling it
-		// without a repo list means "every watched repo"), and the Features
-		// dialog always sends the full sub-object it rendered. Absent key
-		// still leaves the block untouched, matching the contract above.
-		Recommendations *config.RecommendationsConfig `json:"recommendations"`
-		// ReviewBots carries the one editable classification.review_bots
-		// field (#10481). Logins are deliberately not accepted: adding one
-		// grants thread-resolution rights and stays a config-file edit.
-		ReviewBots *struct {
-			MinPriority *string `json:"min_priority"`
-		} `json:"review_bots"`
-		// Severity and Backlog are the 'Severity & backlog' settings
-		// (#11088). Pointer fields keep "absent means unchanged".
-		Severity *struct {
-			BlockAt      *string `json:"block_at"`
-			CommentBelow *bool   `json:"comment_below"`
-			BacklogBelow *bool   `json:"backlog_below"`
-		} `json:"severity"`
-		Backlog *struct {
-			Destination     *string   `json:"destination"`
-			ProjectColumnID *string   `json:"project_column_id"`
-			LinearState     *string   `json:"linear_state"`
-			JiraStatus      *string   `json:"jira_status"`
-			Labels          *[]string `json:"labels"`
-			MaxPerPRPerDay  *int      `json:"max_per_pr_per_day"`
-		} `json:"backlog"`
-		// ReviewerAutoscale is review.reviewers.autoscale
-		// (hivecommons/hive#14685). Pointer fields keep "absent means
-		// unchanged"; the band is validated before anything is mutated.
-		ReviewerAutoscale *struct {
-			Enabled                  *bool    `json:"enabled"`
-			Agent                    *string  `json:"agent"`
-			Min                      *int     `json:"min"`
-			Max                      *int     `json:"max"`
-			TargetBacklogPerReviewer *int     `json:"target_backlog_per_reviewer"`
-			ScaleUpCycles            *int     `json:"scale_up_cycles"`
-			ScaleDownCycles          *int     `json:"scale_down_cycles"`
-			Cooldown                 *string  `json:"cooldown"`
-			CPUPerReviewer           *float64 `json:"cpu_per_reviewer"`
-			MemPerReviewerMB         *int     `json:"mem_per_reviewer_mb"`
-		} `json:"reviewer_autoscale"`
-	}
+	var body reviewConfigPutBody
 	if err := decodeBody(r, &body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	// perspectives_source is parsed and gated before anything is mutated.
+	newSource, sourceChange, srcErr := s.parsePerspectivesSourceBody(body.PerspectivesSource)
+	if srcErr != nil {
+		jsonError(w, srcErr.msg, srcErr.status)
+		return
+	}
+	linkedAfter := s.deps.Config.Review.PerspectivesSource.IsSet()
+	if sourceChange {
+		linkedAfter = newSource.IsSet()
+	}
+
+	// A linked perspective set is owned by its repo file: an inline edit
+	// would be saved and then silently replaced by the next reload, so it is
+	// refused before anything is mutated. The operator-owned review knobs
+	// (combined_perspectives, plan_match, max_perspectives_per_pr) stay
+	// editable (hivecommons/hive#17989). Unlinking in the same request lifts
+	// the refusal.
+	if src := s.deps.Config.Review.PerspectivesSource; linkedAfter && src.IsSet() && (body.Perspectives != nil || body.PerspectivePrompts != nil) {
+		jsonError(w, "review perspectives are linked to "+perspectivesSourceLabel(*src)+
+			"; change them in that file, or use Unlink in Review Gate (or send perspectives_source: null) to edit them here", http.StatusConflict)
 		return
 	}
 
@@ -216,6 +336,7 @@ func (s *Server) handleReviewConfigPut(w http.ResponseWriter, r *http.Request) {
 		name string
 	}{
 		{body.MaxRedispatch, "max_redispatch"},
+		{body.FixerFallbackAfterUndeliverable, "fixer_fallback_after_undeliverable"},
 		{body.HeadMaxRetries, "head_max_retries"},
 		{body.MaxOutOfScopeBacklogIssues, "max_out_of_scope_backlog_issues"},
 	} {
@@ -302,6 +423,10 @@ func (s *Server) handleReviewConfigPut(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if err := reviewerAutoscaleAgentError(cfg, autoscaleCfg, body.ReviewerAgents); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	if body.Severity != nil {
 		if body.Severity.BlockAt != nil {
@@ -355,6 +480,17 @@ func (s *Server) handleReviewConfigPut(w http.ResponseWriter, r *http.Request) {
 		}
 		if bl.MaxPerPRPerDay != nil {
 			backlog.MaxPerPRPerDay = *bl.MaxPerPRPerDay
+		}
+		if bl.MaxPerPR != nil {
+			backlog.MaxPerPR = *bl.MaxPerPR
+		}
+		if bl.MinSeverity != nil {
+			// Empty keeps "use the default" rather than pinning P2 into the file.
+			if v := strings.TrimSpace(*bl.MinSeverity); v == "" {
+				backlog.MinSeverity = ""
+			} else {
+				backlog.MinSeverity = strings.ToUpper(v)
+			}
 		}
 	}
 	if err := severity.Validate(); err != nil {
@@ -423,6 +559,12 @@ func (s *Server) handleReviewConfigPut(w http.ResponseWriter, r *http.Request) {
 			cfg.Review.PerspectivePrompts = cleaned
 		}
 	}
+	if sourceChange {
+		cfg.Review.PerspectivesSource = newSource
+		if newSource == nil {
+			cfg.Review.LinkedPerspectives = nil
+		}
+	}
 	if body.CombinedPerspectives != nil {
 		cfg.Review.CombinedPerspectives = *body.CombinedPerspectives
 	}
@@ -471,6 +613,12 @@ func (s *Server) handleReviewConfigPut(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.FixerAgent != nil {
 		cfg.Review.FixerAgent = strings.TrimSpace(*body.FixerAgent)
+	}
+	if body.FixerFallbackAgents != nil {
+		cfg.Review.FixerFallbackAgents = (config.ReviewConfig{FixerFallbackAgents: *body.FixerFallbackAgents}).EffectiveFixerFallbackAgents()
+	}
+	if body.FixerFallbackAfterUndeliverable != nil {
+		cfg.Review.FixerFallbackAfterUndeliverable = *body.FixerFallbackAfterUndeliverable
 	}
 	if body.AllAuthors != nil {
 		cfg.Review.AllAuthors = *body.AllAuthors
@@ -598,4 +746,53 @@ func (s *Server) handleReviewConfigPut(w http.ResponseWriter, r *http.Request) {
 	}
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated"})
+}
+
+// perspectivesSourceError is a refusal from parsePerspectivesSourceBody.
+type perspectivesSourceError struct {
+	msg    string
+	status int
+}
+
+// promptSourcesSettingsPath is where an owner approves a repo as a prompt
+// and definition source.
+const promptSourcesSettingsPath = "Settings, Security, Prompt sources"
+
+// parsePerspectivesSourceBody validates the perspectives_source request value
+// like an agent's definition_source: an object missing owner, repo or path
+// counts as unset (a clear), and a set source must name a repo that
+// GitHubPromptAllowed accepts (seed allowlist or owner approval). changed is
+// false when the key was absent. The returned source is nil for a clear.
+func (s *Server) parsePerspectivesSourceBody(raw json.RawMessage) (src *config.DefinitionSourceConfig, changed bool, perr *perspectivesSourceError) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	var in struct {
+		Owner string `json:"owner"`
+		Repo  string `json:"repo"`
+		Path  string `json:"path"`
+		Ref   string `json:"ref"`
+	}
+	if string(raw) == "null" {
+		return nil, true, nil
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, false, &perspectivesSourceError{"perspectives_source must be an object with owner, repo, path and optional ref, or null to unlink", http.StatusBadRequest}
+	}
+	ds := &config.DefinitionSourceConfig{
+		Type:  "github",
+		Owner: sanitizeString(in.Owner),
+		Repo:  sanitizeString(in.Repo),
+		Path:  strings.TrimLeft(sanitizeString(in.Path), "/"),
+		Ref:   sanitizeString(in.Ref),
+	}
+	if !ds.IsSet() {
+		return nil, true, nil
+	}
+	if !s.deps.Config.GitHubPromptAllowed(ds.Slug()) {
+		return nil, false, &perspectivesSourceError{fmt.Sprintf(
+			"perspectives_source: repo %q is not approved as a prompt source. An owner can approve it under %s, or add it to github_prompt_allowlist on the config volume",
+			ds.Slug(), promptSourcesSettingsPath), http.StatusBadRequest}
+	}
+	return ds, true, nil
 }

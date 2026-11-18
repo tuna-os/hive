@@ -53,9 +53,9 @@ func decodeGQLPRNode(t *testing.T, raw string) graphQLPRBatchNode {
 
 func TestGraphQLCheckRunsMixesCheckRunsAndStatusContexts(t *testing.T) {
 	n := decodeGQLPRNode(t, gqlPRNodeWithContextsJSON(1, "sha-1",
-		`{"__typename":"CheckRun","name":"unit","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci.example/unit"},`+
-			`{"__typename":"StatusContext","context":"DCO","state":"FAILURE","targetUrl":"https://probot.github.io/apps/dco/"},`+
-			`{"__typename":"StatusContext","context":"ci/pending","state":"PENDING"},`+
+		`{"__typename":"CheckRun","id":"CR_unit","databaseId":101,"name":"unit","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci.example/unit"},`+
+			`{"__typename":"StatusContext","id":"SC_DCO","context":"DCO","state":"FAILURE","targetUrl":"https://probot.github.io/apps/dco/"},`+
+			`{"__typename":"StatusContext","id":"SC_pending","context":"ci/pending","state":"PENDING"},`+
 			`{"__typename":"SomethingElse","name":"ignored","status":"COMPLETED","conclusion":"FAILURE"}`))
 
 	checks, ok := graphQLCheckRuns(n)
@@ -65,15 +65,18 @@ func TestGraphQLCheckRunsMixesCheckRunsAndStatusContexts(t *testing.T) {
 	if len(checks) != 3 {
 		t.Fatalf("got %d check runs, want 3 (unknown __typename skipped)", len(checks))
 	}
-	want := []struct{ name, status, conclusion, url string }{
-		{"unit", "completed", "success", "https://ci.example/unit"},
-		{"DCO", "completed", "failure", "https://probot.github.io/apps/dco/"},
-		{"ci/pending", "in_progress", "", ""},
+	want := []struct {
+		id                                    int64
+		nodeID, name, status, conclusion, url string
+	}{
+		{101, "CR_unit", "unit", "completed", "success", "https://ci.example/unit"},
+		{0, "SC_DCO", "DCO", "completed", "failure", "https://probot.github.io/apps/dco/"},
+		{0, "SC_pending", "ci/pending", "in_progress", "", ""},
 	}
 	for i, w := range want {
 		cr := checks[i]
-		if cr.GetID() != int64(i+1) {
-			t.Fatalf("check[%d] id = %d, want %d", i, cr.GetID(), i+1)
+		if cr.GetID() != w.id || cr.GetNodeID() != w.nodeID || cr.GetHeadSHA() != "sha-1" {
+			t.Fatalf("check[%d] identity = %d/%s/%s, want %d/%s/sha-1", i, cr.GetID(), cr.GetNodeID(), cr.GetHeadSHA(), w.id, w.nodeID)
 		}
 		if cr.GetName() != w.name || cr.GetStatus() != w.status || cr.GetConclusion() != w.conclusion || cr.GetDetailsURL() != w.url {
 			t.Fatalf("check[%d] = %s/%s/%s/%s, want %s/%s/%s/%s", i,
@@ -268,7 +271,7 @@ func TestGraphQLPRBatchRefetchClearsStaleRepoEntries(t *testing.T) {
 	c.SetGraphQLPRBatchConfig(func() bool { return true }, func() int { return 50 })
 
 	// Another repo's entries must survive a refetch of org/repo.
-	c.storeGraphQLPRBatchNode("org/other", graphQLPRBatchNode{Number: 9, HeadRefOID: "sha-9", ReviewDecision: "APPROVED"})
+	c.storeGraphQLPRBatchNode("org/other", graphQLPRBatchNode{Number: 9, HeadRefOID: "sha-9", reviewDecisionNode: reviewDecisionNode{ReviewDecision: "APPROVED"}})
 
 	c.prefetchOpenPRDetailsGraphQL(context.Background(), "org", "repo", "org/repo")
 	for _, want := range []struct {
@@ -333,5 +336,35 @@ func TestGraphQLPRBatchRefetchClearsStaleRepoEntries(t *testing.T) {
 	}
 	if got := call.Load(); got != 2 {
 		t.Fatalf("GraphQL calls = %d, want 2 (none while disabled)", got)
+	}
+}
+
+// hivecommons/hive#16615: a head with more contexts than one GraphQL page
+// (70 matrix jobs + statuses) was cached as a partial listing, so the
+// required `test` aggregate fell off the page and the dashboard reported
+// `CI 7/11 · required check "test" hasn't reported` on an all-green head.
+func TestGraphQLCheckRunsTruncatedContextsReportsNotOK(t *testing.T) {
+	node := `{"number":16615,"headRefOid":"d88928e","commits":{"nodes":[{"commit":{"oid":"d88928e","statusCheckRollup":{"state":"SUCCESS","contexts":{"totalCount":73,"nodes":[` +
+		`{"__typename":"CheckRun","id":"CR_1","databaseId":1,"name":"test (agent 1/5)","status":"COMPLETED","conclusion":"SUCCESS"},` +
+		`{"__typename":"CheckRun","id":"CR_2","databaseId":2,"name":"coverage","status":"COMPLETED","conclusion":"SUCCESS"}` +
+		`]}}}}]}}`
+	n := decodeGQLPRNode(t, node)
+	if !graphQLContextsTruncated(n) {
+		t.Fatalf("totalCount 73 with 2 nodes should be truncated")
+	}
+	if checks, ok := graphQLCheckRuns(n); ok || checks != nil {
+		t.Fatalf("truncated rollup: got ok=%v checks=%d, want ok=false nil so enrichPRCI falls back to paginated REST", ok, len(checks))
+	}
+
+	complete := decodeGQLPRNode(t, strings.Replace(node, `"totalCount":73`, `"totalCount":2`, 1))
+	if graphQLContextsTruncated(complete) {
+		t.Fatalf("totalCount == len(nodes) must not be truncated")
+	}
+	if checks, ok := graphQLCheckRuns(complete); !ok || len(checks) != 2 {
+		t.Fatalf("complete rollup: got ok=%v checks=%d, want ok=true 2", ok, len(checks))
+	}
+	legacy := decodeGQLPRNode(t, strings.Replace(node, `"totalCount":73,`, ``, 1))
+	if checks, ok := graphQLCheckRuns(legacy); !ok || len(checks) != 2 {
+		t.Fatalf("rollup without totalCount (older fixtures): got ok=%v checks=%d, want ok=true 2", ok, len(checks))
 	}
 }

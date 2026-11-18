@@ -30,6 +30,12 @@ type unparkWireIssue struct {
 	PullRequest *unparkWirePRLink `json:"pull_request,omitempty"`
 	HeadSHA     string            `json:"-"`
 	State       string            `json:"state,omitempty"`
+	// UpdatedAt is the item's updated_at in the list; empty omits it, which
+	// keeps the sweep's per-item read cache out of the test.
+	UpdatedAt string `json:"updated_at,omitempty"`
+	// CommentCount is the list's comments count; the PR approve-command
+	// read is skipped for a PR without comments.
+	CommentCount int `json:"comments,omitempty"`
 }
 
 type unparkWirePRLink struct {
@@ -53,10 +59,15 @@ type unparkServer struct {
 	posted map[int][]string
 	// edited maps comment ID to the body it was edited to.
 	edited map[int64]string
+	// deleted lists the comment IDs DELETEd, in order.
+	deleted []int64
 	// added maps issue number to the labels added to it.
 	added map[int][]string
 	// removed maps issue number to the labels removed from it.
 	removed map[int][]string
+	// replyAfterPost maps issue number to comments that appear in its
+	// listing once a comment is POSTed on it (e.g. Prow's reply).
+	replyAfterPost map[int][]unparkWireComment
 	// permissions maps login to the permission level the API reports.
 	permissions map[string]string
 	// roles maps login to the role_name the permission endpoint reports
@@ -83,6 +94,8 @@ type unparkServer struct {
 	register func(unparkWireIssue)
 	// orgLookups counts membership lookups, permLookups permission lookups.
 	orgLookups, permLookups, timelineReads int
+	// commentReads counts comment-list GETs per issue number.
+	commentReads map[int]int
 }
 
 type unparkWireTimelineEvent struct {
@@ -106,12 +119,13 @@ func unlabeledAt(id int64, actor, label string, at time.Time) unparkWireTimeline
 func newUnparkServer(t *testing.T, owner, repo string, issues []unparkWireIssue, permissions map[string]string) (*httptest.Server, *unparkServer) {
 	t.Helper()
 	rec := &unparkServer{
-		posted:      map[int][]string{},
-		edited:      map[int64]string{},
-		added:       map[int][]string{},
-		removed:     map[int][]string{},
-		patched:     map[int][]string{},
-		permissions: permissions,
+		posted:       map[int][]string{},
+		edited:       map[int64]string{},
+		added:        map[int][]string{},
+		removed:      map[int][]string{},
+		patched:      map[int][]string{},
+		permissions:  permissions,
+		commentReads: map[int]int{},
 	}
 	byNum := map[int]unparkWireIssue{}
 	for _, issue := range issues {
@@ -199,6 +213,7 @@ func newUnparkServer(t *testing.T, owner, repo string, issues []unparkWireIssue,
 		case strings.HasSuffix(path, "/comments") && r.Method == http.MethodGet:
 			var n int
 			fmt.Sscanf(path, "issues/%d/comments", &n)
+			rec.commentReads[n]++
 			_ = json.NewEncoder(w).Encode(byNum[n].Comments)
 
 		case strings.HasSuffix(path, "/comments") && r.Method == http.MethodPost:
@@ -209,6 +224,11 @@ func newUnparkServer(t *testing.T, owner, repo string, issues []unparkWireIssue,
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			rec.posted[n] = append(rec.posted[n], body.Body)
+			if extra := rec.replyAfterPost[n]; len(extra) > 0 {
+				iss := byNum[n]
+				iss.Comments = append(append([]unparkWireComment(nil), iss.Comments...), extra...)
+				byNum[n] = iss
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9000 + len(rec.posted[n])})
 
 		case strings.HasPrefix(path, "issues/comments/") && r.Method == http.MethodPatch:
@@ -220,6 +240,12 @@ func newUnparkServer(t *testing.T, owner, repo string, issues []unparkWireIssue,
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			rec.edited[id] = body.Body
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+
+		case strings.HasPrefix(path, "issues/comments/") && r.Method == http.MethodDelete:
+			var id int64
+			fmt.Sscanf(path, "issues/comments/%d", &id)
+			rec.deleted = append(rec.deleted, id)
+			w.WriteHeader(http.StatusNoContent)
 
 		case strings.HasSuffix(path, "/labels") && r.Method == http.MethodPost:
 			var n int
@@ -1385,16 +1411,15 @@ func TestSweepClosedIssueStageLabelsCap(t *testing.T) {
 }
 
 // hivecommons/hive#14679 (seen on #14628): the owner's `/hive decision
-// approve` followed by numbered instructions must reach the author agent
-// whole, and a bare approve must read as an approval, not an instruction.
+// approve` followed by rationale retains the whole text and reads as approval.
 func TestParseUnparkCommandKeepsDecisionTextAfterFirstLine(t *testing.T) {
 	body := "/hive decision approve\r\n\r\nPlease do the following before merging:\r\n\r\n1. Change `Closes #14605` to `Refs #14605`.\n2. Keep #14605 open.\n3. Merge on green.\n"
 	cmd, ok := parseUnparkCommand(body)
 	if !ok || cmd.Kind != unparkCommandDecision || cmd.Decision != "approve" {
 		t.Fatalf("parseUnparkCommand = %+v, %v", cmd, ok)
 	}
-	if cmd.BareApproval() {
-		t.Fatalf("approve with instructions read as a bare approval: %q", cmd.Text)
+	if !cmd.Approval() {
+		t.Fatalf("approve with rationale did not read as approval: %q", cmd.Text)
 	}
 	for _, want := range []string{"approve\n\n", "1. Change `Closes #14605` to `Refs #14605`.", "2. Keep #14605 open.", "3. Merge on green."} {
 		if !strings.Contains(cmd.DecisionText(), want) {
@@ -1403,12 +1428,98 @@ func TestParseUnparkCommandKeepsDecisionTextAfterFirstLine(t *testing.T) {
 	}
 	for _, bare := range []string{"/hive decision approve", "/hive decision Approved\n", "/hive decision approve.\n\n"} {
 		cmd, ok := parseUnparkCommand(bare)
-		if !ok || !cmd.BareApproval() || cmd.DecisionText() == "" {
+		if !ok || !cmd.Approval() || cmd.DecisionText() == "" {
 			t.Fatalf("parseUnparkCommand(%q) = %+v, %v; want a bare approval", bare, cmd, ok)
 		}
 	}
 	single, _ := parseUnparkCommand("/hive decision keep 10 stable tags")
-	if single.DecisionText() != "keep 10 stable tags" || single.BareApproval() {
+	if single.DecisionText() != "keep 10 stable tags" || single.Approval() {
 		t.Fatalf("single-line decision = %+v", single)
+	}
+}
+
+func heldIssue(number int, comments ...unparkWireComment) unparkWireIssue {
+	issue := parkedIssue(number, comments...)
+	issue.Labels = []wireLabel{{Name: "needs-human"}, {Name: HumanAckLabel}, {Name: "hold"}}
+	return issue
+}
+
+func TestIsHeldAfterDecision(t *testing.T) {
+	if !isHeldAfterDecision([]string{"needs-human", HumanAckLabel}) {
+		t.Fatal("needs-human + approved-direction without a park stage is held")
+	}
+	if isHeldAfterDecision([]string{"needs-human", HumanAckLabel, NeedsDecisionStageLabel}) {
+		t.Fatal("a stage/045 park label means something is still open to decide")
+	}
+	if isHeldAfterDecision([]string{"needs-human"}) {
+		t.Fatal("needs-human alone is parked, not held")
+	}
+	if !hasIssueParkingLabel([]string{"needs-human", HumanAckLabel}) {
+		t.Fatal("a held issue stays in the sweep so its commands are still answered")
+	}
+}
+
+func TestSweepIssueUnparkCommandsHeldIssueGetsNoNoticeOrProseHint(t *testing.T) {
+	issues := []unparkWireIssue{
+		heldIssue(61),
+		heldIssue(62, humanComment(71, "maintainer", "sounds good, go ahead")),
+	}
+	server, rec := newUnparkServer(t, "org", "repo", issues, map[string]string{"maintainer": "admin"})
+	c := newTestClient(t, server, "org", []string{"repo"})
+
+	result, err := c.SweepIssueUnparkCommands(context.Background(), IssueUnparkSweepOptions{})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if result.Seen != 2 || len(result.Unparked) != 0 || result.Replies != 0 {
+		t.Fatalf("seen=%d unparked=%+v replies=%d", result.Seen, result.Unparked, result.Replies)
+	}
+	for _, n := range []int{61, 62} {
+		if len(rec.posted[n]) != 0 {
+			t.Fatalf("held issue %d must not be re-offered a decision, got %v", n, rec.posted[n])
+		}
+	}
+	if len(rec.edited) != 0 {
+		t.Fatalf("no notice to edit on a held issue, got %v", rec.edited)
+	}
+}
+
+func TestSweepIssueUnparkCommandsHeldIssueStillAnswersDecision(t *testing.T) {
+	issues := []unparkWireIssue{heldIssue(63, humanComment(72, "maintainer", "/hive decision ship it as is"))}
+	server, rec := newUnparkServer(t, "org", "repo", issues, map[string]string{"maintainer": "admin"})
+	c := newTestClient(t, server, "org", []string{"repo"})
+
+	result, err := c.SweepIssueUnparkCommands(context.Background(), IssueUnparkSweepOptions{})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(result.Unparked) != 1 || result.Unparked[0].Number != 63 || result.Unparked[0].Decision != "ship it as is" {
+		t.Fatalf("a /hive decision on a held issue must still be answered, got %+v", result.Unparked)
+	}
+	if len(rec.posted[63]) != 1 || !strings.Contains(rec.posted[63][0], "Decision: ship it as is") {
+		t.Fatalf("expected exactly the acceptance reply, got %v", rec.posted[63])
+	}
+	if strings.Contains(rec.posted[63][0], unparkNoticeMarker) {
+		t.Fatalf("the notice must not be posted on a held issue: %v", rec.posted[63])
+	}
+	if strings.Contains(strings.Join(rec.removed[63], ","), "hold") {
+		t.Fatalf("hold must never be removed, got %v", rec.removed[63])
+	}
+}
+
+func TestSweepIssueUnparkCommandsHeldIssueStillAnswersHelp(t *testing.T) {
+	issues := []unparkWireIssue{heldIssue(64, humanComment(73, "maintainer", "/hive help"))}
+	server, rec := newUnparkServer(t, "org", "repo", issues, map[string]string{"maintainer": "admin"})
+	c := newTestClient(t, server, "org", []string{"repo"})
+
+	result, err := c.SweepIssueUnparkCommands(context.Background(), IssueUnparkSweepOptions{})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if result.Replies != 1 || len(rec.posted[64]) != 1 {
+		t.Fatalf("expected one help reply, replies=%d posted=%v", result.Replies, rec.posted[64])
+	}
+	if strings.Contains(rec.posted[64][0], unparkNoticeMarker) {
+		t.Fatalf("the help reply must be the only comment, got %v", rec.posted[64])
 	}
 }

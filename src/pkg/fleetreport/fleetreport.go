@@ -18,6 +18,7 @@ import (
 
 	"github.com/hivecommons/hive/crux/logscrub"
 	"github.com/hivecommons/hive/pkg/acmmadvisor"
+	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/hivestate"
 )
 
@@ -384,6 +385,9 @@ func Evaluate(obs Observation, prev State, dryRun bool) Result {
 		if ev.Class == "" || !IsKnownClass(ev.Class) {
 			continue
 		}
+		if onboardingOnlyCondition(obs, ev) {
+			continue
+		}
 		fp := RuntimeFingerprint(ev.Class, ev.Message)
 		report := BuildRuntimeReport(obs, ev, fp, instance, obs.HiveSlug, version, commit, now)
 		active[fp] = true
@@ -430,6 +434,22 @@ func Evaluate(obs Observation, prev State, dryRun bool) Result {
 	sort.Slice(res.Recoveries, func(i, j int) bool { return res.Recoveries[i].Fingerprint < res.Recoveries[j].Fingerprint })
 	res.State = state
 	return res
+}
+
+// onboardingOnlyCondition reports whether ev is the expected state of a hive
+// that has not been onboarded yet rather than a fleet defect (#17593). An
+// unclaimed hosted slot has no real project.org — either none at all, or the
+// synthetic "available-<id>" / legacy "placeholder" org the pool replenisher
+// seeds and the hub templates into the spoke hive.yaml — so it legitimately
+// has no GitHub App installation; the dashboard already surfaces that as the
+// github_app_not_installed onboarding banner. Once a real org is configured, a
+// missing installation is a real misconfiguration and is still reported.
+func onboardingOnlyCondition(obs Observation, ev Evidence) bool {
+	if ev.Class != ClassGitHubAppNotInstalled {
+		return false
+	}
+	org := strings.TrimSpace(obs.ProjectOrg)
+	return org == "" || config.IsPlaceholderOrg(org)
 }
 
 // BuildObservationReports converts detector findings into reports consumed by
@@ -708,6 +728,19 @@ func benignIOTimeout(class, component string) bool {
 // as noise for the generic repeated-error feed (see IsBenignMessage). Keep
 // each entry specific enough that it cannot swallow a real defect.
 var benignSubstrings = []string{
+	// A provider spending-limit refusal is surfaced by the budget notifier and
+	// already withholds agent kicks; it is an account state, not a runtime
+	// defect (#15809).
+	"inference backend refused on a spending limit",
+	// The kick manager's own backoff reaction to a provider error already
+	// logs the classified error and withholds kicks; the reaction itself is
+	// not a defect (hivecommons/hive#15843).
+	"inference provider error detected, backing off kicks",
+	// The prose-only watchdog sends at most one action nudge per kick and
+	// counts it in ActionNudges. This notice records the recovery action,
+	// not its failure; repeated notices across kicks are not an unclassified
+	// runtime defect (#16795). Keep actual nudge failures reportable.
+	"inference agent answered kick with prose only, sending action nudge",
 	// Shutdown and per-request deadlines log cancellation on purpose.
 	"context canceled",
 	"context cancelled",
@@ -747,6 +780,13 @@ var benignSubstrings = []string{
 	// every agent warn once in the same boot — an operator configuration
 	// condition, not a repeated runtime defect (hivecommons/hive#14020).
 	"copilot cli substituted the configured model",
+	// The inference translator (src/crux/proxy/github_proxy_inference.go)
+	// refuses every request from an agent with neither an agent model nor a
+	// gateway default_model, and names the remedy on the agent's dashboard
+	// LastError. Each refused call warns, so an unconfigured agent bursts —
+	// an operator configuration condition, not an upstream inference defect
+	// (hivecommons/hive#16170).
+	"inference model not configured; request refused",
 	// The scheduler (src/pkg/scheduler/kick_priming.go) warns when the primer
 	// render exceeds knowledge.primer.max_bytes (#12124). The render already
 	// carries its own truncation marker. A hive whose vault outgrows the cap
@@ -790,6 +830,23 @@ var benignSubstrings = []string{
 	// is a per-hive operational signal, not a runtime error
 	// (hivecommons/hive#15009).
 	"stage labels: pr waits on the hive past the stage dwell",
+	// The kick-undeliverable WARN (src/crux/agent/busy_visibility.go) says in
+	// its own message that it is not self-reporting: until busyNoActivityStall
+	// has restarted the pane the condition is a dashboard warning and a log
+	// line only (decision B on hivecommons/hive#12787). The WARN repeats on
+	// every refused kick, so the generic feed filed it as a repeated runtime
+	// defect anyway (hivecommons/hive#15313). Kicks that keep failing after
+	// the restart are reported under kick_failed_repeatedly instead.
+	"busy-no-activity restart not yet attempted, not self-reporting",
+	// The review-dispatch promotion WARN (src/cmd/hive/main_sweeps.go) fires
+	// when the starvation guard walks a head that has been starved of a
+	// reviewer for ReviewWaitStarvationCycles ahead of the queue: the guard
+	// working as designed, an operational signal about the reviewer lane.
+	// The warn-once dampener re-arms whenever a PR leaves the promoted set
+	// and the WARN is per PR, so a backed-up lane filed it as a repeated
+	// runtime defect (hivecommons/hive#17366). Exhausted dispatch and forced
+	// fixes keep their own messages and stay reportable.
+	"review dispatch promoted: head starved of a reviewer",
 }
 
 // rateLimitSubstrings are lower-case fragments that mark a GitHub rate-limit
@@ -809,6 +866,7 @@ var rateLimitSubstrings = []string{
 	"429 too many requests",
 	"github pacing: request shed",
 	"github pacing: slot would miss request deadline",
+	"github rest budget below reserve ",
 	"rate-limit caution window is engaged",
 }
 
@@ -825,13 +883,91 @@ func IsGitHubRateLimited(s string) bool {
 	return false
 }
 
+// upstreamUnavailableSubstrings are lower-case fragments that mark a GitHub
+// gateway-class transient failure (see IsGitHubUpstreamUnavailable). The
+// status codes are anchored to go-github's "<METHOD> <url>: 503 ..." shape so
+// a PR number or page=503 cannot match; 500 is deliberately absent. The
+// status phrases are anchored to the same ": " separator so prose that merely
+// mentions them does not match.
+var upstreamUnavailableSubstrings = []string{
+	": 502 ",
+	": 503 ",
+	": 504 ",
+	": bad gateway",
+	": service unavailable",
+	": gateway timeout",
+	": gateway time-out",
+}
+
+// IsGitHubUpstreamUnavailable reports whether s (a log message or an error
+// string) is a GitHub 502/503/504 gateway-class failure. The caller retries
+// on its next tick, so the generic repeated-error feed treats such lines as
+// benign (hivecommons/hive#15365); the WARN stays in local logs.
+func IsGitHubUpstreamUnavailable(s string) bool {
+	m := strings.ToLower(s) + " "
+	for _, sub := range upstreamUnavailableSubstrings {
+		if strings.Contains(m, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsBenignMessage reports whether a raw log message is noise the generic
 // repeated-error feed must not report: the read/keepalive i/o timeout rule
 // above applied to the whole line, GitHub rate-limit and pacing refusals
-// (IsGitHubRateLimited), every benignSubstrings entry, and the
+// (IsGitHubRateLimited), gateway failures (IsGitHubUpstreamUnavailable),
+// every benignSubstrings entry, and the
 // exact-message exclusions matched in the function body below.
 func IsBenignMessage(msg string) bool {
 	m := strings.ToLower(msg)
+	// A repository's AGENTS.md outgrowing the injection cap is operator
+	// content enforcement working as designed (#12129), re-logged on every
+	// kick for that repo (#17318). The WARN stays in local logs; "agentsmd:
+	// parse failed, skipping injection" remains reportable.
+	if strings.TrimSpace(m) == "agentsmd: agents.md exceeded the injection cap; sections dropped whole" {
+		return true
+	}
+	// The bounded rebase loop hands an unresolved conflict to a person after
+	// its attempt cap. Repeated polls of that same handoff are expected, not
+	// a runtime defect (#16510). Keep other rebase failures reportable.
+	if strings.TrimSpace(m) == "rebase attempts exhausted; leaving the conflict to a person" {
+		return true
+	}
+	// A moved held branch requires fresh review: this is the hold guard
+	// enforcing merge safety, not a runtime defect (#16100). Match only the
+	// successful refusal; provenance, comment and re-hold failures stay reportable.
+	if strings.TrimSpace(m) == "hold guard: branch moved while hold-gated — blocking auto-merge, requiring fresh review" {
+		return true
+	}
+	// A sentinel finding flags a PR for a human: the sweep working as designed,
+	// not a runtime defect (#16112). Match only the finding notice; "sentinel
+	// sweep failed" and non-pacing "sentinel sweep: PR skipped" remain reportable.
+	if strings.TrimSpace(m) == "sentinel alert" {
+		return true
+	}
+	// The GitHub proxy refusing a request its mode, write-surface or
+	// issue-shape policy forbids (recordViolation, crux/proxy) is sandbox
+	// enforcement working as designed: the agent gets a denial body, the
+	// refusal is counted per agent and audited. The WARN fires once per
+	// distinct (agent, method, path), so one agent probing a few forbidden
+	// endpoints crossed the repeat threshold (hivecommons/hive#18230). Match
+	// only the refusal notice; proxy forwarding and read failures stay
+	// reportable.
+	if strings.TrimSpace(m) == "proxy request blocked" {
+		return true
+	}
+	// ioscan fail-closed withholding a kick because untrusted issue/PR text
+	// tripped the injection policy is the defense working as designed on
+	// content, not a classifier outage or hive defect (hivecommons/hive#18459);
+	// it is audited and warned once per agent. The classifier-outage variant
+	// ("ioscan fail-closed blocked kick", ClassIOScanClassifierUnavail) stays
+	// reportable. Strings from pkg/scheduler warnBlockedKick.
+	switch strings.TrimSpace(m) {
+	case "ioscan fail-closed withheld kick on an injection finding",
+		"ioscan fail-closed withheld held-pr coordination kick on an injection finding":
+		return true
+	}
 	// A CI gate refusal is the merge safety policy working as designed, even
 	// when a required check remains unsuccessful across repeated polls (#14364).
 	// Keep the operator warning, but do not turn it into a runtime defect.
@@ -852,6 +988,18 @@ func IsBenignMessage(msg string) bool {
 	case "agent github api hourly cap reached", "agent github api hourly budget above soft threshold":
 		return true
 	}
+	// The eval cycle withholding kicks from agents out of provider quota
+	// (#18112) or behind a clipped spending limit (#15809) is backpressure
+	// working as designed: the notice repeats every cycle until the quota
+	// resets and a probe kick clears it, so it crossed the repeat threshold on
+	// its own (hivecommons/hive#18239). Match only the complete notices;
+	// failures to gate, probe or deliver kicks stay reportable.
+	switch strings.TrimSpace(m) {
+	case "provider quota exhausted: withholding agent kicks",
+		"provider spending limit: withholding agent kicks",
+		"provider spending limit: withholding all but the probe kick":
+		return true
+	}
 	// Contributor tier limits are normal policy enforcement on each poll,
 	// not runtime failures (#14414). Match the complete notices so failures
 	// to enforce or persist a limit remain reportable.
@@ -861,7 +1009,7 @@ func IsBenignMessage(msg string) bool {
 		"[contribute-ws] refusing task: daily rate limit reached":
 		return true
 	}
-	if benignIOTimeout(m, m) || IsGitHubRateLimited(m) {
+	if benignIOTimeout(m, m) || IsGitHubRateLimited(m) || IsGitHubUpstreamUnavailable(m) {
 		return true
 	}
 	for _, s := range benignSubstrings {

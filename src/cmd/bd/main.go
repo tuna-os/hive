@@ -77,6 +77,8 @@ func main() {
 		cmdRemember(os.Args[2:])
 	case "kb":
 		cmdKB(os.Args[2:])
+	case "topic":
+		cmdTopic(os.Args[2:])
 	case "dolt":
 		cmdDolt(os.Args[2:])
 	case "init":
@@ -97,6 +99,9 @@ Commands:
   list   [--json] [--status=<s>] [--actor=<a>]  List beads
   ready  [--json] [--actor=<a>]                List open/unblocked beads
   create --title "..." --type <type> --priority <0-4> --actor <name> [--external-ref <ref>]
+  create --type knowledge --title "..." (--body "..." | --body-file <path|->)
+         [--state draft|approved] [--tag <tag>]... [--layer <channel>] [--fact-type <type>]
+                                           Create a knowledge fact via the dashboard API
   update <id> --claim                      Claim a bead (set in_progress)
   update <id> --status <status>            Change status
   update <id> --set-metadata key=value     Set metadata key
@@ -107,6 +112,10 @@ Commands:
   kb       import-file <path> [--name <n>] Import document from file
   kb       list-docs                      List imported documents
   remember "<fact>"                        Quick-add an advisory bead
+  topic  claim <key> --repo o/r --pr N [--branch B]
+                                           Claim a topic for one PR (refused if held by another PR)
+  topic  get <key> [--json] | list [--json] | release <key>
+                                           Read, list or release topic claims
   close  <id>                              Close a bead
   decompose <epic-id> [--plan <file>] [--actor <lane>]
                                            Decompose an epic into a DAG of child task beads
@@ -177,9 +186,13 @@ func cmdReady(args []string) {
 // ---------- create ----------
 
 func cmdCreate(args []string) {
+	if createTypeArg(args) == knowledgeCreateType {
+		cmdCreateKnowledge(args)
+		return
+	}
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
 	title := fs.String("title", "", "Bead title (required)")
-	beadType := fs.String("type", "task", "Bead type: bug|feature|task|epic|chore|decision|advisory")
+	beadType := fs.String("type", "task", "Bead type: bug|feature|task|epic|chore|decision|advisory|knowledge")
 	priority := fs.Int("priority", 2, "Priority 0-4 (0=critical, 4=minor)")
 	actor := fs.String("actor", "", "Actor name (required)")
 	extRef := fs.String("external-ref", "", "External reference (e.g. issue URL)")

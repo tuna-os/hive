@@ -7,6 +7,7 @@ type (
 	AgentConfig                = cruxconfig.AgentConfig
 	AgentRuntimeConfig         = cruxconfig.AgentRuntimeConfig
 	SessionRecycleConfig       = cruxconfig.SessionRecycleConfig
+	CLIMemoryConfig            = cruxconfig.CLIMemoryConfig
 	AgentRuntimeGovernorConfig = cruxconfig.AgentRuntimeGovernorConfig
 	AgentSandboxConfig         = cruxconfig.AgentSandboxConfig
 	AgentSandboxOverride       = cruxconfig.AgentSandboxOverride
@@ -17,6 +18,8 @@ type (
 	ConnectionConfig           = cruxconfig.ConnectionConfig
 	DefinitionSourceConfig     = cruxconfig.DefinitionSourceConfig
 	GatewayConfig              = cruxconfig.GatewayConfig
+	GatewayModelPrice          = cruxconfig.GatewayModelPrice
+	GatewayPrices              = cruxconfig.GatewayPrices
 	InferenceAuthConfig        = cruxconfig.InferenceAuthConfig
 	KickLimitsConfig           = cruxconfig.KickLimitsConfig
 	LiteLLMConfig              = cruxconfig.LiteLLMConfig
@@ -34,9 +37,13 @@ type (
 	ReviewModelsConfig         = cruxconfig.ReviewModelsConfig
 	RotationConfig             = cruxconfig.RotationConfig
 	SandboxJobConfig           = cruxconfig.SandboxJobConfig
+	SandboxGitHubReadProxy     = cruxconfig.SandboxGitHubReadProxy
+	SandboxPublishConfig       = cruxconfig.SandboxPublishConfig
 	SandboxJobResources        = cruxconfig.SandboxJobResources
 	SandboxJobToleration       = cruxconfig.SandboxJobToleration
 	SandboxJobVolume           = cruxconfig.SandboxJobVolume
+	SandboxOpenShellConfig     = cruxconfig.SandboxOpenShellConfig
+	SandboxSubstrateConfig     = cruxconfig.SandboxSubstrateConfig
 	StatsDisplayEntry          = cruxconfig.StatsDisplayEntry
 	ToolApprovalConfig         = cruxconfig.ToolApprovalConfig
 	ToolApprovalRule           = cruxconfig.ToolApprovalRule
@@ -49,6 +56,16 @@ type (
 	WatchdogLivenessConfig     = cruxconfig.WatchdogLivenessConfig
 	WatchdogReadinessConfig    = cruxconfig.WatchdogReadinessConfig
 	WatchdogRestartConfig      = cruxconfig.WatchdogRestartConfig
+)
+
+type (
+	SandboxJobAffinity                = cruxconfig.SandboxJobAffinity
+	SandboxPreflightConfig            = cruxconfig.SandboxPreflightConfig
+	SandboxJobNodeAffinity            = cruxconfig.SandboxJobNodeAffinity
+	SandboxJobNodeSelector            = cruxconfig.SandboxJobNodeSelector
+	SandboxJobNodeSelectorTerm        = cruxconfig.SandboxJobNodeSelectorTerm
+	SandboxJobNodeSelectorRequirement = cruxconfig.SandboxJobNodeSelectorRequirement
+	SandboxJobPreferredSchedulingTerm = cruxconfig.SandboxJobPreferredSchedulingTerm
 )
 
 const (
@@ -143,7 +160,10 @@ const (
 	ReviewModelsFallbackSkip            = cruxconfig.ReviewModelsFallbackSkip
 	RotationHeadroomSourceBuiltin       = cruxconfig.RotationHeadroomSourceBuiltin
 	RotationHeadroomSourceCCLeft        = cruxconfig.RotationHeadroomSourceCCLeft
+	MaxJobImagePullSecrets              = cruxconfig.MaxJobImagePullSecrets
 	SandboxRuntimeJob                   = cruxconfig.SandboxRuntimeJob
+	SandboxRuntimeOpenShell             = cruxconfig.SandboxRuntimeOpenShell
+	SandboxRuntimeSubstrate             = cruxconfig.SandboxRuntimeSubstrate
 	SandboxRuntimePodman                = cruxconfig.SandboxRuntimePodman
 	SelfMergeMinACMMLevel               = cruxconfig.SelfMergeMinACMMLevel
 	WritableBobAPIKeyFile               = cruxconfig.WritableBobAPIKeyFile
@@ -161,21 +181,28 @@ var (
 	ReasoningEffortsByBackend = cruxconfig.ReasoningEffortsByBackend
 	ToolPresets               = cruxconfig.ToolPresets
 	ValidSandboxRuntimes      = cruxconfig.ValidSandboxRuntimes
+	ValidateImagePullSecrets  = cruxconfig.ValidateImagePullSecrets
 )
 
 var (
 	APIKeySHA256              = cruxconfig.APIKeySHA256
+	CopiedSandboxBlock        = cruxconfig.CopiedSandboxBlock
 	AllowSecretFileRoot       = cruxconfig.AllowSecretFileRoot
+	DropDanglingModelFlag     = cruxconfig.DropDanglingModelFlag
 	IsCLIBackend              = cruxconfig.IsCLIBackend
 	IsInferenceBackend        = cruxconfig.IsInferenceBackend
 	LiteLLMChatCompletionsURL = cruxconfig.LiteLLMChatCompletionsURL
 	LocalLiteLLMProxyURL      = cruxconfig.LocalLiteLLMProxyURL
+	ModelArgs                 = cruxconfig.ModelArgs
+	ModelFlag                 = cruxconfig.ModelFlag
 	NormalizeKickLogSource    = cruxconfig.NormalizeKickLogSource
 	ProxyInjectGHAuth         = cruxconfig.ProxyInjectGHAuth
 	QualifyRepo               = cruxconfig.QualifyRepo
 	ReviewHeadKey             = cruxconfig.ReviewHeadKey
 	SecretFilePathAllowed     = cruxconfig.SecretFilePathAllowed
+	SecretFilePathRejection   = cruxconfig.SecretFilePathRejection
 	SecretFileRoots           = cruxconfig.SecretFileRoots
+	DescribeKeySource         = cruxconfig.DescribeKeySource
 	SetSecretFileRootsForTest = cruxconfig.SetSecretFileRootsForTest
 	SupportedBackends         = cruxconfig.SupportedBackends
 	ValidEffort               = cruxconfig.ValidEffort
@@ -187,6 +214,7 @@ var (
 const (
 	DefaultReviewBacklogLabel = cruxconfig.DefaultReviewBacklogLabel
 	OriginLabelPrefix         = cruxconfig.OriginLabelPrefix
+	GitHubLabelDescriptionMax = cruxconfig.GitHubLabelDescriptionMax
 	OriginReviewerLabel       = cruxconfig.OriginReviewerLabel
 	LegacyOriginReviewLabel   = cruxconfig.LegacyOriginReviewLabel
 	LegacyReviewBacklogLabel  = cruxconfig.LegacyReviewBacklogLabel
@@ -229,15 +257,16 @@ type (
 )
 
 const (
-	ChannelTypeMention      = cruxconfig.ChannelTypeMention
-	DefaultExperimentEngine = cruxconfig.DefaultExperimentEngine
-	ExperimentEngineNous    = cruxconfig.ExperimentEngineNous
-	RoleExperimenter        = cruxconfig.RoleExperimenter
-	StandbyDefaultFloor     = cruxconfig.StandbyDefaultFloor
-	StandbyTierT1           = cruxconfig.StandbyTierT1
-	StandbyTierT2           = cruxconfig.StandbyTierT2
-	StandbyTierT3           = cruxconfig.StandbyTierT3
-	StandbyTierUnknown      = cruxconfig.StandbyTierUnknown
+	ChannelTypeMention           = cruxconfig.ChannelTypeMention
+	DefaultContributorFirstGrace = cruxconfig.DefaultContributorFirstGrace
+	DefaultExperimentEngine      = cruxconfig.DefaultExperimentEngine
+	ExperimentEngineNous         = cruxconfig.ExperimentEngineNous
+	RoleExperimenter             = cruxconfig.RoleExperimenter
+	StandbyDefaultFloor          = cruxconfig.StandbyDefaultFloor
+	StandbyTierT1                = cruxconfig.StandbyTierT1
+	StandbyTierT2                = cruxconfig.StandbyTierT2
+	StandbyTierT3                = cruxconfig.StandbyTierT3
+	StandbyTierUnknown           = cruxconfig.StandbyTierUnknown
 )
 
 var NormalizeStandbyTier = cruxconfig.NormalizeStandbyTier

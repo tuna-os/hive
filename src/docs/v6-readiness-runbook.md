@@ -470,66 +470,20 @@ Evidence checklist:
 
 ## Inception via chat
 
-The row requires one greenfield inception to reach `complete` driven only from
-chat: no Inception-tab form, no direct `/api/inception/*` calls to move it
-forward. `just runs-e2e` does not cover this row: it runs
-`go test -tags integration ./test -run Runs`, which selects the staged-run
-acceptance tests (`TestRunsE2EAcceptance`, `TestRunsE2EV6Surfaces`). Those do
-not start an inception, and `TestInceptionE2E` drives the REST API rather than
-the chat spine. The exercise is manual.
+Retired (#18565). This row used to require one greenfield inception to reach
+`complete` driven only from chat. The `/api/inception/*` routes that flow
+called were retired in #18419 (they answer `410 Gone`, replacement
+`/api/sessions`), so the `!inception` command is now a stub: every subcommand
+answers `Start an Inception session from the dashboard Sessions section`
+(`src/pkg/chat/inception.go`), multi-line input is refused as a whole, and the
+state-changing subcommands (`start`, `scan`, `answer`, `skip`, `submit`,
+`facts`, `approve`, `reset`) still refuse below owner with
+`❌ owner role required` (`requireCommandOwner`). It makes no dashboard calls,
+and unprefixed chat replies are no longer taken as inception answers.
 
-Prerequisites:
-
-- Any chat surface on the spine: the dashboard chat panel (see the identity
-  prerequisite above) or an external backend from the sections above.
-- The chat author must resolve to `owner` in that surface's allowlist (an
-  `id:owner` entry, or the first bare entry). Every state-changing
-  `!inception` subcommand refuses below owner with `❌ owner role required`
-  (`requireCommandOwner` in `src/pkg/chat/inception.go`).
-- The spine's own dashboard calls must pass the inception owner gate, which
-  requires an owner `X-Hive-Role` and the owner-verification header
-  (`requireOwnerRole` in `src/pkg/dashboard/api.go`). A
-  `❌ Failed to start inception: … owner access required` reply means the spine's
-  dashboard credential cannot do that on this hive. Record it as a blocker and
-  do not tick the row.
-- The `brainstorm` agent is enabled (see [Inception](inception.md#prerequisites)),
-  and no inception is in progress. Only one run can be active; archive an
-  earlier one with `!inception reset` first.
-
-Run:
-
-1. Send `!inception start <one-line greenfield idea>`. Expect
-   `✅ Inception started.`
-2. Wait for the spine to post the numbered clarification questions when the
-   engine enters `clarify`. Answer each one with an ordinary unprefixed reply;
-   each reply is submitted to the next unanswered question.
-   `!inception answer <n> <text>` is the explicit form.
-3. Wait for the brainstorm agent's fact beads. The inception watcher records
-   them and advances `structure → scaffold`
-   (`InceptionWatcher` in `src/pkg/dashboard/inception_watcher.go`). Use
-   `!inception state` to watch the phase. If transcript-derived facts are
-   listed as proposals, confirm them from chat, or record facts explicitly with
-   `!inception facts <json-array-of-facts>`.
-4. Once `!inception state` reports `scaffold`, send `!inception approve`.
-   Expect `✅ Inception approved and brainstorm re-paused.`
-5. Save `GET /api/inception/state` showing `phase: complete` as read-only
-   evidence. Reading state does not drive the run, so it does not break the
-   chat-only requirement.
-
-Evidence checklist:
-
-- [ ] Chat transcript (links or screenshots) from `!inception start` through
-      the `approve` reply, including the posted question list and the answers.
-- [ ] `!inception state` output at `scaffold`, and the final state showing
-      `phase: complete` with the recorded fact count.
-- [ ] Surface and identity used, and the allowlist entry that resolved to
-      `owner`.
-- [ ] Hive log/audit for the `/api/inception/*` calls made on the spine's
-      behalf (start, answer, approve).
-- [ ] A statement that no dashboard-form or direct API call drove any phase.
-- [ ] Paste the template as a comment on #7563, tick the Inception via chat row
-      in its **v6 readiness bar** section, and link the evidence comment from
-      the row.
+There is nothing to exercise and no evidence to collect for this row. Inception
+now runs as Inception (spek) sessions in the dashboard; see
+[Inception](inception.md) and the [Sessions API](api-reference/sessions.md).
 
 <a id="email"></a>
 
@@ -641,6 +595,23 @@ Prerequisites:
   contributor's GitHub login, and `standby_model_tiers` maps the contributor's
   backend/model/effort to `T2`, so step 2 fails to qualify
   ([Configuration schema](design/standby-contributors.md#configuration-schema)).
+- The target lane must have a mode that can create PRs; standby does not
+  bypass its mode ceiling (`standbyModeCeilingReason` in
+  `src/pkg/dashboard/contribute_standby_dispatch.go`). At ACMM L2 every pack
+  lane is `ADVISORY`, so an operator must deliberately set
+  `agents.<lane>.mode: ISSUES_AND_PRS` and
+  `agents.<lane>.mode_owner: operator` for this exercise. Without the owner
+  marker, pack reconciliation resets the mode on startup. `ADVISORY` and
+  `ISSUES_ONLY` lanes are refused with `mode_ceiling`.
+- For a private sandbox repository, explicitly opt in with
+  `hub.standby_allow_private_repos: true` (default `false`); otherwise dispatch
+  returns `private_repo: standby private repositories are not enabled`.
+  Approve only contributors trusted with read access to the private repositories
+  the hive serves; see [Private repos and approval](design/standby-contributors.md#3-private-repos-and-what-the-approval-screen-says--opt-in-default-off-and-the-screen-states-the-read-access-equivalence-verbatim).
+- Confirm the intended item appears in `GET /api/contribute/queue` with its
+  `lane` equal to the standby lane. Use this routing evidence rather than the
+  tile's lane counts, which can differ (see
+  [#16420](https://github.com/hivecommons/hive/issues/16420)).
 - An owner or read-write dashboard session for dispatch and clear
   (`POST /api/contribute/standby/dispatch`, `POST /api/contribute/standby/clear`).
   The chat equivalents are `!standby <lane> [owner/repo#number]` and
@@ -656,9 +627,21 @@ Run:
    the T2 configuration, confirm the tile reads `0 qualify` (`/api/status`
    `governor.qualified_standbys` has `0` for the lane), the lane stays paused,
    and no surface proposes lowering the floor.
-3. **(S5) Lower the floor deliberately and dispatch.** Set the lane's
-   `min_model_capability: T2` in `hive.yaml`. Confirm `1 qualifies`. Dispatch
-   one item by hand from the dashboard or with `!standby <lane> <owner/repo#n>`.
+3. **(S5) Lower the floor deliberately and dispatch.** Set
+   `agents.<lane>.standby.min_model_capability: T2` in the persisted config,
+   keeping the lane's PR-capable `mode`, `mode_owner: operator`, and (for a
+   private repo) `hub.standby_allow_private_repos: true` from the prerequisites.
+   On Kubernetes, scale the hive Deployment to `0` and wait for its pod to
+   terminate before editing the PVC through a temporary maintenance pod mounted
+   at `/data`. Back up and edit both `/data/hive.yaml.runtime` and
+   `/data/hive.yaml.dashboard`, preserving their other settings and file
+   ownership. The running hive rewrites the runtime file, and the dashboard
+   overlay is merged at boot, so an in-pod edit to the runtime file alone does
+   not reliably persist. Remove the maintenance pod, then scale the Deployment
+   back to `1`. Confirm the effective config after restart and `1 qualifies`;
+   recheck that the item is routed to this lane in `GET /api/contribute/queue`.
+   Dispatch one item by hand from the dashboard or with
+   `!standby <lane> <owner/repo#n>`.
    Confirm the `contribute_standby_dispatch` audit entry (`lane`, `task`), and
    that the PR arrives from the **contributor's** account, carries the `hold`
    label, and has `standby_lane` and `standby_tier` in its `— hive:` trailer
@@ -681,7 +664,10 @@ Evidence checklist:
       (suspended, then cleared).
 - [ ] `/api/status` excerpts showing `qualified_standbys` and
       `suspended_standbys` for the lane.
-- [ ] Redacted `hive.yaml` diff lowering the floor to `T2`.
+- [ ] Redacted persisted-config diff lowering the floor to `T2`, showing the
+      lane's `mode` and `mode_owner`, and the private-repo opt-in if applicable;
+      on Kubernetes, confirm the effective values survived the restart.
+- [ ] `GET /api/contribute/queue` excerpt showing the dispatched item's `lane`.
 - [ ] Donated PR URL showing the contributor author, the `hold` label, and the
       `— hive:` trailer with `standby_lane` / `standby_tier`, plus the reviewer
       minutes.
@@ -703,8 +689,10 @@ Prerequisites:
   hub proxy proof, internal header), or any caller on a direct-route spoke,
   sees `writes_enabled: false` with a `writes_unavailable_reason`
   ([Write contract](design/admin-mcp.md#write-contract-phase-3)).
-- Writes are off by default. Set `HIVE_ADMIN_MCP_ENABLE_WRITES=1` on the hive
-  process for the endpoint write steps.
+- Writes are off by default. For the endpoint write steps, turn on **Allow
+  admin MCP writes** on Settings → Channels (`admin_mcp.writes_enabled`), or set
+  `HIVE_ADMIN_MCP_ENABLE_WRITES=1` on the hive process while that switch is
+  unused.
 - For the stdio half, build `hive-admin-mcp` from `src/cmd/hive-admin-mcp` and
   set `HIVE_ADMIN_MCP_HIVES` to a roster naming the live hive plus at least one
   other entry, with `HIVE_ADMIN_MCP_ACTIVE` (or roster order) making the

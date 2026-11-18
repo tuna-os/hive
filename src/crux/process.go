@@ -16,43 +16,52 @@ import (
 // The field meanings are documented on agent.AgentProcess. A snapshot is a
 // read-only display value; writing to one does not change the runtime.
 type Process struct {
-	Name                   string
-	ID                     string
-	Config                 config.AgentConfig
-	State                  ProcessState
-	PID                    int
-	UID                    int
-	StartedAt              *time.Time
-	LastKick               *time.Time
-	KicksUndeliverable     int
-	BusySince              time.Time
-	LastTranscriptActivity time.Time
-	BusyCondition          string
-	BusyConditionMessage   string
-	Paused                 bool
-	PausedAt               time.Time
-	PausedReason           string
-	PausedTrigger          string
-	PausedBy               string
-	OperatorStopped        bool
-	PinnedCLI              string
-	PinnedModel            string
-	ModelOverride          string
-	BackendOverride        string
-	RestartCount           int
-	RestartEvents          []RestartEvent
-	LastRestartReason      string
-	OutputBuffer           *RingBuffer
-	SubAgentModels         []SubAgentModel
-	KickHistory            []KickRecord
-	LastKickMessage        string
-	KickRefused            bool
-	KickRefusalReason      string
-	LaunchedMode           AgentMode
-	HasLaunched            bool
-	BootstrapOverride      string
-	LastError              string
-	NeedsLogin             bool
+	Name                    string
+	ID                      string
+	Config                  config.AgentConfig
+	State                   ProcessState
+	PID                     int
+	UID                     int
+	StartedAt               *time.Time
+	LastKick                *time.Time
+	KicksUndeliverable      int
+	ConsecutiveKickFailures int
+	LastKickError           string
+	BusySince               time.Time
+	LastTranscriptActivity  time.Time
+	CodeWork                *CodeWork
+	BusyCondition           string
+	BusyConditionMessage    string
+	Paused                  bool
+	PausedAt                time.Time
+	PausedReason            string
+	PausedTrigger           string
+	PausedBy                string
+	OperatorStopped         bool
+	PinnedCLI               string
+	PinnedModel             string
+	ModelOverride           string
+	BackendOverride         string
+	RestartCount            int
+	RestartEvents           []RestartEvent
+	LastRestartReason       string
+	OutputBuffer            *RingBuffer
+	SubAgentModels          []SubAgentModel
+	KickHistory             []KickRecord
+	LastKickMessage         string
+	KickRefused             bool
+	KickRefusalReason       string
+	LaunchedMode            AgentMode
+	HasLaunched             bool
+	BootstrapOverride       string
+	LastError               string
+	NeedsLogin              bool
+	// CredentialBridgeBroken is true for a per-UID claude agent whose
+	// $HOME/.claude/.credentials.json is a regular file instead of the symlink
+	// to the shared login: a Claude Code token refresh replaced the link with
+	// a private copy, so a dashboard sign-in does not reach this agent until
+	// hive re-bridges it (launch, credential watchdog, or sign-in).
+	CredentialBridgeBroken bool
 	LoginURL               string
 	Starting               bool
 	QuotaExhausted         bool
@@ -77,6 +86,7 @@ type Process struct {
 	KickOutcome               KickOutcome
 	RepeatFailure             RepeatFailureStatus
 	SandboxLastRun            *SandboxRun
+	SandboxPhase              *SandboxPhase
 	StartFailureClass         string
 	StartFailureReason        string
 	StartFailureCount         int
@@ -88,6 +98,15 @@ type Process struct {
 
 	paneCapture []string
 	paneFilter  func(lines []string, n int) []string
+}
+
+// TurnInFlight reports whether the agent is mid-task: its process is running
+// and it has a delivered kick whose turn has not been seen to end. An agent
+// that was never kicked has no turn to be in, so it is idle, not working
+// (#18458); KickOutcome.Settled alone reads false for it. The dashboard's
+// busy flag and the reviewer autoscaler both use this, so the two agree.
+func (p *Process) TurnInFlight() bool {
+	return p.State == StateRunning && p.LastKick != nil && !p.KickOutcome.Settled(p.LastKick)
 }
 
 // SetPaneCapture records the pane capture a snapshot was taken with and the

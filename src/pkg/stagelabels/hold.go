@@ -17,8 +17,9 @@ type HoldProvenance struct {
 	// lower-cased login of the person (or other app) who did; "" unknown.
 	By string `json:"by,omitempty"`
 	// Source names the hive gate behind a hive-set hold: HoldSourceReporterTrust
-	// for the reporter-trust gate (#9665), HoldSourceLabel for a hold the
-	// hive can only attribute to the label event.
+	// for the reporter-trust gate (#9665), HoldSourceHumanMergePath for the
+	// human-merge-path refusal (#11027), HoldSourceLabel for a hold the hive
+	// can only attribute to the label event.
 	Source string `json:"source,omitempty"`
 	// Reason is the plain-words cause ("reporter trust (issue #N by @X,
 	// contributor)"), "" when only the label is known.
@@ -31,14 +32,22 @@ type HoldProvenance struct {
 	Issue       int    `json:"issue,omitempty"`
 	Reporter    string `json:"reporter,omitempty"`
 	Association string `json:"association,omitempty"`
+	// Label is the hold-class label this provenance explains: `hold`, or
+	// the hive's decision-needed gate label (hivecommons/hive#18468).
+	// "" reads as `hold`.
+	Label string `json:"label,omitempty"`
 }
 
 // Hold sources.
 const (
-	HoldByHive              = "hive"
-	HoldSourceReporterTrust = "reporter-trust"
-	HoldSourceLabel         = "label"
+	HoldByHive               = "hive"
+	HoldSourceReporterTrust  = "reporter-trust"
+	HoldSourceHumanMergePath = "human-merge-path"
+	HoldSourceLabel          = "label"
 )
+
+// HumanMergePathReason is the plain-words cause of a human-merge-path hold.
+const HumanMergePathReason = "a human-merge path (`auto_merge.human_merge_paths`)"
 
 // SelfImposed reports whether the hive itself set this hold.
 func (h *HoldProvenance) SelfImposed() bool {
@@ -48,6 +57,12 @@ func (h *HoldProvenance) SelfImposed() bool {
 // ReporterTrust reports whether the hold came from the reporter-trust gate.
 func (h *HoldProvenance) ReporterTrust() bool {
 	return h != nil && strings.EqualFold(strings.TrimSpace(h.Source), HoldSourceReporterTrust)
+}
+
+// HumanMergePath reports whether the hold came from the human-merge-path
+// refusal: no lane merges the PR, whatever the label says.
+func (h *HoldProvenance) HumanMergePath() bool {
+	return h != nil && strings.EqualFold(strings.TrimSpace(h.Source), HoldSourceHumanMergePath)
 }
 
 // Pill is the tracker pill text: "Held by hive · reporter trust (issue #N
@@ -77,11 +92,19 @@ func (h *HoldProvenance) Clause() string {
 	if h.SelfImposed() {
 		who = "the hive itself"
 	}
-	s := "the `hold` label was set by " + who
+	s := "the `" + h.LabelOrHold() + "` label was set by " + who
 	if reason := strings.TrimSpace(h.Reason); reason != "" {
 		s += ": " + reason
 	}
 	return s
+}
+
+// LabelOrHold is the label the provenance explains, `hold` when unset.
+func (h *HoldProvenance) LabelOrHold() string {
+	if h == nil || strings.TrimSpace(h.Label) == "" {
+		return "hold"
+	}
+	return strings.ToLower(strings.TrimSpace(h.Label))
 }
 
 // ReporterTrustReason renders the gate's finding the way the pill and the

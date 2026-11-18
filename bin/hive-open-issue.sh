@@ -16,8 +16,8 @@
 # forge-resistance as the gh wrapper; this shim adds no privilege.
 #
 # Usage (drop-in for the common gh shapes):
-#   hive-open-issue --repo <owner/repo> --title "<t>" [--body "<b>"|--body-file f] [--label a,b] [--parent <n>] [--blocked-by <n[,n]>] [--close-on-merge] [--needs-decision] [--no-consolidate <reason>]
-#   hive-open-issue comment --repo <owner/repo> <number|url> --body "<b>" [--needs-decision] [--blocked-on-pr <n>]
+#   hive-open-issue --repo <owner/repo> --title "<t>" [--body "<b>"|--body-file f] [--label a,b] [--parent <n|owner/repo#n>] [--blocked-by <n[,n]>] [--close-on-merge] [--needs-decision] [--no-consolidate <reason>]
+#   hive-open-issue comment --repo <owner/repo> <number|url> --body "<b>" [--needs-decision|--withdraw-decision] [--blocked-by <n[,n]>] [--blocked-on-pr <n|owner/repo#n>] [--not-agent-work <verdict>]
 #   hive-open-issue claim   --repo <owner/repo> <number|url>
 #   hive-open-issue close   --repo <owner/repo> <number|url> [--override-reason "..."]
 #   hive-open-issue label   --repo <owner/repo> <number|url> [--label a,b] [--remove-label c]
@@ -30,12 +30,23 @@
 # so the link still reads in plain text. A failed link (parent missing, at
 # GitHub's sub-issue cap, …) does not stop the child issue from being created.
 #
+# --parent <owner/repo#n> (or the parent's issue URL) names a parent in
+# ANOTHER repo (hivecommons/hive#18680). File each child in the managed repo
+# where its work lives (--repo) and point --parent at the tracker: the
+# watcher links it across repos, writes `Part of owner/repo#n` and a
+# cross-repo `hive:parent` marker, and counts it in the tracker's progress.
+# When --repo is not a repo this hive manages, the child is filed in the
+# parent's repo instead (the result's repo_fallback_from says so).
+#
 # --blocked-by <n[,n]> (repeatable) records each issue <n> in the same repo as
 # a GitHub "blocked by" dependency of the new issue (hivecommons/hive#9839).
 # Use it when a split has an order: the hive keeps a blocked child out of the
 # ready work until its blockers close, and lifts it automatically when they do
 # — write the order here, not only in a comment. A blocker that cannot be
 # linked is reported in the result and does not stop the create.
+# On `comment` it links the existing issue the same way: use it when a park
+# only defers to another parked issue's decision ("answer on #511; the same
+# choice applies here"), so the owner sees one ask, not two.
 #
 # --close-on-merge appends the legacy `hive: close-on-merge` marker to the new
 # issue's body (hivecommons/hive#10304). Close-on-merge is now the default, so
@@ -56,18 +67,37 @@
 # owner's /hive done reply records the done decision, and the lane that next
 # picks the issue up re-checks the step and closes it once verified.
 #
+# --withdraw-decision (comment only) takes back a decision park you placed
+# yourself, when the question is gone: a fix you or another lane found needs
+# no choice, or an open PR already carries the answer and closes the issue.
+# The body says why in one or two sentences. The watcher refuses it unless
+# the issue is parked on a decision (not `needs-human`) and the newest park
+# text is yours; it then lifts the park, removes the "What to reply" notice
+# and marks the comment, so the issue leaves the owner's queue without an
+# owner reply. Never withdraw a park another lane or a person placed.
+#
 # --no-consolidate <reason> (issue only) asks the watcher not to fold this
 # request into an existing open issue (hivecommons/hive#14360); use it when the
 # request is unrelated work that merely shares a file or component with one.
 # The reason is required, and the watcher records it in the result.
 #
-# --blocked-on-pr <n> (comment only) parks the issue on open PR <n> in the
-# same repo (hivecommons/hive#13093): use it when the code a finding names
-# exists only in an unmerged PR, so there is nothing to ship until it lands.
+# --blocked-on-pr <n|owner/repo#n> (comment only) parks the issue on open PR
+# <n> in the same repo, or on owner/repo#n in another one
+# (hivecommons/hive#13093): use it when the code a finding names exists only
+# in an unmerged PR, so there is nothing to ship until it lands.
 # The watcher prefixes the note with the blocked-on marker, strips any
 # @-mentions (the PR's author is not asked to do the hive's work), adds the
 # `blocked` label and removes `help wanted`; the hive lifts the label itself
 # once the PR merges or closes. Never @-mention the PR author in the note.
+#
+# --not-agent-work <verdict> (comment only) records a triage verdict that the
+# issue is not agent work (hivecommons/hive#18675): `not-a-defect` (a
+# configuration condition or expected behaviour), `needs-human` (a person's
+# action, access or judgement), or `needs-environment` (real logins, hardware,
+# a live meeting). The watcher posts the note once with a marker and parks the
+# issue on `needs-human`, so it leaves the Actionable lane and the scanner's
+# work list; the same verdict again with no human comment since is dropped
+# (already_existed). A person's later comment re-queues the issue.
 #
 # Every shape accepts --dry-run (-n): validate the arguments, print the exact
 # request that WOULD be written, and exit 0 without writing it — nothing is
@@ -121,6 +151,19 @@
 set -euo pipefail
 
 REQ_DIR="/var/run/hive-metrics/issue-requests"
+# Inside a sandbox (Podman or a Kubernetes Job) the pod-local relay dir is not
+# reachable. Hive sets HIVE_SANDBOX_REQUEST_DIR to the kick's request spool and
+# HIVE_SANDBOX_SPOOL_KEY to a per-run key (hivecommons/hive#18573); the request
+# is then written there as {"kind": "issue", "request": "<request JSON>",
+# "mac": "<hex HMAC-SHA256(key, "issue\n" + request JSON)>"}. The relay runs it
+# through the same issue handler and gates, attributed to the kick's own agent
+# whatever "agent" says. The older HIVE_REVIEW_* names are accepted too.
+SPOOL_DIR="${HIVE_SANDBOX_REQUEST_DIR:-${HIVE_REVIEW_REQUEST_DIR:-}}"
+SPOOL_KEY="${HIVE_SANDBOX_SPOOL_KEY:-${HIVE_REVIEW_SPOOL_KEY:-}}"
+if [ -n "$SPOOL_DIR" ] && [ -n "$SPOOL_KEY" ]; then
+  REQ_DIR="$SPOOL_DIR"
+  export HIVE_OPEN_ISSUE_SPOOL_KEY="$SPOOL_KEY"
+fi
 
 KIND="issue"
 case "${1:-}" in
@@ -137,8 +180,11 @@ PARENT=""
 BLOCKED_BY=()
 CLOSE_ON_MERGE=0
 NEEDS_DECISION=0
+WITHDRAW_DECISION=0
 STEP_KIND=""; RELEASE_TAG=""; RELEASE_TARGET=""; STEP_REQUESTED=0
 BLOCKED_ON_PR=""
+BLOCKED_ON_PR_REPO=""
+NOT_AGENT_WORK=""
 NO_CONSOLIDATE=""
 NO_CONSOLIDATE_SET=0
 DRY_RUN=0
@@ -146,7 +192,7 @@ LABELS=()
 REMOVE_LABELS=()
 REVIEWERS=()
 TEAM_REVIEWERS=()
-SUPPORTED_FLAGS="--repo/-R, --title/-t, --body/-b, --body-file/-F, --label/-l, --remove-label, --reviewer, --team-reviewer, --number, --parent, --blocked-by, --close-on-merge, --needs-decision, --no-consolidate, --blocked-on-pr, --step-kind, --release-tag, --release-target, --override-reason, --dry-run/-n (plus the ignored gh flags --assignee/-a, --milestone/-m, --project/-p, --template/-T, --web/-w, --editor/-e)"
+SUPPORTED_FLAGS="--repo/-R, --title/-t, --body/-b, --body-file/-F, --label/-l, --remove-label, --reviewer, --team-reviewer, --number, --parent, --blocked-by, --close-on-merge, --needs-decision, --withdraw-decision, --no-consolidate, --blocked-on-pr, --not-agent-work, --step-kind, --release-tag, --release-target, --override-reason, --dry-run/-n (plus the ignored gh flags --assignee/-a, --milestone/-m, --project/-p, --template/-T, --web/-w, --editor/-e)"
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo|-R) REPO="$2"; shift 2;;
@@ -175,6 +221,7 @@ while [ $# -gt 0 ]; do
     --override-reason=*) OVERRIDE_REASON="${1#*=}"; shift;;
     --close-on-merge) CLOSE_ON_MERGE=1; shift;;
     --needs-decision) NEEDS_DECISION=1; shift;;
+    --withdraw-decision) WITHDRAW_DECISION=1; shift;;
     --step-kind|--release-tag|--release-target)
       STEP_REQUESTED=1
       if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
@@ -194,6 +241,8 @@ while [ $# -gt 0 ]; do
     --no-consolidate=*) NO_CONSOLIDATE_SET=1; NO_CONSOLIDATE="${1#*=}"; shift;;
     --blocked-on-pr) BLOCKED_ON_PR="$2"; shift 2;;
     --blocked-on-pr=*) BLOCKED_ON_PR="${1#*=}"; shift;;
+    --not-agent-work) NOT_AGENT_WORK="$2"; shift 2;;
+    --not-agent-work=*) NOT_AGENT_WORK="${1#*=}"; shift;;
     --dry-run|-n) DRY_RUN=1; shift;;
     # Tolerate gh flags we don't need; skip a following value only for flags
     # that take one, so a bare flag can't swallow the next real argument.
@@ -244,6 +293,15 @@ if [ "$NEEDS_DECISION" -eq 1 ] && [ "$KIND" != "issue" ] && [ "$KIND" != "commen
   exit 2
 fi
 
+if [ "$WITHDRAW_DECISION" -eq 1 ] && [ "$KIND" != "comment" ]; then
+  echo "hive-open-issue: --withdraw-decision only applies to a comment; nothing was written." >&2
+  exit 2
+fi
+if [ "$WITHDRAW_DECISION" -eq 1 ] && [ "$NEEDS_DECISION" -eq 1 ]; then
+  echo "hive-open-issue: --withdraw-decision and --needs-decision cannot be combined; nothing was written." >&2
+  exit 2
+fi
+
 if [ "$NO_CONSOLIDATE_SET" -eq 1 ] && [ "$KIND" != "issue" ]; then
   echo "hive-open-issue: --no-consolidate only applies when creating an issue; nothing was written." >&2
   exit 2
@@ -257,8 +315,22 @@ if [ -n "${BLOCKED_ON_PR:-}" ] && [ "$KIND" != "comment" ]; then
   echo "hive-open-issue: --blocked-on-pr only applies to a comment; nothing was written." >&2
   exit 2
 fi
+# owner/repo#n names a PR in another repository: split it into the number
+# and the repo the watcher reads it from.
+if [ -n "${BLOCKED_ON_PR:-}" ] && [[ "$BLOCKED_ON_PR" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$ ]]; then
+  BLOCKED_ON_PR_REPO="${BASH_REMATCH[1]}"
+  BLOCKED_ON_PR="${BASH_REMATCH[2]}"
+fi
+if [ -n "${NOT_AGENT_WORK:-}" ] && [ "$KIND" != "comment" ]; then
+  echo "hive-open-issue: --not-agent-work only applies to a comment; nothing was written." >&2
+  exit 2
+fi
+if [ -n "${NOT_AGENT_WORK:-}" ] && ! [[ "$NOT_AGENT_WORK" =~ ^(not-a-defect|needs-human|needs-environment)$ ]]; then
+  echo "hive-open-issue: --not-agent-work needs one of not-a-defect, needs-human, needs-environment; nothing was written." >&2
+  exit 2
+fi
 if [ -n "${BLOCKED_ON_PR:-}" ] && ! [[ "$BLOCKED_ON_PR" =~ ^[0-9]+$ && "$BLOCKED_ON_PR" -gt 0 ]]; then
-  echo "hive-open-issue: --blocked-on-pr needs a positive PR number; nothing was written." >&2
+  echo "hive-open-issue: --blocked-on-pr needs a positive PR number or owner/repo#n; nothing was written." >&2
   exit 2
 fi
 
@@ -376,10 +448,13 @@ REMOVE_LABELS_JSON="$(printf '%s\n' "${REMOVE_LABELS[@]:-}" | python3 -c 'import
 REVIEWERS_JSON="$(printf '%s\n' "${REVIEWERS[@]:-}" | python3 -c 'import json,sys; print(json.dumps([x.rstrip("\n") for x in sys.stdin if x.rstrip("\n")]))')"
 TEAM_REVIEWERS_JSON="$(printf '%s\n' "${TEAM_REVIEWERS[@]:-}" | python3 -c 'import json,sys; print(json.dumps([x.rstrip("\n") for x in sys.stdin if x.rstrip("\n")]))')"
 BLOCKED_BY_JSON="$(printf '%s\n' "${BLOCKED_BY[@]:-}" | python3 -c 'import json,sys; print(json.dumps([x.rstrip("\n") for x in sys.stdin if x.rstrip("\n")]))')"
-python3 - "$TEMP_FILE" "$REQ_FILE" "$KIND" "$REPO" "$TITLE" "${OVERRIDE_REASON:-$BODY}" "$AGENT" "$LABELS_JSON" "${NUMBER:-0}" "$DRY_RUN" "${PARENT:-0}" "$REMOVE_LABELS_JSON" "$REVIEWERS_JSON" "$TEAM_REVIEWERS_JSON" "$BLOCKED_BY_JSON" "$NEEDS_DECISION" "${BLOCKED_ON_PR:-0}" "$STEP_KIND" "$RELEASE_TAG" "$RELEASE_TARGET" "$STEP_REQUESTED" "$NO_CONSOLIDATE" <<'PY'
+python3 - "$TEMP_FILE" "$REQ_FILE" "$KIND" "$REPO" "$TITLE" "${OVERRIDE_REASON:-$BODY}" "$AGENT" "$LABELS_JSON" "${NUMBER:-0}" "$DRY_RUN" "${PARENT:-0}" "$REMOVE_LABELS_JSON" "$REVIEWERS_JSON" "$TEAM_REVIEWERS_JSON" "$BLOCKED_BY_JSON" "$NEEDS_DECISION" "${BLOCKED_ON_PR:-0}" "$STEP_KIND" "$RELEASE_TAG" "$RELEASE_TARGET" "$STEP_REQUESTED" "$NO_CONSOLIDATE" "$WITHDRAW_DECISION" "$BLOCKED_ON_PR_REPO" "${NOT_AGENT_WORK:-}" <<'PY'
 import json, os, re, sys
 temporary, path, kind, repo, title, body, agent, labels, number, dry_run, parent, remove_labels, reviewers, team_reviewers, blocked_by, needs_decision, blocked_on_pr = sys.argv[1:18]
 no_consolidate = sys.argv[22]
+withdraw_decision = sys.argv[23]
+blocked_on_pr_repo = sys.argv[24].strip()
+not_agent_work = sys.argv[25]
 labels = [part.strip() for value in json.loads(labels)
           for part in value.split(",") if part.strip()]
 remove_labels = [part.strip() for value in json.loads(remove_labels)
@@ -389,6 +464,25 @@ reviewers = [part.strip() for value in json.loads(reviewers)
 team_reviewers = [part.strip() for value in json.loads(team_reviewers)
                   for part in value.split(",") if part.strip()]
 req = {"kind": kind, "repo": repo, "agent": agent}
+
+
+def parse_blockers():
+    # --blocked-by accepts "12", "#12", "12,13" and repeated flags.
+    blockers = []
+    for value in json.loads(blocked_by):
+        for part in value.split(","):
+            part = part.strip().lstrip("#")
+            if not part:
+                continue
+            if not part.isdigit():
+                sys.stderr.write("hive-open-issue: --blocked-by expects issue numbers, got %r; nothing was written.\n" % part)
+                sys.exit(2)
+            n = int(part)
+            if n > 0 and n not in blockers:
+                blockers.append(n)
+    return blockers
+
+
 step_kind, release_tag, release_target = sys.argv[18:21]
 if sys.argv[21] == "1":
     error = ""
@@ -416,6 +510,15 @@ if kind == "comment":
     # the configured needs-decision label before posting (hivecommons/hive#12329).
     if needs_decision == "1":
         req["needs_decision"] = True
+    # --blocked-by on a comment links the existing issue: a park that only
+    # defers to another issue's decision waits on that one instead of
+    # counting as a second owner ask.
+    blockers = parse_blockers()
+    if blockers:
+        req["blocked_by"] = blockers
+    # --withdraw-decision takes back the caller's own decision park.
+    if withdraw_decision == "1":
+        req["withdraw_decision"] = True
 elif kind == "claim":
     # The watcher applies the hive/claimed-by-<agent> label; number is all it
     # needs. No body/title/labels.
@@ -447,22 +550,24 @@ else:
     req["labels"] = labels
     # --parent: link the new issue as a GitHub sub-issue of this number
     # (hivecommons/hive#9435). Only meaningful for a create.
+    # (hivecommons/hive#18680) Also accepts "owner/repo#N" or an issue URL
+    # for a parent in another repo.
+    parent = parent.strip()
+    parent_repo = ""
+    m = re.match(r'^(?:https?://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:#|/issues/)(\d+)/?$', parent)
+    if m:
+        parent_repo = m.group(1) + "/" + m.group(2)
+        parent = m.group(3)
+    parent = parent.lstrip("#")
+    if not parent.isdigit():
+        sys.exit("hive-open-issue: --parent must be N, #N, owner/repo#N or an issue URL")
     if int(parent) > 0:
         req["parent"] = int(parent)
+        if parent_repo and parent_repo.lower() != repo.strip().lower():
+            req["parent_repo"] = parent_repo
     # --blocked-by: record GitHub "blocked by" dependencies on the new issue
-    # (hivecommons/hive#9839). Accepts "12", "#12", "12,13", repeated flags.
-    blockers = []
-    for value in json.loads(blocked_by):
-        for part in value.split(","):
-            part = part.strip().lstrip("#")
-            if not part:
-                continue
-            if not part.isdigit():
-                sys.stderr.write("hive-open-issue: --blocked-by expects issue numbers, got %r; nothing was created.\n" % part)
-                sys.exit(2)
-            n = int(part)
-            if n > 0 and n not in blockers:
-                blockers.append(n)
+    # (hivecommons/hive#9839).
+    blockers = parse_blockers()
     if blockers:
         req["blocked_by"] = blockers
     # --needs-decision: the watcher applies the configured needs-decision
@@ -477,13 +582,28 @@ if kind == "comment" and int(blocked_on_pr) > 0:
     # --blocked-on-pr: the watcher adds the marker and the `blocked` label
     # itself (hivecommons/hive#13093).
     req["blocked_on_pr"] = int(blocked_on_pr)
+    if blocked_on_pr_repo:
+        # owner/repo#n: the PR lives in another repository.
+        req["blocked_on_pr_repo"] = blocked_on_pr_repo
+if kind == "comment" and not_agent_work:
+    # --not-agent-work: the watcher adds the marker and parks the issue on
+    # needs-human itself (hivecommons/hive#18675).
+    req["not_agent_work"] = not_agent_work
 if dry_run == "1":
     # Honour --dry-run: show exactly what would be queued, write nothing.
     print("hive-open-issue: DRY RUN — no request written, nothing will be created. Would write %s:" % path)
     print(json.dumps(req, indent=2))
     sys.exit(0)
+data = json.dumps(req)
+# Sandbox spool: sign for this run. Read from the environment, never argv:
+# argv is visible to every user.
+key = os.environ.get("HIVE_OPEN_ISSUE_SPOOL_KEY", "")
+if key:
+    import hashlib, hmac
+    mac = hmac.new(key.encode(), ("issue\n" + data).encode(), hashlib.sha256).hexdigest()
+    data = json.dumps({"kind": "issue", "request": data, "mac": mac})
 with open(temporary, "w") as fh:
-    json.dump(req, fh)
+    fh.write(data)
 os.replace(temporary, path)
 PY
 
@@ -496,8 +616,14 @@ if [ "$KIND" = "comment" ]; then
   if [ "$NEEDS_DECISION" -eq 1 ]; then
     echo "hive-open-issue: will park $REPO#$NUMBER on a maintainer decision (needs-decision label)"
   fi
+  if [ "$WITHDRAW_DECISION" -eq 1 ]; then
+    echo "hive-open-issue: will withdraw your decision park on $REPO#$NUMBER (refused if the park is not yours)"
+  fi
   if [ -n "${BLOCKED_ON_PR:-}" ]; then
-    echo "hive-open-issue: will park the issue on $REPO#$BLOCKED_ON_PR (blocked label; help wanted removed; no one is @-mentioned)"
+    echo "hive-open-issue: will park the issue on ${BLOCKED_ON_PR_REPO:-$REPO}#$BLOCKED_ON_PR (blocked label; help wanted removed; no one is @-mentioned)"
+  fi
+  if [ -n "${NOT_AGENT_WORK:-}" ]; then
+    echo "hive-open-issue: will record the $NOT_AGENT_WORK verdict and park the issue on needs-human (an identical repeat is dropped)"
   fi
 elif [ "$KIND" = "claim" ]; then
   echo "hive-open-issue: requested claim of $REPO#$NUMBER (hive/claimed-by-$AGENT label)"
@@ -510,7 +636,10 @@ elif [ "$KIND" = "request_review" ]; then
 else
   echo "hive-open-issue: requested issue on $REPO as the App bot: $TITLE"
   if [ -n "$PARENT" ] && [ "$PARENT" != "0" ]; then
-    echo "hive-open-issue: will link as a GitHub sub-issue of $REPO#$PARENT"
+    case "$PARENT" in
+      */*) echo "hive-open-issue: will link as a GitHub sub-issue of $PARENT" ;;
+      *) echo "hive-open-issue: will link as a GitHub sub-issue of $REPO#${PARENT#\#}" ;;
+    esac
   fi
   if [ "$NEEDS_DECISION" -eq 1 ]; then
     echo "hive-open-issue: will park the issue on a maintainer decision (needs-decision label)"

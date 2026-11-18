@@ -6,7 +6,9 @@ package automerge
 // and names a head whose runs were never created instead of polling it forever.
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,14 +16,13 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
-	"github.com/hivecommons/hive/pkg/effects"
 	"github.com/hivecommons/hive/pkg/oktotest"
 	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
 func heldRun(id int, headRepo string) map[string]any {
 	return map[string]any{
-		"id": id, "name": "v2 CI", "status": "completed", "conclusion": "action_required",
+		"id": id, "name": "v2 CI", "event": "pull_request", "status": "completed", "conclusion": "action_required",
 		"head_repository": map[string]any{"full_name": headRepo},
 	}
 }
@@ -129,6 +130,61 @@ func TestTrySweepSelfAuthoredPRNamesNeverStartedRequiredCheck(t *testing.T) {
 	}
 }
 
+// TestTrySweepSelfAuthoredPRTreatsOrphanedQueuedRunsAsNeverStarted pins
+// #17775: GitHub can leave a head's runs `queued` with zero jobs forever, and
+// such runs must not keep the PR at a bare required-check-missing reason.
+func TestTrySweepSelfAuthoredPRTreatsOrphanedQueuedRunsAsNeverStarted(t *testing.T) {
+	now := time.Date(2026, 11, 11, 22, 10, 0, 0, time.UTC)
+	old := now.Add(-2 * heldRunNeverStartedGrace).Format(time.RFC3339)
+	fresh := now.Add(-time.Minute).Format(time.RFC3339)
+	queuedRun := func(id int, headRepo, createdAt string) map[string]any {
+		return map[string]any{
+			"id": id, "name": "v2 CI", "status": "queued", "created_at": createdAt,
+			"head_repository": map[string]any{"full_name": headRepo},
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		runs []map[string]any
+		jobs map[int]int
+		want string
+	}{
+		{name: "old queued runs with zero jobs", runs: []map[string]any{queuedRun(1, "acme/widget", old), queuedRun(2, "acme/widget", old)}, want: requiredCheckNeverStartedPrefix + "ci/build"},
+		{name: "queued run with jobs", runs: []map[string]any{queuedRun(1, "acme/widget", old)}, jobs: map[int]int{1: 1}, want: "required-check-missing:ci/build"},
+		{name: "freshly queued run", runs: []map[string]any{queuedRun(1, "acme/widget", fresh)}, want: "required-check-missing:ci/build"},
+		{name: "fork head queued run", runs: []map[string]any{queuedRun(1, "mallory/widget", old)}, want: "required-check-missing:ci/build"},
+		{
+			name: "orphaned run beside an in-progress run",
+			runs: []map[string]any{queuedRun(1, "acme/widget", old), {"id": 2, "name": "Tests", "status": "in_progress", "head_repository": map[string]any{"full_name": "acme/widget"}}},
+			want: "required-check-missing:ci/build",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := missingRequiredPR(func(p *selfAuthoredPR) {
+				p.workflowRuns = tc.runs
+				p.workflowRunJobs = tc.jobs
+				p.updatedAt = old
+			})
+			var merged []int
+			api := newSelfAuthoredAutoMergeAPI(t, []selfAuthoredPR{pr}, &merged)
+			defer api.Close()
+			c := newAutoMergeSweepClient(api.URL)
+			c.now = func() time.Time { return now }
+
+			_, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "widget", "acme", "widget", 23, true)
+			if err != nil {
+				t.Fatalf("trySweepSelfAuthoredPR returned error: %v", err)
+			}
+			if reason != tc.want {
+				t.Fatalf("reason = %q, want %q", reason, tc.want)
+			}
+			if len(merged) != 0 {
+				t.Fatalf("merged = %v, want no merge", merged)
+			}
+		})
+	}
+}
+
 func TestTerminalRequiredCheckHoldLoggedOncePerHeadAndReason(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -137,6 +193,8 @@ func TestTerminalRequiredCheckHoldLoggedOncePerHeadAndReason(t *testing.T) {
 	}{
 		{"held", workflowApprovalRequiredPrefix + "ci/build", true},
 		{"never started", "required-check-never-started:ci/build", true},
+		{"never ran after takeover", "required-check-never-ran:ci/build", true},
+		{"never ran on autofix head", "required-check-never-ran-autofix:ci/build", true},
 		{"missing", "required-check-missing:ci/build", false},
 		{"empty", "", false},
 	}
@@ -205,9 +263,12 @@ func TestReportTerminalHoldNotifiesOncePerHead(t *testing.T) {
 }
 
 // #11923: a Dependabot head autofix-pushed by github-actions[bot] can never
-// produce a pull_request_target-only required context. The sweep names it
-// required-check-never-ran and asks Dependabot to rebase exactly once per head.
-func TestTrySweepTrustedBotNudgesDependabotRebaseOncePerHead(t *testing.T) {
+// produce a pull_request_target-only required context. Dependabot refuses
+// every comment command a GitHub App posts (dependabot/dependabot-core#9147),
+// so the sweep posts nothing — no `@dependabot` comment, no mutation-journal
+// claim — and names the head required-check-never-ran-autofix on every tick,
+// a terminal hold the dependency-bot sweep hands to a person.
+func TestTrySweepTrustedBotHandsAutofixDependabotHeadToAPerson(t *testing.T) {
 	now := time.Date(2026, 10, 14, 19, 0, 0, 0, time.UTC)
 	var comments []string
 	pr := missingRequiredPR(func(p *selfAuthoredPR) {
@@ -225,8 +286,10 @@ func TestTrySweepTrustedBotNudgesDependabotRebaseOncePerHead(t *testing.T) {
 	c.now = func() time.Time { return now }
 	rec := &recordingBoundary{}
 	c.mutation = rec
+	var holds []string
+	c.onTerminalHold = func(_ string, _ int, _ string, reason string) { holds = append(holds, reason) }
 
-	want := requiredCheckNeverRanPrefix + "ci/build"
+	want := requiredCheckNeverRanAutofixPrefix + "ci/build"
 	for tick := 1; tick <= 3; tick++ {
 		_, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "widget", "acme", "widget", 23, true)
 		if err != nil {
@@ -235,22 +298,69 @@ func TestTrySweepTrustedBotNudgesDependabotRebaseOncePerHead(t *testing.T) {
 		if reason != want {
 			t.Fatalf("tick %d reason = %q, want %q", tick, reason, want)
 		}
+		c.reportTerminalHold("acme/widget", "acme", "widget", 23, "sha23", reason)
 	}
-	if len(comments) != 1 || comments[0] != dependabotRebaseComment {
-		t.Fatalf("comments = %q, want exactly one %q", comments, dependabotRebaseComment)
+	for _, body := range comments {
+		if strings.Contains(strings.ToLower(body), "@dependabot") {
+			t.Fatalf("comments = %q, want no @dependabot command posted as the App", comments)
+		}
 	}
-	if len(rec.claims) != 1 || rec.claims[0].Kind != effects.KindIssueComment || rec.claims[0].Target != "23" || rec.claims[0].Inputs["head_sha"] != "sha23" {
-		t.Fatalf("mutation claims = %#v, want one issue_comment claim for PR 23 head sha23", rec.claims)
+	if len(comments) != 0 {
+		t.Fatalf("comments = %q, want none", comments)
+	}
+	if len(rec.claims) != 0 {
+		t.Fatalf("mutation claims = %#v, want none", rec.claims)
 	}
 	if !isTerminalRequiredCheckHold(want) {
-		t.Fatalf("isTerminalRequiredCheckHold(%q) = false, want true so the hold logs once", want)
+		t.Fatalf("isTerminalRequiredCheckHold(%q) = false, want true so the hold is handed off once", want)
+	}
+	if len(holds) != 1 || holds[0] != want {
+		t.Fatalf("OnTerminalHold reasons = %q, want exactly one %q", holds, want)
+	}
+	if !c.autofixDependabotHeadKnown("acme", "widget", 23, "sha23") {
+		t.Fatal("autofix verdict not remembered for the head; later ticks would re-read the head commit")
 	}
 	if len(merged) != 0 {
 		t.Fatalf("merged = %v, want no merge", merged)
 	}
 }
 
-func TestTrySweepTrustedBotDoesNotNudgeOutsideAutofixShape(t *testing.T) {
+// A hive upgraded from a build that posted `@dependabot rebase` may still
+// hold that build's per-head marker. The marker is ignored: the head gets the
+// same autofix hold as a fresh one, and nothing is posted.
+func TestTrySweepTrustedBotIgnoresOldRebaseNudgeMarker(t *testing.T) {
+	now := time.Date(2026, 10, 14, 19, 0, 0, 0, time.UTC)
+	var comments []string
+	pr := missingRequiredPR(func(p *selfAuthoredPR) {
+		p.author = "dependabot[bot]"
+		p.updatedAt = now.Add(-2 * heldRunNeverStartedGrace).Format(time.RFC3339)
+		p.workflowRuns = []map[string]any{{"id": 1, "name": "v2 CI", "status": "completed", "conclusion": "success", "head_repository": map[string]any{"full_name": "acme/widget"}}}
+		p.headCommitAuthor = githubActionsBotLogin
+		p.commentBodies = &comments
+	})
+	var merged []int
+	api := newSelfAuthoredAutoMergeAPI(t, []selfAuthoredPR{pr}, &merged)
+	defer api.Close()
+	c := newAutoMergeSweepClient(api.URL)
+	c.trustedBotAuthors = func() map[string]bool { return map[string]bool{"dependabot[bot]": true} }
+	c.now = func() time.Time { return now }
+	rec := &recordingBoundary{}
+	c.mutation = rec
+	c.heldRunApprovals = map[string]bool{"rebase-nudge:" + c.evaluatedHeadKey("acme", "widget", 23) + "@sha23": true}
+
+	_, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "widget", "acme", "widget", 23, true)
+	if err != nil {
+		t.Fatalf("trySweepSelfAuthoredPR returned error: %v", err)
+	}
+	if want := requiredCheckNeverRanAutofixPrefix + "ci/build"; reason != want {
+		t.Fatalf("reason = %q, want %q", reason, want)
+	}
+	if len(comments) != 0 || len(rec.claims) != 0 {
+		t.Fatalf("comments = %q, claims = %#v, want nothing posted", comments, rec.claims)
+	}
+}
+
+func TestTrySweepTrustedBotNoAutofixHoldOutsideAutofixShape(t *testing.T) {
 	now := time.Date(2026, 10, 14, 19, 0, 0, 0, time.UTC)
 	old := now.Add(-2 * heldRunNeverStartedGrace).Format(time.RFC3339)
 	for _, tc := range []struct {
@@ -294,7 +404,9 @@ func TestTrySweepTrustedBotDoesNotNudgeOutsideAutofixShape(t *testing.T) {
 	}
 }
 
-func TestDependabotRebaseNudgeDegradesOnAPIErrors(t *testing.T) {
+// A failed head-commit lookup is not an autofix verdict: the head keeps its
+// existing hold, nothing is remembered for it, and nothing is posted.
+func TestAutofixDependabotHeadLookupFailureIsNotAutofix(t *testing.T) {
 	posts := 0
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -311,13 +423,11 @@ func TestDependabotRebaseNudgeDegradesOnAPIErrors(t *testing.T) {
 	if c.isAutofixPushedDependabotHead(context.Background(), "widget", "acme", "widget", pr, 23, "sha23") {
 		t.Fatal("head-commit lookup failure must not be treated as an autofix head")
 	}
-	c.nudgeDependabotRebase(context.Background(), "widget", "acme", "widget", 23, "sha23", "ci/build")
-	c.nudgeDependabotRebase(context.Background(), "widget", "acme", "widget", 23, "sha23", "ci/build")
-	if posts != 1 {
-		t.Fatalf("comment POSTs = %d, want 1 (a failed nudge is not retried for the same head)", posts)
+	if c.autofixDependabotHeadKnown("acme", "widget", 23, "sha23") {
+		t.Fatal("a failed lookup must not be remembered as an autofix head")
 	}
-	if !c.rebaseNudged("acme", "widget", 23, "SHA23") {
-		t.Fatal("rebaseNudged = false after an attempted nudge")
+	if posts != 0 {
+		t.Fatalf("POSTs = %d, want none", posts)
 	}
 }
 
@@ -429,6 +539,8 @@ func TestTrySweepTrustedBotWorkflowApprovalMissingWorkflowAfterGrace(t *testing.
 	c := newAutoMergeSweepClient(api.URL)
 	c.trustedBotAuthors = func() map[string]bool { return map[string]bool{"dependabot[bot]": true} }
 	c.now = func() time.Time { return now }
+	var logs bytes.Buffer
+	c.logger = slog.New(slog.NewTextHandler(&logs, nil))
 
 	_, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "widget", "acme", "widget", 23, true)
 	if err != nil {
@@ -447,6 +559,17 @@ func TestTrySweepTrustedBotWorkflowApprovalMissingWorkflowAfterGrace(t *testing.
 	}
 	if len(comments) != 1 || comments[0] != workflowApprovalCommandBody("sha23") {
 		t.Fatalf("comments = %q, want one %q command with the head marker", comments, workflowApprovalCommand)
+	}
+	if _, _, err = c.trySweepSelfAuthoredPR(context.Background(), "widget", "acme", "widget", 23, true); err != nil {
+		t.Fatalf("third tick returned error: %v", err)
+	}
+	if n := strings.Count(logs.String(), "still required after ok-to-test grace"); n != 1 {
+		t.Fatalf("grace warning logged %d times across repeat ticks, want once per head", n)
+	}
+	// The grace warning must not claim the hold reason's own dedupe key, or the
+	// sweep loop's once-per-head "automerge hold" line would never fire.
+	if !c.markTerminalHoldLogged("acme", "widget", 23, "sha23", reason) {
+		t.Fatalf("hold reason %q already marked logged by the grace warning; sweep loop would skip its automerge hold line", reason)
 	}
 }
 
@@ -555,6 +678,65 @@ func TestTrySweepSelfAuthoredPRStopsOkToTestAfterProwRejection(t *testing.T) {
 	}
 }
 
+// cncf/prow-github-actions refuses the App in its own words, naming the
+// login without an @ (projectbluefin/utah#1274): the same-repo path stops on
+// that reply too, and its note quotes the action's wording, not Prow's.
+func TestTrySweepSelfAuthoredPRStopsOkToTestAfterProwActionsRefusal(t *testing.T) {
+	var comments []string
+	pr := missingRequiredPR(func(p *selfAuthoredPR) {
+		p.workflowRuns = []map[string]any{heldRun(1, "acme/widget")}
+		p.commentBodies = &comments
+		p.existingComments = &[]map[string]any{
+			appComment(1, workflowApprovalCommandBody("oldhead")),
+			prowComment(2, "Cannot /ok-to-test because Error: "+testHiveAppBotLogin+" is not a reviewer or approver for any changed file"),
+		}
+	})
+	var merged []int
+	api := newSelfAuthoredAutoMergeAPI(t, []selfAuthoredPR{pr}, &merged)
+	defer api.Close()
+	c := newAutoMergeSweepClient(api.URL)
+
+	want := workflowApprovalUntrustedPrefix + "ci/build"
+	for tick := 1; tick <= 3; tick++ {
+		_, reason, err := c.trySweepSelfAuthoredPR(context.Background(), "widget", "acme", "widget", 23, true)
+		if err != nil {
+			t.Fatalf("tick %d returned error: %v", tick, err)
+		}
+		if reason != want {
+			t.Fatalf("tick %d reason = %q, want %q", tick, reason, want)
+		}
+	}
+	if len(comments) != 1 {
+		t.Fatalf("comments = %q, want exactly one needs-human note and no further %q", comments, workflowApprovalCommand)
+	}
+	if !strings.HasPrefix(comments[0], workflowApprovalRejectedMarker) || !strings.Contains(comments[0], prowActionsOkToTestRefusal) || strings.Contains(comments[0], prowOkToTestRejection) {
+		t.Fatalf("note = %q, want the rejected marker quoting the action's wording", comments[0])
+	}
+}
+
+func TestOkToTestRefusal(t *testing.T) {
+	const app = testHiveAppBotLogin
+	for _, tc := range []struct {
+		name, body, login, want string
+	}{
+		{name: "Prow trigger plugin, @App", body: "@" + app + ": Cannot trigger testing until a trusted user reviews the PR and leaves an `/ok-to-test` message.", login: app, want: prowOkToTestRejection},
+		{name: "Prow wording without @App is someone else's", body: app + ": Cannot trigger testing until a trusted user reviews the PR", login: app},
+		{name: "prow-github-actions, bare login", body: "Cannot /ok-to-test because Error: " + app + " is not a reviewer or approver for any changed file", login: app, want: prowActionsOkToTestRefusal + "…"},
+		{name: "prow-github-actions, login case differs", body: "Cannot /ok-to-test because Error: " + strings.ToUpper(app) + " is not a org member or collaborator", login: app, want: prowActionsOkToTestRefusal + "…"},
+		{name: "prow-github-actions refusing another commenter", body: "Cannot /ok-to-test because Error: karibhou is not a reviewer or approver for any changed file", login: app},
+		{name: "a different command's refusal", body: "Cannot /lgtm because Error: " + app + " is not a reviewer or approver for any changed file", login: app},
+		{name: "the wording quoted mid-comment is not the action's reply", body: "FYI the bot said: Cannot /ok-to-test because Error: " + app + " is not a reviewer", login: app},
+		{name: "unknown App login keeps Prow's lenient match", body: "Cannot /ok-to-test because Error: someone is not a reviewer", want: prowActionsOkToTestRefusal + "…"},
+		{name: "unrelated comment", body: "/ok-to-test", login: app},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := okToTestRefusal(tc.body, tc.login); got != tc.want {
+				t.Fatalf("okToTestRefusal(%q) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
 // The needs-human note is posted once per PR, even across a restart: a
 // thread that already carries it gets nothing new.
 func TestTrySweepSelfAuthoredPRProwRejectionNoteIsOncePerPR(t *testing.T) {
@@ -565,7 +747,7 @@ func TestTrySweepSelfAuthoredPRProwRejectionNoteIsOncePerPR(t *testing.T) {
 		p.existingComments = &[]map[string]any{
 			appComment(1, workflowApprovalCommandBody("oldhead")),
 			prowComment(2, "@"+testHiveAppBotLogin+": Cannot trigger testing until a trusted user reviews the PR and leaves an `/ok-to-test` message."),
-			appComment(3, workflowApprovalUntrustedNote(testHiveAppBotLogin, true)),
+			appComment(3, workflowApprovalUntrustedNote(testHiveAppBotLogin, prowOkToTestRejection)),
 		}
 	})
 	var merged []int
@@ -734,5 +916,32 @@ func TestWorkflowApprovalUntrustedReasonParksAtNeedsDecision(t *testing.T) {
 	cause := decisionCause(reason)
 	if !strings.Contains(cause, "Prow") || !strings.Contains(cause, workflowApprovalCommand) || !strings.Contains(cause, oktotest.WorkflowPath) {
 		t.Fatalf("decisionCause(%q) = %q, want Prow, the command and the workflow path named", reason, cause)
+	}
+}
+
+func TestWorkflowApprovalAttentionSkipsCommandInReadOnlyEligibilityProbe(t *testing.T) {
+	var comments []string
+	pr := missingRequiredPR(func(p *selfAuthoredPR) {
+		p.workflowRuns = []map[string]any{heldRun(1, "acme/widget")}
+		p.commentBodies = &comments
+	})
+	var merged []int
+	api := newSelfAuthoredAutoMergeAPI(t, []selfAuthoredPR{pr}, &merged)
+	defer api.Close()
+	c := newAutoMergeSweepClient(api.URL)
+
+	probeCtx := context.WithValue(context.Background(), integrationEligibilityContextKey{}, &integrationEligibilityCapture{})
+	want := workflowApprovalRequiredPrefix + "ci/build"
+	if got := c.workflowApprovalAttention(probeCtx, "widget", "acme", "widget", 23, "sha23", "ci/build", 1); got != want {
+		t.Fatalf("probe reason = %q, want %q", got, want)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("probe posted comments %q, want none", comments)
+	}
+	if got := c.workflowApprovalAttention(context.Background(), "widget", "acme", "widget", 23, "sha23", "ci/build", 1); got != want {
+		t.Fatalf("live reason = %q, want %q", got, want)
+	}
+	if len(comments) != 1 || comments[0] != workflowApprovalCommandBody("sha23") {
+		t.Fatalf("live comments = %q, want one command after the probe", comments)
 	}
 }

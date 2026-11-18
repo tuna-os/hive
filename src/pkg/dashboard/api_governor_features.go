@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/retro"
@@ -153,6 +154,19 @@ func (s *Server) handleGovernorFeatures(w http.ResponseWriter, r *http.Request) 
 		ClaimsMaxTTLS         *int `json:"claimsMaxTtlS"`
 
 		PRFollowUpEnabled *bool `json:"prFollowUpEnabled"`
+
+		// #18742: customers.enabled, the one switch for the Customers
+		// section. Read at boot, so a change applies on the next restart.
+		CustomersEnabled *bool `json:"customersEnabled"`
+		// #18742: customers.inference.enabled, goal and satisfaction
+		// suggestions made with a model. Default off.
+		CustomersInferenceEnabled *bool `json:"customersInferenceEnabled"`
+		// customers.avatars.enabled: GitHub profile pictures on the
+		// Customers list. Default on.
+		CustomersAvatarsEnabled *bool `json:"customersAvatarsEnabled"`
+		// #18884: customers.mention_search.enabled, the budgeted GitHub
+		// search made when a suggested person is accepted. Default off.
+		CustomersSearchEnabled *bool `json:"customersSearchEnabled"`
 
 		AutonomyAutoPromote  *bool   `json:"autonomyAutoPromote"`
 		AutonomyAutoDemote   *bool   `json:"autonomyAutoDemote"`
@@ -487,6 +501,22 @@ func (s *Server) handleGovernorFeatures(w http.ResponseWriter, r *http.Request) 
 	if body.ClaimsEnabled != nil {
 		cfg.Governor.Claims.Enabled = *body.ClaimsEnabled
 	}
+	if body.CustomersEnabled != nil {
+		on := *body.CustomersEnabled
+		cfg.Customers.Enabled = &on
+	}
+	if body.CustomersInferenceEnabled != nil {
+		on := *body.CustomersInferenceEnabled
+		cfg.Customers.Inference.Enabled = &on
+	}
+	if body.CustomersAvatarsEnabled != nil {
+		on := *body.CustomersAvatarsEnabled
+		cfg.Customers.Avatars.Enabled = &on
+	}
+	if body.CustomersSearchEnabled != nil {
+		on := *body.CustomersSearchEnabled
+		cfg.Customers.MentionSearch.Enabled = &on
+	}
 	if claimsTTLsChanged {
 		applyClaimsTTLs(&cfg.Governor.Claims, body.ClaimsTTLS, body.ClaimsHumanTTLS, body.ClaimsAgentTTLS, body.ClaimsContributorTTLS, body.ClaimsMaxTTLS)
 		// Live claims keep their expiry; claims made or renewed from now on
@@ -724,6 +754,9 @@ func (s *Server) featuresLinkedView() map[string]interface{} {
 // which is what the governor config GET serves.
 func (s *Server) featuresSectionWithLinked(cfg *config.Config) map[string]interface{} {
 	out := featuresSectionResponse(cfg)
+	for k, v := range s.featuresBenchmarksResponse(cfg) {
+		out[k] = v
+	}
 	for k, v := range s.featuresLinkedView() {
 		out[k] = v
 	}
@@ -789,6 +822,14 @@ func featuresSectionResponse(cfg *config.Config) map[string]interface{} {
 		"claimsTtlS":                          int(cfg.Governor.Claims.EffectiveTTL().Seconds()),
 		"prFollowUpEnabled":                   cfg.Turn.PRFollowUp.Enabled,
 		"prFollowUpEffective":                 cfg.PRFollowUpResumeEnabled(),
+		"customersEnabled":                    cfg.Customers.IsEnabled(),
+		"customersEffective":                  cfg.CustomersEnabled(),
+		"customersInference":                  cfg.Customers.Inference.IsEnabled(),
+		"customersInferenceEffective":         cfg.CustomersInferenceEnabled(),
+		"customersAvatars":                    cfg.Customers.Avatars.IsEnabled(),
+		"customersAvatarsEffective":           cfg.CustomersAvatarsEnabled(),
+		"customersSearch":                     cfg.Customers.MentionSearch.IsEnabled(),
+		"customersSearchEffective":            cfg.CustomersMentionSearchEnabled(),
 		"publicationEnabled":                  cfg.Publication.Enabled,
 		"publicationPrivateChannel":           cfg.Publication.PrivateChannel,
 		"publicationOwner":                    cfg.Publication.Owner,
@@ -981,9 +1022,11 @@ func (s *Server) handleGovernorAdvisoryPut(w http.ResponseWriter, r *http.Reques
 		StalenessDays     *int                              `json:"staleness_days"`
 		PRAutoClose       *bool                             `json:"pr_autoclose"`
 		UpdateIntervalS   *int                              `json:"update_interval_s"`
+		DigestMinInterval *string                           `json:"digest_min_interval"`
 		PostRetryBackoffS *int                              `json:"post_retry_backoff_s"`
 		Target            *string                           `json:"target"`
 		LinearIssue       *string                           `json:"linear_issue"`
+		PerRepo           *bool                             `json:"per_repo"`
 		QueueHealth       *config.AdvisoryQueueHealthConfig `json:"queue_health"`
 	}
 	if err := decodeBody(r, &body); err != nil {
@@ -1020,6 +1063,19 @@ func (s *Server) handleGovernorAdvisoryPut(w http.ResponseWriter, r *http.Reques
 		jsonError(w, fmt.Sprintf("update_interval_s must be 0 (default cadence) or between %d and %d seconds",
 			config.MinAdvisoryUpdateIntervalS, config.MaxAdvisoryUpdateIntervalS), http.StatusBadRequest)
 		return
+	}
+	// digest_min_interval (hivecommons/hive#17435) is a Go duration; empty
+	// restores the 1h default and "0" disables the floor, so only the shape
+	// is validated here.
+	if body.DigestMinInterval != nil {
+		v := strings.TrimSpace(*body.DigestMinInterval)
+		if v != "" {
+			if _, err := time.ParseDuration(v); err != nil {
+				jsonError(w, "digest_min_interval must be a Go duration such as 1h or 30m (empty restores the 1h default, 0 disables)", http.StatusBadRequest)
+				return
+			}
+		}
+		body.DigestMinInterval = &v
 	}
 	if body.QueueHealth != nil {
 		qh := body.QueueHealth
@@ -1076,17 +1132,29 @@ func (s *Server) handleGovernorAdvisoryPut(w http.ResponseWriter, r *http.Reques
 	if body.UpdateIntervalS != nil {
 		cfg.Governor.Advisory.UpdateIntervalS = *body.UpdateIntervalS
 	}
+	if body.DigestMinInterval != nil {
+		cfg.Governor.Advisory.DigestMinInterval = *body.DigestMinInterval
+	}
 	if body.PostRetryBackoffS != nil {
 		cfg.Governor.Advisory.PostRetryBackoffS = *body.PostRetryBackoffS
 	}
 	if body.QueueHealth != nil {
 		cfg.Governor.Advisory.QueueHealth = *body.QueueHealth
 	}
+	// per_repo (#18448) decides whether every monitored repo gets its own
+	// advisory report, so its before/after goes into the audit detail.
+	auditKV := []string{"section", "advisory"}
+	if body.PerRepo != nil {
+		before := cfg.Governor.Advisory.PerRepoEnabled()
+		v := *body.PerRepo
+		cfg.Governor.Advisory.PerRepo = &v
+		auditKV = append(auditKV, "per_repo", fmt.Sprintf("%t->%t", before, v))
+	}
 
 	if err := s.saveConfig(); err != nil {
 		s.logger.Error("failed to persist config after advisory update", "error", err)
 	}
-	s.auditFromRequest(r, "config_governor_advisory", auditDetail("section", "advisory"), "")
+	s.auditFromRequest(r, "config_governor_advisory", auditDetail(auditKV...), "")
 	s.refreshAndPersist()
 	jsonResponse(w, advisorySectionResponse(cfg))
 }
@@ -1102,6 +1170,7 @@ func advisorySectionResponse(cfg *config.Config) map[string]interface{} {
 		"staleness_days":       a.StalenessDays,
 		"pr_autoclose":         a.PRAutoCloseEnabled(),
 		"update_interval_s":    a.UpdateIntervalS,
+		"digest_min_interval":  a.DigestMinInterval,
 		"post_retry_backoff_s": a.PostRetryBackoffS,
 		"queue_health": map[string]interface{}{
 			"blocked_pr_pct":        a.QueueHealth.BlockedPRPct,
@@ -1113,6 +1182,7 @@ func advisorySectionResponse(cfg *config.Config) map[string]interface{} {
 		},
 		"target":       a.ResolvedTarget(),
 		"linear_issue": a.LinearIssue,
+		"per_repo":     a.PerRepoEnabled(),
 	}
 }
 

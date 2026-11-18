@@ -6,6 +6,15 @@ open advisory beads of every agent into a single **advisory digest** and posts i
 as a pinned comment on the advisory issue of the primary repo, rewriting the same
 comment each cycle so a repo owner has exactly one place to look.
 
+A hive that manages several repos still keeps exactly **one** advisory report,
+in `project.primary_repo` (or the first repo in `project.repos` when no primary
+is set). By default no other repo in `project.repos` gets an advisory issue or a
+digest comment. The report is found by its title and the `hive/advisory` label
+before anything is created, so a restart reuses the open report instead of
+filing a new one ([#18568](https://github.com/hivecommons/hive/issues/18568)).
+An owner who wants a report in every repo can opt in; see
+[One report, or one per repo](#one-report-or-one-per-repo).
+
 Everything on this page lives under `governor.advisory` in `hive.yaml`, and every
 setting is also editable from **Governor Config → Advisory** in the dashboard
 (owner role required).
@@ -18,9 +27,42 @@ governor:
     staleness_days: 7
     pr_autoclose: true
     update_interval_s: 0  # 0 = default (~60s cycle); 30–3600 to slow the refresh
+    digest_min_interval: 1h  # a CHANGED digest is rewritten at most this often; 0 = every changed cycle
     target: github        # github (default) | linear
     linear_issue: ""      # required when target is linear, e.g. ONB-123
+    per_repo: false       # true = every monitored repo also gets its own report
 ```
+
+## One report, or one per repo
+
+`governor.advisory.per_repo` (Settings, **Governor Config → Advisory**,
+"Advisory report in every repo"; default **off**) decides whether a multi-repo
+hive files one report or one per repo
+([#18448](https://github.com/hivecommons/hive/issues/18448)).
+
+- **Off** (default): one Hive Advisory Report in your primary repo covers all
+  repos. Nothing is created in any other repo.
+- **On**: each monitored repo also gets its own report, with the same digest
+  posted to it. Each repo gets exactly one: before creating anything the hive
+  looks for an existing report by its title together with the `hive/advisory`
+  label or the `<!-- hive:advisory-report -->` marker in its body, open or
+  closed, so a restart never files a second one. A repo added in Settings gets
+  its report on the next eval cycle.
+- **A closed report stays closed.** If someone closes a repo's report, the hive
+  stops posting to it and never reopens it or files a replacement, on this run
+  or after a restart. (The primary repo's report is different: it is reopened
+  when closed, because it is the hive's one place to look.)
+- **Repos the hive cannot write to are skipped.** A repo with Issues disabled,
+  or where the hive's GitHub App has no write access, is logged once and shown
+  as a dashboard warning; the hive checks it again at most hourly rather than
+  every cycle, and the other repos are not affected.
+- **Turning it off** stops updating the per-repo reports. They are not closed
+  or deleted; close them by hand if you no longer want them.
+
+When `per_repo` is absent from `hive.yaml`, the `HIVE_ADVISORY_PER_REPO`
+environment variable (`true` / `false`) sets the default. An explicit value in
+`hive.yaml`, or a change in Settings, always wins. Every change made in Settings
+is recorded in the audit log.
 
 ## Keeping findings current
 
@@ -289,10 +331,17 @@ quietly:
   post error naming the remedy: enable Issues in the repo's **Settings >
   General > Features**, or point the hive at the upstream repo. This is not an
   App-permission problem; the App banner stays down.
-- **Someone closed the pinned issue.** The hive reopens the existing issue rather
+- **Someone closed the pinned issue.** When a bot (or the hive itself) closed it,
+  or GitHub does not say who did, the hive reopens the existing issue rather
   than filing a new one. Filing a new one splits the digest: the hive writes to
   the new issue while everyone subscribed to the old one watches a comment that
-  never changes again — which looks exactly like a wedged digest. If a repo
+  never changes again — which looks exactly like a wedged digest. When a
+  **person** closed it, that is a decision: the hive leaves it closed and files
+  a new advisory issue that opens with "This replaces #N, which X closed…",
+  says the hive does not reopen an issue a person closed, and names
+  `advisory.target: linear` (with `advisory.linear_issue`) as the way to keep
+  the digest off GitHub. To go back to the old issue, reopen it and close the
+  new one. If a repo
   already has several `🐝 Hive Advisory Report` issues from before this behavior,
   close the stale duplicates and keep the one the hive is currently updating (the
   one with the newest digest comment).
@@ -362,6 +411,23 @@ Details worth knowing:
   stalled digest.
 - Values outside the band are rejected by the dashboard API and clamped (with
   a one-time warning in the hive log) when hand-edited into `hive.yaml`.
+
+### One comment, rewritten at most hourly
+
+The digest lives in exactly one comment per advisory issue, anchored by an
+`<!-- hive:advisory-digest updates=N -->` marker and closed by an
+`Updated N times · last <timestamp>` footer; the counter is read back from the
+comment itself, so it continues across restarts. `update_interval_s` paces how
+often the hive *checks*; `governor.advisory.digest_min_interval` (default `1h`,
+**Settings → Advisory → Rewrite floor for a changed digest**) bounds how often
+a *changed* body is actually written. Live counts in the Advice block drift on
+every eval cycle, which used to rewrite the comment every ~5 minutes; now the
+first change after the window is written and later drift waits for the next
+window. An unchanged digest never writes. The baseline is the comment's own
+`updated_at` on GitHub, so a restarted governor never reposts inside the
+window; `0` disables the floor. The governor log line
+`advisory digest comment written` marks the cycles that really reached GitHub
+(`posted advisory digest` is logged for every healthy cycle, skipped or not).
 
 ## Where the digest is posted
 

@@ -316,6 +316,39 @@ func TestRequeueFailedDispatchBacksOff(t *testing.T) {
 	}
 }
 
+// A dispatch the relay never started because it was not free (busy, or
+// polling another hive) goes back like a failed one but keeps its attempt
+// count (projectbluefin/utah-packages#972: one such refusal booked
+// attempts=1 toward the relay hand-off).
+func TestReturnKeepsAttempts(t *testing.T) {
+	c := newClock()
+	s := newSched(c)
+	s.Enqueue("ida", red(1, time.Hour, c))
+	d := s.Dispatch("ida", Capacity{Max: 1})
+	if d == nil {
+		t.Fatal("no dispatch")
+	}
+	if s.Return("ida", "nope", time.Minute) != nil || s.Return("zed", d.ID, time.Minute) != nil {
+		t.Fatal("unknown dispatch returned")
+	}
+	got := s.Return("ida", d.ID, time.Minute)
+	if len(got) != 1 || got[0].Attempts != 0 || !got[0].NotBefore.Equal(c.at.Add(time.Minute)) {
+		t.Fatalf("returned = %+v, want Attempts 0 and the backoff", got)
+	}
+	if st := s.Status("ida", Capacity{Max: 1}); st.Queued != 1 || st.InFlight != 0 {
+		t.Fatalf("status after return = %+v", st)
+	}
+	// A real failure after the refusal is still counted from zero.
+	c.advance(time.Minute)
+	d2 := s.Dispatch("ida", Capacity{Max: 1})
+	if d2 == nil {
+		t.Fatal("no retry after the backoff")
+	}
+	if got := s.Requeue("ida", d2.ID, time.Minute); len(got) != 1 || got[0].Attempts != 1 {
+		t.Fatalf("requeue after a return = %+v, want Attempts 1", got)
+	}
+}
+
 func TestCompleteDispatchAndPartialRemove(t *testing.T) {
 	c := newClock()
 	s := newSched(c)
@@ -399,5 +432,86 @@ func TestCapacityHelpers(t *testing.T) {
 	}
 	if (Item{Repo: "a/b", Number: 1}).Key() != "a/b#1" {
 		t.Fatal("item key")
+	}
+}
+
+// A dispatch remembers when it left the queue (hivecommons/hive#15280: the
+// stage tracker says "clanker picked up the rework 5 min ago" from it).
+func TestDispatchAt(t *testing.T) {
+	c := newClock()
+	s := newSched(c)
+	s.Enqueue("ida", red(1, time.Hour, c))
+	c.advance(7 * time.Minute)
+	d := s.Dispatch("ida", Capacity{Max: 1})
+	if d == nil || !d.At.Equal(c.at) {
+		t.Fatalf("dispatch=%+v, want At=%v", d, c.at)
+	}
+	c.advance(time.Minute)
+	if got := s.InFlight("ida"); len(got) != 1 || !got[0].At.Equal(c.at.Add(-time.Minute)) {
+		t.Fatalf("inflight=%+v", got)
+	}
+}
+
+// Next previews exactly what Dispatch / DispatchAtBoundary would hand out,
+// coalesced siblings included, and takes nothing; it is nil whenever they
+// would return nil.
+func TestNextPreviewsDispatchWithoutTakingIt(t *testing.T) {
+	c := newClock()
+	s := newSched(c)
+	cap := Capacity{Max: 1}
+	if got := s.Next("alice", cap, false); got != nil {
+		t.Fatalf("empty queue: Next = %v, want nil", keys(got))
+	}
+	shared := Cause{Check: "lint", Signature: "gofmt"}
+	a, b, other := red(1, 3*time.Hour, c), red(2, 2*time.Hour, c), red(3, time.Hour, c)
+	a.Cause, b.Cause = shared, shared
+	for _, it := range []Item{a, b, other} {
+		s.Enqueue("alice", it)
+	}
+	next := s.Next("alice", cap, false)
+	if !eq(keys(next), []int{1, 2}) {
+		t.Fatalf("Next = %v, want the head and its coalesced sibling [1 2]", keys(next))
+	}
+	if st := s.Status("alice", cap); st.Queued != 3 || st.InFlight != 0 {
+		t.Fatalf("Next must not take anything: %+v", st)
+	}
+	d := s.Dispatch("alice", cap)
+	if d == nil || !eq(keys(d.Items), keys(next)) {
+		t.Fatalf("Dispatch = %+v, want what Next previewed %v", d, keys(next))
+	}
+	// A preemption is in flight and capacity 1 is used: both previews are nil.
+	if got := s.Next("alice", cap, false); got != nil {
+		t.Fatalf("preemption in flight: Next = %v, want nil", keys(got))
+	}
+	if got := s.Next("alice", cap, true); got != nil {
+		t.Fatalf("boundary with the only slot busy: Next = %v, want nil", keys(got))
+	}
+	if got := s.Next("alice", Capacity{Max: 2}, true); !eq(keys(got), []int{3}) {
+		t.Fatalf("boundary with a free slot: Next = %v, want [3]", keys(got))
+	}
+}
+
+// Release puts an in-flight dispatch back without an attempt or a backoff:
+// the relay never reported on it, so the PR is immediately dispatchable.
+func TestReleaseReturnsDispatchWithoutAttempt(t *testing.T) {
+	c := newClock()
+	s := newSched(c)
+	s.Enqueue("ida", red(1, time.Hour, c))
+	d := s.Dispatch("ida", Capacity{Max: 1})
+	if d == nil {
+		t.Fatal("dispatch expected")
+	}
+	if s.Release("ida", "nope") != nil || s.Release("zed", d.ID) != nil {
+		t.Fatal("unknown dispatch released")
+	}
+	got := s.Release("ida", d.ID)
+	if len(got) != 1 || got[0].Attempts != 0 || !got[0].NotBefore.IsZero() {
+		t.Fatalf("released = %+v", got)
+	}
+	if st := s.Status("ida", Capacity{Max: 1}); st.Queued != 1 || st.InFlight != 0 || st.FocusUntil != nil {
+		t.Fatalf("status after release = %+v", st)
+	}
+	if s.Dispatch("ida", Capacity{Max: 1}) == nil {
+		t.Fatal("released item must be dispatchable at once")
 	}
 }

@@ -91,6 +91,21 @@ const (
 	// and records per-connection standby availability. Purely additive: relays
 	// that never advertise or send standby frames see today's traffic.
 	capStandbyV1 = "standby_v1"
+	// capQuotaHoldV1: the hub accepts quota_hold messages (State "held" or
+	// "released") telling it the relay's quota guard has started or stopped
+	// withholding `ready`. A held connection does not count as contributor-first
+	// cover (RoleCoverage). Purely additive: a relay that never sends it is
+	// read as not held, exactly as before, and a relay only sends it to a hub
+	// that advertises this token.
+	capQuotaHoldV1 = "quota_hold_v1"
+	// capBusyElsewhereV1: the hub accepts busy_elsewhere messages (State
+	// "busy" or "clear") telling it the relay is working ANOTHER hive's task.
+	// A relay subscribed to several hives works one task at a time, so while
+	// it is busy elsewhere it does not count as contributor-first cover here
+	// (RoleCoverage). Purely additive: a relay that never sends it is read as
+	// not busy elsewhere, exactly as before, and a relay only sends it to a hub
+	// that advertises this token.
+	capBusyElsewhereV1 = "busy_elsewhere_v1"
 
 	// capRunStage: the relay can receive stage-scoped run assignments. Unlike
 	// plain task metadata, a stage is load-bearing for per-stage generations, so
@@ -144,6 +159,8 @@ func serverCapabilities() []string {
 		capExtExecClaudeManagedAgents,
 		capFixPRInterrupt,
 		capRepoScope,
+		capQuotaHoldV1,
+		capBusyElsewhereV1,
 	}
 }
 

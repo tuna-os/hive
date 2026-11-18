@@ -47,6 +47,30 @@ func repoHoldResult(repoFull string, number int, itemType string, held bool, lab
 		Next: "The hive picks it up on its next pass."}
 }
 
+// repoHoldCoveringPR is the open covering PR that carries the hold an
+// issue row shows (the row draws it, so its gate pill reads the PR's hold),
+// or 0. A release on the issue removes nothing there
+// (hivecommons/hive#17564).
+func repoHoldCoveringPR(it StageTrackerItem) int {
+	for _, lp := range it.LinkedPRs {
+		if lp.State == "closed" || (lp.DrawnUnder != 0 && lp.DrawnUnder != it.Number) {
+			continue
+		}
+		if lp.Hold != nil || slices.Contains(lp.Modifiers, modHold) {
+			return lp.Number
+		}
+	}
+	return 0
+}
+
+// repoHoldElsewhereResult answers a release that removed nothing from an
+// issue whose covering PR carries the hold: no effect, naming the PR.
+func repoHoldElsewhereResult(repoFull string, number, pr int) *RowActionResult {
+	return &RowActionResult{Action: rowActionNoEffect, Target: rowActionTarget(repoFull, rowActionTargetIssue, number),
+		Outcome: "Nothing to release on #" + strconv.Itoa(number) + " — the hold is on #" + strconv.Itoa(pr) + ".",
+		Next:    "Release the hold on PR #" + strconv.Itoa(pr) + "."}
+}
+
 type repoHoldPermissionCacheEntry struct {
 	allowed bool
 	at      time.Time
@@ -631,6 +655,25 @@ func (s *Server) handleRepoHoldPermission(w http.ResponseWriter, r *http.Request
 	jsonResponse(w, map[string]any{"ok": true, "allowed": allowed})
 }
 
+// repoHoldDependencyStatus is the status a hold toggle answers when GitHub
+// (or the missing GitHub client) is what failed. It is deliberately not 502
+// or 503: the Ingress in front of a hosted hive intercepts both
+// (custom-http-errors "502,503", saas_provision.go) and replaces the body
+// with the generic "hive unavailable" page, which is how a GitHub 422 on
+// the hold label read as "the hive is down" (hivecommons/hive#17037). 424
+// passes through with the GitHub error the operator can act on.
+const repoHoldDependencyStatus = http.StatusFailedDependency
+
+// repoHoldGitHubError answers a hold toggle whose GitHub step failed with
+// the step and GitHub's reason, and logs the same so the spoke's log names
+// the failure the dashboard shows.
+func (s *Server) repoHoldGitHubError(w http.ResponseWriter, step, repoFull string, number int, label string, err error) {
+	if s.logger != nil {
+		s.logger.Warn("repo item hold: GitHub "+step+" failed", "repo", repoFull, "number", number, "label", label, "error", err)
+	}
+	jsonError(w, "GitHub "+step+" failed: "+err.Error(), repoHoldDependencyStatus)
+}
+
 func (s *Server) handleRepoItemHold(w http.ResponseWriter, r *http.Request) {
 	owner, repoName, number, ok := s.parseRepoItemPath(w, r)
 	if !ok {
@@ -642,7 +685,7 @@ func (s *Server) handleRepoItemHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.deps == nil || s.deps.GHClient == nil {
-		jsonError(w, "GitHub client not configured", http.StatusServiceUnavailable)
+		jsonError(w, "GitHub client not configured", repoHoldDependencyStatus)
 		return
 	}
 	var body repoHoldRequest
@@ -659,24 +702,24 @@ func (s *Server) handleRepoItemHold(w http.ResponseWriter, r *http.Request) {
 	var removed []string
 	if body.Held {
 		if err := s.deps.GHClient.EnsureIssueLabel(ctx, repoFull, canonical, "8250df", "Hive dashboard hold: agents will not act on this item until an operator removes this label."); err != nil {
-			jsonError(w, err.Error(), http.StatusBadGateway)
+			s.repoHoldGitHubError(w, "ensure hold label", repoFull, number, canonical, err)
 			return
 		}
 		if err := s.deps.GHClient.AddLabels(ctx, repoFull, number, []string{canonical}); err != nil {
-			jsonError(w, err.Error(), http.StatusBadGateway)
+			s.repoHoldGitHubError(w, "add hold label", repoFull, number, canonical, err)
 			return
 		}
 		s.auditFromRequest(r, "repo_item_hold_add", auditDetail("repo", repoFull, "number", strconv.Itoa(number), "label", canonical), "")
 	} else {
 		labels, err := s.currentItemLabels(ctx, owner, repoName, number)
 		if err != nil {
-			jsonError(w, err.Error(), http.StatusBadGateway)
+			s.repoHoldGitHubError(w, "read labels", repoFull, number, canonical, err)
 			return
 		}
 		removed = holdCausingLabels(labels, canonical)
 		for _, label := range removed {
 			if err := s.deps.GHClient.RemoveLabel(ctx, repoFull, number, label); err != nil {
-				jsonError(w, err.Error(), http.StatusBadGateway)
+				s.repoHoldGitHubError(w, "remove hold label", repoFull, number, label, err)
 				return
 			}
 		}
@@ -687,6 +730,14 @@ func (s *Server) handleRepoItemHold(w http.ResponseWriter, r *http.Request) {
 		itemType = "issue"
 	}
 	minStatusSeq := s.applyRepoHoldToStatus(repoFull, number, itemType, body.Held, canonical, removed)
+	result := repoHoldResult(repoFull, number, itemType, body.Held, canonical, removed)
+	if !body.Held && len(removed) == 0 && itemType == rowActionTargetIssue {
+		if it, ok := s.stageTrackerItemFor(repoFull, number); ok {
+			if pr := repoHoldCoveringPR(it); pr > 0 {
+				result = repoHoldElsewhereResult(repoFull, number, pr)
+			}
+		}
+	}
 	jsonResponse(w, repoHoldResponse{
 		OK:           true,
 		Repo:         repoFull,
@@ -695,6 +746,6 @@ func (s *Server) handleRepoItemHold(w http.ResponseWriter, r *http.Request) {
 		HoldLabel:    canonical,
 		Removed:      removed,
 		MinStatusSeq: minStatusSeq,
-		Result:       repoHoldResult(repoFull, number, itemType, body.Held, canonical, removed),
+		Result:       result,
 	})
 }

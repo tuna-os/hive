@@ -8,6 +8,7 @@ import (
 
 	"github.com/hivecommons/hive/pkg/config"
 	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
 // webhookTrackerRefresh is the activity-monitor half of a GitHub webhook
@@ -251,6 +252,13 @@ func (s *Server) scheduleWebhookTrackerRefresh(res github.WebhookEventResult, de
 	if !s.webhookTrackerRefreshEnabled() {
 		return 0
 	}
+	if res.CIEvidence != nil && res.CIEvidence.Applied > 0 {
+		// The payload itself moved the row's CI evidence
+		// (hivecommons/hive#16521); the PR object did not change, so the
+		// re-read would only spend a request to confirm labels and title.
+		s.invalidateStageTrackerForWebhook()
+		return 0
+	}
 	keys := webhookTrackerKeys(res)
 	if len(keys) == 0 {
 		return 0
@@ -258,6 +266,17 @@ func (s *Server) scheduleWebhookTrackerRefresh(res github.WebhookEventResult, de
 	s.invalidateStageTrackerForWebhook()
 	s.trackerRefresher().enqueue(keys, deliveryID)
 	return len(keys)
+}
+
+// RefreshCIEvidence is the github.CIEvidenceHook: a check delivery or a
+// coalesced check-run re-read changed the CI evidence for repo's head, so
+// the tracker payload is dropped and the page nudged over SSE; the next GET
+// re-derives the row's counts from the merged evidence.
+func (s *Server) RefreshCIEvidence(repo, head string) {
+	if s == nil {
+		return
+	}
+	s.invalidateStageTrackerForWebhook()
 }
 
 // selfEditDeliveryID tags the re-reads the hive's own GitHub edits ask for,
@@ -281,6 +300,32 @@ func (s *Server) RefreshSelfEditedItem(repo string, number int, isPR bool) {
 		return
 	}
 	s.trackerRefresher().enqueue([]trackerRefreshKey{{repo: repo, number: number, pr: isPR}}, selfEditDeliveryID)
+}
+
+// selfMergeDeliveryID tags the snapshot patch a hive-performed merge
+// applies the moment the merge call returns (hivecommons/hive#15808).
+const selfMergeDeliveryID = "self:merge"
+
+// noteMergeAttempt is the merge-attempt registry's change hook
+// (github.MergeAttempts.SetOnChange). Every change nudges open tabs so the
+// row reads "Merging" within one SPA poll instead of waiting for the next
+// enumerate; a merge that landed also patches the cached snapshot the way
+// a webhook `closed` read would — the row leaves as merged and the merged
+// ledger records it — so the celebration does not depend on the webhook
+// arriving, whichever lane (self-authored, trusted-author, contributor,
+// relay, dashboard) performed the merge (hivecommons/hive#15808).
+func (s *Server) noteMergeAttempt(a github.MergeAttempt) {
+	if s == nil {
+		return
+	}
+	if a.Merged && !a.EndedAt.IsZero() {
+		snap := github.WebhookItemSnapshot{Repo: a.Repo, Number: a.Number, IsPR: true, State: "closed", Merged: true,
+			MergedByHive: true, MergedAt: a.EndedAt, UpdatedAt: a.EndedAt, HeadSHA: a.Head, FetchedAt: a.EndedAt, DeliveryID: selfMergeDeliveryID}
+		if s.applyWebhookItemSnapshots([]github.WebhookItemSnapshot{snap}) > 0 {
+			return
+		}
+	}
+	s.invalidateStageTrackerForWebhook()
 }
 
 // evictClosedWebhookItem applies the one payload fact the tracker trusts
@@ -352,6 +397,9 @@ func (s *Server) applyWebhookItemSnapshots(snaps []github.WebhookItemSnapshot) i
 		return 0
 	}
 	s.recordMergedSnapshots(snaps)
+	s.forgetClosedSnapshots(snaps)
+	s.noteClosedSnapshots(snaps)
+	s.notePushedSnapshots(snaps)
 	if s.deps != nil && s.deps.ApplyWebhookItems != nil {
 		s.deps.ApplyWebhookItems(snaps)
 	}
@@ -402,6 +450,28 @@ func (s *Server) applyWebhookItemSnapshots(snaps []github.WebhookItemSnapshot) i
 		s.invalidateStageTrackerForWebhook()
 	}
 	return changed
+}
+
+// notePushedSnapshots books the head each open PR re-read reports on its
+// stage record (stagelabels.Store.NotePush) so a `pull_request` synchronize
+// delivery shows as "pushed abc1234" on the activity monitor at once, ahead
+// of the enumerate that re-stages the PR (hivecommons/hive#15784). Reads
+// whose head the store already knows change nothing; the store decides.
+func (s *Server) notePushedSnapshots(snaps []github.WebhookItemSnapshot) int {
+	store := s.stageStoreOrShared()
+	if store == nil {
+		return 0
+	}
+	booked := 0
+	for _, snap := range snaps {
+		if !snap.IsPR || !snap.Open() || snap.HeadSHA == "" {
+			continue
+		}
+		if store.NotePush(stagelabels.Key(snap.Repo, snap.Number), snap.HeadSHA, snap.FetchedAt) {
+			booked++
+		}
+	}
+	return booked
 }
 
 // snapshotOlderThanListed reports whether the listed copy of the snapshot's
@@ -753,6 +823,9 @@ func patchWorkPRAny(raw any, snap github.WebhookItemSnapshot) (any, bool) {
 	w.Title = snap.Title
 	w.Labels = append([]string(nil), snap.Labels...)
 	w.Draft = snap.Draft
+	if snap.HeadSHA != "" {
+		w.HeadSHA = snap.HeadSHA
+	}
 	if !snap.UpdatedAt.IsZero() {
 		w.UpdatedAt = snap.UpdatedAt
 	}

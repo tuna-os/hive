@@ -250,6 +250,8 @@ func TestEnsureFleetReport_AuditedOnCommentWithRedactedFingerprint(t *testing.T)
 		switch {
 		case r.URL.Path == "/search/issues":
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{"number": 7}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/hivecommons/hive/issues/7/comments":
+			_ = json.NewEncoder(w).Encode([]any{})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/hivecommons/hive/issues/7/comments":
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
@@ -519,14 +521,16 @@ func TestReviewBacklog_FiledIssuesAndSummaryAudited(t *testing.T) {
 	}
 	c.ProcessReviewRequestsOnce(context.Background())
 
-	rec := assertTypedWrite(t, *recs, AuditActionReviewBacklogIssueFiled, "o/r", 101, 2)
-	for _, want := range []string{"pr=5", "perspective=correctness", "reused=false", "review_agent=reviewer"} {
+	// The two fixture findings share a perspective and collapse into one
+	// item, so one filed entry carrying findings=2 (hivecommons/hive#17065).
+	rec := assertTypedWrite(t, *recs, AuditActionReviewBacklogIssueFiled, "o/r", 101, 1)
+	for _, want := range []string{"pr=5", "perspective=correctness", "findings=2", "reused=false", "review_agent=reviewer"} {
 		if !strings.Contains(rec.Detail, want) {
 			t.Errorf("filed-issue detail %q missing %q", rec.Detail, want)
 		}
 	}
 	rec = assertTypedWrite(t, *recs, AuditActionReviewBacklogSummaryPosted, "o/r", 5, 1)
-	if !strings.Contains(rec.Detail, "issues=2") {
-		t.Errorf("summary detail %q missing issues=2", rec.Detail)
+	if !strings.Contains(rec.Detail, "issues=1") {
+		t.Errorf("summary detail %q missing issues=1", rec.Detail)
 	}
 }

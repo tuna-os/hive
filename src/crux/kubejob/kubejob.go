@@ -26,21 +26,16 @@
 package kubejob
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
+	"github.com/hivecommons/hive/crux/config"
 	"github.com/hivecommons/hive/crux/sandbox"
 )
 
@@ -66,6 +61,18 @@ const (
 	// DefaultPollInterval is how often the launcher re-reads the Job status.
 	DefaultPollInterval = 5 * time.Second
 
+	// DefaultKickTimeout is the sandbox kick timeout hive applies when none is
+	// configured; crux/agent's DefaultSandboxKickTimeout is this value.
+	DefaultKickTimeout = 45 * time.Minute
+
+	// DeadlineMargin is added to a kick's timeout to give the Job's
+	// activeDeadlineSeconds. Hive cancels a kick at its timeout and deletes
+	// the Job itself; the deadline is the cluster-side backstop for a Job
+	// hive lost track of (a restart mid-kick, a Job left Pending or
+	// Unschedulable), so it must land after hive's own timeout, never before
+	// (hivecommons/hive#18525).
+	DeadlineMargin = 15 * time.Minute
+
 	// requestTimeout bounds every single API call; the overall run is bounded
 	// by the caller's context (the sandbox kick timeout).
 	requestTimeout = 30 * time.Second
@@ -83,8 +90,12 @@ const (
 	jobLabelKey   = "job-name"
 	// managedByLabel marks Jobs this launcher created so an operator (or a
 	// future sweeper) can list them without guessing at name prefixes.
-	managedByLabel   = "app.kubernetes.io/managed-by"
-	managedByValue   = "hive-kubejob"
+	managedByLabel = "app.kubernetes.io/managed-by"
+	managedByValue = "hive-kubejob"
+	// jobLabel marks a Job's pods with the Job name so a per-Job
+	// NetworkPolicy can select them without relying on the controller's
+	// own job-name label, whose key changed across Kubernetes releases.
+	jobLabel         = "hive.kubestellar.io/job"
 	agentLabel       = "hive.kubestellar.io/agent"
 	namePrefix       = "hive-kick-"
 	restartNever     = "Never"
@@ -107,9 +118,10 @@ type Options struct {
 	// WorkspaceClaimMount is where that claim is mounted INSIDE THE HIVE POD
 	// (default /data). The Job's subPath is the workspace path relative to it.
 	WorkspaceClaimMount string
-	// NodeSelector, Tolerations, Resources, ServiceAccount are passed through
-	// to the pod template verbatim.
+	// NodeSelector, Affinity, Tolerations, Resources, ServiceAccount are passed
+	// through to the pod template verbatim.
 	NodeSelector   map[string]string
+	Affinity       *config.SandboxJobAffinity
 	Tolerations    []Toleration
 	Resources      Resources
 	ServiceAccount string
@@ -120,35 +132,79 @@ type Options struct {
 	// EnvFromSecrets are Secret names whose keys become environment variables
 	// in the Job. This is the ONLY credential path into the Job.
 	EnvFromSecrets []string
+	// ImagePullSecrets are Secret names added to the pod's imagePullSecrets
+	// alongside hive's own and the service account's (#18819). Names only.
+	ImagePullSecrets []string
 	// ExtraVolumes mounts additional claims (a compile cache, a model store).
 	ExtraVolumes []VolumeMount
 	// TTLSeconds is the Job's ttlSecondsAfterFinished (default one hour).
 	TTLSeconds int
+	// Network is NetworkDefault, NetworkNone or NetworkHost; empty is
+	// NetworkDefault so the agent sandbox, which needs the network, is
+	// unchanged. The contained-run backend sets NetworkNone by default.
+	Network string
 	// PollInterval overrides how often the Job status is read (tests).
 	PollInterval time.Duration
+	// RelayImage is the image of the init container that supplies hive's
+	// sandbox relays to a LaunchSpec with Relays set (#18512). Empty resolves
+	// the running hive image, by digest, from hive's own pod; RelayImageNone
+	// skips the relays.
+	RelayImage string
+	// RelayRunAsUser pins the relay init container's uid. Nil leaves it to
+	// the cluster on OpenShift and uses DefaultRelayRunAsUser elsewhere.
+	RelayRunAsUser *int64
+	// ActiveDeadlineSeconds is the Job's activeDeadlineSeconds. Non-positive
+	// derives it from the run's context deadline, else from
+	// DefaultKickTimeout; either way DeadlineMargin is added. Run uses
+	// whichever of this and the context-derived value is later, so the
+	// deadline never cuts a run short of the timeout hive gave it.
+	ActiveDeadlineSeconds int64
+	// Preflight, PreflightTimeout, PreflightTotalTimeout and
+	// PreflightRetryDelay configure the node preflight (#18811); see
+	// preflight.go. Preflight empty leaves the Job exactly as before.
+	Preflight             []string
+	PreflightTimeout      time.Duration
+	PreflightTotalTimeout time.Duration
+	PreflightRetryDelay   time.Duration
+	// ScheduleTimeout is how long the pod may stay Unschedulable before the
+	// kick fails with waiting_for_node; zero uses DefaultScheduleTimeout.
+	ScheduleTimeout time.Duration
+	// OnEvent, when set, is told about scheduling and preflight-retry events
+	// so the manager can surface them (see Event). It must not block.
+	OnEvent func(Event)
 }
 
-// Toleration mirrors the subset of corev1.Toleration an operator writes in YAML.
-type Toleration struct {
-	Key      string `json:"key,omitempty"`
-	Operator string `json:"operator,omitempty"`
-	Value    string `json:"value,omitempty"`
-	Effect   string `json:"effect,omitempty"`
+// ActiveDeadlineSeconds returns the activeDeadlineSeconds for a Job running
+// one kick with the given timeout: the timeout (DefaultKickTimeout when
+// non-positive) plus DeadlineMargin.
+func ActiveDeadlineSeconds(kickTimeout time.Duration) int64 {
+	if kickTimeout <= 0 {
+		kickTimeout = DefaultKickTimeout
+	}
+	return int64((kickTimeout + DeadlineMargin) / time.Second)
 }
 
-// Resources mirrors corev1.ResourceRequirements with string quantities, so a
-// device limit like `<vendor>.com/<device>: "2"` passes through untouched.
-type Resources struct {
-	Limits   map[string]string `json:"limits,omitempty"`
-	Requests map[string]string `json:"requests,omitempty"`
+// activeDeadline resolves the deadline for one Run: the configured value or
+// the one derived from ctx's remaining time, whichever is later.
+func (l *Launcher) activeDeadline(ctx context.Context) int64 {
+	deadline := l.Options.ActiveDeadlineSeconds
+	if dl, ok := ctx.Deadline(); ok {
+		if fromCtx := ActiveDeadlineSeconds(time.Until(dl)); fromCtx > deadline {
+			deadline = fromCtx
+		}
+	}
+	if deadline <= 0 {
+		deadline = ActiveDeadlineSeconds(DefaultKickTimeout)
+	}
+	return deadline
 }
 
-// VolumeMount is an additional PVC to mount into the Job.
-type VolumeMount struct {
-	Name      string `json:"name"`
-	Claim     string `json:"claim"`
-	MountPath string `json:"mount_path"`
-	ReadOnly  bool   `json:"read_only,omitempty"`
+// network is Options.Network with the empty default applied.
+func (o Options) network() string {
+	if o.Network == "" {
+		return NetworkDefault
+	}
+	return o.Network
 }
 
 // Launcher implements sandbox.Launcher by running the kick as a Job.
@@ -164,6 +220,9 @@ type Launcher struct {
 	NamespacePath string
 	HTTPClient    *http.Client
 	Now           func() time.Time
+	// PodName is hive's own pod, read to resolve the relay image; empty
+	// falls back to $POD_NAME, then $HOSTNAME, then os.Hostname.
+	PodName string
 }
 
 var _ sandbox.Launcher = (*Launcher)(nil)
@@ -182,6 +241,20 @@ func (o Options) Validate() error {
 			return fmt.Errorf("kubejob: volumes[%d] needs both claim and mount_path", i)
 		}
 	}
+	if o.RelayRunAsUser != nil && *o.RelayRunAsUser <= 0 {
+		return errors.New("kubejob: relay_run_as_user must be a positive (non-root) uid")
+	}
+	if err := validatePullSecretNames(o.ImagePullSecrets); err != nil {
+		return err
+	}
+	if err := o.validatePreflight(); err != nil {
+		return err
+	}
+	switch o.network() {
+	case NetworkDefault, NetworkNone, NetworkHost:
+	default:
+		return fmt.Errorf("kubejob: network must be %q, %q or %q, got %q", NetworkNone, NetworkHost, NetworkDefault, o.Network)
+	}
 	return nil
 }
 
@@ -190,6 +263,10 @@ func (o Options) Validate() error {
 // left in place until its TTL so the operator can inspect it.
 func (l *Launcher) Run(ctx context.Context, spec sandbox.LaunchSpec) (sandbox.Result, error) {
 	var res sandbox.Result
+	if spec.ClineProvider != nil {
+		_ = spec.ClineProvider.Close()
+		return res, errors.New("kubejob: scoped Cline provider files are Podman-only; configure Job Secret references instead")
+	}
 	if err := l.Options.Validate(); err != nil {
 		return res, err
 	}
@@ -207,83 +284,25 @@ func (l *Launcher) Run(ctx context.Context, spec sandbox.LaunchSpec) (sandbox.Re
 	if err != nil {
 		return res, err
 	}
-	name := jobName(spec.Name, l.now())
-	body, err := json.Marshal(l.manifest(ns, name, subPath, spec))
-	if err != nil {
-		return res, err
+	var relays *relayPlan
+	if spec.Relays {
+		if relays, err = l.resolveRelays(ctx, ns); err != nil {
+			return res, err
+		}
 	}
-	jobsPath := fmt.Sprintf("/apis/batch/v1/namespaces/%s/jobs", ns)
-	if _, err := l.do(ctx, http.MethodPost, jobsPath, body); err != nil {
-		return res, fmt.Errorf("kubejob: creating job %s: %w", name, err)
+	if spec.Relays && len(l.Options.Preflight) > 0 && len(spec.Command) == 0 {
+		return res, errors.New("kubejob: sandbox.preflight needs an explicit command to run the agent after it; this launch has none")
 	}
-	jobPath := jobsPath + "/" + name
-
-	done, waitErr := l.wait(ctx, jobPath)
-	// Collect whatever the pod produced BEFORE deciding anything: a timed-out
-	// or failed kick with no transcript is the worst outcome for an operator.
-	// After a timeout the caller's ctx is already dead, so the collection and
-	// the cleanup below run on a fresh, request-bounded context.
-	collectCtx := ctx
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		collectCtx, cancel = context.WithTimeout(context.Background(), requestTimeout)
-		defer cancel()
-	}
-	pod, podErr := l.findPod(collectCtx, ns, name)
-	if podErr == nil && pod != "" {
-		res.Stdout = l.podLog(collectCtx, ns, pod)
-		res.ExitCode = l.podExitCode(collectCtx, ns, pod)
-	} else {
-		res.ExitCode = exitCodeUnknown
-	}
-	if waitErr != nil {
-		// Context ended (kick timeout or cancel). The Job would otherwise
-		// keep running the workload on the accelerator node; stop it.
-		_ = l.delete(collectCtx, jobPath)
-		return res, waitErr
-	}
-	if !done.succeeded {
-		res.Stderr = done.reason
-		return res, fmt.Errorf("kubejob: job %s failed: %s", name, done.reason)
-	}
-	if res.ExitCode == exitCodeUnknown {
-		// The Job reports Complete, so the container exited 0 even though the
-		// pod could not be read back (already GC'd, or RBAC on pods missing).
-		res.ExitCode = 0
-	}
-	_ = l.delete(ctx, jobPath)
-	return res, nil
+	return l.runWithRetry(ctx, spec, ns, subPath, relays)
 }
 
 type jobOutcome struct {
 	succeeded bool
 	reason    string
-}
-
-// wait polls the Job until a Complete or Failed condition, or ctx ends.
-func (l *Launcher) wait(ctx context.Context, jobPath string) (jobOutcome, error) {
-	interval := l.Options.PollInterval
-	if interval <= 0 {
-		interval = DefaultPollInterval
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		raw, err := l.do(ctx, http.MethodGet, jobPath, nil)
-		if err != nil {
-			if ctx.Err() != nil {
-				return jobOutcome{}, fmt.Errorf("kubejob: %w", ctx.Err())
-			}
-			// Transient API error: keep polling; the context still bounds us.
-		} else if out, finished := parseJobStatus(raw); finished {
-			return out, nil
-		}
-		select {
-		case <-ctx.Done():
-			return jobOutcome{}, fmt.Errorf("kubejob: %w", ctx.Err())
-		case <-ticker.C:
-		}
-	}
+	// failReason is sandbox.FailReasonWaitingForNode when the pod stayed
+	// Unschedulable past the schedule timeout; node is where the pod landed.
+	failReason string
+	node       string
 }
 
 // parseJobStatus reads the Complete/Failed conditions off a Job object.
@@ -354,33 +373,7 @@ func (l *Launcher) podLog(ctx context.Context, ns, pod string) string {
 // podExitCode reads the kick container's terminated exit code, or
 // exitCodeUnknown when the pod is not terminated or cannot be read.
 func (l *Launcher) podExitCode(ctx context.Context, ns, pod string) int {
-	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", ns, pod)
-	raw, err := l.do(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return exitCodeUnknown
-	}
-	var p struct {
-		Status struct {
-			ContainerStatuses []struct {
-				Name  string `json:"name"`
-				State map[string]struct {
-					ExitCode int `json:"exitCode"`
-				} `json:"state"`
-			} `json:"containerStatuses"`
-		} `json:"status"`
-	}
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return exitCodeUnknown
-	}
-	for _, cs := range p.Status.ContainerStatuses {
-		if cs.Name != containerName {
-			continue
-		}
-		if term, ok := cs.State[stateTerminated]; ok {
-			return term.ExitCode
-		}
-	}
-	return exitCodeUnknown
+	return l.podDetails(ctx, ns, pod).exitCode
 }
 
 func (l *Launcher) delete(ctx context.Context, jobPath string) error {
@@ -392,6 +385,12 @@ func (l *Launcher) delete(ctx context.Context, jobPath string) error {
 // manifest renders the batch/v1 Job. Kept as plain maps rather than client-go
 // types: the repo has no k8s.io dependency and this is the only writer.
 func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) map[string]any {
+	return l.jobManifest(ns, name, subPath, spec, nil)
+}
+
+// jobManifest is manifest plus, when relays is non-nil, the relay init
+// container, its emptyDir and the agent container's read-only mount of it.
+func (l *Launcher) jobManifest(ns, name, subPath string, spec sandbox.LaunchSpec, relays *relayPlan) map[string]any {
 	mount := spec.WorkspaceMount
 	if mount == "" {
 		mount = sandbox.DefaultWorkspaceMount
@@ -403,6 +402,10 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 	ttl := l.Options.TTLSeconds
 	if ttl == 0 {
 		ttl = DefaultTTLSeconds
+	}
+	deadline := l.Options.ActiveDeadlineSeconds
+	if deadline <= 0 {
+		deadline = ActiveDeadlineSeconds(DefaultKickTimeout)
 	}
 
 	// Same filter as the Podman path; explicit spec.Env entries come last and win.
@@ -442,6 +445,13 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 	}
 
 	container := map[string]any{
+		// The workspace PVC and the agent's home need to stay writable, so the
+		// root filesystem is deliberately not made read-only.
+		"securityContext": map[string]any{
+			"allowPrivilegeEscalation": false,
+			"capabilities":             map[string]any{"drop": []string{"ALL"}},
+			"seccompProfile":           map[string]string{"type": "RuntimeDefault"},
+		},
 		"name":         containerName,
 		"image":        spec.Image,
 		"workingDir":   workdir,
@@ -449,8 +459,18 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 		"envFrom":      envFrom,
 		"volumeMounts": mounts,
 	}
-	if len(spec.Command) > 0 {
-		container["command"] = spec.Command
+	command := preflightCommand(spec.Command, l.Options)
+	if relays != nil {
+		command = sandbox.RelayCommand(command)
+		mounts = append(mounts, map[string]any{"name": relayVolumeName, "mountPath": sandbox.RelayMountPath, "readOnly": true})
+		container["volumeMounts"] = mounts
+		volumes = append(volumes, map[string]any{
+			"name":     relayVolumeName,
+			"emptyDir": map[string]string{"sizeLimit": relayVolumeSizeLimit},
+		})
+	}
+	if len(command) > 0 {
+		container["command"] = command
 	}
 	if len(l.Options.Resources.Limits) > 0 || len(l.Options.Resources.Requests) > 0 {
 		container["resources"] = l.Options.Resources
@@ -459,9 +479,24 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 		"restartPolicy": restartNever,
 		"containers":    []map[string]any{container},
 		"volumes":       volumes,
+		// Nothing in the kick pod calls the Kubernetes API, so the SA token is
+		// never mounted into a contained run.
+		"automountServiceAccountToken": false,
+		"securityContext": map[string]any{
+			"seccompProfile": map[string]string{"type": "RuntimeDefault"},
+		},
+	}
+	if relays != nil {
+		podSpec["initContainers"] = []map[string]any{relays.initContainer()}
+		if len(relays.pullSecrets) > 0 {
+			podSpec["imagePullSecrets"] = relays.pullSecrets
+		}
 	}
 	if len(l.Options.NodeSelector) > 0 {
 		podSpec["nodeSelector"] = l.Options.NodeSelector
+	}
+	if l.Options.Affinity != nil {
+		podSpec["affinity"] = l.Options.Affinity
 	}
 	if len(l.Options.Tolerations) > 0 {
 		podSpec["tolerations"] = l.Options.Tolerations
@@ -472,7 +507,11 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 	if l.Options.SchedulerName != "" {
 		podSpec["schedulerName"] = l.Options.SchedulerName
 	}
-	labels := map[string]string{managedByLabel: managedByValue}
+	if l.Options.network() == NetworkHost {
+		podSpec["hostNetwork"] = true
+		podSpec["dnsPolicy"] = "ClusterFirstWithHostNet"
+	}
+	labels := map[string]string{managedByLabel: managedByValue, jobLabel: name}
 	if spec.Name != "" {
 		labels[agentLabel] = sanitizeLabel(spec.Name)
 	}
@@ -489,64 +528,16 @@ func (l *Launcher) manifest(ns, name, subPath string, spec sandbox.LaunchSpec) m
 			// workspace the first attempt already changed.
 			"backoffLimit":            0,
 			"ttlSecondsAfterFinished": ttl,
+			// The cluster fails a Job still running (or never scheduled)
+			// past this, so one hive lost track of cannot sit Pending
+			// forever (hivecommons/hive#18525).
+			"activeDeadlineSeconds": deadline,
 			"template": map[string]any{
 				"metadata": map[string]any{"labels": labels},
 				"spec":     podSpec,
 			},
 		},
 	}
-}
-
-// workspaceSubPath turns hive's absolute workspace path into the path relative
-// to the claim mount, which is what the Job's volumeMount.subPath needs.
-func workspaceSubPath(workspace, claimMount string) (string, error) {
-	if claimMount == "" {
-		claimMount = DefaultWorkspaceClaimMount
-	}
-	ws := filepath.Clean(workspace)
-	cm := filepath.Clean(claimMount)
-	rel, err := filepath.Rel(cm, ws)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-		return "", fmt.Errorf("kubejob: workspace %q is not under the workspace claim mount %q — set agent_sandbox.workspace_dir under it, or job.workspace_claim_mount to where the claim is mounted", workspace, claimMount)
-	}
-	return filepath.ToSlash(rel), nil
-}
-
-var labelUnsafe = regexp.MustCompile(`[^a-z0-9-]+`)
-
-// jobName builds a unique, DNS-label-safe Job name from the launch name and a
-// timestamp: hive-kick-<agent>-<unix>. Names must survive as pod-name prefixes.
-func jobName(launchName string, now time.Time) string {
-	base := sanitizeLabel(strings.TrimSuffix(launchName, "-sandbox"))
-	if base == "" {
-		base = "agent"
-	}
-	suffix := fmt.Sprintf("-%d", now.Unix())
-	room := jobNameMax - len(namePrefix) - len(suffix)
-	if len(base) > room {
-		base = strings.TrimRight(base[:room], "-")
-	}
-	return namePrefix + base + suffix
-}
-
-func sanitizeLabel(s string) string {
-	s = labelUnsafe.ReplaceAllString(strings.ToLower(s), "-")
-	return strings.Trim(s, "-")
-}
-
-func sortedKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	// insertion sort: env maps are tiny and this avoids importing sort for
-	// one call site.
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
-			keys[j], keys[j-1] = keys[j-1], keys[j]
-		}
-	}
-	return keys
 }
 
 func (l *Launcher) now() time.Time {
@@ -573,95 +564,4 @@ func (l *Launcher) namespace() (string, error) {
 		return "", fmt.Errorf("kubejob: empty namespace in %s", path)
 	}
 	return ns, nil
-}
-
-// do performs one authenticated API call and returns the response body.
-// Non-2xx responses are errors carrying the status and the API's message.
-func (l *Launcher) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
-	client, err := l.client()
-	if err != nil {
-		return nil, err
-	}
-	server := l.APIServer
-	if server == "" {
-		server = DefaultAPIServer
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
-	defer cancel()
-	var rdr io.Reader
-	if body != nil {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(reqCtx, method, server+path, rdr)
-	if err != nil {
-		return nil, err
-	}
-	if tok := l.token(); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	out, err := io.ReadAll(io.LimitReader(resp.Body, maxLogBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, apiMessage(out))
-	}
-	return out, nil
-}
-
-// apiMessage pulls the human message out of a Kubernetes Status body, falling
-// back to a trimmed raw body.
-func apiMessage(raw []byte) string {
-	var st struct {
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(raw, &st) == nil && st.Message != "" {
-		return st.Message
-	}
-	s := strings.TrimSpace(string(raw))
-	if len(s) > 200 {
-		s = s[:200]
-	}
-	return s
-}
-
-func (l *Launcher) token() string {
-	path := l.TokenPath
-	if path == "" {
-		path = DefaultTokenPath
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(raw))
-}
-
-// client returns the injected HTTP client, or one trusting the in-cluster CA.
-func (l *Launcher) client() (*http.Client, error) {
-	if l.HTTPClient != nil {
-		return l.HTTPClient, nil
-	}
-	path := l.CAPath
-	if path == "" {
-		path = DefaultCAPath
-	}
-	pem, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("kubejob: reading in-cluster CA: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, errors.New("kubejob: in-cluster CA bundle contained no certificates")
-	}
-	l.HTTPClient = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}}
-	return l.HTTPClient, nil
 }

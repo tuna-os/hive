@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	wfstore "github.com/hivecommons/hive/pkg/workflowmodel/store"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,18 +24,24 @@ import (
 	"github.com/hivecommons/hive/pkg/dashboard/collect"
 	"github.com/hivecommons/hive/pkg/delegatedecision"
 	ghpkg "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/github/automerge"
 	"github.com/hivecommons/hive/pkg/governor"
 	"github.com/hivecommons/hive/pkg/hivestate"
 	"github.com/hivecommons/hive/pkg/hooks"
+	"github.com/hivecommons/hive/pkg/inbox"
 	"github.com/hivecommons/hive/pkg/knowledge"
 	"github.com/hivecommons/hive/pkg/mention"
 	"github.com/hivecommons/hive/pkg/nous"
+	"github.com/hivecommons/hive/pkg/repoagents"
 	"github.com/hivecommons/hive/pkg/review/autoscale"
 	"github.com/hivecommons/hive/pkg/review/eventdispatch"
 	"github.com/hivecommons/hive/pkg/rotation"
 	"github.com/hivecommons/hive/pkg/scheduler"
 	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/workflowmodel"
+	"github.com/hivecommons/hive/pkg/workflowmodel/checksfile"
+	"github.com/hivecommons/hive/pkg/workflowmodel/ingest/cluster"
 )
 
 type ChatOutbound struct {
@@ -56,6 +63,56 @@ type ChatPoll struct {
 
 type Dependencies struct {
 	Config *config.Config
+	// WorkflowStore serves the workflow-model library (hivecommons/hive#17620).
+	// Nil disables the /api/workflows endpoints.
+	WorkflowStore *wfstore.Store
+	// WorkflowRepoFiles fetches a repository's default-branch CI definition
+	// files (repo-relative slash path -> contents) and the ref read, for
+	// POST /api/workflows/ingest. Nil disables ingest from a repository.
+	WorkflowRepoFiles func(ctx context.Context, repo string) (files map[string][]byte, ref string, err error)
+	// WorkflowItemSnapshot reads one issue or PR head-level for
+	// POST /api/workflows/{name}/{version}/simulate (RFC #17620 phase 3c)
+	// so the operator can simulate a real item. Nil disables the fetch; the
+	// handler then answers 422 and the form still accepts hand-set facts.
+	WorkflowItemSnapshot func(ctx context.Context, repo string, number int) (ghpkg.WorkflowItemSnapshot, error)
+	// WorkflowPostMerge observes the post-merge runs (Main CI, Release,
+	// Deploy) of the model's bound pipelines for merged PRs of repo, so a
+	// simulated merged PR's pipeline.status is the observed one, not
+	// always unknown (hivecommons/hive#18356). Nil leaves pr.pipeline
+	// unknown.
+	WorkflowPostMerge func(ctx context.Context, repo string, m *workflowmodel.Model, defaultBranch string, prs []workflowmodel.MergedPR) (map[int]*stageengine.PostMergeFacts, error)
+	// WorkflowRepoFile fetches one default-branch file (a written process
+	// spec) for POST /api/workflows/ingest/spec {repo, path}. Nil disables
+	// repo-path spec ingest.
+	WorkflowRepoFile func(ctx context.Context, repo, path string) (string, error)
+	// WorkflowProvisionLabels creates (or recolours) one bound repository's
+	// stage and model labels now, for PUT /api/workflows/enabled turning
+	// derivation on. Nil leaves provisioning to the next sweep pass.
+	WorkflowProvisionLabels func(ctx context.Context, repo string) error
+	// WorkflowDispatchPrepare prepares the owner's "Send to <profile>" for
+	// POST /api/workflows/dispatch (cncf/techdocs#395): reads the item,
+	// resolves its model state, the agent and the agent claim, and renders
+	// the prompt. Nil answers 503.
+	WorkflowDispatchPrepare workflowDispatchPrepareFunc
+	// WorkflowDispatchHandoffs lists the hand-offs an agent declined or did
+	// not act on and whose item still waits in that state
+	// (hivecommons/hive#18749), for the workflow row on Settings → Repos
+	// and the item's Activity Monitor row. Nil lists none.
+	WorkflowDispatchHandoffs func() []WorkflowDispatchHandoff
+	// WorkflowEmitChecks proposes a newly bound model's declared checks to
+	// the repository as .hive/workflows/checks.yml through the checks PR
+	// (hivecommons/hive#18355), for PUT /api/workflows/bindings. Nil leaves
+	// the file unemitted.
+	WorkflowEmitChecks func(ctx context.Context, repo string, m *workflowmodel.Model) (checksfile.Result, error)
+	// WorkflowClusterRunner runs kubectl for POST /api/workflows/ingest/cluster
+	// (RFC #17620 phase 6). Nil means no kube access is configured on this
+	// spoke and the route answers 422.
+	WorkflowClusterRunner cluster.Runner
+	// WorkflowSpecLLM is the reviewer-gateway turn behind the optional LLM
+	// refinement of POST /api/workflows/ingest/spec. It is the only LLM use
+	// in the workflow-model stack; nil or an unconfigured gateway disables
+	// it and the route reports spec.llm=false in capabilities.
+	WorkflowSpecLLM delegatedecision.TurnRunner
 	// AgentMgr is the agent runtime (hivecommons/hive#13536). The dashboard
 	// programs against the crux.Runtime surface, not *agent.Manager; tests that
 	// need manager-only seams unwrap it with agentManager.
@@ -66,6 +123,9 @@ type Dependencies struct {
 	Governor              *governor.Governor
 	GHClient              *ghpkg.Client
 	GHAppAuth             *ghpkg.AppAuth
+	// Sessions is the interactive-session runtime behind /api/sessions
+	// (dashboard.sessions.enabled). Nil keeps the feature unavailable.
+	Sessions SessionRuntime
 	// CruxRuntimeHealth reports the agent runtime's reachability for
 	// /api/health (hivecommons/hive#14138 stage 4). nil (in-process, or a
 	// test without a runtime) leaves the field out of the body.
@@ -87,7 +147,6 @@ type Dependencies struct {
 	ReviewerAutoscaleStatus func() autoscale.Status
 	Tokens                  *tokens.Collector
 	Knowledge               *knowledge.KnowledgeAPI
-	Inception               *knowledge.InceptionEngine
 	Nous                    *NousState
 	Scheduler               SchedulerControl
 	MetricsCollector        *MetricsCollector
@@ -96,11 +155,22 @@ type Dependencies struct {
 	// (bare test deps) means the toggle can only persist the flag, so it
 	// answers restart_required.
 	KnowledgePrimer KnowledgePrimerControl
-	// KnowledgeConnectors is the running connector syncer; nil when none is wired.
+	// KnowledgeConnectors is the running connector syncer; nil when none is
+	// wired. Read it through Server.knowledgeConnectors: a dashboard edit
+	// can replace it at runtime (#18091).
 	KnowledgeConnectors KnowledgeConnectorRuntime
+	// ReloadKnowledgeConnectors applies a saved knowledge.connectors list to
+	// the running hive without a restart (#18091): it builds the syncer when
+	// none is running, else reconfigures it in place. It returns the runtime
+	// to serve, nil when none is needed. Nil (bare test deps) keeps the
+	// pre-#18091 behaviour where a new connector needs a restart.
+	ReloadKnowledgeConnectors func(entries []config.KnowledgeConnector) (KnowledgeConnectorRuntime, error)
 	// KnowledgePublish is the running knowledge.publish mirror; nil when
 	// publishing is not configured or failed to start.
 	KnowledgePublish KnowledgePublishRuntime
+	// Inbox is the voice-source triage service; nil when no voice
+	// connector is configured.
+	Inbox *inbox.Service
 	// RotationMgr is the provider-rotation headroom reporter (RFC #3958). Nil
 	// when rotation is disabled; the headroom endpoint then reports
 	// enabled=false.
@@ -168,6 +238,11 @@ type Dependencies struct {
 	// OnACMMLevelChanged is called after an in-process runtime level change
 	// has been persisted/applied. Nil means no live component needs to react.
 	OnACMMLevelChanged func(prev, next int)
+	// IoscanConfigApplied is called after PUT /api/config/governor/security
+	// has changed an ioscan setting, so the owner of the scheduler can rebuild
+	// the semantic classifier from the new values without a restart. Nil means
+	// nothing caches.
+	IoscanConfigApplied func()
 	// ReviewConfigApplied is called after PUT /api/config/review has mutated
 	// Config.Review, so the owner of any component that caches review
 	// settings at boot (the GitHub client's revise allowlist and perspective
@@ -181,6 +256,46 @@ type Dependencies struct {
 	// escalation dispatcher can rebuild its sinks without a restart. Nil
 	// means nothing hot-reloads; the tab then shows the restart note.
 	ChannelsConfigApplied func()
+	// ApplyReferenceRepos is called by PUT /api/config/reference-repos with
+	// the validated list BEFORE it is stored: it verifies each write-mode
+	// entry's credential the way boot does and installs the result on the
+	// GitHub proxy, so the allow-list changes without a restart. A non-nil
+	// error refuses the edit with that message and nothing changes. Nil (no
+	// proxy, most tests) skips the check, matching boot, which only verifies
+	// credentials when a proxy is wired (hivecommons/hive#18136).
+	ApplyReferenceRepos func(ctx context.Context, refs []config.ReferenceRepo) error
+	// RemergeDerivedReferenceRepos is called after PUT /api/config/reference-repos
+	// has persisted the hand-written list: it puts the derived entries of the
+	// last pass (hivecommons/hive#18139) back into Config.Project.ReferenceRepos
+	// in memory, as the config reload hook does, so the kick and /api/status
+	// keep showing them. Nil (no deriver, most tests) leaves the list as saved.
+	RemergeDerivedReferenceRepos func()
+	// OwnerIdentity is the store behind /api/github-owner-identity
+	// (hivecommons/hive#18197): the hive owner's GitHub account, consented
+	// once on this dashboard, that write-tier reference repos are written as.
+	// Nil (most tests, a hive without a secrets dir) answers 503 on those
+	// routes.
+	OwnerIdentity *ghpkg.OwnerIdentityStore
+	// OwnerIdentityChanged is called after the owner connects, reconnects or
+	// disconnects their account, so the reference-repo policies re-resolve
+	// without a restart. Nil skips.
+	OwnerIdentityChanged func()
+	// RepoAgents holds the agent definitions discovered under managed repos'
+	// .hive/agents/ that wait for an owner's approval (hivecommons/hive#18491).
+	// Nil (most tests, a hive without a GitHub client) reports the feature
+	// off on GET /api/agents/discovered and answers 503 on its mutations.
+	RepoAgents *repoagents.Discoverer
+	// CheckRemoteWriteIdentity is called by
+	// PUT /api/config/reference-repos/write-identity with the requested
+	// project.remote_write_identity BEFORE it is stored: it resolves the
+	// hand-written reference repos under that setting the way boot does, so a
+	// value that would stop the next boot with exit 22 is refused with that
+	// message (hivecommons/hive#18516). Nil (no proxy, most tests) skips.
+	CheckRemoteWriteIdentity func(ctx context.Context, setting string) error
+	// RemoteWriteIdentityChanged is called after that PUT has persisted the
+	// setting: it re-resolves the reference repos so the proxy, the kick and
+	// /api/status use the new identity at once. Nil skips.
+	RemoteWriteIdentityChanged func()
 	// RescanReposFunc re-enumerates every watched repository's open issues
 	// and pull requests against the forge, enriches PR CI status, applies the
 	// duplicate-PR claim guard and republishes the dashboard status snapshot
@@ -323,6 +438,13 @@ type Dependencies struct {
 	// reason names the delivery ("pull_request_review org/repo#12"). Nil
 	// leaves invalidated items waiting for the next cadence tick.
 	WebhookWake func(reason string)
+	// SweepNudge asks the automerge lanes for an early pass over one PR
+	// (repo is "owner/name"). The operator row actions that leave a
+	// durable mark for the sweep (Adopt now) call it so the pass runs now
+	// rather than on cadence. Nil leaves the mark for the next sweep.
+	SweepNudge func(repo string, number int)
+	// BasePreparation reads durable preparation tickets, never merge readiness.
+	BasePreparation func(repo, base string) (automerge.BasePreparationSnapshot, error)
 	// ApplyWebhookItems hands the targeted re-reads a webhook delivery
 	// caused (webhook_tracker_refresh.go) to the governor so its cached
 	// actionable snapshot is patched for those items only; the wake cycle
@@ -342,6 +464,12 @@ type Dependencies struct {
 	// repo is the configured slug. It must not block the webhook response.
 	// Nil leaves PRs to the sentinel's reconcile cadence.
 	SentinelPREvent func(repo string, number int)
+	// CIFailureKick reacts to one webhook CI-failure signal on a
+	// hive-authored PR: attributes it to the owning agent and, when the
+	// agent is enabled, unpaused, governor-eligible and outside the per-head
+	// cooldown, kicks it now with the fix-before-new section. It must not
+	// block the webhook response. Nil leaves the signal to the sweep.
+	CIFailureKick func(sig ghpkg.CIFailureSignal) CIFailureKickOutcome
 	// ProjectsV2ItemEvent applies a verified `projects_v2_item` delivery to
 	// the GitHub Projects work source cache as a targeted patch (#13379).
 	// These deliveries are organization-scoped and carry no repository. Nil
@@ -371,6 +499,11 @@ type EvalLoopStatus struct {
 	// counts items webhook re-reads upserted into that snapshot.
 	CachedCycles   int `json:"cachedCycles,omitempty"`
 	WebhookPatches int `json:"webhookPatches,omitempty"`
+	// APIBudgetPacing is the API budget pacing state
+	// (governor.api_budget_pacing): whether the loop interval is being
+	// stretched to make the GitHub budget last until the reset, by how much,
+	// and why. IntervalS above is already the paced interval.
+	APIBudgetPacing *ghpkg.APIBudgetPacing `json:"api_budget_pacing,omitempty"`
 }
 
 // NousScopeRepo is the only experiment scope the Experiment Lab supports.
@@ -646,6 +779,12 @@ func pruneNousSnapshots(dir string, entries []os.DirEntry, keep int) int {
 type SchedulerControl interface {
 	BuildAgentMessage(agentName string, issues []ghpkg.Issue, actionable *ghpkg.ActionableResult) string
 	BuildAgentMessageFromLastActionable(agentName string) string
+	// BuildAgentGuidanceForTask is the role's guidance without the resident
+	// agent's work lists or session steps, for a contributor working one
+	// assigned task in that role: knowledge primed from that issue, and the
+	// AGENTS.md of the task's repository. It reads no queue, classifies
+	// nothing and records no kick summary.
+	BuildAgentGuidanceForTask(agentName string, task ghpkg.Issue) string
 	FirstScanDone() bool
 	DeferKickUntilFirstScan(agentName string, deliver func(msg string))
 	GetLastActionable() *ghpkg.ActionableResult

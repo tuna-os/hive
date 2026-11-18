@@ -24,6 +24,7 @@ type ciFixture struct {
 	author      string
 	authorType  string
 	headRepo    string
+	headRef     string
 	baseRepo    string
 	statuses    []ciStatus
 	checks      []ciCheck
@@ -45,6 +46,9 @@ type ciFixture struct {
 	// (to exercise the GitHub-side refusal paths); zero merges successfully.
 	mergeStatus  int
 	approveCalls *atomic.Int32
+	// updatedAt, when set, is the PR's updated_at (RFC 3339): the head time
+	// the min_head_age gate measures from.
+	updatedAt string
 }
 
 type ciStatus struct{ context, state string }
@@ -107,13 +111,17 @@ func (f *ciFixture) serveCI(w http.ResponseWriter, r *http.Request) bool {
 		if baseRepo == "" {
 			baseRepo = "o/r"
 		}
-		enc(map[string]any{
+		pr := map[string]any{
 			"number": n,
 			"state":  "open",
 			"user":   map[string]any{"login": author, "type": authorType},
-			"head":   map[string]any{"sha": head, "repo": map[string]any{"full_name": headRepo}},
+			"head":   map[string]any{"sha": head, "ref": f.headRef, "repo": map[string]any{"full_name": headRepo}},
 			"base":   map[string]any{"ref": "main", "repo": map[string]any{"full_name": baseRepo}},
-		})
+		}
+		if f.updatedAt != "" {
+			pr["updated_at"] = f.updatedAt
+		}
+		enc(pr)
 	case strings.Contains(p, "/branches/") && !strings.Contains(p, "/protection"): // /repos/{o}/{r}/branches/{branch}
 		if f.branchStatus != 0 {
 			w.WriteHeader(f.branchStatus)
@@ -1154,14 +1162,100 @@ func TestMergeCIGate_RequiredCheckNeverCreated(t *testing.T) {
 			mustExist(t, reqPath+".exhausted", "never-created request quarantined on the first verdict")
 			mustNotExist(t, reqPath, "live request after quarantine")
 
-			// A re-request for the same head is refused with the recorded
-			// reason instead of being evaluated again.
+			// A re-request for the same head re-evaluates the gate once
+			// (#17606); the check is still never created, so it is refused
+			// with the recorded reason.
 			again, _ := WriteMergeRequest(t.TempDir(), MergeRequest{Repo: "o/r", Number: 42, ExpectSHA: "abc", Agent: "scanner"})
 			c.handleOneMergeRequest(context.Background(), again, fixedNow)
 			if resp := readMergeResult(t, again); !strings.Contains(resp.Error, "exhausted on the same head") || !strings.Contains(resp.Error, "was never created") {
 				t.Fatalf("re-request on the same head must be refused with the recorded reason, got %+v", resp)
 			}
 			mustExist(t, again+".exhausted", "refused re-request")
+		})
+	}
+}
+
+// #16152: a merge request without expect_sha has no persisted wait state, so
+// while GitHub's head time is ahead of the host clock the min_head_age hold
+// must be measured from the gate's own first observation of the head, and
+// clear after one window, instead of reading "first seen 0s ago" every poll
+// for as long as the skew lasts.
+func TestMergeCIGate_SkewedHeadWithoutExpectSHAHoldsFromFirstObservation(t *testing.T) {
+	f := greenFixture()
+	f.updatedAt = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	var merges atomic.Int32
+	srv := ciGateServer(t, f, &merges)
+	defer srv.Close()
+	c := testMergeClient(t, srv.URL)
+	c.SetAutoMergeMinHeadAge(10 * time.Minute)
+	ctx := context.Background()
+
+	verdict, why, err := c.verifyMergeRequestCI(ctx, "o/r", 100, "", time.Now().Add(-5*time.Minute), time.Time{})
+	if err != nil || verdict != mergeCIPending || !strings.Contains(why, "head time ahead of host clock; head first seen 5m") {
+		t.Fatalf("first poll = (%v, %q, %v), want pending held from the first observation 5m ago", verdict, why, err)
+	}
+	// A later poll without expect_sha still has no persisted PendingSince; the
+	// gate must keep its first observation rather than restart at 0s.
+	verdict, why, err = c.verifyMergeRequestCI(ctx, "o/r", 100, "", time.Now(), time.Time{})
+	if err != nil || verdict != mergeCIPending || !strings.Contains(why, "head first seen 5m") {
+		t.Fatalf("second poll = (%v, %q, %v), want the hold measured from the first observation", verdict, why, err)
+	}
+	c.SetAutoMergeMinHeadAge(4 * time.Minute)
+	verdict, why, err = c.verifyMergeRequestCI(ctx, "o/r", 100, "", time.Now(), time.Time{})
+	if err != nil || verdict != mergeCIGreen {
+		t.Fatalf("poll after one min_head_age window = (%v, %q, %v), want green", verdict, why, err)
+	}
+	// A new head is a new first observation: it is held again (fail closed).
+	f.heads[100] = "def456"
+	verdict, why, err = c.verifyMergeRequestCI(ctx, "o/r", 100, "", time.Now(), time.Time{})
+	if err != nil || verdict != mergeCIPending || !strings.Contains(why, "head first seen 0s ago") {
+		t.Fatalf("new head = (%v, %q, %v), want pending from a fresh first observation", verdict, why, err)
+	}
+	if got := merges.Load(); got != 0 {
+		t.Fatalf("verifyMergeRequestCI must never merge, got %d", got)
+	}
+}
+
+func TestCIGateReason(t *testing.T) {
+	cases := []struct {
+		name, got, want string
+	}{
+		{"plain", ciGateReason("fetching PR"), "ci gate: fetching PR"},
+		{"formatted", ciGateReason("CI still running (%s)", "build"), "ci gate: CI still running (build)"},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// Every reason verifyMergeRequestCI returns must carry the prefix the
+// exhausted-head re-evaluation keys off.
+func TestMergeCIGate_ReasonsCarryPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		f    *ciFixture
+		sha  string
+	}{
+		{"green", greenFixture(), "abc"},
+		{"no CI evidence", &ciFixture{defaultHead: "abc"}, "abc"},
+		{"head moved", greenFixture(), "def"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.f.defaultHead = "abc"
+			var merges atomic.Int32
+			srv := ciGateServer(t, tc.f, &merges)
+			defer srv.Close()
+			c := testMergeClient(t, srv.URL)
+			_, why, err := c.verifyMergeRequestCI(context.Background(), "o/r", 42, tc.sha, fixedNow(), time.Time{})
+			if err != nil {
+				why = err.Error()
+			}
+			if !strings.HasPrefix(why, mergeRequestCIGateReasonPrefix) {
+				t.Fatalf("reason %q must start with %q", why, mergeRequestCIGateReasonPrefix)
+			}
 		})
 	}
 }

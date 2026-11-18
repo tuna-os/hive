@@ -173,6 +173,10 @@ func TestLifecycleRoutes(t *testing.T) {
 	if c := f.called("RestartWithBootstrap"); c.Args[1] != "hello" {
 		t.Fatalf("bootstrap: %v", c)
 	}
+	f.expect(http.MethodPost, api.RestartPath("alpha"), api.RestartRequest{ModelChange: true, By: "owner"}, http.StatusOK, &resp)
+	if c := f.called("RestartAfterModelChange"); c.Args[1] != "owner" {
+		t.Fatalf("model change: %v", c)
+	}
 	f.rt.Err = cruxtest.ErrRecorder
 	f.expectCode(http.MethodPost, api.RestartPath("alpha"), nil, http.StatusInternalServerError, api.CodeRuntime)
 	f.expectCode(http.MethodPost, api.StartPath("alpha"), nil, http.StatusInternalServerError, api.CodeRuntime)
@@ -884,6 +888,7 @@ func TestServeWithoutHostOrBackground(t *testing.T) {
 	if len(rt.Background()) != 0 {
 		t.Fatal("background loops started while disabled")
 	}
+	t.Setenv("PATH", fakeTmuxDir(t))
 	var h api.Health
 	newFamServer(t).expect(http.MethodGet, api.PathHealth, nil, http.StatusOK, &h)
 	if len(h.Background) != 0 {

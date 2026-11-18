@@ -20,9 +20,13 @@ query($owner: String!, $name: String!, $first: Int!, $cursor: String) {
         baseRefOid
         updatedAt
         isDraft
+        maintainerCanModify
         mergeable
         mergeStateStatus
         reviewDecision
+        latestOpinionatedReviews(first:50){nodes{state submittedAt authorAssociation author{__typename login}}}
+        comments(first:1){totalCount}
+        reviewThreads(first:1){totalCount}
         labels(first: 30) { nodes { name } }
         author { login }
         baseRefName
@@ -31,13 +35,15 @@ query($owner: String!, $name: String!, $first: Int!, $cursor: String) {
         commits(last: 1) {
           nodes {
             commit {
+              oid
               statusCheckRollup {
                 state
-                contexts(first: 50) {
+                contexts(first: 100) {
+                  totalCount
                   nodes {
                     __typename
-                    ... on CheckRun { databaseId name conclusion status detailsUrl }
-                    ... on StatusContext { context state targetUrl }
+                    ... on CheckRun { id databaseId name conclusion status detailsUrl startedAt completedAt checkSuite { app { databaseId } commit { oid } } }
+                    ... on StatusContext { id context state targetUrl createdAt }
                   }
                 }
               }
@@ -75,15 +81,19 @@ type graphQLPRBatchResponse struct {
 }
 
 type graphQLPRBatchNode struct {
-	Number           int       `json:"number"`
-	HeadRefOID       string    `json:"headRefOid"`
-	BaseRefOID       string    `json:"baseRefOid"`
-	UpdatedAt        time.Time `json:"updatedAt"`
-	IsDraft          bool      `json:"isDraft"`
-	Mergeable        string    `json:"mergeable"`
-	MergeStateStatus string    `json:"mergeStateStatus"`
-	ReviewDecision   string    `json:"reviewDecision"`
-	Labels           struct {
+	Number     int       `json:"number"`
+	HeadRefOID string    `json:"headRefOid"`
+	BaseRefOID string    `json:"baseRefOid"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+	IsDraft    bool      `json:"isDraft"`
+	// MaintainerCanModify is "allow edits by maintainers". The stored
+	// detail stands in for a REST GET, so leaving it out read every fork PR
+	// as one the hive cannot push to (projectbluefin/gutenprint-printer-app#196).
+	MaintainerCanModify bool   `json:"maintainerCanModify"`
+	Mergeable           string `json:"mergeable"`
+	MergeStateStatus    string `json:"mergeStateStatus"`
+	reviewDecisionNode
+	Labels struct {
 		Nodes []struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
@@ -97,42 +107,41 @@ type graphQLPRBatchNode struct {
 	Commits     struct {
 		Nodes []struct {
 			Commit struct {
+				OID               string `json:"oid"`
 				StatusCheckRollup *struct {
 					State    string `json:"state"`
 					Contexts struct {
-						Nodes []graphQLPRBatchContext `json:"nodes"`
+						TotalCount int                     `json:"totalCount"`
+						Nodes      []graphQLPRBatchContext `json:"nodes"`
 					} `json:"contexts"`
 				} `json:"statusCheckRollup"`
 			} `json:"commit"`
 		} `json:"nodes"`
 	} `json:"commits"`
-	ClosingIssuesReferences struct {
-		Nodes []struct {
-			Number      int    `json:"number"`
-			Title       string `json:"title"`
-			State       string `json:"state"`
-			StateReason string `json:"stateReason"`
-			URL         string `json:"url"`
-			Repository  struct {
-				NameWithOwner string `json:"nameWithOwner"`
-			} `json:"repository"`
-		} `json:"nodes"`
-	} `json:"closingIssuesReferences"`
 }
 
 type graphQLPRBatchContext struct {
-	TypeName string `json:"__typename"`
-	// DatabaseID is the check run's REST id (CheckRun only). The external-CI
-	// marker pins a triage to it (hivecommons/hive#11609), and annotation
-	// lookups need the real id rather than a positional stand-in.
-	DatabaseID int64  `json:"databaseId"`
-	Name       string `json:"name"`
-	Conclusion string `json:"conclusion"`
-	Status     string `json:"status"`
-	DetailsURL string `json:"detailsUrl"`
-	Context    string `json:"context"`
-	State      string `json:"state"`
-	TargetURL  string `json:"targetUrl"`
+	TypeName    string     `json:"__typename"`
+	Name        string     `json:"name"`
+	Conclusion  string     `json:"conclusion"`
+	Status      string     `json:"status"`
+	DetailsURL  string     `json:"detailsUrl"`
+	Context     string     `json:"context"`
+	State       string     `json:"state"`
+	TargetURL   string     `json:"targetUrl"`
+	ID          string     `json:"id"`
+	DatabaseID  *int64     `json:"databaseId"`
+	StartedAt   *time.Time `json:"startedAt"`
+	CompletedAt *time.Time `json:"completedAt"`
+	CreatedAt   *time.Time `json:"createdAt"`
+	CheckSuite  *struct {
+		App *struct {
+			DatabaseID *int64 `json:"databaseId"`
+		} `json:"app"`
+		Commit *struct {
+			OID string `json:"oid"`
+		} `json:"commit"`
+	} `json:"checkSuite"`
 }
 
 func (c *Client) graphQLPRBatchEnabledEffective() bool {
@@ -159,11 +168,11 @@ func (c *Client) prefetchOpenPRDetailsGraphQL(ctx context.Context, owner, repoNa
 	}
 	// With healthy webhooks and nothing marked dirty since the last batch,
 	// the cached batch still describes every open PR (#11177).
-	if sharedWebhookTracker.repoCleanAndHealthy(fullRepo) && c.hasGraphQLPRBatchRepo(fullRepo) {
+	if sharedWebhookTracker().repoCleanAndHealthy(fullRepo) && c.hasGraphQLPRBatchRepo(fullRepo) {
 		c.recordGraphQLPRBatchWebhookSkip()
 		return
 	}
-	started := sharedWebhookTracker.now()
+	started := sharedWebhookTracker().now()
 	c.clearGraphQLPRBatchRepo(fullRepo)
 	pageSize := c.graphQLPRBatchPageSizeEffective()
 	var cursor string
@@ -197,7 +206,7 @@ func (c *Client) prefetchOpenPRDetailsGraphQL(ctx context.Context, owner, repoNa
 		}
 	}
 	c.recordGraphQLPRBatchSuccess(repoPRs, pages)
-	sharedWebhookTracker.clearDirtyRepoBefore(fullRepo, started)
+	sharedWebhookTracker().clearDirtyRepoBefore(fullRepo, started)
 }
 
 func (c *Client) hasGraphQLPRBatchRepo(repo string) bool {
@@ -220,6 +229,7 @@ func (c *Client) invalidateGraphQLPRBatchPR(repo string, number int) {
 	for k := range c.prBatchCheckRuns {
 		if k.repo == key && k.number == number {
 			delete(c.prBatchCheckRuns, k)
+			delete(c.prBatchCheckObservedAt, k)
 		}
 	}
 }
@@ -235,6 +245,7 @@ func (c *Client) clearGraphQLPRBatchRepo(repo string) {
 		for k := range c.prBatchCheckRuns {
 			if k.repo == key {
 				delete(c.prBatchCheckRuns, k)
+				delete(c.prBatchCheckObservedAt, k)
 			}
 		}
 	}
@@ -244,16 +255,17 @@ func (c *Client) storeGraphQLPRBatchNode(repo string, n graphQLPRBatchNode) {
 	state := graphQLMergeStateStatusToREST(n.MergeStateStatus)
 	mergeable := graphQLMergeable(n.Mergeable)
 	pr := &gh.PullRequest{
-		Number:         gh.Ptr(n.Number),
-		State:          gh.Ptr("open"),
-		Title:          gh.Ptr(n.Title),
-		UpdatedAt:      &gh.Timestamp{Time: n.UpdatedAt},
-		User:           &gh.User{Login: gh.Ptr(n.Author.Login)},
-		Draft:          gh.Ptr(n.IsDraft),
-		Mergeable:      mergeable,
-		MergeableState: gh.Ptr(state),
-		Head:           &gh.PullRequestBranch{SHA: gh.Ptr(n.HeadRefOID), Ref: gh.Ptr(n.HeadRefName)},
-		Base:           &gh.PullRequestBranch{SHA: gh.Ptr(n.BaseRefOID), Ref: gh.Ptr(n.BaseRefName)},
+		Number:              gh.Ptr(n.Number),
+		State:               gh.Ptr("open"),
+		Title:               gh.Ptr(n.Title),
+		UpdatedAt:           &gh.Timestamp{Time: n.UpdatedAt},
+		User:                &gh.User{Login: gh.Ptr(n.Author.Login)},
+		Draft:               gh.Ptr(n.IsDraft),
+		MaintainerCanModify: gh.Ptr(n.MaintainerCanModify),
+		Mergeable:           mergeable,
+		MergeableState:      gh.Ptr(state),
+		Head:                &gh.PullRequestBranch{SHA: gh.Ptr(n.HeadRefOID), Ref: gh.Ptr(n.HeadRefName)},
+		Base:                &gh.PullRequestBranch{SHA: gh.Ptr(n.BaseRefOID), Ref: gh.Ptr(n.BaseRefName)},
 	}
 	for _, l := range n.Labels.Nodes {
 		if strings.TrimSpace(l.Name) != "" {
@@ -268,6 +280,10 @@ func (c *Client) storeGraphQLPRBatchNode(repo string, n graphQLPRBatchNode) {
 		}
 		key := prBatchCheckRunKey{repo: canonicalPRDetailRepo(repo), number: n.Number, headSHA: n.HeadRefOID}
 		c.prBatchCheckRuns[key] = cloneCheckRuns(checks)
+		if c.prBatchCheckObservedAt == nil {
+			c.prBatchCheckObservedAt = map[prBatchCheckRunKey]time.Time{}
+		}
+		c.prBatchCheckObservedAt[key] = time.Now().UTC()
 		c.prBatchMu.Unlock()
 	}
 	c.storeGraphQLPRBatchReview(repo, n)
@@ -287,12 +303,23 @@ func graphQLMergeable(raw string) *bool {
 	}
 }
 
+// graphQLCheckRuns converts a PR node's statusCheckRollup into check runs. It
+// reports ok=false when the rollup is absent OR when GitHub truncated the
+// contexts page: a head with more contexts than one page holds (a 70-job
+// matrix plus statuses) would otherwise be cached as a partial listing, and
+// enrichPRCI would read the missing required checks as "never reported"
+// (hivecommons/hive#16615 showed `CI 7/11 · required check "test" hasn't
+// reported` while every check was green). The caller falls back to the
+// paginated REST listing instead.
 func graphQLCheckRuns(n graphQLPRBatchNode) ([]*gh.CheckRun, bool) {
 	if len(n.Commits.Nodes) == 0 || n.Commits.Nodes[0].Commit.StatusCheckRollup == nil {
 		return nil, false
 	}
+	if graphQLContextsTruncated(n) {
+		return nil, false
+	}
 	var out []*gh.CheckRun
-	for i, ctx := range n.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.Nodes {
+	for _, ctx := range n.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.Nodes {
 		name, status, conclusion, url := "", "", "", ""
 		switch ctx.TypeName {
 		case "CheckRun":
@@ -302,19 +329,51 @@ func graphQLCheckRuns(n graphQLPRBatchNode) ([]*gh.CheckRun, bool) {
 		default:
 			continue
 		}
-		id := int64(i + 1)
-		if ctx.TypeName == "CheckRun" && ctx.DatabaseID > 0 {
-			id = ctx.DatabaseID
-		}
-		out = append(out, &gh.CheckRun{
-			ID:         gh.Ptr(id),
+		run := &gh.CheckRun{
+			ID:         clonePtr(ctx.DatabaseID),
+			NodeID:     gh.Ptr(ctx.ID),
+			HeadSHA:    gh.Ptr(n.HeadRefOID),
 			Name:       gh.Ptr(name),
 			Status:     gh.Ptr(status),
 			Conclusion: gh.Ptr(conclusion),
 			DetailsURL: gh.Ptr(url),
-		})
+		}
+		if oid := n.Commits.Nodes[0].Commit.OID; oid != "" {
+			run.HeadSHA = gh.Ptr(oid)
+		}
+		if ctx.TypeName == "CheckRun" {
+			if ctx.CheckSuite != nil && ctx.CheckSuite.Commit != nil && ctx.CheckSuite.Commit.OID != "" {
+				run.HeadSHA = gh.Ptr(ctx.CheckSuite.Commit.OID)
+			}
+			if ctx.CheckSuite != nil && ctx.CheckSuite.App != nil {
+				run.App = &gh.App{ID: clonePtr(ctx.CheckSuite.App.DatabaseID)}
+			}
+			if ctx.StartedAt != nil {
+				run.StartedAt = &gh.Timestamp{Time: *ctx.StartedAt}
+			}
+			if ctx.CompletedAt != nil {
+				run.CompletedAt = &gh.Timestamp{Time: *ctx.CompletedAt}
+			}
+		} else {
+			// Legacy statuses have a real node ID and creation time, but no
+			// numeric check-run or producer App identity.
+			if ctx.CreatedAt != nil {
+				run.StartedAt = &gh.Timestamp{Time: *ctx.CreatedAt}
+			}
+		}
+		out = append(out, run)
 	}
 	return out, true
+}
+
+// graphQLContextsTruncated reports whether the rollup's contexts connection
+// holds fewer nodes than GitHub says exist for the head.
+func graphQLContextsTruncated(n graphQLPRBatchNode) bool {
+	if len(n.Commits.Nodes) == 0 || n.Commits.Nodes[0].Commit.StatusCheckRollup == nil {
+		return false
+	}
+	contexts := n.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts
+	return contexts.TotalCount > len(contexts.Nodes)
 }
 
 func statusFromStatusContext(state string) string {
@@ -338,20 +397,36 @@ func conclusionFromStatusContext(state string) string {
 }
 
 func (c *Client) graphQLBatchCheckRuns(repo string, number int, headSHA string) ([]*gh.CheckRun, bool) {
+	checks, _, ok := c.graphQLBatchCheckRunsObservation(repo, number, headSHA)
+	return checks, ok
+}
+
+func (c *Client) graphQLBatchCheckRunsObservation(repo string, number int, headSHA string) ([]*gh.CheckRun, *time.Time, bool) {
 	if c == nil || strings.TrimSpace(headSHA) == "" {
-		return nil, false
+		return nil, nil, false
 	}
+
 	key := prBatchCheckRunKey{repo: canonicalPRDetailRepo(repo), number: number, headSHA: headSHA}
 	c.prBatchMu.Lock()
 	defer c.prBatchMu.Unlock()
 	checks, ok := c.prBatchCheckRuns[key]
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
-	return cloneCheckRuns(checks), true
+	at := c.prBatchCheckObservedAt[key]
+	if at.IsZero() {
+		return cloneCheckRuns(checks), nil, true
+	}
+	return cloneCheckRuns(checks), &at, true
+}
+
+func (c *Client) graphQLBatchCheckObservedAt(repo string, number int, headSHA string) *time.Time {
+	_, at, _ := c.graphQLBatchCheckRunsObservation(repo, number, headSHA)
+	return at
 }
 
 func (c *Client) storeGraphQLPRBatchReview(repo string, n graphQLPRBatchNode) {
+	st := c.reviewStateFromNode(n.reviewDecisionNode)
 	c.prBatchMu.Lock()
 	defer c.prBatchMu.Unlock()
 	if c.prBatchReviews == nil {
@@ -362,19 +437,6 @@ func (c *Client) storeGraphQLPRBatchReview(repo string, n graphQLPRBatchNode) {
 	if byNumber == nil {
 		byNumber = map[int]prReviewState{}
 		c.prBatchReviews[key] = byNumber
-	}
-	st := prReviewState{decision: ReviewDecision(strings.ToUpper(strings.TrimSpace(n.ReviewDecision)))}
-	for _, li := range n.ClosingIssuesReferences.Nodes {
-		if li.Number > 0 {
-			st.linkedIssues = append(st.linkedIssues, PRLinkedIssue{
-				Number:      li.Number,
-				Title:       li.Title,
-				Repo:        li.Repository.NameWithOwner,
-				State:       strings.ToLower(strings.TrimSpace(li.State)),
-				StateReason: strings.ToLower(strings.TrimSpace(li.StateReason)),
-				URL:         li.URL,
-			})
-		}
 	}
 	byNumber[n.Number] = st
 }
@@ -409,14 +471,21 @@ func cloneCheckRuns(in []*gh.CheckRun) []*gh.CheckRun {
 			continue
 		}
 		out = append(out, &gh.CheckRun{
-			ID:         clonePtr(cr.ID),
-			Name:       clonePtr(cr.Name),
-			Status:     clonePtr(cr.Status),
-			Conclusion: clonePtr(cr.Conclusion),
-			DetailsURL: clonePtr(cr.DetailsURL),
-			StartedAt:  cloneTimestamp(cr.StartedAt),
-			App:        cr.App,
+			ID:          clonePtr(cr.ID),
+			NodeID:      clonePtr(cr.NodeID),
+			HeadSHA:     clonePtr(cr.HeadSHA),
+			Name:        clonePtr(cr.Name),
+			Status:      clonePtr(cr.Status),
+			Conclusion:  clonePtr(cr.Conclusion),
+			DetailsURL:  clonePtr(cr.DetailsURL),
+			StartedAt:   cloneTimestamp(cr.StartedAt),
+			CompletedAt: cloneTimestamp(cr.CompletedAt),
 		})
+		if cr.App != nil {
+			app := *cr.App
+			app.ID = clonePtr(cr.App.ID)
+			out[len(out)-1].App = &app
+		}
 	}
 	return out
 }

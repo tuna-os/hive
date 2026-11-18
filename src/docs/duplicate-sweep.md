@@ -52,11 +52,17 @@ not check" must never render as "we checked and they agree".
   a change should not be asked to stand down for someone who arrived later.
   Suggestions are posted on the **later** PRs.
 - **Bot regeneration series** (every member authored by the same `[bot]`
-  account, or a login listed in `bot_authors`) — the **newest** survives, since
-  each run supersedes the last by construction, and a **single summary** is
-  posted on that newest PR rather than one comment on each. A bot re-opening
-  the same PR daily would otherwise turn this sweep into the noise source it is
-  meant to reduce.
+  account, or a login listed in `bot_authors`, running the **same job**: the
+  titles match once versions, dates and hashes are set aside, or the patches
+  are byte-identical) — the **newest** survives, since each run supersedes the
+  last by construction, and a **single summary** is posted on that newest PR
+  rather than one comment on each. A bot re-opening the same PR daily would
+  otherwise turn this sweep into the noise source it is meant to reduce.
+- **One bot's different jobs** — a dependency bot's separate bumps that all
+  edit `package.json` and its lockfile, say "update dependency vue-tsc to
+  v3.3.14" and "update dependency js-yaml to v5" — are **not clustered at
+  all** and get no comment. They are separate updates, not duplicates. A
+  shared finding identity still clusters them as an ordinary cluster.
 
 Drafts are excluded entirely: a draft is not competing for the queue slot the
 sweep exists to free.
@@ -79,7 +85,7 @@ duplicate_sweep:
 says anything on a contributor's PR. `post_comments` has no effect without it.
 
 The sweep runs at most once per hour (`duplicateSweepInterval`,
-`src/cmd/hive/main.go`) and its comments are idempotent: each cluster carries an
+`src/cmd/hive/main_sweeps.go`) and its comments are idempotent: each cluster carries an
 invisible marker, so a later pass edits its own prior suggestion in place — and
 elides the write entirely when the body is unchanged — rather than stacking a
 fresh comment every hour.
@@ -98,4 +104,4 @@ fresh comment every hour.
 
 Source: `src/pkg/dupsweep` (clustering and rendering, no GitHub dependency),
 `src/pkg/github/duplicate_sweep.go` (the scan and the comment path),
-`runDuplicateSweepIfDue` in `src/cmd/hive/main.go` (the cadence).
+`runDuplicateSweepIfDue` in `src/cmd/hive/main_sweeps.go` (the cadence).

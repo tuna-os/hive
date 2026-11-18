@@ -2,6 +2,9 @@ package automerge
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 
 	gh "github.com/google/go-github/v72/github"
@@ -16,6 +19,10 @@ const (
 	// currentBaseUpdateReason is the update-branch claim reason recorded when
 	// a green head is refreshed because the base moved under it.
 	currentBaseUpdateReason = "base-moved"
+	// currentBaseFallbackMessage is the one-per-PR WARN emitted when a repo
+	// gated only by auto_merge.require_current_base_default has a behind head
+	// the App cannot update, so the head merges as it was tested.
+	currentBaseFallbackMessage = "automerge current-base gate: head is behind the base but the branch cannot be updated; merging as tested (list the repo in auto_merge.require_current_base to park it instead)"
 )
 
 func (c *Engine) requireCurrentBaseFor(repo string) bool {
@@ -23,6 +30,51 @@ func (c *Engine) requireCurrentBaseFor(repo string) bool {
 		return false
 	}
 	return c.requireCurrentBase(repo)
+}
+
+func (c *Engine) requireCurrentBaseStrictFor(repo string) bool {
+	if c == nil || c.requireCurrentBaseStrict == nil {
+		return false
+	}
+	return c.requireCurrentBaseStrict(repo)
+}
+
+// currentBaseUpdateUnavailable reports whether an update-branch attempt
+// failed because the App may not write the head at all — a fork head without
+// maintainer edits, or a same-repo 403 (branch protection or a missing
+// contents:write) — as opposed to a transient or conflict failure. Only
+// these outcomes let a default-gated repo fall back to merging as tested;
+// a conflict or an unknown error still stops the merge.
+func currentBaseUpdateUnavailable(reason string, err error) bool {
+	if reason == autoMergeReasonForkNotEditable {
+		return true
+	}
+	var ghErr *gh.ErrorResponse
+	return err != nil && errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusForbidden
+}
+
+// warnCurrentBaseFallbackOnce logs, once per repo#pr, that the default gate
+// is letting a behind head merge as tested because the App cannot update it.
+// Later ticks for the same PR log at Debug so a parked PR does not repeat
+// the line every sweep.
+func (c *Engine) warnCurrentBaseFallbackOnce(displayRepo string, number int, reason string, err error) {
+	if c == nil {
+		return
+	}
+	key := fmt.Sprintf("%s#%d", strings.ToLower(displayRepo), number)
+	c.currentBaseFallbackWarnedMu.Lock()
+	if c.currentBaseFallbackWarned == nil || len(c.currentBaseFallbackWarned) > 4096 {
+		c.currentBaseFallbackWarned = map[string]struct{}{}
+	}
+	_, seen := c.currentBaseFallbackWarned[key]
+	c.currentBaseFallbackWarned[key] = struct{}{}
+	c.currentBaseFallbackWarnedMu.Unlock()
+	args := []any{"repo", displayRepo, "pr", number, "reason", reason, "error", err, "opt_in_key", "auto_merge.require_current_base"}
+	if seen {
+		c.debug(currentBaseFallbackMessage, args...)
+		return
+	}
+	c.warn(currentBaseFallbackMessage, args...)
 }
 
 // currentBaseGate enforces auto_merge.require_current_base
@@ -33,7 +85,9 @@ func (c *Engine) requireCurrentBaseFor(repo string) bool {
 // repo opts in, the head must contain the current base tip: if it does not,
 // the branch is updated (a merge commit, no human commit rewritten) and the
 // merge waits for CI on the new head. holdReason is returned instead when
-// the caller may not update the branch this tick.
+// the caller may not update the branch this tick. pr is the PR payload the
+// lane evaluated (fork head, dependency-bot branch); nil reads as a
+// same-repo, non-bot head.
 //
 // A base that refused a direct merge as merge-queue-only is not updated
 // (hivecommons/hive#14068): the hive cannot enqueue, so the PR never merges
@@ -45,7 +99,13 @@ func (c *Engine) requireCurrentBaseFor(repo string) bool {
 //
 // stop is false when the merge may proceed; otherwise the caller returns the
 // event, reason and error as-is.
-func (c *Engine) currentBaseGate(ctx context.Context, displayRepo, owner, repo string, number int, baseBranch, headSHA string, branchUpdateAllowed bool, holdReason string, fork bool) (AutoMergeSweepEvent, string, bool, error) {
+func (c *Engine) currentBaseGate(ctx context.Context, displayRepo, owner, repo string, number int, baseBranch, headSHA string, branchUpdateAllowed bool, holdReason string, pr *gh.PullRequest, admissionLane ...string) (AutoMergeSweepEvent, string, bool, error) {
+	if combined, err := integrationCombinedBaseCheck(ctx, owner+"/"+repo, baseBranch, number, headSHA); combined {
+		if err != nil {
+			return AutoMergeSweepEvent{}, autoMergeReasonCurrentBaseCheck, true, err
+		}
+		return AutoMergeSweepEvent{}, "", false, nil
+	}
 	if !c.requireCurrentBaseFor(owner+"/"+repo) || c.gh == nil {
 		return AutoMergeSweepEvent{}, "", false, nil
 	}
@@ -58,6 +118,8 @@ func (c *Engine) currentBaseGate(ctx context.Context, displayRepo, owner, repo s
 		return AutoMergeSweepEvent{}, autoMergeReasonCurrentBaseCheck, true, err
 	}
 	if cmp.GetBehindBy() <= 0 {
+		// Ownership serializes REFRESHES, never already-current ready work.
+		// A fully gated successor may land while another head prepares.
 		return AutoMergeSweepEvent{}, "", false, nil
 	}
 	if c.mergeQueueBaseHoldsRefresh(owner, repo, baseBranch) {
@@ -67,10 +129,42 @@ func (c *Engine) currentBaseGate(ctx context.Context, displayRepo, owner, repo s
 	if !branchUpdateAllowed {
 		return AutoMergeSweepEvent{}, holdReason, true, nil
 	}
+	if c.leaveBaseSyncToDependencyBot(displayRepo, owner, repo, pr, "current-base") {
+		// The bot keeps its own branch current, and a hive merge commit
+		// would stop it doing so for good. The head holds as "behind" until
+		// the bot rebases it when the repo is explicitly listed in
+		// auto_merge.require_current_base, or when GitHub itself requires
+		// up-to-date branches (mergeable_state "behind": GitHub would refuse
+		// the merge, and Renovate rebases behind branches under that rule).
+		// A repo gated only by the hive-wide default merges it as tested,
+		// like a head the App may not write: no bot rebases a merely stale
+		// branch there.
+		if c.requireCurrentBaseStrictFor(owner+"/"+repo) || strings.EqualFold(pr.GetMergeableState(), "behind") {
+			return AutoMergeSweepEvent{}, "behind", true, nil
+		}
+		c.warnCurrentBaseFallbackOnce(displayRepo, number, "dependency-bot-branch", nil)
+		return AutoMergeSweepEvent{}, "", false, nil
+	}
+	lane := stageLaneSelf
+	if len(admissionLane) > 0 {
+		lane = admissionLane[0]
+	}
+	if reason, err := c.admitBasePreparation(ctx, owner, repo, baseBranch, number, headSHA, lane, false); reason != "" || err != nil {
+		return AutoMergeSweepEvent{}, nonEmpty(reason, basePreparationPrefix+"state-unavailable"), true, err
+	}
 	baseSHA := cmp.GetBaseCommit().GetSHA()
 	if !c.branchUpdateWorkflowRefused(owner, repo, number, headSHA, baseSHA) {
 		c.info("automerge head is behind the current base; updating before merge", "repo", displayRepo, "pr", number, "base", baseBranch, "behind_by", cmp.GetBehindBy())
 	}
-	event, reason, err := c.updateBranchAndSkip(ctx, displayRepo, owner, repo, number, headSHA, baseSHA, currentBaseUpdateReason, fork)
+	event, reason, err := c.updateBranchAndSkip(ctx, displayRepo, owner, repo, number, headSHA, baseSHA, currentBaseUpdateReason, pr)
+	if currentBaseUpdateUnavailable(reason, err) && !c.requireCurrentBaseStrictFor(owner+"/"+repo) {
+		// Gate inherited from the hive-wide default (#15335) on a head the App
+		// may not write: parking it would turn every non-editable fork PR
+		// into a stall a human has to clear, so keep the pre-gate behaviour
+		// for this PR and say so once. Strict (explicitly listed) repos
+		// still park.
+		c.warnCurrentBaseFallbackOnce(displayRepo, number, reason, err)
+		return AutoMergeSweepEvent{}, "", false, nil
+	}
 	return event, reason, true, err
 }

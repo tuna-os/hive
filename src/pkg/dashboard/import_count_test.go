@@ -63,8 +63,31 @@ func TestDashboardInternalImportCountRatchet(t *testing.T) {
 	// surface the dashboard holds instead of *agent.Manager; pkg/agent stays
 	// for the audit, trailer, provider-status and agent-mode helpers the
 	// Runtime does not cover, and leaves when those move behind the boundary
-	// (hivecommons/hive#13536).
-	const maxDashboardInternalImports = 66
+	// (hivecommons/hive#13536), plus pkg/hubactivity, the leaf wire contract
+	// (ceilings, urgency order, sanitiser) the spoke's heartbeat activity
+	// digest is built against from the dashboard's own stage tracker
+	// (hivecommons/hive#15963), plus pkg/webassets, the browser-asset
+	// packages (tracker view, kiosk call-to-action badge) shared verbatim by
+	// the spoke dashboard and the hub's public Fleet page so the two kiosk
+	// surfaces render one markup (hivecommons/hive#16236), plus
+	// pkg/maintainernotes, the append-only store behind the Activity
+	// Monitor's private per-item maintainer notes and the /api/notes routes,
+	// shared with the scheduler's kick injection (hivecommons/hive#17244),
+	// plus pkg/workflowmodel/store, the spoke-local library of workflow
+	// models behind the /api/workflows routes and the tracker's per-repo
+	// column block (RFC hivecommons/hive#17620, phase 2), plus pkg/inbox,
+	// the source-agnostic voice-recording triage service (items keyed by
+	// source + item id, spek_rfc/dibs destinations) behind the /api/inbox
+	// routes and the Inbox dashboard section, plus pkg/keystore, the
+	// secrets-at-rest seam every dashboard-written secret file (LiteLLM, Bob,
+	// gateway and backup keys, the Copilot login, the NPS relay identity) is
+	// sealed and opened through (hivecommons/hive#18214), plus pkg/mailallow,
+	// the calendar email allowlist, and pkg/mailin (its stdlib-only wire
+	// subpackage, the hive-mx delivery contract) behind the email-in routes
+	// (hivecommons/hive#18395), plus pkg/repoagents, the .hive/agents/
+	// discoverer behind the /api/agents/discovered approval routes
+	// (hivecommons/hive#18491).
+	const maxDashboardInternalImports = 74
 
 	entries, err := os.ReadDir(".")
 	if err != nil {

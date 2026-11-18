@@ -109,7 +109,29 @@ type Config struct {
 	// TimeoutS bounds one review call; when it elapses the agent proceeds and
 	// the review is recorded as skipped.
 	TimeoutS int
+	// ReasoningEffort is sent as the request's reasoning_effort when set (the
+	// advisor model's role names one); empty sends none, so the endpoint's
+	// default applies.
+	ReasoningEffort string
+	// Route is the path a review takes: RouteHTTP (the default) calls the
+	// reviewer endpoint, RouteClaudeCLI runs CLI.
+	Route string
+	// CLI runs one review turn through the Claude CLI on the hive's own
+	// Claude login (the composition root wires the reviewer CLI runner). It
+	// is required for RouteClaudeCLI and unused otherwise.
+	CLI CLITurn
 }
+
+// Review routes, as config.ReviewerTurnRoute.Path names them.
+const (
+	RouteHTTP      = "http"
+	RouteClaudeCLI = "claude-cli"
+)
+
+// CLITurn runs one tool-less model turn with system and user prompts and
+// returns the reply text. model may be empty (the CLI's default model) and
+// effort empty (the CLI's default effort). It must stop by ctx's deadline.
+type CLITurn func(ctx context.Context, system, user, model, effort string) (string, error)
 
 // Evaluator makes one stateless model call per finished turn and reads back a
 // strict-JSON verdict. Safe for concurrent use.
@@ -118,14 +140,34 @@ type Evaluator struct {
 	apiKey       string
 	model        string
 	instructions string
+	effort       string
 	timeout      time.Duration
 	http         *http.Client
+	// cli is set on the Claude CLI route; the review then never calls the
+	// endpoint.
+	cli CLITurn
 }
 
 // NewEvaluator builds an Evaluator. It returns (nil, error) when no endpoint
 // or model resolves, so the caller can report once instead of failing every
 // turn.
 func NewEvaluator(c Config) (*Evaluator, error) {
+	timeout := time.Duration(c.TimeoutS) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if c.Route == RouteClaudeCLI {
+		if c.CLI == nil {
+			return nil, fmt.Errorf("advisor: the Claude CLI route is not available on this hive")
+		}
+		return &Evaluator{
+			model:        strings.TrimSpace(c.Model),
+			instructions: strings.TrimSpace(c.Instructions),
+			effort:       strings.TrimSpace(c.ReasoningEffort),
+			timeout:      timeout,
+			cli:          c.CLI,
+		}, nil
+	}
 	endpoint := strings.TrimRight(strings.TrimSpace(c.Endpoint), "/")
 	if endpoint == "" {
 		return nil, fmt.Errorf("advisor: no reviewer endpoint resolved (set governor.trajectory.endpoint or governor.litellm.endpoint)")
@@ -133,15 +175,12 @@ func NewEvaluator(c Config) (*Evaluator, error) {
 	if strings.TrimSpace(c.Model) == "" {
 		return nil, fmt.Errorf("advisor: no advisor model resolved")
 	}
-	timeout := time.Duration(c.TimeoutS) * time.Second
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
 	return &Evaluator{
 		endpoint:     endpoint,
 		apiKey:       c.APIKey,
 		model:        strings.TrimSpace(c.Model),
 		instructions: strings.TrimSpace(c.Instructions),
+		effort:       strings.TrimSpace(c.ReasoningEffort),
 		timeout:      timeout,
 		http:         &http.Client{Timeout: timeout},
 	}, nil
@@ -196,11 +235,22 @@ type chatMessage struct {
 }
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens"`
+	Model           string        `json:"model"`
+	Messages        []chatMessage `json:"messages"`
+	Temperature     float64       `json:"temperature"`
+	MaxTokens       int           `json:"max_tokens"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
 }
+
+const (
+	// reviewMaxTokens caps the verdict, a short JSON object.
+	reviewMaxTokens = 400
+	// reviewMaxTokensWithEffort caps a review that asks for reasoning: a
+	// reasoning model spends its thinking from the same allowance, so the
+	// verdict's 400 would be used up before it is written. The review's
+	// timeout and the agent's daily advisor budget still bound the spend.
+	reviewMaxTokensWithEffort = 16000
+)
 
 type chatResponse struct {
 	Choices []struct {
@@ -224,11 +274,19 @@ func (e *Evaluator) Review(ctx context.Context, agentName, transcript string) (V
 	}
 
 	messages := buildPrompt(agentName, e.instructions, tail)
+	if e.cli != nil {
+		return e.reviewCLI(ctx, messages)
+	}
+	maxTokens := reviewMaxTokens
+	if e.effort != "" {
+		maxTokens = reviewMaxTokensWithEffort
+	}
 	body, err := json.Marshal(chatRequest{
-		Model:       e.model,
-		Messages:    messages,
-		Temperature: 0,
-		MaxTokens:   400,
+		Model:           e.model,
+		Messages:        messages,
+		Temperature:     0,
+		MaxTokens:       maxTokens,
+		ReasoningEffort: e.effort,
 	})
 	if err != nil {
 		return Verdict{}, Usage{}, fmt.Errorf("marshal review request: %w", err)
@@ -268,16 +326,40 @@ func (e *Evaluator) Review(ctx context.Context, agentName, transcript string) (V
 	}
 	content := cr.Choices[0].Message.Content
 	if usage.Total() == 0 {
-		// Endpoint reported no usage: estimate at ~4 chars per token so the
-		// daily budget still applies.
-		promptChars := 0
-		for _, m := range messages {
-			promptChars += len(m.Content)
-		}
-		usage = Usage{InputTokens: promptChars / 4, OutputTokens: max(len(content)/4, 1), Estimated: true}
+		// Endpoint reported no usage: estimate so the daily budget still
+		// applies.
+		usage = estimateUsage(messages, content)
 	}
 	v, err := ParseVerdict(content)
 	return v, usage, err
+}
+
+// reviewCLI runs the review as one Claude CLI turn: the system message is the
+// CLI's system prompt and the user message its stdin. The CLI reports no
+// token usage the runner reads, so usage is estimated for the daily budget.
+func (e *Evaluator) reviewCLI(ctx context.Context, messages []chatMessage) (Verdict, Usage, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, e.timeout)
+	defer cancel()
+	content, err := e.cli(reqCtx, messages[0].Content, messages[1].Content, e.model, e.effort)
+	if err != nil {
+		if reqCtx.Err() != nil {
+			return Verdict{}, Usage{}, fmt.Errorf("review turn: %w", reqCtx.Err())
+		}
+		return Verdict{}, Usage{}, fmt.Errorf("review turn failed: %w", err)
+	}
+	usage := estimateUsage(messages, content)
+	v, err := ParseVerdict(content)
+	return v, usage, err
+}
+
+// estimateUsage estimates a review's tokens at ~4 characters per token, for a
+// reply whose usage was not reported.
+func estimateUsage(messages []chatMessage, content string) Usage {
+	promptChars := 0
+	for _, m := range messages {
+		promptChars += len(m.Content)
+	}
+	return Usage{InputTokens: promptChars / 4, OutputTokens: max(len(content)/4, 1), Estimated: true}
 }
 
 // ParseVerdict extracts the Verdict JSON from a model reply, tolerating models

@@ -23,12 +23,12 @@ func levelHoldNotice(agent string) string {
 	agent = strings.TrimSpace(agent)
 	return fmt.Sprintf(`%s
 > [!IMPORTANT]
-> **Held for human review by the hive's ACMM level gate.**
+> **Ready for review: held for a maintainer by the hive's ACMM level gate.**
 >
 > This PR was opened by the %q agent while Hive policy required a human checkpoint for that agent. Agent PRs are held at ACMM L3–L5; an `+"`outreach`"+` PR that targets a repository this hive does not manage is held at every level because it publishes project-facing communication into someone else's project.
 >
-> Hive will keep the `+"`hold`"+` label until a human removes it. Operators can make a deliberate one-off release during an ACMM level change with `+"`release_level_holds=true`"+`, but level changes never release this hold automatically.`,
-		levelHoldMarker(agent), agent)
+> The hive's work on this PR is done. Hive will keep the `+"`%s`"+` label until a maintainer reviews the PR and removes it; it blocks merging the same way `+"`hold`"+` does. Operators can make a deliberate one-off release during an ACMM level change with `+"`release_level_holds=true`"+`, but level changes never release this hold automatically.`,
+		levelHoldMarker(agent), agent, ReadyForReviewLabelName())
 }
 
 func levelHoldMarker(agent string) string {
@@ -107,9 +107,9 @@ type LevelHoldPR struct {
 	Agent  string `json:"agent,omitempty"`
 }
 
-// PendingLevelHolds lists open PRs across active repositories whose hold label
-// is attributable to the ACMM level gate and whose latest hold-label event was
-// the Hive App applying that hold. Human re-holds are not considered pending
+// PendingLevelHolds lists open PRs across active repositories whose
+// ready-for-review label is attributable to the ACMM level gate and whose
+// latest event for that label was the Hive App applying it. Human re-holds are not considered pending
 // level holds; they are a human's to remove.
 func (c *Client) PendingLevelHolds(ctx context.Context) ([]LevelHoldPR, error) {
 	if c == nil {
@@ -125,7 +125,10 @@ func (c *Client) PendingLevelHolds(ctx context.Context) ([]LevelHoldPR, error) {
 				return nil, fmt.Errorf("listing open pull requests for %s/%s: %w", owner, repo, err)
 			}
 			for _, pr := range prs {
-				if pr == nil || !HasHoldLabel(extractPRLabels(pr.Labels)) {
+				// Only the level gate's own label is ever released here; a
+				// `hold` (a person's, or a pre-#18468 one awaiting migration)
+				// is never touched.
+				if pr == nil || !hasExactLabel(extractPRLabels(pr.Labels), ReadyForReviewLabelName()) {
 					continue
 				}
 				meta, ok, comments, err := c.levelHoldMetadataAndCommentsForPR(ctx, owner, repo, pr.GetNumber())
@@ -142,7 +145,7 @@ func (c *Client) PendingLevelHolds(ctx context.Context) ([]LevelHoldPR, error) {
 				if blocked {
 					continue
 				}
-				appHeld, err := c.latestHoldLabelEventWasByApp(ctx, owner, repo, pr.GetNumber())
+				appHeld, _, err := c.latestLabelEventByApp(ctx, owner, repo, pr.GetNumber(), ReadyForReviewLabelName())
 				if err != nil {
 					return nil, err
 				}
@@ -159,7 +162,7 @@ func (c *Client) PendingLevelHolds(ctx context.Context) ([]LevelHoldPR, error) {
 	return pending, nil
 }
 
-// ReleaseLevelHoldsOnce removes the literal hold label from the level-held PRs
+// ReleaseLevelHoldsOnce removes the ready-for-review gate label from the level-held PRs
 // currently pending across active repositories and comments with the operator
 // and target level that authorized this deliberate one-off release.
 func (c *Client) ReleaseLevelHoldsOnce(ctx context.Context, level int, actor string) ([]LevelHoldPR, error) {
@@ -176,7 +179,7 @@ func (c *Client) ReleaseLevelHoldsOnce(ctx context.Context, level int, actor str
 	}
 	for _, pr := range pending {
 		owner, repo := c.splitRepo(pr.Repo)
-		if _, err := c.client.Issues.RemoveLabelForIssue(ctx, owner, repo, pr.Number, url.PathEscape("hold")); err != nil && !githubStatusError(err, http.StatusNotFound) {
+		if _, err := c.client.Issues.RemoveLabelForIssue(ctx, owner, repo, pr.Number, url.PathEscape(ReadyForReviewLabelName())); err != nil && !githubStatusError(err, http.StatusNotFound) {
 			return pending, fmt.Errorf("removing level hold label on %s#%d: %w", pr.Repo, pr.Number, err)
 		}
 		body := fmt.Sprintf("hold released by operator %s when raising to L%d", actor, level)
@@ -267,11 +270,6 @@ func hasSelfAuthorizationNotice(comments []*gh.IssueComment, appBotLogin string)
 	return false
 }
 
-func (c *Client) latestHoldLabelEventWasByApp(ctx context.Context, owner, repo string, number int) (bool, error) {
-	ok, _, err := c.latestHoldLabelEventByApp(ctx, owner, repo, number)
-	return ok, err
-}
-
 // latestHoldLabelEventByApp reports whether the newest `hold` label event on
 // the issue or PR is a `labeled` by the App bot, and when that event happened
 // so a caller can pair it with the notice the App posted alongside it. A
@@ -287,15 +285,33 @@ func (c *Client) latestLabelEventByApp(ctx context.Context, owner, repo string, 
 	if c == nil || strings.TrimSpace(c.appBotLogin) == "" {
 		return false, gh.Timestamp{}, nil
 	}
-	opts := &gh.ListOptions{PerPage: 100}
-	latestEvent := ""
-	latestActor := ""
+	h, err := c.labelEventHistory(ctx, owner, repo, number, label)
+	if err != nil {
+		return false, gh.Timestamp{}, err
+	}
+	return h.latestKind == "labeled" && strings.EqualFold(h.latestActor, c.appBotLogin), h.latestAt, nil
+}
+
+// labelEventSummary is what one walk of an item's label events says about
+// one label: the newest labeled/unlabeled event (kind, actor, time), and
+// whether the App bot ever applied it.
+type labelEventSummary struct {
+	latestKind  string
+	latestActor string
+	latestAt    gh.Timestamp
+	appLabeled  bool
+}
+
+// labelEventHistory walks the item's issue events for label. The caller
+// checks that the App bot login is set; with none, appLabeled stays false.
+func (c *Client) labelEventHistory(ctx context.Context, owner, repo string, number int, label string) (labelEventSummary, error) {
+	var h labelEventSummary
 	latestAtSet := false
-	var latestAt gh.Timestamp
+	opts := &gh.ListOptions{PerPage: 100}
 	for {
 		events, resp, err := c.client.Issues.ListIssueEvents(ctx, owner, repo, number, opts)
 		if err != nil {
-			return false, gh.Timestamp{}, fmt.Errorf("listing issue events for %s/%s#%d: %w", owner, repo, number, err)
+			return labelEventSummary{}, fmt.Errorf("listing issue events for %s/%s#%d: %w", owner, repo, number, err)
 		}
 		for _, event := range events {
 			if event == nil || !strings.EqualFold(event.GetLabel().GetName(), label) {
@@ -305,19 +321,23 @@ func (c *Client) latestLabelEventByApp(ctx context.Context, owner, repo string, 
 			if kind != "labeled" && kind != "unlabeled" {
 				continue
 			}
-			if !latestAtSet || event.GetCreatedAt().After(latestAt.Time) {
+			actor := safeGetLogin(event.GetActor())
+			if kind == "labeled" && c.appBotLogin != "" && strings.EqualFold(actor, c.appBotLogin) {
+				h.appLabeled = true
+			}
+			if !latestAtSet || event.GetCreatedAt().After(h.latestAt.Time) {
 				latestAtSet = true
-				latestAt = event.GetCreatedAt()
-				latestEvent = kind
-				latestActor = safeGetLogin(event.GetActor())
+				h.latestAt = event.GetCreatedAt()
+				h.latestKind = kind
+				h.latestActor = actor
 			}
 		}
-		if resp.NextPage == 0 {
+		if resp == nil || resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-	return latestEvent == "labeled" && strings.EqualFold(latestActor, c.appBotLogin), latestAt, nil
+	return h, nil
 }
 
 func (c *Client) listIssueComments(ctx context.Context, owner, repo string, number int) ([]*gh.IssueComment, error) {
@@ -325,11 +345,13 @@ func (c *Client) listIssueComments(ctx context.Context, owner, repo string, numb
 }
 
 // listIssueCommentsSince lists comments updated at or after since; a zero
-// since lists every comment.
+// since lists every comment. The since sent is rounded down to the hour
+// (cacheableSince), so callers may get a few older comments and must keep
+// filtering on their own cutoff.
 func (c *Client) listIssueCommentsSince(ctx context.Context, owner, repo string, number int, since time.Time) ([]*gh.IssueComment, error) {
 	opts := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	if !since.IsZero() {
-		opts.Since = gh.Ptr(since)
+		opts.Since = gh.Ptr(cacheableSince(since))
 	}
 	var all []*gh.IssueComment
 	for {

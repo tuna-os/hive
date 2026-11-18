@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hivecommons/hive/crux/agent/panesignal"
 )
 
 // pollTmuxOutputForAgent is pollTmuxOutput using the agent's tmux socket.
@@ -19,12 +21,21 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 	var prevLines []string
 	loginStreak := 0
 	tokenRestartProducingLogged := false
+	// A dashboard Claude sign-in that predates this poller is not its signal
+	// to restart on (#18732); only a newer one is.
+	signInGenSeen := m.claudeSignInGeneration()
 	outcomeTick := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// The Copilot CLI's own atomic save replaces the config.json
+			// symlink seconds after launch; relink it within one poll interval
+			// so a later dashboard login reaches this running agent (#18671).
+			// One Lstat while the link is intact; a no-op for other backends.
+			m.relinkCopilotConfigAfterCLISave(agent)
+
 			// Scrollback capture for dashboard display + ring buffer diff
 			output := m.captureTmuxPaneForAgent(agent)
 			if output == "" {
@@ -94,9 +105,9 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 				if agent.shouldResetTokenRestartCap(paneHasCLIMarker(strings.Join(tail, "\n")), startedAt, time.Now()) {
 					// A future "token appeared, nudge it" restart is now a
 					// fresh theory rather than a repeat of one that already
-					// failed. Reset both halves of the cap together.
-					agent.tokenRestartAttempts = 0
-					agent.tokenRestartGaveUp = false
+					// failed. The latch survives while the rolling window is
+					// still full (#17483).
+					agent.rearmTokenRestartCap(time.Now())
 				}
 			}
 
@@ -170,6 +181,14 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 			//   5. A quiet-output window: a genuinely stuck login prompt sits
 			//      silent, while an agent still rendering output may simply be
 			//      discussing login/auth work in its answer.
+			//
+			// A Copilot agent whose config.json diverged from the shared login
+			// (#18443) is relinked first: the credential probe below rejects a
+			// diverged copy, and once relinked it evaluates the shared login, so
+			// the one restart that follows starts a CLI that reads it.
+			if showsLogin && loginStreak >= loginStreakRestartMin {
+				m.repairCopilotConfigOnLoginPrompt(agent)
+			}
 			if showsLogin && loginStreak >= loginStreakRestartMin && m.AgentHasValidCredential(agent.Name) {
 				now := time.Now()
 				m.mu.RLock()
@@ -178,7 +197,34 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 				if lastKick != nil && now.Sub(*lastKick) < tokenRestartKickGrace {
 					continue
 				}
-				if tokenRestartBlockedByOutput(lastPaneChange, now) {
+				// #18732: "valid" has to mean the PROVIDER accepts the token,
+				// not that the file is well-formed — a revoked grant leaves
+				// the file intact. For Claude the heal is chosen only after a
+				// live check (claude_login_revoked.go); other backends route
+				// straight to the capped heal below.
+				heal := m.decideLoginPromptHeal(ctx, agent, &signInGenSeen, now)
+				if heal == loginHealSignInRestart {
+					m.logger.Info("restarting agent still at a login prompt after the operator signed in to Claude; token-restart window bypassed",
+						"agent", agent.Name,
+						"restarts_24h", agent.tokenRestartsInWindow(now),
+						"window_max", tokenRestartWindowMax,
+					)
+					go func() {
+						if err := m.RestartWithReason(ctx, agent.Name, "operator signed in to Claude"); err != nil {
+							m.logger.Warn("post-sign-in restart failed", "agent", agent.Name, "error", err)
+						}
+					}()
+					return // stop polling; Restart will spawn a new goroutine
+				}
+				if heal == loginHealOperatorLogin {
+					// The provider rejected the credential: the dashboard
+					// banner, the login detector's notification and the hub
+					// verdict carry it from the BackendAuthRevoked mark. No
+					// restart, and decideTokenRestart is not consulted, so
+					// the 24h ledger is untouched for the sign-in that fixes
+					// this. Deliberately no `continue`: the TLS and hung-CLI
+					// detectors below stay live.
+				} else if tokenRestartBlockedByOutput(lastPaneChange, now) {
 					if !tokenRestartProducingLogged {
 						m.logger.Info("token-triggered restart suppressed: agent is producing output",
 							"agent", agent.Name,
@@ -253,6 +299,15 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 				}
 			}
 
+			// The CLI refused the configured model id (Claude Code: "There's
+			// an issue with the selected model (<id>)"). Not transient, not a
+			// login problem: surface it as the agent's error, back kicks off,
+			// and park the agent after repeated identical failures instead of
+			// letting it cycle kick → refusal → restart (model_rejection.go).
+			if m.observeModelRejection(agent, tail, time.Now()) {
+				return
+			}
+
 			if bobKeyRejected {
 				agent.LastError = startFailureReason(bobBackend, StartFailureCredentialRejected, "")
 				m.mu.Lock()
@@ -323,7 +378,9 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 			}
 
 			if !IsInferenceBackend(effectiveBackend(agent)) {
-				m.nudgeIfPollingCI(agent, output, m.captureVisiblePaneForAgent(agent))
+				visible := m.captureVisiblePaneForAgent(agent)
+				m.nudgeIfPollingCI(agent, output, visible)
+				m.adviseKnowledge(agent, output, visible)
 			}
 
 			// Detect copilot hung: if running long enough with no CLI prompt,
@@ -339,7 +396,13 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 			// the prompt out of the capture window for ~100s on a large kick,
 			// far longer than expiredTokenHangTimeoutSec has any reason to
 			// tolerate.
-			if agent.Config.Backend == "copilot" && !IsInferenceBackend(agent.BackendOverride) && agent.StartedAt != nil &&
+			//
+			// ctx.Err() gates it too: a tick still running when a restart
+			// cancelled this poller sees the relaunched, still-empty pane
+			// against the OLD StartedAt, so it reads as a session hung for
+			// hours. That session is the restart's, not this poller's (and
+			// runCopilotDiagnostic re-checks ctx under m.mu before touching it).
+			if ctx.Err() == nil && agent.Config.Backend == "copilot" && !IsInferenceBackend(agent.BackendOverride) && agent.StartedAt != nil &&
 				!agent.kickDelivering.Load() &&
 				time.Since(*agent.StartedAt).Seconds() >= expiredTokenHangTimeoutSec &&
 				!paneShowsCLIReady(filtered) {
@@ -397,18 +460,6 @@ func (m *Manager) pollTmuxOutputForAgent(agent *AgentProcess, ctx context.Contex
 	}
 }
 
-// codexUpdatePromptLabel identifies the codex update menu in blockingPrompts.
-//
-// NOTE: answering "skip until next version" is deliberate, and updating in
-// place is NOT a viable alternative here. The prompt's own "1. Update now"
-// runs `npm install -g @openai/codex`, which needs write access to
-// /usr/local/lib/node_modules (root:root). Neither the agent UID nor the hub
-// process has it — attempting the install from the hub fails with the same
-// exit status 243. "Skip until next version" persists in each agent's
-// CODEX_HOME, so the prompt is answered once per agent and does not recur.
-// Updating the CLI belongs to the image build, not to a running agent.
-const codexUpdatePromptLabel = "codex update prompt"
-
 // watchForTrustPromptForAgent monitors a tmux session for startup-blocking
 // modal prompts using the agent's tmux socket, and answers each with the
 // specific option that unblocks it (see blockingPrompts).
@@ -462,10 +513,25 @@ func (m *Manager) watchForTrustPromptForAgent(agent *AgentProcess, ctx context.C
 			}
 			output := m.captureTmuxPaneForAgent(agent)
 			backend := agent.effectiveBackend()
-			if m.routableBackend(backend) {
+			inference := m.routableBackend(backend)
+			if inference {
 				backend = "claude"
 			}
-			if key, label, ok := blockingPromptKey(backend, output); ok && time.Since(answeredAt[label]) > trustReanswerAfter {
+			if key, label, ok := blockingPromptKey(backend, output); ok && !inferenceDismisserOwnsPrompt(inference, label) && time.Since(answeredAt[label]) > trustReanswerAfter {
+				if label == claudePermissionDialogLabel {
+					title, _ := claudePermissionDialog(output)
+					if !agentExpectsSkipPermissions(agent, backend) {
+						m.logger.Warn("Claude Code permission dialog on screen; launch_cmd does not declare --dangerously-skip-permissions, leaving it for the operator",
+							"agent", agent.Name, "dialog", title)
+						answeredAt[label] = time.Now()
+						continue
+					}
+					m.logger.Warn("Claude Code permission dialog on screen; the agent is meant to run with --dangerously-skip-permissions — answering option 1",
+						"agent", agent.Name, "dialog", title, "option", key)
+				}
+				if label == claudeFirstRunNoticeLabel {
+					m.noteClaudeFirstRunNotice(agent, "launch")
+				}
 				answeredAt[label] = time.Now()
 				time.Sleep(paneCaptureSleep)
 				// An empty key means the affirmative option is already selected
@@ -483,6 +549,15 @@ func (m *Manager) watchForTrustPromptForAgent(agent *AgentProcess, ctx context.C
 			}
 		}
 	}
+}
+
+// inferenceDismisserOwnsPrompt reports whether the lifetime watcher must leave
+// a recognised prompt to dismissInferencePrompts. That routine already presses
+// Enter on every "Press Enter to continue" screen of an inference agent, so the
+// watcher answering Claude's first-run security notes too would send a second
+// Enter, which lands on whatever screen comes next.
+func inferenceDismisserOwnsPrompt(inference bool, label string) bool {
+	return inference && label == panesignal.ClaudeSecurityNotesLabel
 }
 
 // outputSignalPatterns are substrings in agent output that indicate meaningful
@@ -505,8 +580,11 @@ var outputSignalPatterns = map[string]string{
 }
 
 // logOutputSignals checks a line of agent output for meaningful patterns
-// and emits a structured slog entry for each match.
+// and emits a structured slog entry for each match. The structured markers
+// ([STATUS], [FINDING], [COMPLETE], [ERROR]) also go to the kick observers
+// (#18287; see output_signals.go).
 func (m *Manager) logOutputSignals(agent, line string) {
+	m.emitOutputSignal(agent, line)
 	for pattern, event := range outputSignalPatterns {
 		if strings.Contains(line, pattern) {
 			preview := line
@@ -568,6 +646,12 @@ func (m *Manager) checkKickRefusal(agent *AgentProcess, line string) {
 	if looksLikeEchoedKickContent(line) {
 		return
 	}
+	// Claude Code's first-run security notice says "Due to prompt injection
+	// risks, …", which matches the "prompt injection" refusal pattern; it is
+	// CLI onboarding text, not the model declining a kick.
+	if strings.Contains(line, claudeFirstRunNoticeInjectionMarker) {
+		return
+	}
 	lower := strings.ToLower(line)
 	for _, pattern := range kickRefusalPatterns {
 		if strings.Contains(lower, strings.ToLower(pattern)) {
@@ -583,6 +667,7 @@ func (m *Manager) checkKickRefusal(agent *AgentProcess, line string) {
 				"pattern", pattern,
 				"line", reason,
 			)
+			m.retryRefusedCanaryKick(agent)
 			return
 		}
 	}
@@ -614,18 +699,8 @@ func diffNewLines(prev, curr []string) []string {
 	return out
 }
 
-var spinnerReplacer = strings.NewReplacer(
-	"◐", "○", "◑", "○", "◒", "○", "◓", "○",
-	"◎", "○", "◉", "○", "●", "○",
-)
-
-var creditsRe = regexp.MustCompile(`AI Credits: [\d.]+`)
-
 func normalizeLine(s string) string {
-	s = strings.TrimRight(s, " \t")
-	s = spinnerReplacer.Replace(s)
-	s = creditsRe.ReplaceAllString(s, "AI Credits: _")
-	return s
+	return panesignal.NormalizeLine(s)
 }
 
 func findOverlap(prev, curr []string) int {

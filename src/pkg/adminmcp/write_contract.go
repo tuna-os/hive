@@ -33,6 +33,8 @@ var (
 	ErrWritesDisabled      = errors.New("admin MCP writes are disabled")
 	ErrConfirmationExpired = errors.New("admin MCP confirmation expired")
 	ErrConfirmationMissing = errors.New("admin MCP confirmation not found")
+	ErrConfirmationActor   = errors.New("admin MCP confirmation was previewed by another caller; preview it again yourself")
+	ErrConfirmationStale   = errors.New("admin MCP confirmation is stale: the settings it was previewed against changed after the preview; preview it again")
 )
 
 type WriteClient interface {
@@ -54,6 +56,10 @@ type WritePreview struct {
 	WideningDisclosure  string         `json:"widening_disclosure"`
 	ConfirmationMessage string         `json:"confirmation_message"`
 	Details             map[string]any `json:"details,omitempty"`
+	// StateFingerprint is set by an op whose request was built from live
+	// hive state (confirmGuardOp). It is stored with the confirmation, and
+	// write_confirm refuses when the state no longer matches it.
+	StateFingerprint string `json:"state_fingerprint,omitempty"`
 }
 
 type WriteOp interface {
@@ -123,6 +129,7 @@ type PendingConfirmation struct {
 	Args      map[string]any `json:"args"`
 	Preview   WritePreview   `json:"preview"`
 	Hive      string         `json:"hive"`
+	Actor     string         `json:"actor,omitempty"`
 	CreatedAt time.Time      `json:"created_at"`
 	ExpiresAt time.Time      `json:"expires_at"`
 }

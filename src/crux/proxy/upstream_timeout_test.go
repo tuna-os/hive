@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -35,6 +37,11 @@ func readGitHubProxySource(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("glob github_proxy*.go: %v", err)
 	}
+	chain, err := filepath.Glob(filepath.Join(filepath.Dir(file), "upstream_chain.go"))
+	if err != nil {
+		t.Fatalf("glob upstream_chain.go: %v", err)
+	}
+	paths = append(paths, chain...)
 	var sb strings.Builder
 	for _, path := range paths {
 		if strings.HasSuffix(path, "_test.go") {
@@ -61,9 +68,18 @@ func TestAllTLSUpstreamDialsAreBound(t *testing.T) {
 	if strings.Contains(text, "tls.DialWithDialer(markDialer(0)") {
 		t.Fatal("TLS upstream dials must not use an unbounded zero-timeout dialer")
 	}
+	// Every TLS upstream dial funnels through dialUpstreamTLS, whose direct
+	// leg is the single bounded tls.DialWithDialer(markDialer(timeout)) and
+	// whose chained leg is bounded by a context carrying the same timeout.
+	if got := strings.Count(text, "tls.DialWithDialer("); got != 1 {
+		t.Fatalf("tls.DialWithDialer sites = %d, want 1 (dialUpstreamTLS)", got)
+	}
+	if !strings.Contains(text, "tls.DialWithDialer(markDialer(timeout)") {
+		t.Fatal("dialUpstreamTLS direct leg must use the bounded markDialer(timeout)")
+	}
 	const wantBoundTLSUpstreamDials = 3
-	if got := strings.Count(text, "tls.DialWithDialer(markDialer(upstreamDialTimeout)"); got != wantBoundTLSUpstreamDials {
-		t.Fatalf("bounded TLS upstream dials = %d, want %d", got, wantBoundTLSUpstreamDials)
+	if got := strings.Count(text, "upstreamDialTimeout)"); got < wantBoundTLSUpstreamDials {
+		t.Fatalf("dialUpstreamTLS callers passing upstreamDialTimeout = %d, want >= %d", got, wantBoundTLSUpstreamDials)
 	}
 	for _, want := range []string{
 		`p.logger.Error("transparent proxy upstream dial failed"`,
@@ -144,5 +160,100 @@ func TestIsClientHangup(t *testing.T) {
 	}
 	if isClientHangup(errors.New("tls: failed to verify certificate")) {
 		t.Fatal("certificate errors must stay WARN")
+	}
+}
+
+func TestLogTimeoutBoundsWarnBursts(t *testing.T) {
+	var buf bytes.Buffer
+	p := &GitHubProxy{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	const msg = "copilot sniff: upstream response read timed out"
+	err := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
+	for i := 0; i < 24; i++ {
+		p.logTimeout(msg, err, "agent", "a")
+	}
+	if got := strings.Count(buf.String(), "level=WARN"); got != 1 {
+		t.Fatalf("WARN lines = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), msg); got != 24 {
+		t.Fatalf("timeouts must stay observable; lines = %d, want 24", got)
+	}
+}
+
+func TestLogTimeoutNonTimeoutDoesNotConsumeWarnWindow(t *testing.T) {
+	var buf bytes.Buffer
+	p := &GitHubProxy{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	const msg = "copilot sniff: upstream response read timed out"
+	p.logTimeout(msg, io.EOF, "agent", "a")
+	if buf.Len() != 0 {
+		t.Fatalf("non-timeout error must log nothing, got %q", buf.String())
+	}
+	p.logTimeout(msg, &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}, "agent", "a")
+	if got := strings.Count(buf.String(), "level=WARN"); got != 1 {
+		t.Fatalf("first real timeout after a hangup must WARN; WARN lines = %d, want 1", got)
+	}
+}
+
+func TestLogTimeoutWarnWindowReArmsPerMessage(t *testing.T) {
+	var buf bytes.Buffer
+	p := &GitHubProxy{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	const (
+		readMsg  = "copilot sniff: upstream response read timed out"
+		relayMsg = "copilot sniff: response relay timed out"
+	)
+	err := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
+
+	// Inside the window the second message is independent: a WARN for one
+	// timeout site must not swallow the first WARN of another.
+	p.logTimeout(readMsg, err, "agent", "a")
+	p.logTimeout(relayMsg, err, "agent", "a")
+	if got := strings.Count(buf.String(), "level=WARN"); got != 2 {
+		t.Fatalf("distinct messages inside the window WARN lines = %d, want 2", got)
+	}
+
+	// Age only readMsg past the window: it WARNs again while relayMsg,
+	// still inside its window, stays at DEBUG.
+	buf.Reset()
+	p.timeoutWarnMu.Lock()
+	p.timeoutWarnAt[readMsg] = time.Now().Add(-timeoutWarnWindow - time.Second)
+	p.timeoutWarnMu.Unlock()
+	p.logTimeout(readMsg, err, "agent", "a")
+	p.logTimeout(relayMsg, err, "agent", "a")
+	out := buf.String()
+	if got := strings.Count(out, "level=WARN"); got != 1 {
+		t.Fatalf("after the window elapsed WARN lines = %d, want 1:\n%s", got, out)
+	}
+	if !strings.Contains(out, "level=WARN msg=\""+readMsg+"\"") {
+		t.Fatalf("the re-armed WARN must be the aged message:\n%s", out)
+	}
+	if !strings.Contains(out, "level=DEBUG msg=\""+relayMsg+"\"") {
+		t.Fatalf("the message still inside its window must stay DEBUG:\n%s", out)
+	}
+
+	// Re-arming stamps a fresh window start, so the next repeat is DEBUG again.
+	buf.Reset()
+	p.logTimeout(readMsg, err, "agent", "a")
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Fatalf("repeat right after re-arm must be DEBUG:\n%s", buf.String())
+	}
+}
+
+func TestLogConnectDialFailedLevels(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"no such host", &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", Name: "prom.example.com", IsNotFound: true}}, "level=DEBUG"},
+		{"refused", errors.New("connection refused"), "level=WARN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			p := &GitHubProxy{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+			p.logConnectDialFailed("prom.example.com:9090", tc.err)
+			if !strings.Contains(buf.String(), tc.want) {
+				t.Errorf("want %s, got %q", tc.want, buf.String())
+			}
+		})
 	}
 }

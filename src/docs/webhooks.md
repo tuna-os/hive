@@ -13,6 +13,85 @@ The priority order throughout is **accuracy → latency → API thrift**. A
 delivery is a free hint; every outbound GitHub call is budgeted. The rules
 below exist so that the hive never trades the first for the third.
 
+## Setting up webhooks (owner guide)
+
+Webhooks are optional. Without them a hive polls GitHub every
+`governor.eval_interval_s` (default 300 s) and finds out about a review, a red
+check or a new comment at the next tick. With them the hive is told at once:
+the governor wakes early, CI-failure and review kicks land within seconds
+instead of minutes, the base tick stretches to `governor.eval_interval_webhook_s`
+(default 900 s), and the outbound API budget drops because each delivery costs
+one confirming `GET` instead of a full re-list. Open ⚙ Settings → **Forge App**
+→ **GitHub webhooks** on your hive, or click the **webhooks** tile on the
+Governor card, to see which of the two cases below applies to you.
+
+Hive never shares its own webhook secret. Every hive verifies deliveries with
+a key that belongs to it alone.
+
+### Hosted hive (hub-managed)
+
+Nothing to do. GitHub sends App deliveries to the hub, the hub verifies them
+and relays each one to every hive that manages that repository, signed with
+the relay key it minted for your hive when it was provisioned. The Settings
+section reports **Receiver: hub relay** and the events/hour count; the
+Governor tile reads `N/1h`. If it stays at **no events yet** for an hour of
+activity, confirm the hivecommons GitHub App is installed on the organization
+or repositories your hive tracks (Settings → Forge App → Installation) — the
+hub can only relay what GitHub sends it.
+
+### Self-hosted hive
+
+Your hive needs an org- or repo-level webhook in GitHub that points at it and
+uses a secret only you hold.
+
+1. **Generate the secret.** Settings → Forge App → GitHub webhooks →
+   **Generate secret**. The hive writes it to `/data/github-webhook-secret.key`
+   (0600) and shows it once with a copy button; it is never shown again
+   (regenerate to rotate). If you prefer to manage it yourself, set
+   `GITHUB_WEBHOOK_SECRET` in the hive's environment instead — the button then
+   reports that the environment variable is in charge.
+2. **Create the webhook.** If the section offers **Create webhook for me**,
+   click it: the hive's GitHub App installation holds `organization_hooks` or
+   `repository_hooks` write permission and the hive creates the hook with the
+   right URL, secret and events. Clicking it again is safe: when a hook for
+   this hive's payload URL already exists it is reported, not duplicated.
+   Otherwise do it by hand in GitHub:
+   organization (or repository) → Settings → Webhooks → **Add webhook**.
+   - Payload URL: the value shown in the section, i.e.
+     `https://<your-hive>/api/webhook/github`
+   - Content type: `application/json`
+   - Secret: the value from step 1
+   - SSL verification: enabled
+   - Events: *Let me select individual events* → `check_run`, `check_suite`,
+     `issue_comment`, `issues`, `pull_request`, `pull_request_review`,
+     `pull_request_review_comment`, `push`, `status`, `workflow_run`
+     (optionally `workflow_job`, and `projects_v2_item` if your work source is
+     GitHub Projects).
+3. **Verify.** GitHub sends a `ping` immediately; the section's **Receiver**
+   card should read **github-signed** with a fresh *last event*, and the
+   Governor tile moves from **set up →** to `N/1h` after the first real event.
+
+The payload URL comes from `dashboard.public_url`; if the section shows no URL
+or the wrong one, set that key (or the hub-reported dashboard URL) to the
+address GitHub can reach.
+
+### Troubleshooting
+
+| Symptom (GitHub → Settings → Webhooks → Recent deliveries) | Cause | Fix |
+| --- | --- | --- |
+| `401 invalid signature` | Secret in GitHub differs from the hive's | Paste the current secret into the GitHub hook (Edit → Secret), or regenerate in Settings and update GitHub. `GITHUB_WEBHOOK_SECRET` overrides the generated file — check which one the section says is active. |
+| `503 webhooks disabled: no secret configured` | Hive has neither a generated/env secret nor a hub relay key | Step 1 above. |
+| `404` | Wrong path | The path is `/api/webhook/github` on the spoke (the hub's App endpoint is `/api/github/webhook` — do not point an org hook there). |
+| `200` but **no events yet** | Deliveries are for repos the hive does not manage | Check `project.repos`; deliveries for other repos are acknowledged and dropped. |
+| Hosted hive, no events | App not installed on the repo / relay rejected | Install the App on the org or repo; the hub relays to the dashboard URL your hive reports, which must be reachable from the hub. |
+| Deliveries time out | Hive not reachable from GitHub (private network, redirects) | GitHub (and the hub relay) follow no redirects and need a public HTTPS endpoint. |
+
+Hub relay vs direct: a hive registered with the hub whose repos carry the
+hivecommons App receives relays as well as any direct hook you add; both are
+accepted, duplicates are dropped by delivery id. Only one is needed. A
+self-hosted hive with a private dashboard URL cannot receive relays and must
+use a direct hook.
+
 ## Polling cadence vs webhook patch vs reconcile
 
 Three writers feed one snapshot per repository. A fourth path writes PR
@@ -113,12 +192,18 @@ These are the acceptance criteria of #13373 and the tests that hold them.
 | `governor.eval_interval_max_s` | `1800` | cap on either tick after the API-budget stretch |
 | `governor.webhook_wake_debounce_s` | `10` | a delivery and its check fan-out coalesce into one wake cycle |
 | `governor.webhook_wake_min_gap_s` | `30` | minimum spacing between webhook-triggered cycles, and between the cycles recorded review verdicts trigger |
+| `governor.ci_failure_webhook_kick` | `true` | a failed `check_run`/`check_suite`/`status` delivery kicks the owning agent (hive-authored PR) or runs a targeted contributor-lane pass (contributor PR) at once; `false` records the signal for the sweep only |
+| `governor.ci.auto_approve_workflows` | `true` (unset = on) | approve GitHub-gated (`action_required`) `pull_request` workflow runs once per trusted PR head, in the sweep right after CI enrichment; the sweep is skipped on cycles where the API-budget decision sets `SkipOptional` (`conserve`/`critical` mode, off-cadence and cached-snapshot cycles). `false` leaves the gate to a person. See [runtime-and-quota.md](operator-reference/runtime-and-quota.md) |
+| `governor.ci.auto_approve_workflow_actors` | `['dependabot[bot]', 'renovate[bot]']` | PR authors / triggering actors trusted for workflow approval, besides this hive's App and heads a person admitted from the dashboard (the automerge label alone does not count); an explicit `[]` trusts only those two |
+| `governor.ci_failure_kick_cooldown_s` | `600` | at most one webhook-triggered CI-failure kick or nudge per PR head in this window |
 | `forgestate.reconcile_interval_s` | `900` | ForgeState's own full-list interval per repo, shortened while drift is high |
 | `forgestate.freshness_bound_s` | `60` | maximum item age before merge/close/claim/kick re-reads it |
 | `forgestate.drift_threshold` | `0.05` | fraction of items a reconcile may find wrong before the interval shortens |
 | `dashboard.stage_tracker.webhook_refresh_debounce_ms` | `2000` | debounce of the single-item re-read a delivery queues |
 | `dashboard.stage_tracker.webhook_refresh_replay_window_s` | `1800` | how long a re-read is remembered and re-applied to every status snapshot the governor publishes, so a cycle that enumerated before the close cannot re-list the item |
 | `dashboard.stage_tracker.closed_sweep_interval_s` | `300` | how often (driven by status publishes) each repo's items closed since the last look are listed (one call per repo) and rows still shown are evicted; negative disables |
+| `dashboard.stage_tracker.waiting_push_stale_h` | `4` | hours a CI / Review row may go without a push (booked from the `pull_request` synchronize / `push` re-read, enumerate as fallback) before its pill's age takes the muted-amber tone; negative disables |
+| `dashboard.stage_tracker.merged_hold_s` | `8` | ceiling (seconds, floor `3`) on how long a row stays at "Merging · merge landed" after the payload dropped it before the merged fact arrives; the celebration (toast, bee, odometer) launches as soon as the merge is confirmed, not at the end of the hold (hivecommons/hive#15808) |
 | health window | `2 × governor.eval_interval_s` (10 min at the defaults) | how recent the newest verified delivery must be for webhooks to count as healthy |
 | recovery hysteresis | `WebhookRecoveryHealthyWindows` = `2` | consecutive healthy windows required before the cadence returns to webhook mode after a degradation |
 
@@ -126,13 +211,15 @@ Defaults: `src/pkg/config/defaults.go:30-32` (`DefaultEvalIntervalWebhookS`,
 `DefaultWebhookWakeDebounceS`, `DefaultWebhookWakeMinGapS`),
 `src/pkg/config/forgestate.go:8` (`DefaultForgeStateReconcileInterval`,
 `DefaultForgeStateFreshnessBound`, `DefaultForgeStateDriftThreshold`),
-`src/pkg/github/webhook_cache.go:14` (`DefaultWebhookHealthWindow`, replaced
-by `SetWebhookHealthWindow` at `src/pkg/github/webhook_cache.go:102` once the
+`src/pkg/github/webhook_cache.go:17` (`DefaultWebhookHealthWindow`, replaced
+by `SetWebhookHealthWindow` at `src/pkg/github/webhook_cache.go:206` once the
 governor loop publishes 2 × `eval_interval_s`), and
-`src/pkg/github/webhook_mode.go:34` (`WebhookRecoveryHealthyWindows`). The
+`src/pkg/github/webhook_mode.go:38` (`WebhookRecoveryHealthyWindows`). The
 effective tick is composed in `webhookAwareEvalInterval`
 (`src/cmd/hive/api_budget_decision.go:82`): the API-budget stretch still
-applies and the larger interval wins.
+applies and the larger interval wins. With `governor.api_budget_pacing` on,
+pacing can lengthen that tick further, never shorten it; see
+[API budget pacing](operator-reference/runtime-and-quota.md#api-budget-pacing).
 
 ```yaml
 governor:
@@ -152,7 +239,7 @@ forgestate:
 
 Webhook mode is only safe while deliveries actually arrive. The governor
 therefore keeps a small cadence **mode** machine on top of the raw health
-window (`src/pkg/github/webhook_mode.go:100`, `observe`) and recomputes it
+window (`src/pkg/github/webhook_mode.go:149`, `observe`) and recomputes it
 wherever it recomputes the eval interval
 (`evalIntervalAndModeForConfig`, `src/cmd/hive/api_budget_decision.go:115`),
 including the re-check timer that fires as the health window closes
@@ -168,16 +255,16 @@ States and transitions:
   - the health window lapsed **and** GitHub was active meanwhile: a cadence
     pass listed an item whose `updated_at` is newer than the newest delivery
     (plus a 30 s clock-skew allowance, `webhookActivityClockSkew`,
-    `src/pkg/github/webhook_mode.go:40`). The reconcile pass reports that
+    `src/pkg/github/webhook_mode.go:44`). The reconcile pass reports that
     newest `updated_at` through `RecordGitHubActivity`
-    (`src/pkg/github/webhook_mode.go:183`). Silence alone — a quiet
+    (`src/pkg/github/webhook_mode.go:232`). Silence alone — a quiet
     repository overnight — is **not** degradation and keeps the stretched
     tick; or
   - deliveries are failing: the receiver saw a delivery (direct or relayed
     by the hub) whose signature did not verify or whose payload did not
     decode, newer than the last good delivery and inside the window
-    (`RecordWebhookDeliveryFailure`, `src/pkg/github/webhook_mode.go:199`,
-    called from `src/pkg/dashboard/api_github_webhook.go:58`). A wrong
+    (`RecordWebhookDeliveryFailure`, `src/pkg/github/webhook_mode.go:251`,
+    called from `src/pkg/dashboard/api_github_webhook.go:84`). A wrong
     `GITHUB_WEBHOOK_SECRET` on a spoke therefore shows up as polling mode
     with `mode_reason: deliveries failing verification`, not as a silent
     stretch to 900 s.
@@ -202,8 +289,15 @@ The dashboard reads the same machine:
 
 - `/api/status.webhooks.mode` — `webhook` | `polling`;
   `/api/status.webhooks.since` — when the current mode began;
-  `mode_reason` while polling after a degradation; `healthy_windows` while
-  recovering (`src/pkg/github/webhook_cache.go:307`, `snapshot`).
+  `mode_reason` while polling after a degradation or while webhooks cannot
+  work at all; `mode_reason_code` (`no_secret`, `signature_failed`,
+  `deliveries_rejected`, `no_deliveries`, and for hub-relayed deliveries
+  `relay_signature_invalid`, `relay_timestamp_stale`,
+  `relay_delivery_replayed`, `relay_delivery_missing`) whenever it is
+  polling for a reason; `verification` (`github-signed`,
+  `relay (hub-signed)` or `none`) says how deliveries are authenticated; `rejected_1h` and `last_rejected_at` for deliveries the receiver
+  turned away; `healthy_windows` while recovering
+  (`src/pkg/github/webhook_cache.go:430`, `snapshot`).
   `webhooks.healthy` stays the raw window (a delivery inside
   2 × `eval_interval_s`), so `healthy: false, mode: webhook` reads "quiet
   but trusted" and `healthy: true, mode: polling` reads "recovering".
@@ -222,7 +316,19 @@ Operator checks:
    `mode: webhook` on a busy repo with the App webhook pointed at the hub
    or the spoke; `polling` with a `mode_reason` is a configuration fault to
    fix (secret, App subscription, hub relay target), `polling` without one
-   means no delivery has ever arrived.
+   means no delivery has ever arrived. `mode_reason_code` tells the causes
+   apart: `no_secret` means `GITHUB_WEBHOOK_SECRET` is unset on this spoke,
+   no hub relay key has arrived either, and every delivery, relayed or
+   direct, is answered 503 (`rejected_1h` and
+   `last_rejected_at` show they are arriving); `signature_failed` means the
+   secret does not match the sender's — or, on a hosted spoke with no
+   `GITHUB_WEBHOOK_SECRET`, that a relayed delivery arrived without
+   `X-Hive-Relay-Signature-256` (an unsigned or not-yet-provisioned relay,
+   not a secret mismatch); `deliveries_rejected` means signed
+   payloads did not decode; `no_deliveries` means the secret is set but
+   nothing verified has arrived, so look at the App webhook URL or the hub
+   relay. `GET /api/health/deep` carries the same cause as a `webhooks`
+   warning.
 2. `grep 'webhooks degraded' hive.log` — one line per outage with the
    reason; the matching `webhooks healthy; webhook cadence engaged` closes
    it.

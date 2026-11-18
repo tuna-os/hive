@@ -13,7 +13,8 @@ import (
 // Human-merge paths (#11027): auto_merge.human_merge_paths lists, per repo,
 // paths a person must merge. Every App merge path (the automerge sweep lanes
 // and the merge-request relay) refuses a PR that touches one, adds `hold`,
-// and leaves one marker-stamped comment naming the path(s).
+// and leaves one marker-stamped comment naming the path(s), unless the
+// configured pin-only exception is proven.
 const (
 	// HumanMergePathsConfigKey is the config key named in every refusal.
 	HumanMergePathsConfigKey = "auto_merge.human_merge_paths"
@@ -53,6 +54,7 @@ func ListPRChangedFiles(ctx context.Context, client *gh.Client, owner, repo stri
 				Status:    f.GetStatus(),
 				Additions: f.GetAdditions(),
 				Deletions: f.GetDeletions(),
+				Patch:     f.GetPatch(),
 			})
 		}
 		if resp == nil || resp.NextPage == 0 {
@@ -96,9 +98,26 @@ func HumanMergePathComment(matches []string) string {
 // marker-stamped comment naming matches, unless a comment carrying
 // HumanMergePathMarker already exists. Shared by the sweep lanes and the
 // merge-request relay so both leave exactly one comment.
-func HoldForHumanMergePaths(ctx context.Context, client *gh.Client, owner, repo string, number int, matches []string) error {
+func HoldForHumanMergePaths(ctx context.Context, client *gh.Client, owner, repo string, number int, matches []string, head ...string) error {
 	if client == nil {
 		return fmt.Errorf("human-merge-path hold: no client")
+	}
+	// Never attribute an existing hold to this policy. Older callers without an
+	// exact head retain the legacy, non-releasable marker.
+	attributedHead := ""
+	if len(head) == 1 && validHumanMergeHead(head[0]) {
+		pr, _, err := client.PullRequests.Get(ctx, owner, repo, number)
+		if err != nil {
+			return fmt.Errorf("fetching human-merge-path head: %w", err)
+		}
+		if pr.GetHead().GetSHA() == head[0] {
+			attributedHead = head[0]
+			for _, label := range pr.Labels {
+				if strings.EqualFold(label.GetName(), HumanMergePathHoldLabel) {
+					attributedHead = ""
+				}
+			}
+		}
 	}
 	if _, _, err := client.Issues.AddLabelsToIssue(ctx, owner, repo, number, []string{HumanMergePathHoldLabel}); err != nil {
 		return fmt.Errorf("adding %s label: %w", HumanMergePathHoldLabel, err)
@@ -110,7 +129,11 @@ func HoldForHumanMergePaths(ctx context.Context, client *gh.Client, owner, repo 
 	if posted {
 		return nil
 	}
-	if _, _, err := client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(HumanMergePathComment(matches))}); err != nil {
+	body := HumanMergePathComment(matches)
+	if attributedHead != "" {
+		body += humanMergeHeadMarker(attributedHead) + "\n"
+	}
+	if _, _, err := client.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{Body: gh.Ptr(body)}); err != nil {
 		return fmt.Errorf("posting human-merge-path comment: %w", err)
 	}
 	return nil
@@ -170,9 +193,65 @@ func (c *Client) humanMergePathsFor(repo string) []string {
 	return c.humanMergePaths[repoPolicyKey(c.org, repo)]
 }
 
+// PinOnlySpec is the relay's config-independent pin-only exception policy.
+// It only lifts the human-merge-path gate, never any other merge requirement.
+type PinOnlySpec struct {
+	Enabled        bool
+	Paths          []string
+	Kinds          []string
+	TrustedAuthors []string
+}
+
+func (p PinOnlySpec) clone() PinOnlySpec {
+	p.Paths = append([]string(nil), p.Paths...)
+	p.Kinds = append([]string(nil), p.Kinds...)
+	p.TrustedAuthors = append([]string(nil), p.TrustedAuthors...)
+	return p
+}
+
+// SetHumanMergePinOnly replaces the relay policy on config reload; nil clears it.
+// Duplicate normalized repository keys fail closed.
+func (c *Client) SetHumanMergePinOnly(policies map[string]PinOnlySpec) {
+	if c == nil {
+		return
+	}
+	normalized := make(map[string]PinOnlySpec, len(policies))
+	for repo, policy := range policies {
+		key := repoPolicyKey(c.org, repo)
+		if key == "" {
+			continue
+		}
+		if _, duplicate := normalized[key]; duplicate {
+			normalized[key] = PinOnlySpec{}
+			continue
+		}
+		normalized[key] = policy.clone()
+	}
+	c.mergePolicyMu.Lock()
+	defer c.mergePolicyMu.Unlock()
+	c.humanMergePinOnly = normalized
+}
+
+// HumanMergePinOnlyFor returns a copy of the relay's pin-only policy for repo
+// (owner/repo or a bare name in the client's org), the value the last
+// SetHumanMergePinOnly installed; disabled when none.
+func (c *Client) HumanMergePinOnlyFor(repo string) PinOnlySpec {
+	return c.humanMergePinOnlyFor(repo)
+}
+
+func (c *Client) humanMergePinOnlyFor(repo string) PinOnlySpec {
+	if c == nil {
+		return PinOnlySpec{}
+	}
+	c.mergePolicyMu.RLock()
+	defer c.mergePolicyMu.RUnlock()
+	return c.humanMergePinOnly[repoPolicyKey(c.org, repo)].clone()
+}
+
 // mergeRequestHumanMergePathRefusal checks a merge request against the
 // repo's human-merge paths. It returns a non-empty refusal (terminal) when
-// the PR touches one — after adding `hold` and the single marker comment —
+// the PR touches one without a proven pin-only exception — after adding
+// `hold` and the single marker comment —
 // and an error when the repo has paths configured but the complete
 // changed-file list cannot be established (fail closed). An unconfigured
 // repo costs no API call.
@@ -194,8 +273,102 @@ func (c *Client) mergeRequestHumanMergePathRefusal(ctx context.Context, req Merg
 	if len(matches) == 0 {
 		return "", nil
 	}
-	if err := HoldForHumanMergePaths(ctx, c.client, owner, name, req.Number, matches); err != nil {
+	if reason, enabled := c.humanMergePinOnlyRejection(ctx, owner, name, req, pr, files, matches); enabled {
+		if reason == "" {
+			return "", nil
+		}
+		c.warn("merge-request watcher: pin-only exception rejected", "repo", req.Repo, "pr", req.Number, "reason", reason)
+	}
+	if err := HoldForHumanMergePaths(ctx, c.client, owner, name, req.Number, matches, pr.GetHead().GetSHA()); err != nil {
 		c.warn("merge-request watcher: human-merge-path hold failed", "repo", req.Repo, "pr", req.Number, "error", err)
 	}
 	return HumanMergePathReason(matches), nil
+}
+
+// humanMergePinOnlyRejection applies the repo's auto_merge.human_merge_pin_only
+// exception to a PR whose files match the human-merge paths. enabled is false
+// when the repo has no enabled exception; otherwise reason is "" when the
+// exception admits the PR and the refusal reason when it does not. It writes
+// nothing: the relay and HumanMergePathHeld share it so both read one policy.
+func (c *Client) humanMergePinOnlyRejection(ctx context.Context, owner, name string, req MergeRequest, pr *gh.PullRequest, files []intent.ChangedFile, matches []string) (reason string, enabled bool) {
+	ex := c.humanMergePinOnlyFor(req.Repo)
+	if !ex.Enabled {
+		return "", false
+	}
+	if !PinOnlyTrustedLogin(ex.TrustedAuthors, SafeGetLogin(pr.GetUser())) {
+		return "PR author is not trusted", true
+	}
+	switch {
+	case req.ExpectSHA == "" || pr.GetHead().GetSHA() != req.ExpectSHA:
+		return "PR head does not match requested head", true
+	case pr.ChangedFiles == nil || pr.GetChangedFiles() != len(files):
+		return "complete changed-file count is unavailable", true
+	}
+	return c.pinOnlyProvenance(ctx, owner, name, req, pr, files, matches, ex), true
+}
+
+// HumanMergePathHeld reports whether PR number of repo, at headSHA, touches
+// one of the repo's auto_merge.human_merge_paths without the repo's
+// pin-only exception admitting it: the same files, matcher and exception the
+// merge-request relay applies, read-only (no hold label, no comment). An
+// unconfigured repo answers false with no API call. A PR that cannot be read,
+// an incomplete changed-file list or a head other than headSHA answers
+// (true, err) or true, so a caller deciding whether the hive may act on the
+// PR fails closed.
+func (c *Client) HumanMergePathHeld(ctx context.Context, repo string, number int, headSHA string) (bool, error) {
+	patterns := c.humanMergePathsFor(repo)
+	if len(patterns) == 0 {
+		return false, nil
+	}
+	if c.client == nil {
+		return true, fmt.Errorf("%s is set for %s but no GitHub client is configured", HumanMergePathsConfigKey, repo)
+	}
+	owner, name := c.splitRepo(repo)
+	pr, _, err := c.client.PullRequests.Get(ctx, owner, name, number)
+	if err != nil {
+		return true, fmt.Errorf("%s is set for %s but the PR could not be fetched: %w", HumanMergePathsConfigKey, repo, err)
+	}
+	if headSHA == "" || pr.GetHead().GetSHA() != headSHA {
+		return true, nil
+	}
+	files, err := ListPRChangedFiles(ctx, c.client, owner, name, pr)
+	if err != nil {
+		return true, fmt.Errorf("%s is set for %s but the complete changed-file list is unavailable: %w", HumanMergePathsConfigKey, repo, err)
+	}
+	matches := intent.HumanMergePathMatches(files, patterns)
+	if len(matches) == 0 {
+		return false, nil
+	}
+	req := MergeRequest{Repo: repo, Number: number, ExpectSHA: headSHA}
+	if reason, enabled := c.humanMergePinOnlyRejection(ctx, owner, name, req, pr, files, matches); enabled && reason == "" {
+		return false, nil
+	}
+	return true, nil
+}
+
+// pinOnlyProvenance applies the relay's share of the pin-only exception once
+// the author, requested head and file count have qualified: the whole diff
+// must classify as pin replacements, every commit must be a verified
+// trusted-author commit, every new action SHA must be anchored upstream
+// (#16399, the same checks the sweep applies), and the head must still be the
+// requested SHA after the file listing. It returns "" when the PR qualifies
+// and the refusal reason otherwise.
+func (c *Client) pinOnlyProvenance(ctx context.Context, owner, name string, req MergeRequest, pr *gh.PullRequest, files []intent.ChangedFile, matches []string, ex PinOnlySpec) string {
+	ok, reason, pins := intent.ClassifyPinOnlyActions(files, matches, intent.PinOnlySpec{Paths: ex.Paths, Kinds: ex.Kinds})
+	if !ok {
+		return reason
+	}
+	if why := PinOnlyCommitsTrusted(ctx, c.client, owner, name, pr, ex.TrustedAuthors); why != "" {
+		return why
+	}
+	if why := PinOnlyActionPinsUpstream(ctx, c.client, pins); why != "" {
+		return why
+	}
+	// The files endpoint is not SHA-addressable. Ensure the head did not
+	// move while paging; the eventual merge also uses req.ExpectSHA.
+	current, _, err := c.client.PullRequests.Get(ctx, owner, name, req.Number)
+	if err != nil || current.GetHead().GetSHA() != req.ExpectSHA {
+		return "PR head could not be confirmed after listing files"
+	}
+	return ""
 }

@@ -1,6 +1,46 @@
 # Environment variable reference
 
-This reference is compiled by hand from the Go source under `src/`, the deployment manifests, and the top-level helper scripts. The code is authoritative: `hive.yaml` may also expand arbitrary `${NAME}` placeholders through the config resolver, but only the variables below have built-in behavior.
+Use this reference after choosing **which process reads the variable**. Set
+server variables in the deployment's environment/Secret configuration, not in
+an agent terminal. Hosted owners ask the hub/deployment administrator for
+environment changes; dashboard config controls are separate.
+
+Unless a row explicitly describes per-request reads or live reload, arrange a
+service restart after changing its launch environment. Some settings are
+consumed only at boot or agent-session creation; a dashboard reload is not a
+process restart. Never print token or private-key values while diagnosing them.
+
+## Choose the right scope
+
+| Your task / access | Start here |
+|---|---|
+| Operate the spoke or hub process (deployment admin) | [Core runtime](#core-hive-runtime), then [Hub/SaaS/backups](#hub-saas-alerts-and-backups) for hub-only values |
+| Rotate dashboard access (deployment admin and affected clients) | [Token generation/rotation](#generating-and-rotating-hive_dashboard_token) and [precedence](#precedence-dashboardauth_token-dashboard_auth_token-hive_dashboard_token) |
+| Change container/proxy behavior (deployment admin) | [Entrypoint/proxy knobs](#deployment-entrypoint-and-proxy-knobs); read the [credential-injection refusal](#proxy-credential-injection) before enabling it |
+| Configure inference or CLI launch (operator/deployment admin) | [Inference/backends](#inference-cli-backends-and-agents), [launch controls](#backend-launch-controls), [Linear integration](#linear-agent-integration) |
+| Configure Crux durable lanes or Hive's optional participant | [Crux durable lanes](#crux-durable-lanes): separate Crux server and Hive launch environments |
+| Understand a value already present in an agent terminal | [Inside an agent session](#inside-an-agent-session): **Hive-injected metadata, not operator knobs** |
+| Configure a local contributor/client command | [Contributor relay/helper scripts](#contributor-relay-and-top-level-helper-scripts) |
+| Understand platform-provided metadata (cluster admin) | [Kubernetes/platform variables](#kubernetes-downward-api-and-platform-variables): normally injected by the platform |
+| Look up a proposed integration | [Credly](#credly-badge-integration-proposed--not-implemented): **not implemented; setting these does nothing** |
+| Maintain or audit the reference (developer) | [Keeping it current](#keeping-this-reference-current), not deployment instructions |
+
+The same name may be passed from a server into a client or agent, but that does
+not make its meaning global. Follow the row's scope and precedence. In
+particular, `HIVE_DASHBOARD_COOKIE` is client-only and `HIVE_DASHBOARD_BIND`
+belongs to the legacy Node dashboard, not the current Go listener.
+
+**Vocabulary:** PAT = personal access token; JWT = JSON Web Token; OIDC =
+OpenID Connect; JWKS = JSON Web Key Set (public verification keys); CSP =
+Content Security Policy; SSRF = server-side request forgery (making a server
+reach an unintended destination); OCI means Oracle Cloud Infrastructure in
+object-storage settings and Open Container Initiative for image formats;
+OTLP = OpenTelemetry Protocol.
+
+**Provenance:** this reference is maintained from Go source, deployment
+manifests and helper scripts. Code is authoritative. `hive.yaml` can expand
+arbitrary `${NAME}` placeholders, but only the listed variables have built-in
+behavior. [Maintenance limitations](#keeping-this-reference-current) still apply.
 
 ## Core `hive` runtime
 
@@ -9,6 +49,7 @@ This reference is compiled by hand from the Go source under `src/`, the deployme
 | `HIVE_CONFIG` | No | `/etc/hive/hive.yaml` | Default config path used before the `--config` flag is parsed; an explicit `--config` outranks it, so `entrypoint.sh` also appends `--config "$HIVE_CONFIG"` to the launch argv when it is set ([#4973](https://github.com/hivecommons/hive/issues/4973)). The dashboard also uses it when reporting config provenance — which is why the two must not disagree. |
 | `HIVE_MODE` | No | spoke/dashboard mode | Set to `hub` to run the hub server instead of the spoke dashboard. |
 | `HIVE_HUB_PORT` | No | `3001` | Hub listen port when `HIVE_MODE=hub`. |
+| `HIVE_TRACKER_CHECK_STUCK_AFTER` | No | `2h` | Go duration a required check may stay queued or in progress before the activity monitor calls it **stuck** instead of running (`ci_activity.checks_stuck`, the `CI stuck · …` caption and the *waiting on required checks stuck* blocker). Read on every tracker build; an unparsable or non-positive value falls back to the default. |
 | `HIVE_SINGLETON_LOCK` | No | `/var/run/hive-metrics/hive.singleton.lock` when available, otherwise OS temp dir | Overrides the process singleton lock path. Set exactly `off` only for local development where duplicate processes are intentional. |
 | `HIVE_GITHUB_TOKEN` | Required unless GitHub App auth is configured | none | Main PAT fallback for `github.token`; also used by fleet/stat fallback paths and some deployment manifests. Missing PAT scopes surface as request-time 403s — see [Required PAT scopes](github-app-setup.md#personal-access-token-pat-scopes). |
 | `GH_APP_KEY_FILE` | No | configured `github.key_file`, then `/data/gh-app-key.pem` or `/secrets/gh-app-key.pem` in provisioned paths | GitHub App private-key file fallback. |
@@ -17,17 +58,26 @@ This reference is compiled by hand from the Go source under `src/`, the deployme
 | `HIVE_DASHBOARD_COOKIE` | No | none | **Client-side only** - read by `hivectl tui`, never by the server. Cookie header value (e.g. `hive_session=...`) carrying a per-user session, for hives that do not accept the shared token: hub-hosted ones, and spokes with an `authorized_users` allowlist. See [hivectl.md, Credentials](hivectl.md#credentials). |
 | `HIVE_DASHBOARD_BIND` | No | `127.0.0.1` for the legacy `dashboard/server.js` | Legacy Node dashboard listen address. Leave unset for loopback-only binding; set `HIVE_DASHBOARD_BIND=0.0.0.0` only when an authenticated reverse proxy or equivalent network control protects the unauthenticated legacy control endpoints. |
 | `HIVE_AUTHORIZED_USERS` | No | none | Comma-separated direct-route dashboard allowlist, with optional `user:role` entries. Used when `dashboard.authorized_users` is empty. |
+| `HIVE_GITHUB_ETAG_CACHE_MAX_MB` | No | `github.etag_cache_max_mb`, else `128` | Memory cap, in MiB of gzip-compressed bodies, for the GitHub conditional-request (ETag / `304`) response cache shared by every GitHub client in the process. Wins over the YAML key; `1`–`2048`, `0` means the default. Raise it when **Debug → GitHub API budget → ETag cache** sits at the cap and the hit rate slides — evicted bodies turn free `304`s back into charged fetches. See [Conditional requests](github-app-setup.md#api-quota-conditional-requests-and-post-reset-pacing). |
+| `HIVE_GITHUB_ETAG_CACHE_MAX_ENTRIES` | No | `github.etag_cache_max_entries`, else `8192` | Entry cap for the same cache, whatever the bodies' size. Wins over the YAML key; `0` means the default. |
 | `HIVE_SELF_AUTHORIZATION_HOLD` | No | `github.self_authorization_hold` / `project.repo_policies[].self_authorization_hold`; when all are unset, default `true` through ACMM L5 and `false` at ACMM L6 (Autonomous) | Process-level override for the #5117 self-authorization hold. Set `false` to let this hive skip and release self-authorization holds for every repo while preserving unrelated human holds; set `true` to keep the hold enabled even at L6. |
 | `HIVE_SELF_EXPERIMENTS_OPT_IN` | No | unset (off) | Opts this hive in to receiving hub-delivered Hive-self feature-flag assignments over heartbeat (`pkg/hub/spoke/self_experiment_flags.go`). Only the exact string `true` enables it; `1`, `yes`, `on` and any other value leave it off. Consent is local: the hub cannot opt a spoke in. Unsetting it withdraws the flags on the next heartbeat. Separate from the Experiment Lab/governor settings. |
 | `HIVE_REPORTER_TRUST_HOLD` | No | `github.reporter_trust_hold` / `project.repo_policies[].reporter_trust_hold`; when all are unset, follows `project.issue_filter.reporter_trust.enabled` | Process-level override for the #9665 reporter-trust hold (a PR whose rationale traces to an issue from an untrusted reporter is held at every ACMM level). When set, the dashboard toggle and per-repo overrides are locked and say so. |
 | `HIVE_REPO` | No | none | Bootstrap shortcut in `owner/repo` form; fills `project.org`, `project.repos`, and `project.primary_repo` if missing. |
 | `HIVE_RELEASE_SENTINEL_ENABLED` | No | `release_sentinel.enabled` (default `false`) | Process-level override for the opt-in release sentinel ([#9585](https://github.com/hivecommons/hive/issues/9585)). `true`/`1`/`on`/`yes` turns it on and `false`/`0`/`off`/`no` turns it off regardless of config; any other value leaves the config in charge. See [release-sentinel.md](release-sentinel.md). |
 | `HIVE_RELEASE_SENTINEL_RETAG_ENABLED` | No | `release_sentinel.retag_enabled` (default `false`) | Process-level override for the release sentinel's separate retag opt-in ([#9585](https://github.com/hivecommons/hive/issues/9585)): when on, the hive moves the `v<version>` tag to a merged, marked fix PR's merge commit with one leased, atomic tag push. Same values as `HIVE_RELEASE_SENTINEL_ENABLED`. It never turns retagging on while the sentinel itself is off. See [release-sentinel.md](release-sentinel.md#retag-after-merge). |
+| `HIVE_SCANNER_BUSY_BRANCH_MINUTES` | No | `60` | Busy-branch window for the repair queues ([#18488](https://github.com/hivecommons/hive/issues/18488)). A red or conflicted PR the hive App did not open is listed as "suggest, do not push" instead of as a push target while its head is younger than this many minutes or a claim by another worker covers the PR or a linked issue; the agent posts the fix as one suggestion comment for the worker to apply as its own signed commit. Whole minutes; unset, unparsable or non-positive values keep `60`. |
+| `HIVE_RELEASE_FEED_INTERVAL` | No | `governor.release_feeds.interval_s`, else `15m` | Poll interval of the release-feed watcher ([#18494](https://github.com/hivecommons/hive/issues/18494)) as a Go duration. An explicit `interval_s` wins over it; never below `1m`. Invalid or non-positive values fall back to `15m`. See [release-feeds.md](release-feeds.md). |
+| `HIVE_RELEASE_FEED_COOLDOWN` | No | `governor.release_feeds.cooldown_s` / per-agent `cooldown_s`, else `1h` | Default minimum gap between two release-feed kicks of one agent, as a Go duration. The YAML keys win over it. See [release-feeds.md](release-feeds.md#cooldown). |
 | `HIVE_ATTRIBUTED_CLOSED_PR_LOOKBACK` | No | `14d` | Bounds the per-repo closed-PR attribution scan that feeds dashboard outcome/rework metrics during PR enumeration. The scan lists closed PRs sorted by `updated_at` descending, stops when results are older than this window, and also stops after five pages so large repositories are never walked from history on every governor tick. Values accept Go durations such as `336h`, or day counts such as `14`/`14d`; invalid or non-positive values fall back to `14d`. |
 | `HIVE_LEVEL` | No | config/pack value | ACMM level bootstrap/override used by hosted flows and the entrypoint pack selection. |
 | `HIVE_ID` | No | config or generated id | Stable hive/spoke identifier override; passed through to launched agents. |
 | `HIVE_CLUSTER_ID` | No | config or hub-provisioned value | Hosted cluster identifier override. |
 | `HIVE_HUB_URL` | No | `hub.url` from config | Hub URL override for spoke heartbeats/registration. On the hub it is also the last environment variable consulted in the hub public-origin chain (see `HIVE_HUB_PUBLIC_URL`). |
+| `HIVE_MIRROR_HUB_URL` | No | unset (no mirror) | Base URL of a **second hub** that receives a report-only copy of every heartbeat the primary hub accepts ([#18060](https://github.com/hivecommons/hive/issues/18060), [#18148](https://github.com/hivecommons/hive/issues/18148); `pkg/hub/spoke/heartbeat_mirror.go`). Must be an absolute `http(s)` URL and must differ from the primary hub. The copy leaves out the dashboard token hash, the App and webhook key fingerprints, authentication error text, the signed-in user list and the activity digest. The mirror's response is never applied: config, credential, upgrade, restart, breaker, access-list and visibility fields from it are counted and ignored, and logged at most once per hour as `mirror_hub_response_ignored` (field names only). A mirror failure never affects the primary heartbeat, liveness or the hive. Status appears in `GET /api/health/deep` under `hub_heartbeat.mirror` (host only). Read per beat; no restart needed. |
+| `HIVE_MIRROR_HUB_HEARTBEAT_KEY` | Required when `HIVE_MIRROR_HUB_URL` is set | none | Per-hive heartbeat key the **mirror** hub issued (its **Register your own hive** form, or an operator-minted key). Sent only to the mirror. The primary `HIVE_HEARTBEAT_KEY` is never offered to a mirror: with the URL set and this unset, nothing is sent and `hub_heartbeat.mirror.last_error` says so. Never logged. |
+| `HIVE_MIRROR_HUB_HIVE_ID` | No | the primary `hive_id` | Overrides `hive_id` on the mirrored copy only, for a mirror hub that knows this hive under another id (for example its self-service `byo-<login>--<name>` id). |
+| `HIVE_MIRROR_HUB_TIMEOUT` | No | `5s` | Timeout for one mirror POST, Go duration syntax. Deliberately shorter than the primary heartbeat budget; a slow mirror misses a beat rather than holding a goroutine. Invalid or non-positive values keep the default. |
 | `HIVE_SHARED_AGENT_POOL_ENABLED` | No | `false` | Spoke opt-in for Hub-coordinated CLI session sharing. Requires an in-process runtime and a Hub link; each Hive keeps its own workspace, UID, credentials, and tmux session. Idle CLI sessions are terminated after turns to return the global slot. |
 | `HIVE_SHARED_AGENT_POOL_MAX_SESSIONS` | No | `0` (disabled) | Hub-side maximum number of live CLI session leases. Set to `1` to serialize agent sessions across participating Hives. |
 | `HIVE_SHARED_AGENT_POOL_MAX_PER_HIVE` | No | `0` (no per-tenant cap) | Hub-side maximum number of live CLI session leases a single Hive may hold. Set below `HIVE_SHARED_AGENT_POOL_MAX_SESSIONS` on multi-tenant hosts so one tenant cannot take every slot and renew them indefinitely. A Hive at its cap gets `409` without taking a FIFO position. |
@@ -38,9 +88,15 @@ This reference is compiled by hand from the Go source under `src/`, the deployme
 | `HIVE_HUB_TASK_STATUS_PUSH` | No | `hub.task_status_push`, default `true` | Enable the separate spoke task-status push loop. Accepts `1/true/yes/on` or `0/false/no/off` (case-insensitive); empty/invalid values fall back to config. Read at startup; restart after changing. Core heartbeat and hub-managed upgrade/config delivery remain enabled. |
 | `HIVE_HUB_PUBLIC_URL` | No | compiled fallback `https://hive.hivecommons.dev` (`defaultHubPublicURL`, `src/pkg/hub/saas_auth.go`) | Hub canonical public origin used to derive OAuth/OIDC callback URLs, hub Open Graph/notification links, same-origin checks, and the registrable-domain scope for hub SSO cookies. Public hub operators should set this to `https://hive.hivecommons.dev` for the cutover; leave the legacy value only while deliberately serving the redirect hostname. **Changing the registrable domain here signs users out of every first-party sibling product left on the old one** — the `hive_hub_user` cookie is scoped to this URL's registrable domain and a browser will not send it anywhere else. See [Moving a public hostname](hivecommons-migration.md#moving-a-public-hostname). |
 | `HIVE_HUB_SPOKE_DOMAIN` | No | compiled fallback `hive.hivecommons.dev` (`defaultHubSpokeDomain`, `src/pkg/hub/saas_auth.go`) | Parent domain used for hub-provisioned spoke ingress hostnames (for example `<hive-id>.<domain>`). Kept separate from `HIVE_HUB_PUBLIC_URL` because the wildcard spoke domain may differ from the hub's own hostname. |
+| `HIVE_HUB_KIOSK_CTA_URL` | No | `https://hive.hivecommons.dev/get-started` (`kioskcta.DefaultURL`, `src/pkg/webassets/kioskcta`) | Destination of the call-to-action badge the hub Fleet activity page shows bottom-right when loaded with `?kiosk=1` (the fleet Twitch stream). Rendered as text and as a QR code. |
+| `HIVE_HUB_KIOSK_CTA_TEXT` | No | `🐝 Want this for your repos?` (`kioskcta.DefaultText`) | Copy line above the URL on that badge. |
 | `HIVE_HUB_LEGACY_COOKIE_DOMAIN` | No | none | Optional transition-only hub SSO cookie domain to expire alongside the active cookie domain while accepting any carried `hive_hub_user` cookie value during a host migration. Writes still target the domain derived from `HIVE_HUB_PUBLIC_URL`; unset disables the extra legacy-domain cleanup. |
-| `HIVE_HUB_SECRET` | Required for spokes registered to a protected hub; optional for a standalone hub with `/data/saas/hub-secret.key` | `/data/saas/hub-secret.key` on the hub when present; no fallback for spoke heartbeat auth | Bearer secret for spoke heartbeats and hub/spoke SaaS APIs. |
+| `HIVE_HUB_SECRET` | Required for spokes registered to a protected hub; optional for a standalone hub with `/data/saas/hub-secret.key` | `/data/saas/hub-secret.key` on the hub when present; no fallback for spoke heartbeat auth | Bearer secret for spoke heartbeats and hub/spoke SaaS APIs. Self-hosted (`byo-`) hives registered through self-service never receive it: they hold only their own `HIVE_HEARTBEAT_KEY`, and the hub never tries `HIVE_HUB_SECRET` or anything derived from it for a `byo-` ID. |
 | `HIVE_HUB_SELFSERVICE_REGISTRATION` | No | off | Enables the self-service registration API (`/api/hub/selfservice/*`) that lets a signed-in user register a hive they run themselves under the reserved `byo-<login>--<name>` ID namespace, after proving `permissions.admin` on every listed repo with their own GitHub token ([#18060](https://github.com/hivecommons/hive/issues/18060)). Accepts `1/true/yes/on`. When off, every route but `GET /api/hub/selfservice/status` answers `404` and the status reports `enabled: false`. Read per request; no restart needed. |
+| `HIVE_HUB_MAIL_TOKEN` | Only on a hub that routes mail from `hive-mx` | none | Bearer token `hive-mx` presents on `GET /api/mail/hosts` and `POST /api/mail/inbound` ([#18395](https://github.com/hivecommons/hive/issues/18395)); the same value as the `hive-mx` Secret. Unset: both endpoints answer `404`. Read per request. Secret. |
+| `HIVE_HUB_MAIL_MAX_BODY_BYTES` | No | `50331648` | Largest delivery `POST /api/mail/inbound` accepts from a `hive-mx` that sends routing headers (48 MiB, this route only; [#18564](https://github.com/hivecommons/hive/issues/18564)). Without routing headers the cap stays 8 MiB. |
+| `HIVE_HUB_MAIL_CHUNK_BYTES` | No | `786432` | Piece size when the hub relays a large mail-in delivery to the spoke (768 KiB, under the 1 MiB ingress default); clamped to 64 KiB to 8 MiB. |
+| `HIVE_HUB_MAIL_SPOOL_DIR` | No | system temp directory | Where the hub keeps a delivery on disk while it relays it. |
 | `HIVE_HUB_SELFSERVICE_MAX_PER_USER` | No | `5` | Maximum self-service hives one user may have registered at once; the next registration answers `429` until one is removed. |
 | `HIVE_HUB_SELFSERVICE_MAX_REPOS` | No | `20` | Maximum repos one self-service registration may list, on create and on `PATCH /api/hub/v1/registrations/{id}` ([#18642](https://github.com/hivecommons/hive/issues/18642)). Each listed repo costs one read-only GitHub ownership check, so values above `500` are clamped to `500`. Advertised by `GET /api/hub/v1` as `limits.max_repos`. Over the cap, `POST /api/hub/selfservice/hives` answers `400`; `POST /api/hub/v1/registrations` and `PATCH /api/hub/v1/registrations/{id}` answer `413` with `limit: max_repos`. Read per request. |
 | `HIVE_HUB_SELFSERVICE_EXPIRY` | No | `24h` | How long a self-service hive may go without an accepted heartbeat before the expiry sweep revokes its key and removes its registry entry (counted from the last accepted heartbeat, or from registration while there has been none). Reported by `GET /api/hub/selfservice/status` as `expiry`. Go duration syntax. |
@@ -55,17 +111,17 @@ This reference is compiled by hand from the Go source under `src/`, the deployme
 | `HIVE_ADVISORY_ISSUE` | No | none | Passed to launched agents so advisory findings can target a configured issue. |
 | `HIVE_TTYD_PORT` | No | `7681` | Web terminal port used by the entrypoint and terminal proxy. |
 | `HIVE_TTYD_CREDENTIAL` | No | `hive:<HIVE_DASHBOARD_TOKEN>` when a token is set, else none | ttyd basic-auth credential (`user:pass`) the entrypoint starts the web terminal with. The dashboard's `/terminal` proxies (Go and Node) present it to ttyd on every forwarded request, so a browser the dashboard has already authenticated is never shown ttyd's own user/password dialog. Also read by `hivectl tui`'s remote attach ([#5644](https://github.com/hivecommons/hive/issues/5644)), which must present the same credential through the terminal proxy and derives the same default from `HIVE_DASHBOARD_TOKEN` — set it on the client only if the deployment overrode it on the server. |
-| `HIVE_METRICS_ENABLED` | No | disabled | Registers Prometheus `/metrics` when set to `1`, `true`, `yes`, or `on`. Requires `HIVE_METRICS_TOKEN` — enabled-but-tokenless returns 403 ([#3804](https://github.com/hivecommons/hive/pull/3804)). |
-| `HIVE_METRICS_TOKEN` | Yes when metrics enabled | none | Bearer token read by `pkg/dashboard/metrics_prometheus.go` for `/metrics` (`Authorization: Bearer ...`; Prometheus `bearer_token`). `/metrics` bypasses dashboard session auth, so this token is its only guard; enabled-but-tokenless fails closed and the cost/agent series are never served without it. |
+| `HIVE_METRICS_ENABLED` | No | disabled | Registers Prometheus `/metrics` when set to `1`, `true`, `yes`, or `on`. Requires `HIVE_METRICS_TOKEN` — enabled-but-tokenless returns 403 ([#3804](https://github.com/hivecommons/hive/pull/3804)). See [monitoring.md](monitoring.md). |
+| `HIVE_METRICS_TOKEN` | Yes when metrics enabled | none | Bearer token read by `pkg/dashboard/metrics_prometheus.go` for `/metrics` (`Authorization: Bearer ...`; Prometheus `bearer_token`). `/metrics` bypasses dashboard session auth, so this token is its only guard; enabled-but-tokenless fails closed and the cost/agent series are never served without it. In Kubernetes it is read from the dedicated `hive-metrics-token` Secret, not `hive-secrets`. See [monitoring.md](monitoring.md). |
 | `HIVE_METRICS_FILE` | No | `/var/run/hive-metrics/contribute.json` | Contributor metrics JSON file override. |
-| `HIVE_PUBLIC_KNOWLEDGE` | No | disabled | Env fallback for the anonymous, **read-only** MCP knowledge endpoint `POST /mcp/knowledge` (`1`, `true`, `yes`, or `on` — same spelling as `HIVE_METRICS_ENABLED`). The owner dashboard toggle in the Knowledge header and Settings → Knowledge takes precedence once saved; with no saved setting this remains the switch. Off → 404 even for authenticated callers. Resolved on each request so it can be closed without a pod roll. Only operational fact types (pattern, gotcha, regression, test_scaffold, integration, coverage_rule, general) are served; ideation/governance types, sources, and usage data never leave the hive. See [public-knowledge-mcp.md](public-knowledge-mcp.md) ([#10615](https://github.com/hivecommons/hive/issues/10615)). |
+| `HIVE_PUBLIC_KNOWLEDGE` | No | disabled | Env fallback for the anonymous, **read-only** MCP knowledge endpoint `POST /mcp/knowledge` (`1`, `true`, `yes`, or `on` — same spelling as `HIVE_METRICS_ENABLED`). The owner dashboard toggle in the Knowledge header and Settings → Knowledge takes precedence once saved; with no saved setting this remains the switch. Off → 404 even for authenticated callers, and 401 with the sign-in page for a caller who is not signed in. Resolved on each request so it can be closed without a pod roll. Only operational fact types (pattern, gotcha, regression, test_scaffold, integration, coverage_rule, general) are served; ideation/governance types, sources, and usage data never leave the hive. See [public-knowledge-mcp.md](public-knowledge-mcp.md) ([#10615](https://github.com/hivecommons/hive/issues/10615)). |
 | `HIVE_PUBLIC_KNOWLEDGE_TAGS` | No | none (all public-type facts) | Env fallback comma-separated tag allow-list that further narrows what `/mcp/knowledge` serves to facts carrying at least one listed tag (case-insensitive). A saved dashboard tag list takes precedence. |
 | `HIVE_COPILOT_INTEGRATION_ID` | No | compiled Copilot integration id | Overrides the integration id used by Copilot model discovery. |
 | `HIVE_CONTRIBUTORS_DIR` | No | hub default | Contributor registry directory override. |
 | `HIVE_CONTRIBUTE_SKIP_LABELS` | No | `blocked,tracking,epic,discussion,question,needs-decision,needs-triage` | Comma-separated, case-insensitive label patterns for issues that are not contributor work and must never be offered by the relay. Patterns use `path.Match`-style `*` globs; `blocked` is always unioned into the effective set even if omitted. Same setting as `hub.contribute_skip_labels`. |
 | `HIVE_FEDERATION_REGISTRY_PATH` | No | `/data/federation/registry.json` | Federation registry path override. |
 | `HIVE_WEBHOOK_SECRET` | No | none | HMAC secret for the spoke `/webhook` channel. |
-| `GITHUB_WEBHOOK_SECRET` | No | `/data/saas/webhook-secret.key` when present (hub only) | GitHub App webhook HMAC secret. The hub verifies `/api/github/webhook` with it; a spoke verifies `/api/webhook/github` (direct or hub-relayed deliveries) with the same secret and rejects every delivery while it is unset. |
+| `GITHUB_WEBHOOK_SECRET` | No | `/data/saas/webhook-secret.key` when present (hub); `/data/github-webhook-secret.key` when present (spoke, written by Settings → Forge App → **Generate secret**) | GitHub App or org/repo webhook HMAC secret. The hub verifies `/api/github/webhook` with it; a self-hosted spoke verifies `/api/webhook/github` (direct or hub-relayed deliveries) with the same secret. When the variable is set it wins over the generated file and the dashboard's Generate button is disabled. See [Setting up webhooks](webhooks.md#setting-up-webhooks-owner-guide). A hosted spoke leaves it unset and verifies hub relays with its own per-hive relay key from the heartbeat; with neither, every delivery is rejected. |
 | `HIVE_DASHBOARD_URL` | No | none | Base URL the `hive tui` client targets (`pkg/tui/client`). A bad value surfaces as a request error on the first call, not at startup. On the hub it is also consulted (fourth) in the hub public-origin chain (see `HIVE_HUB_PUBLIC_URL`). |
 | `HIVE_CONVERGENCE_MODE` | No | `convergence.mode` in `hive.yaml`, else `shadow` | Process-level override of the convergence mode (`off`, `shadow`, `enforce`) so an operator can flip the mode without editing `hive.yaml`. An **unset** mode takes the default, `shadow`, which computes and records admission decisions without withholding any work. A **non-empty but unrecognised** value — a typo, or a mode this build does not know — still resolves to `off`. |
 | `HIVE_RELEASE_LINE_LAG_MAX` | No | `5` | Alarm threshold for the release-line drift surface ([#6960](https://github.com/hivecommons/hive/issues/6960)): how many commits the hosted edge line (`v5`) may sit behind the stable default branch (`v4`) before the dashboard status flags the line as drifting (`releaseLineLag.exceeded`). An unset, empty, non-numeric, or negative value falls back to the default — it can never silently disable the alarm. An unknown lag (tips unresolved or the compare failed) is reported as `unknown`, never a healthy zero. |
@@ -73,13 +129,59 @@ This reference is compiled by hand from the Go source under `src/`, the deployme
 | `HIVE_DELEGATION_CHAIN_ENABLED` | No | disabled | Enables delegation chain minting (`1`, `true`, `yes`, `on` — same spelling as `HIVE_METRICS_ENABLED`). Read on each call rather than cached, so disabling it on a misbehaving spoke does not require a pod roll. |
 | `HIVE_ALLOW_PRIVATE_GIT_SOURCE` | No | `false` | Exact `true` opt-in read by `pkg/knowledge/gitsource.go` to allow knowledge Git sources whose host resolves to a private/internal address (self-hosted GitLab and similar). Off by default as SSRF protection. |
 | `HIVE_SHARED_AGENT_HOME` | No | per-agent HOME | Escape hatch (`1`) restoring the legacy shared-HOME layout for agents. |
+| `HIVE_COPILOT_CONFIG_TMP_MAX_AGE` | No | `1h` | Age (Go duration) a leftover Copilot CLI `config.json.tmp.*` save file must reach before the agent-launch sweep removes it from the shared and per-agent `~/.copilot` directories. Invalid or non-positive values fall back to the default. See [the Copilot login troubleshooting entry](troubleshooting.md#one-copilot-agent-stays-at-the-login-prompt-after-a-dashboard-login). |
 | `HIVE_WORKSPACE_CLEANUP_ENABLED` | No | enabled | Set `0` to opt out of automatic agent workspace cleanup. |
+| `HIVE_GITHUB_OWNER_TOKEN_FILE` | No | `/data/secrets/github-owner-token` | Where the spoke keeps the hive owner's GitHub token for write-tier reference repos (`src/pkg/github/owner_identity.go`, #18197): an owner-only JSON file written by the Settings consent flow, never by hand and never in `hive.yaml`. Move it only together with the secrets volume. |
+| `HIVE_REMOTE_ITEMS_FILE` | No | `/data/turn/remote-items.json` | The tracker for issues and PRs the hive opened in write-tier reference repos (`src/pkg/remoteitems`, #18199): cursors per item and the feedback queued for an agent's next kick. |
+| `HIVE_REFERENCE_REPOS_DERIVE_INTERVAL` | No | `10m` | How often the hive re-lists accepted request issues to derive `project.reference_repos` entries between config reloads (`src/cmd/hive/reference_repos_derive.go`, #18159). A closed request issue or a removed `triage/accepted` label drops the derived entry on the next pass. Go duration; unset, unparseable or non-positive values fall back to the default. |
 | `HIVE_WORKSPACE_CLEANUP_INTERVAL` | No | `1h` | How often the workspace cleanup sweep runs (Go duration, e.g. `30m`). Unset, unparseable, or non-positive values fall back to the default. |
 | `HIVE_WORKSPACE_CLEANUP_MAX_AGE` | No | `2h` | How old an entry under `/data/agents/*/` must be before the cleanup sweep removes it (Go duration, e.g. `6h`). Unset, unparseable, or non-positive values fall back to the default. |
 | `HIVE_FORGE_COUNT_CACHE_TTL` | No | `20m` | How long the dashboard metrics collector reuses its GitHub Search-API count queries (hive-attributed merged PRs / closed issues per repo for the Cost tiles, outreach PR counts) before re-asking (Go duration, e.g. `30m`). A failed refresh serves the last-good counts (marked stale), retries after 10 minutes and logs at most once per 15 minutes; refreshes are also deferred while the GitHub slow-start caution window is engaged. Unset, unparseable, or non-positive values fall back to the default. |
+| `HIVE_GITHUB_ETAG_CACHE_MAX_MB` | No | `64` | Byte bound, in MiB, of the process-wide GitHub conditional-request (ETag) cache that turns repeat `GET`s into free `304`s. It counts what the cache holds: bodies of 1 KiB or more are kept gzip-compressed (GitHub JSON shrinks about 7x), plus the remembered headers. Raise it when `/api/gh-rate-limits` shows `etag_cache.bytes` at `max_bytes` and `evictions` climbing, which means the hive's repeat reads no longer fit. Unset, non-numeric, or non-positive values fall back to the default. Read once at process start. |
 | `HIVE_DOSSIER_CACHE_MAX_ENTRIES` | No | `512` | Caps each public dossier cache. Bounds username-spray memory while keeping normal contributor reuse hot. |
 | `HIVE_CONTRIBUTOR_KNOWLEDGE_EXPORT_MAX_FACTS` | No | `80` | Caps the number of facts returned by the contributor knowledge export API. Unset, non-numeric, or non-positive values fall back to the default. |
 | `HIVE_PUBLIC_REPOS` | No | none | Comma-separated, case-insensitive allowlist of additional Gource project names the dashboard's public war-room view may render, beyond the always-allowed default (`hive`). |
+| `DEEPGRAM_API_KEY` | No | none | The hive owner's own Deepgram API key for Inbox transcription with `inbox.transcription.provider: deepgram`, or `auto` when whisper and Gemini are unavailable ([inbox-transcription.md](inbox-transcription.md)). Read at run time; `inbox.transcription.api_key_env` names a different variable. Never stored in `hive.yaml`, never shown (the UI reports only key present / missing). |
+| `HIVE_INBOX_TRANSCRIPTION_MAX_DURATION_MINUTES` | No | `120` | Overrides `inbox.transcription.max_duration_minutes`: longer recordings are skipped before upload. Non-numeric or non-positive values fall back to the config / default. |
+| `HIVE_INBOX_TRANSCRIPTION_MAX_BYTES` | No | `524288000` | Overrides `inbox.transcription.max_bytes`: an audio download larger than this is cut and the item skipped as too large. |
+| `HIVE_INBOX_TRANSCRIPTION_MONTHLY_BUDGET_MINUTES` | No | `600` | Overrides `inbox.transcription.monthly_budget_minutes`: audio minutes this hive may send per UTC month. |
+| `HIVE_INBOX_UPLOADS_MAX_FILE_BYTES` | No | `26214400` | Overrides `inbox.uploads.max_file_bytes`: the largest text document a drop may add ([inbox-uploads.md](inbox-uploads.md)). Non-numeric or non-positive values fall back to the config / default. |
+| `HIVE_INBOX_UPLOADS_QUOTA_BYTES` | No | `2147483648` | Overrides `inbox.uploads.quota_bytes`: everything stored under `connector-state/uploads` on this hive. |
+| `HIVE_INBOX_UPLOADS_MAX_FILES_PER_DROP` | No | `20` | Overrides `inbox.uploads.max_files_per_drop`: files in one drop or one upload request. |
+| `HIVE_INBOX_UPLOADS_DOCUMENT_RETENTION_DAYS` | No | `0` | Overrides `inbox.uploads.document_retention_days`: days after which a text document's original is deleted (its extracted text and item stay); unset or `0` keeps originals. |
+| `HIVE_INBOX_UPLOADS_MEDIA_RETENTION_DAYS` | No | `5` | Overrides `inbox.uploads.media_retention_days`: days after which an audio or video upload's original is deleted. |
+| `HIVE_PDF_SANDBOX` | No | `/usr/local/bin/hive-pdftext` | The sandbox that reads PDFs dropped onto the Inbox out of process ([inbox-uploads.md](inbox-uploads.md)). |
+| `HIVE_PDF_RUN_AS` | No | `hive-transcribe` | The uid the PDF sandbox runs as through su-exec; `self` runs it as the hive's own uid (development only). |
+| `HIVE_PDF_MEMORY_MB` | No | `1024` | Address-space limit (prlimit `--as`) of the PDF sandbox, in MiB. |
+| `HIVE_INBOX_TRANSCRIPTION_DAILY_MAX_ITEMS` | No | `20` | Overrides `inbox.transcription.daily_max_items`: transcription runs per UTC day. |
+| `HIVE_INBOX_TRANSCRIBE_CONCURRENCY` | No | `1` | How many Inbox transcriptions run at once (capped at 8); queued runs wait for a free slot. Keep `1` with whisper, which decodes on the hive's own CPU ([inbox-transcription.md](inbox-transcription.md)). |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `GOOGLE_GENAI_API_KEY` | No | none | The hive's own Gemini API key, read in this order. Gemini model discovery already uses it; Inbox transcription with `inbox.transcription.provider: gemini` (or `auto` when whisper is unavailable) sends recordings to the Gemini API with it, in the `x-goog-api-key` header. Never stored in `hive.yaml`, never shown ([inbox-transcription.md](inbox-transcription.md)). |
+| `HIVE_WHISPER_MODEL_DIR` | No | `/data/models/whisper` | Where the built-in whisper provider keeps its ggml model (`ggml-<model>.bin`, mode 0644). Air-gapped hives pre-seed the file here; it is checked against its pinned size and SHA-256 before use ([inbox-transcription.md](inbox-transcription.md)). |
+| `HIVE_WHISPER_MODEL_DOWNLOAD` | No | `true` | `false` stops the hive from downloading a missing whisper model (air-gapped hives); whisper then reports *not ready* until the file is pre-seeded. |
+| `HIVE_WHISPER_MODEL_BASE_URL` | No | the pinned `huggingface.co/ggerganov/whisper.cpp` revision | HTTPS mirror the whisper model is downloaded from (`<url>/ggml-<model>.bin`). The pinned SHA-256 still applies. |
+| `HIVE_WHISPER_SANDBOX` | No | `/usr/local/bin/hive-whisper` | Path of the hive-whisper sandbox launcher. |
+| `HIVE_WHISPER_ENGINE_DIR` | No | `/opt/hive-whisper/bin` | Directory holding the bundled `whisper-cli` and LGPL `ffmpeg`. |
+| `HIVE_WHISPER_RUN_AS` | No | `hive-transcribe` | User the sandbox runs as (through su-exec). `self` runs it as the hive's own uid: weaker isolation, for development hosts without su-exec or the sandbox user. |
+| `HIVE_WHISPER_MEMORY_MB` | No | `3072` | Address-space limit (RLIMIT_AS) for each sandboxed engine process, in MiB. |
+
+## Crux durable lanes
+
+The `HIVE_LANES_*` variables belong to the **Hive process** and are read at boot.
+`CRUX_LANES_CONFIG` belongs to **`crux serve`**, not to Hive or an agent session.
+The Hive participant uses the Crux HTTP API as an ordinary project principal;
+it does not connect directly to NATS or inherit broker, agent-control or forge
+permissions. See [Crux durable lanes](crux-lanes.md) for registry configuration,
+project capabilities, deployment requirements and recovery.
+
+| Variable | Required | Default | Purpose |
+|---|---:|---|---|
+| `CRUX_LANES_CONFIG` | No | none (durable lanes disabled) | Crux server's lane configuration file, used when `crux serve --lanes-config` is absent. An explicit flag takes precedence. Broker credentials and project tokens are referenced by environment variable name in that file, not embedded as secret values. |
+| `CRUX_RUNS_CONFIG` | No | none (no contained-run backend; saved run records are still served) | Crux server's contained-run configuration file, used when `crux serve --runs-config` is absent. An explicit flag takes precedence. |
+| `HIVE_LANES_ADDRESS` | No | none (participant disabled) | Opts the Hive process into a Crux API endpoint. This is the Crux server address, not the NATS broker URL. |
+| `HIVE_LANES_LANE` | Yes when `HIVE_LANES_ADDRESS` is set | none | Registered lane ID for the Hive participant. Missing lane, group or token logs an explicit configuration error and leaves participation disabled. |
+| `HIVE_LANES_GROUP` | Yes when `HIVE_LANES_ADDRESS` is set | none | Registered delivery-group ID for Hive's claim loop; the configured project must have that group's work capability. |
+| `HIVE_LANES_TOKEN` | Yes when `HIVE_LANES_ADDRESS` is set | none | Secret bearer token bound to Hive's ordinary project principal in the Crux registry. Supply it through Hive's launch environment/secret configuration; never print it or use the agent-control/admin token as an implicit lane grant. |
+| `HIVE_LANES_SNAPSHOT_PROJECTS` | No | none (no snapshot handler registered) | Comma-separated explicit publisher-project allowlist for read-only `hive-governor-snapshot-request-v1` work. Use subject-safe IDs without surrounding whitespace. Requests must contain `{}`; this does not mirror events, execute prompts/tools or grant forge writes. |
 
 ## Generating and rotating `HIVE_DASHBOARD_TOKEN`
 
@@ -164,13 +266,19 @@ new value at the same time.
 | `HIVE_OUTPUT_LOG_DIR` | No | `/data/.hive/logs` | Directory (`0700`, files `0600`) where the hive keeps the `proxy`, `hive-output`, `litellm` and `requests` log sources read by the admin MCP `log_read` tool ([#11944](https://github.com/hivecommons/hive/issues/11944)); each keeps at most 5 files of 10 MiB and nothing older than 7 days. The `starts` and `crash` sources ([#11945](https://github.com/hivecommons/hive/issues/11945)) live here too: `starts.log` (newest 200 starts), `start-current.json` and at most 10 `crash-<UTC time>.log` files of 1 MiB. See [design/admin-mcp.md](design/admin-mcp.md#output-and-request-log-sources). |
 | `HIVE_PROXY_EGRESS_MARK` | No | `0x1112` | Packet mark exempted from the MITM egress redirect. |
 | `HIVE_PROXY_ADVISORY_OK` | No | `false` | Allows the spoke to start when the forced-proxy egress redirect cannot be installed (no `CAP_NET_ADMIN`/iptables). Enforcement becomes advisory-only — agents can bypass the proxy. Also gates whether the Go proxy trusts a self-asserted `Proxy-Authorization` header as agent identity when its UID map is unavailable (N7, #3841) — off by default, an unidentified caller is treated as `ADVISORY` (writes blocked) rather than whatever name it claims. See [security-model.md](security-model.md#5-network-and-credentials). |
-| `HIVE_PROXY_ALLOW_PRIVATE_FORWARD` | No | `false` | Lifts the plain-HTTP forward destination guard ([#14082](https://github.com/hivecommons/hive/issues/14082)). Off by default: a non-CONNECT request through the proxy is dialled only when the resolved address is globally routable, so an agent cannot use the proxy to reach loopback services beside it, the link-local cloud metadata endpoint (`169.254.169.254`), RFC 1918/CGNAT cluster addresses or multicast, and the refusal is a `403` naming the class. Only the exact string `true` turns it on, for deployments that genuinely egress to a private network over plain HTTP (a LAN mirror on a native install). Loopback refusals stay at `DEBUG` and are not counted as violations, because agents are already handed `NO_PROXY` for loopback (#14076). |
-| `HIVE_PROXY_INJECT_GH_AUTH` | No | unset (off; opt-in only on every hive, hosted or not) | Proxy-side GitHub credential injection ([#1861](https://github.com/hivecommons/hive/issues/1861)). Opt-in only: on exclusively when set to `true`; unset, `false` and any other value are off, and the hub renders no value onto newly provisioned spokes (a brief default-on for hosted App spokes from #9597/#9625 was reverted, [#9586](https://github.com/hivecommons/hive/issues/9586)). `true`: the hive keeps each agent's tier-scoped App token in memory, the MITM proxy strips any agent-supplied `Authorization` on GitHub hosts and attaches the UID-identified agent's real token, and the agent's readable token cache (and the `GH_TOKEN`/`GITHUB_TOKEN` derived from it) holds only the inert placeholder `hive-proxy-injected-<agent>`. `false` is the explicit opt-out (same as unset, but recorded on the pod spec). The resolved state is logged once at boot as `proxy GitHub auth injection: on|off (<reason>)` - unset reads `off (opt-in: set HIVE_PROXY_INJECT_GH_AUTH=true)` - and shown in the dashboard Security tab. Under injection the Copilot CLI's `/copilot_internal/` auth exchange keeps the agent's own credential. **`true` together with `HIVE_PROXY_ADVISORY_OK=true` makes the spoke refuse to start** (exit code 19): advisory mode lets a caller self-assert another agent's identity and receive its injected token. Any other value (`1`, `TRUE`, `yes`, ...) is treated as off, as before, but is logged at ERROR on boot and shown in the dashboard Security tab's coherence warnings, because it leaves the real token in the agent's cache. Requires GitHub App auth; on a PAT-only hive there is nothing to inject. See [security-model.md](security-model.md#5-network-and-credentials). |
+| `HIVE_PROXY_ALLOW_PRIVATE_FORWARD` | No | `false` | Lifts the proxy's destination guard ([#14082](https://github.com/hivecommons/hive/issues/14082), [#16785](https://github.com/hivecommons/hive/pull/16785)). Off by default: a plain-HTTP (non-CONNECT) forward, a CONNECT to a host the proxy does not inspect, and a transparent-TLS passthrough are each dialled only when the resolved address is globally routable, so an agent cannot use the proxy to reach loopback services beside it, the link-local cloud metadata endpoint (`169.254.169.254`), RFC 1918/CGNAT cluster addresses or multicast, and the refusal is a `403` naming the class. Only the exact string `true` turns it on, and it lifts the guard for all three legs at once, for deployments that genuinely egress to a private network through the proxy (a LAN mirror on a native install); the proxy logs a boot-time warning when it is set. Loopback refusals stay at `DEBUG` and are not counted as violations, because agents are already handed `NO_PROXY` for loopback (#14076). With the guard lifted, the inference translator also stops trusting the proxy UID (`dev`, 1001 on v5 pods): agents that run as the hive user without a per-agent UID are refused with `reason=proxy_uid_private_forward` ([#18061](https://github.com/hivecommons/hive/issues/18061), [#14448](https://github.com/hivecommons/hive/issues/14448)). |
+| `HIVE_PROXY_INJECT_GH_AUTH` | No | unset (off on every hive, including hosted) | Exact `true` enables proxy-side App-token injection. **Requires GitHub App auth. Refuses startup (exit 19) with `HIVE_PROXY_ADVISORY_OK=true`.** Other spellings do not enable it. Read [behavior and exceptions](#proxy-credential-injection). |
 | `HIVE_DEPLOYMENT_RUNTIME` | No | none (config `deployment.runtime` fallback; hub-registered Kubernetes hives are auto-detected) | Declares the deployment runtime (`kubernetes`, `podman-quadlet`, or `docker-compose`) so the dashboard can offer standalone upgrades. Unset/unrecognized means `unknown` and the upgrade button stays hidden. See [dashboard-standalone-upgrades.md](dashboard-standalone-upgrades.md). |
 | `HIVE_DEPLOYMENT_PODMAN_MODE` | Only when runtime is `podman-quadlet` | none (config `deployment.podman_mode` fallback) | `rootless` (`systemctl --user`) or `rootful` (system manager). Without an explicit mode the Podman/Quadlet upgrade path stays disabled. |
 | `HIVE_DASHBOARD_UPGRADE_HELPER` | No | config `deployment.upgrade_helper` fallback, then `/usr/local/libexec/hive-dashboard-upgrade-helper` | Absolute path to the standalone upgrade helper executable the dashboard invokes. Must be a regular, executable file at an absolute path or the upgrade button stays hidden. See [dashboard-standalone-upgrades.md](dashboard-standalone-upgrades.md). |
 | `HIVE_GIT_BOT_EMAIL_DOMAIN` | No | `hive.kubestellar.io` | Domain of the bracket-free bot sign-off address `<slug>@<domain>`. With `github.app_signed_commits` on, the PR-request watcher re-addresses any `<slug>[bot]@users.noreply.github.com` `Signed-off-by` trailer it copies into the GitHub-signed commit to this form, because probot-dco rejects the bracketed local-part as a malformed email ([#6251](https://github.com/hivecommons/hive/issues/6251)); on v4 `src/deploy/entrypoint.sh` mints the agents' pane identity under the same domain ([#6276](https://github.com/hivecommons/hive/pull/6276)). A plain hostname only (`[A-Za-z0-9.-]`); anything else falls back to the default. |
 | `HIVE_TMUX_HISTORY_LIMIT` | No | `50000` | tmux scrollback depth applied when an agent session is created (positive integer; the authoritative knob for terminal scrollback and full-log capture). |
+| `HIVE_CUSTOMERS_ENABLED` | No | config `customers.enabled` (default on) | Turns the Customers section and its people store on or off; `false` opens no store, runs no sweep and hides the section, overriding config. Nothing the store holds leaves the hive. |
+| `HIVE_CUSTOMERS_INFERENCE_ENABLED` | No | config `customers.inference.enabled` (default off) | Turns goal and satisfaction suggestions on or off, overriding config. Needs Customers on. When on, a customer's own issues, pull requests and approved mail are sent to the meetings model; every suggestion waits for a person to confirm, edit or reject it. |
+| `HIVE_CUSTOMERS_AVATARS_ENABLED` | No | config `customers.avatars.enabled` (default on) | Turns GitHub pictures on the Customers list on or off, overriding config. On, the viewer's browser requests `https://github.com/<login>.png` with no referrer for each person with a confirmed GitHub login; off, the list shows initials and makes no request to github.com. |
+| `HIVE_CUSTOMERS_MENTION_SEARCH_ENABLED` | No | config `customers.mention_search.enabled` (default off) | Turns the accept-time GitHub mention search on or off, overriding config. Needs Customers on. When on, accepting a suggested GitHub login makes at most two GitHub search requests for that login, counted against the shared API budget. |
+| `HIVE_SESSIONS_ENABLED` | No | config `dashboard.sessions.enabled` (default on) | Turns the dashboard Inception (spek) sessions feature (interactive CLI terminals, `/api/sessions`) on or off; `false` hides it, overriding config. Limits: `HIVE_SESSIONS_MAX`, `HIVE_SESSIONS_MAX_PER_USER`, `HIVE_SESSIONS_IDLE_TTL_HOURS`. Workspace: `HIVE_SESSIONS_WORKSPACE_REPO` (the `org/repo` sessions open in, default `project.org/primary_repo`), `HIVE_SESSIONS_WORKSPACE_DIR` (root of the one shared clone per repo, `<dir>/<org>/<repo>`, and of each session's own git worktree of it, `<dir>/.sessions/<id>/<org>/<repo>` on branch `hive-session/<id>`; sessions share commits and branches but not uncommitted edits or `.spektacular/` state; default `/data/session-sandbox/workspace`), `HIVE_SESSIONS_GID` (the sessions-only group that shares the clone, default 20000). Inbox seeds: `HIVE_SESSIONS_SEED_MAX_BYTES` (cap on one item's enveloped text in `.hive/inbox/`, default 524288); see [Sessions API](api-reference/sessions.md). |
+| `HIVE_SESSIONS_AUTOSTART` | No | config `dashboard.sessions.autostart` (default on) | Turns the session startup auto-answer on or off, overriding config: when a session starts the hive answers the vendor CLI's startup screens (first-run notice, trust for the session's folder, onboarding) so its first request runs unattended. It never answers a permission prompt or a login screen. `HIVE_SESSIONS_AUTOSTART_WINDOW_SEC` (default `90`) bounds how long it answers for after a start. See [Startup auto-answer](api-reference/sessions.md#startup-auto-answer). |
 | `HIVE_TTYD_HISTORY_LIMIT` | No | `50000` | Defense-in-depth history-limit raise applied at browser attach time; only affects panes created after attach. |
 | `HIVE_TMUX_PANE_WIDTH` | No | `200` | Column count agent tmux sessions are created with. A detached tmux session defaults to 80 columns because no attached client supplies a size. |
 | `HIVE_KICK_LOG_DIR` | No | `/data/logs/kicks` | Root directory per-kick log archives are written under. On the persistent volume so archives survive restarts, pod rolls, and image upgrades. |
@@ -185,6 +293,41 @@ new value at the same time.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | none | OTLP/HTTP exporter endpoint for traces and metrics (`github.*`, `forgestate.*`, `webhook.*`). Both stay disabled while unset; see `operator-reference.md` § OpenTelemetry. |
 | `HIVE_WIKI_GIT_URL` | No | none | Optional wiki vault URL cloned into `/data/vaults/hive-wiki` on first boot. |
 | `HIVE_PROMPT_SOURCE_MAX_BYTES` | No | `98304` (`promptsrc.DefaultMaxPromptBytes`, 96 KiB) | Size cap on a GitHub `prompt_source` kick template ([#12130](https://github.com/hivecommons/hive/issues/12130)). A body over the cap is **rejected whole, never truncated**: the kick falls back to the last successfully fetched copy, then the inline template chain, and logs `prompt from GitHub exceeds size cap; REJECTED whole` with repo, path, size and cap. Accepts a byte count or `KiB`/`MiB` suffix (`128KiB`); unparseable values keep the default. The largest shipped template is ~33 KiB, so the default leaves >2× headroom — raise it only for a real template that outgrows that. |
+
+### Proxy credential injection
+
+**Before enabling:** `HIVE_PROXY_INJECT_GH_AUTH=true` must not be combined with
+`HIVE_PROXY_ADVISORY_OK=true`. The spoke refuses to start with exit code **19**:
+advisory mode permits self-asserted agent identity, which could obtain another
+agent's injected token. A PAT-only hive has no App token to inject.
+
+**Accepted setting:** only exact lowercase `true` enables injection.
+Unset is off; `false` explicitly records the opt-out on the pod spec.
+`1`, `TRUE`, `yes` and every other spelling are off, logged at **ERROR** on
+boot and shown as Security-tab coherence warnings because real tokens remain
+in the agent cache.
+
+<details>
+<summary>Token handling, verification and provisioning history</summary>
+
+- Hive keeps tier-scoped App tokens in memory. The man-in-the-middle (MITM)
+  proxy strips agent-supplied `Authorization` on GitHub hosts and attaches
+  the real token for the Unix-user-ID (UID) identified agent.
+- The readable token cache and derived `GH_TOKEN`/`GITHUB_TOKEN` contain only
+  `hive-proxy-injected-<agent>`, an inert placeholder.
+- **Exception:** Copilot CLI's `/copilot_internal/` authentication exchange
+  keeps the agent's own credential.
+- Check the boot log `proxy GitHub auth injection: on|off (<reason>)` and
+  dashboard Security tab. Unset reports
+  `off (opt-in: set HIVE_PROXY_INJECT_GH_AUTH=true)`.
+- Current provisioning renders no value on newly created spokes. The brief
+  hosted default-on behavior in #9597/#9625 was reverted by
+  [#9586](https://github.com/hivecommons/hive/issues/9586).
+
+Implementation background: [#1861](https://github.com/hivecommons/hive/issues/1861)
+and [network/credential controls](security-model.md#5-network-and-credentials).
+
+</details>
 
 ## Inference, CLI backends, and agents
 
@@ -203,6 +346,8 @@ new value at the same time.
 | `HIVE_BOB_API_URL` | No | `https://api.us-east.bob.ibm.com` | Bob key-test endpoint base URL override. |
 | `BOBSHELL_API_KEY` | Required by Bob CLI when Hive injects or contributor mode uses Bob | none | API key name read by bobshell itself. |
 | `COPILOT_GITHUB_TOKEN` | No | dashboard device-flow token file, if present | Copilot completion/model-discovery token and explicit agent injection. |
+| `HIVE_CLAUDE_OAUTH_TOKEN` | No | none | Hive-side secret from `claude setup-token`; takes precedence over the secret file and dashboard sign-in for Claude agents. See [Claude setup-token](agent-configuration.md#claude-setup-token). |
+| `HIVE_CLAUDE_OAUTH_TOKEN_FILE` | No | `/secrets/claude-oauth-token` | Path to a file containing the setup token, used when `HIVE_CLAUDE_OAUTH_TOKEN` is empty. Keep the file readable by Hive and restricted as a secret. |
 | `ANTHROPIC_API_KEY` | Required by `cmd/apiproxy` to inject an upstream key; agent inference backends receive a synthetic value | none | Anthropic-compatible **upstream** API key. Never used to authenticate callers of `cmd/apiproxy`. |
 | `PROXY_AUTH_TOKEN` | **Required** by `cmd/apiproxy`; the binary exits at startup when unset and the proxy handler returns `503` | none | **Client auth token** callers must present to `cmd/apiproxy` via `Authorization: Bearer` or `X-Api-Key`. Validated in constant time and stripped before the upstream request. Mandatory because an unauthenticated proxy would let any co-resident loopback caller spend the host `ANTHROPIC_API_KEY`. |
 | `CONTEXT7_API_KEY` | No | none | Optional key for Context7 knowledge API integration. |
@@ -219,6 +364,7 @@ new value at the same time.
 | `CODEX_API_KEY` | No | none | API key read by `crux/agent/authprobe.go` for the Codex CLI backend; either this or `OPENAI_API_KEY` makes Codex API-key mode count as configured. |
 | `HIVE_AGENT_TOKEN_REFRESH_INTERVAL` | No | `40m` | Go duration overriding the per-agent token refresh interval. Invalid or non-positive values fall back to the default. |
 | `HIVE_CREDENTIAL_WATCHDOG_INTERVAL` | No | `5m` | Go duration overriding how often the credential watchdog verifies each in-use backend credential file. `0` does NOT disable the watchdog — disabling is intentionally not offered. |
+| `HIVE_CLAUDE_CREDENTIAL_BRIDGE_INTERVAL` | No | `5s` | Go duration overriding how often the credential watchdog checks each per-UID claude agent's `~/.claude/.credentials.json` link for a token refresh that replaced it with a private file, and publishes that refresh to the shared login (see [Per-agent homes](agent-configuration.md)). One `lstat` per claude agent per tick. |
 | `HIVE_PROVIDER_ERROR_BACKOFF_BASE` | No | `2m` | Go duration for the first inference-provider error backoff before another kick is allowed. Invalid or non-positive values fall back to the default. |
 | `HIVE_PROVIDER_ERROR_BACKOFF_MAX` | No | `30m` | Go duration cap for exponential inference-provider error backoff. Invalid or non-positive values fall back to the default. |
 | `HIVE_START_FAILURE_BLOCK_THRESHOLD` | No | `3` | Consecutive identical start failures (positive integer) before an agent is blocked from automatic relaunch (`crux/agent/start_failure.go`). Backoff is applied from the first failure regardless; invalid values fall back to the default. |
@@ -247,6 +393,111 @@ Part 2 of [RFC #4492](https://github.com/hivecommons/hive/issues/4492): the hive
 | `LINEAR_AGENT_STORE` | No | `/data/linear-agent.json` | Path of the persisted install record (workspace identity + OAuth grant, mode 0600). Override for tests or non-container runs. |
 
 Inside an **agent** session (set by the hive, never by the operator): ISSUES_ONLY+ agents receive `LINEAR_ACCESS_TOKEN` (the connected app's OAuth token, `Authorization: Bearer`) or, when no workspace is connected, `LINEAR_API_KEY` (the work-source key, bare `Authorization`). Advisory agents receive neither and have both stripped. See [linear-agent.md](linear-agent.md#github-issue-parity-agents-writing-to-linear).
+
+## Meetings (Quorum)
+
+Hive as a live meeting participant ([#18284](https://github.com/hivecommons/hive/issues/18284)). Each variable overrides the matching `meetings.*` key in `hive.yaml`; with `meetings.enabled` off nothing starts. The default consent notice is: "Hive has joined to take notes and help with research. It records this meeting's transcript. Type 'hive leave' to remove it." Other `QUORUM_*` variables set on hive (the contract's numeric limits, for example `QUORUM_CHAT_MAX_CHARS`) pass through to the Quorum child unchanged.
+
+| Variable | Required | Default | Purpose |
+|---|---:|---|---|
+| `HIVE_MEETINGS_ENABLED` | No | `meetings.enabled` (off) | Turns meetings on: hive starts the Quorum child and can join live meetings. Accepts `1/true/yes/on` and `0/false/no/off`. |
+| `HIVE_MEETINGS_QUORUM_BINARY` | No | `/usr/local/lib/quorum/quorum.mjs` | Quorum bundle (run through `node` when it ends in `.mjs` or `.js`) or executable. Overrides `meetings.quorum.binary`. |
+| `HIVE_MEETINGS_QUORUM_LISTEN` | No | `127.0.0.1:8765` | Loopback address Quorum listens on (passed as `QUORUM_LISTEN`). Non-loopback values are rejected. |
+| `HIVE_MEETINGS_VEXA_URL` | Yes for Meet, Teams and Zoom | none | Vexa gateway base URL (passed as `QUORUM_VEXA_URL`). Overrides `meetings.vexa.url`. |
+| `HIVE_MEETINGS_VEXA_API_KEY` | No | none | Vexa tenant key. Secret. Wins over the keystore-sealed secret file; prefer the file, which the dashboard writes. |
+| `HIVE_MEETINGS_VEXA_API_KEY_FILE` | No | `/data/secrets/meetings_vexa_api_key` | Keystore-sealed secret file holding the Vexa tenant key. Overrides `meetings.vexa.api_key_file`. |
+| `HIVE_MEETINGS_DISCORD_TOKEN` | No | none | Per-hive Discord bot token. Secret. Wins over the secret file. Without a token Discord is unavailable. |
+| `HIVE_MEETINGS_DISCORD_TOKEN_FILE` | No | `/data/secrets/meetings_discord_token` | Keystore-sealed secret file holding the Discord bot token. Overrides `meetings.discord.token_file`. |
+| `HIVE_MEETINGS_TRANSCRIBE_URL` | No | none | Shared transcription service for Discord audio (passed as `QUORUM_TRANSCRIBE_URL`). Overrides `meetings.transcribe_url`. In-cluster: `http://vexa-transcription.meetings.svc.cluster.local:8000`. |
+| `HIVE_MEETINGS_TRANSCRIBE_TOKEN` | No | none | Transcription service token. Secret. Wins over the secret file. Hive passes it to Quorum as `QUORUM_TRANSCRIBE_TOKEN_FILE`; without it Discord audio is not transcribed. |
+| `HIVE_MEETINGS_TRANSCRIBE_TOKEN_FILE` | No | `/data/secrets/meetings_transcribe_token` | Keystore-sealed secret file holding the transcription service token. Overrides `meetings.transcribe_token_file`. |
+| `HIVE_MEETINGS_TTS_URL` | No | none | Text-to-speech service Quorum speaks Discord replies with (passed as `QUORUM_TTS_URL`). Overrides `meetings.tts_url`. In-cluster on hive-oke: `http://vexa-tts.meetings.svc.cluster.local:8880`. |
+| `HIVE_MEETINGS_TTS_TOKEN` | No | none | TTS service token. Secret. Wins over the secret file. Hive passes it to Quorum as `QUORUM_TTS_TOKEN_FILE`, with `QUORUM_TTS_VOICE` set to the persona's voice; without it Discord replies stay in chat. On hive-oke, copied by the operator from Secret `vexa-tts` in namespace `meetings`. |
+| `HIVE_MEETINGS_TTS_TOKEN_FILE` | No | `/data/secrets/meetings_tts_token` | Keystore-sealed secret file holding the TTS service token. Overrides `meetings.tts_token_file`. |
+| `HIVE_MEETINGS_DELIVERY` | No | `chat` | Default delivery for meeting output. Only `chat` is supported. |
+| `HIVE_MEETINGS_VOICE_ON_ADDRESS` | No | `true` | Lets hive speak when addressed by name in a meeting whose voice is enabled; otherwise it answers in chat. |
+| `HIVE_MEETINGS_BOT_NAME` | No | the persona's display name (`Betty Bee from the hive`), or `hive (notes)` with the persona off | Display name the meeting bot joins with. |
+| `HIVE_MEETINGS_INVITE_POLICY` | No | `owner` | Who may send hive to a meeting. Only `owner` is supported. |
+| `HIVE_MEETINGS_RESEARCH_POOL_SIZE` | No | `2` | Number of research agents (`research-1..N`). |
+| `HIVE_MEETINGS_RESEARCH_PER_MEETING` | No | `5` | Research items one meeting may start before each further item needs dashboard approval. |
+| `HIVE_MEETINGS_CHAT_POSTS_PER_MINUTE` | No | `6` | Cap on hive's chat posts into one meeting. |
+| `HIVE_MEETINGS_LOBBY_TIMEOUT_S` | No | `600` | Seconds hive waits in a meeting lobby before leaving. |
+| `HIVE_MEETINGS_RETENTION_DAYS` | No | `30` | Days an ended meeting's transcript is kept before it is purged. |
+| `HIVE_MEETINGS_CONSENT_TEXT` | No | the notice above | Notice posted in the meeting chat on join, before anything else. At most 2000 characters. |
+| `HIVE_MEETINGS_DATA_DIR` | No | `/data/meetings` | Where meeting records and transcripts are stored. |
+| `HIVE_MEETINGS_SCHEDULE_TICK_S` | No | `15` | Seconds between the meeting scheduler's checks for a Calendar meeting to join. |
+| `HIVE_MEETINGS_SCHEDULE_LEAD_S` | No | `60` | Seconds before a scheduled meeting's start that hive joins it (`0` joins at the start). |
+| `HIVE_MEETINGS_EMAIL_INVITES_ENABLED` | No | `true` | Accept calendar invites mailed to `hive@<host>` through hive-mx. Overrides `meetings.email.invites_enabled`. |
+| `HIVE_MEETINGS_EMAIL_FILES_ENABLED` | No | `true` | Accept Markdown, office document, audio, video and image attachments and text bodies mailed to `hive@<host>` as Inbox items. Overrides `meetings.email.files_enabled`. |
+| `HIVE_INBOX_EMAIL_MAX_BYTES` | No | `50331648` | Largest mail-in delivery a spoke assembles from relayed pieces (`POST /api/inbox/email/chunk`, 48 MiB). |
+| `HIVE_MEETINGS_MAX_TOKENS_PER_MEETING` | No | `200000` | Per-meeting LLM token budget for Spektacular live mode. |
+| `HIVE_MEETINGS_MAX_TOKENS_PER_HOUR` | No | `500000` | Hive-wide hourly token ceiling across meetings. |
+| `HIVE_MEETINGS_MAX_TOKENS_PER_DAY` | No | `2000000` | Hive-wide daily token ceiling across meetings. |
+| `HIVE_MEETINGS_MAX_INTENTS_PER_MEETING` | No | `500` | Per-meeting budget counted in Spek intents when Spek reports no token usage. |
+| `HIVE_MEETINGS_PERSONA_ENABLED` | No | `true` | Turns the meeting attendee persona (Betty) on or off. Off restores the plain `hive (notes)` attendee. |
+| `HIVE_MEETINGS_PERSONA_PRESET` | No | `betty` | Built-in persona the fields below start from. |
+| `HIVE_MEETINGS_PERSONA_NAME` | No | `Betty` | Name the persona answers to and uses for itself. |
+| `HIVE_MEETINGS_PERSONA_DISPLAY_NAME` | No | `Betty Bee from the hive` | Meeting display name; the default bot name. At most 64 characters. |
+| `HIVE_MEETINGS_PERSONA_ALIASES` | No | `betty,betty bee,hive` | Comma-separated names that address the persona at the start or end of a line. |
+| `HIVE_MEETINGS_PERSONA_PRONOUNS` | No | `she/her` | Kept for compatibility; the persona never states pronouns. |
+| `HIVE_MEETINGS_PERSONA_LANGUAGE` | No | `en-US` | BCP-47 tag; replies use its language and regional conventions. |
+| `HIVE_MEETINGS_PERSONA_VOICE` | No | `af_heart` | TTS voice id for spoken replies (a Kokoro voice id), passed to Quorum as `QUORUM_TTS_VOICE` and as `voice_id` on `meeting.join`. |
+| `HIVE_MEETINGS_PERSONA_VOICE_TYPE` | No | `female` | `female`, `male` or `bot`; descriptive only. |
+| `HIVE_MEETINGS_PERSONA_ACCENT` | No | `American` | Free text; descriptive only. |
+| `HIVE_MEETINGS_PERSONA_INTRO_TEMPLATE` | No | the preset's intro | Intro posted when someone asks the persona to introduce itself. Placeholders `{name}`, `{display_name}`, `{pronouns}` (always empty), `{leave}`, `{accent}`, `{voice_type}`, `{language}`. |
+| `HIVE_MEETINGS_PERSONA_LEAVE_PHRASES` | No | `betty leave,hive leave` | Comma-separated phrases that remove the persona from the meeting. |
+| `HIVE_MEETINGS_PERSONA_HUMOR` | No | `light` | `light` (at most one light touch, never about a person) or `off`. |
+| `HIVE_MEETINGS_PERSONA_SEARXNG_URL` | No | none | SearXNG instance the persona searches the web with (`GET /search?format=json`, 1.2 s timeout, top 3 results as untrusted data). In-cluster on hive-oke: `http://searxng.meetings.svc.cluster.local:8080`. Empty means no web search. |
+| `HIVE_MEETINGS_PERSONA_UNPROMPTED_PER_10M` | No | `2` | Unprompted (question-driven) answers per ten minutes. |
+| `HIVE_MEETINGS_PERSONA_UNPROMPTED_MIN_GAP_S` | No | `90` | Minimum seconds between two unprompted answers. |
+| `HIVE_MEETINGS_PERSONA_UNPROMPTED_PER_MEETING` | No | `12` | Unprompted answers per meeting. |
+| `HIVE_MEETINGS_PERSONA_UNPROMPTED_ANSWER_WAIT_S` | No | `8` | Seconds the persona waits for a person to answer a room question first. |
+| `HIVE_MEETINGS_PERSONA_UNPROMPTED_MIN_CONFIDENCE` | No | `0.75` | Model confidence (0 to 1) an unprompted answer needs. |
+| `HIVE_MEETINGS_PERSONA_UNPROMPTED_QUEUE_DEPTH` | No | `3` | Room questions waiting for an answer at once. |
+| `HIVE_MEETINGS_PERSONA_UNPROMPTED_STALE_S` | No | `60` | Seconds after which a waiting room question is dropped. |
+| `HIVE_MEETINGS_PERSONA_ACTIONS_ENABLED` | No | `true` | Lets people ask the persona in a meeting to draft issues, RFCs, Spek sessions and knowledge notes; every draft waits for approval in the dashboard. |
+| `HIVE_MEETINGS_PERSONA_ACTIONS_TYPES` | No | `issue,rfc,spek,knowledge` | Comma-separated action types the persona may draft. |
+| `HIVE_MEETINGS_PERSONA_ACTIONS_DEFAULT_REPO` | No | `inbox.spek.repo`, then `project.primary_repo` | `owner/repo` a draft targets when the request names no monitored repo. |
+| `HIVE_MEETINGS_PERSONA_ACTIONS_AUTO_APPROVE_KNOWLEDGE` | No | `false` | Saves knowledge notes drafted in meetings without approval. Issues, RFCs and Spek sessions are never auto-approved. |
+| `HIVE_MEETINGS_LLM_MODE` | No | `auto` | Model Spektacular live mode reasons with: `auto` (an Anthropic key if set, else the OpenAI-compatible endpoint), `openai`, `anthropic` or `none` (rules only). |
+| `HIVE_MEETINGS_LLM_ENDPOINT` | No | `governor.litellm` endpoint | OpenAI-compatible base URL `hive meeting-llm` calls for Spek. |
+| `HIVE_MEETINGS_LLM_MODEL` | No | `governor.litellm.default_model` | Model name for that endpoint. Without an endpoint and model, Spek runs on rules only. With only an Anthropic key it is the model the persona answers with through the Anthropic Messages API (default `claude-haiku-5-5`). |
+| `HIVE_MEETINGS_LLM_API_KEY` | No | `governor.litellm` key | Key for that endpoint. Secret. Wins over the secret file. |
+| `HIVE_MEETINGS_LLM_API_KEY_FILE` | No | `/data/secrets/meetings_llm_api_key` | Keystore-sealed key file for the meetings endpoint. |
+| `HIVE_MEETINGS_ANTHROPIC_API_KEY` | No | none | Anthropic key; when set (mode `auto` or `anthropic`) Spek calls Anthropic directly and the persona answers through the Anthropic Messages API. Secret; passed only into the Spek child's environment and used in-process for the persona's calls. |
+| `HIVE_MEETINGS_ANTHROPIC_API_KEY_FILE` | No | `/data/secrets/meetings_anthropic_api_key` | Keystore-sealed Anthropic key file. |
+| `HIVE_MEETINGS_ANTHROPIC_MODEL` | No | Spektacular's default | Anthropic model override (`SPEK_MEETING_MODEL`). |
+| `HIVE_MEETINGS_LLM_TIMEOUT_MS` | No | `2500` | Per-call model timeout. |
+| `HIVE_MEETINGS_LLM_MAX_IN_FLIGHT` | No | `4` | Concurrent model calls across all meetings. |
+
+### Mail receiver (`hive-mx`)
+
+`hive-mx` is the cluster's receive-only mail receiver ([#18395](https://github.com/hivecommons/hive/issues/18395)): it accepts mail only for `hive@<hive host>`, keeps calendar invites, mail-in files and text bodies, and proof codes, and posts them to the hub. It never sends mail, offers no AUTH and relays nothing. It reads only these variables; see [meetings.md](meetings.md#inviting-betty-by-email).
+
+| Variable | Required | Default | Purpose |
+|---|---:|---|---|
+| `HIVE_MX_HUB_URL` | Yes | none | Hub base URL hive-mx fetches the host list from (`GET /api/mail/hosts`) and posts deliveries to (`POST /api/mail/inbound`). |
+| `HIVE_MX_HUB_TOKEN_FILE` | No | `/var/run/secrets/hive-mx/token` | File holding the hub bearer token (a mounted Secret). Read on every call, so a rotated token needs no restart. |
+| `HIVE_MX_LISTEN` | No | `:2525` | SMTP listen address. The Service maps port 25 to it, so the container runs as non-root. |
+| `HIVE_MX_HEALTH_LISTEN` | No | `:8080` | `/healthz` and `/readyz` (ready once the first host list loaded). |
+| `HIVE_MX_DOMAIN` | No | `mx.hive.hivecommons.dev` | Name hive-mx greets with. |
+| `HIVE_MX_HOSTS_REFRESH_S` | No | `60` | Seconds between host list refreshes. A failed refresh keeps the last list. |
+| `HIVE_MX_MAX_MESSAGE_BYTES` | No | `36700160` | SMTP SIZE limit (35 MiB: a 25 MB attachment after base64). |
+| `HIVE_MX_MAX_RECIPIENTS` | No | `5` | Recipients per message. |
+| `HIVE_MX_MAX_CONNECTIONS` | No | `100` | Concurrent SMTP connections. |
+| `HIVE_MX_MAX_FILE_BYTES` | No | `26214400` | Largest decoded mail-in attachment (25 MiB). |
+| `HIVE_MX_MAX_FILES_BYTES` | No | `31457280` | All decoded mail-in attachments of one message (30 MiB). |
+| `HIVE_MX_MAX_FILES` | No | `10` | Mail-in attachments kept per message. |
+| `HIVE_MX_MAX_MARKDOWN_BYTES` | No | `2097152` | Largest Markdown attachment (checked in memory; it has no magic number). |
+| `HIVE_MX_MAX_BODY_BYTES` | No | `262144` | Text body kept as a note (256 KiB); a longer body is cut. |
+| `HIVE_MX_SPOOL_DIR` | No | system temp directory | Where a message and its audio, video and image attachments are spooled while it is processed; mount a size-limited `emptyDir`. |
+| `HIVE_MX_MAX_CONCURRENT_DATA` | No | `8` | Messages processed at once (`451` past it); with the SIZE limit it bounds the spool. |
+| `HIVE_MX_HIVE_DAILY_BYTES` | No | `536870912` | Message bytes delivered per hive per 24 hours (512 MiB); past it the sender gets `452` and retries later. |
+| `HIVE_MX_DELIVER_TIMEOUT_S` | No | `120` | Seconds hive-mx waits for the hub per recipient (a large delivery is relayed to the spoke in pieces meanwhile). |
+| `HIVE_MX_IP_MESSAGES_PER_HOUR` | No | `60` | Messages per remote IP per hour (burst of a quarter of it). |
+| `HIVE_MX_DOMAIN_MESSAGES_PER_HOUR` | No | `120` | Messages per sender (MAIL FROM) organizational domain per hour. |
+| `HIVE_MX_TLS_CERT` | No | none | PEM certificate file; with `HIVE_MX_TLS_KEY` it turns on STARTTLS. Re-read when the file changes. Without it hive-mx accepts plain SMTP only. |
+| `HIVE_MX_TLS_KEY` | No | none | PEM key for `HIVE_MX_TLS_CERT`. |
 
 ## Backend launch controls
 
@@ -295,7 +546,7 @@ Set conditionally:
 | `COPILOT_GITHUB_TOKEN` | When the hive holds a Copilot auth token | Copilot OAuth token (authenticates the AI model, not GitHub writes). **Secret.** |
 | `GITHUB_TOKEN` | Only when App-authored PRs are enabled (`AppAuthoredPRs`), an App is configured, and the agent's mode can push | The per-agent tier-scoped App installation token, so the built-in GitHub MCP server writes as the App bot. Advisory agents have `GITHUB_TOKEN` deliberately stripped. **Secret.** |
 | `LINEAR_ACCESS_TOKEN` / `LINEAR_API_KEY` | ISSUES_ONLY+ agents on Linear-connected hives | See the [Linear agent integration](#linear-agent-integration) note above. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Last resort: claude backend **and** no readable credential file | Dashboard-obtained access token; never injected when the agent can read (and refresh) `~/.claude/.credentials.json` itself. **Secret.** |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude backend with an operator token, or as a last resort when no credential file is readable | Hive injects the operator's setup token when configured, even if a credential file exists. Otherwise the fallback is the dashboard-obtained access token only when no credential file is readable. **Secret.** |
 | `BOBSHELL_API_KEY`, `BOB_API_KEY`, `BOBSHELL_DEFAULT_AUTH_TYPE` | bob backend only | The resolved Bob API key for Bob 1.x / 2.x (**secret**) and the literal `api-key` auth-type selector (non-secret by design - see the #2228 relaunch note in code). |
 | `HIVE_BOB_SESSION_LABEL` | bob backend only when `governor.bob.session_prefix` or `agents.<name>.bob.session_label` is set | The Bob session label also passed to Bob as `--instance-id`. A label only: `HIVE_AGENT` and all functional Hive identity are unchanged. See [agent-configuration.md](agent-configuration.md). |
 | `HIVE_BOB_DISPLAY_NAME` | bob backend only | Legacy alias for the Bob session label, falling back to the agent name for older scripts. Prefer `HIVE_BOB_SESSION_LABEL` when present. |
@@ -373,11 +624,51 @@ section requires for lookups.
 | `HIVE_VANITY_MINT_WINDOW` | No | `168h` | Go duration of the rolling window `HIVE_VANITY_MINT_BUDGET` is counted over. |
 | `HIVE_IMAGE_BUILD_STALE_AFTER` | No | `90m` | Go duration a branch HEAD may stay non-ready (docker workflow queued/building, image not yet on GHCR) before the hub reports its `latest_sha_image_status` as `stale` on the dashboard (`pkg/hub/saas.go`). |
 | `HIVE_ADVISORY_POST_RETRY_BACKOFF_S` | No | `3600` | Seconds the spoke pauses advisory digest writes after a `403 Resource not accessible by integration`, when `governor.advisory.post_retry_backoff_s` is unset. Negative disables the pause. |
+| `HIVE_ADVISORY_PER_REPO` | No | `false` | When `governor.advisory.per_repo` is absent from `hive.yaml`, `true` gives every monitored repo its own Hive Advisory Report in addition to the one in the primary repo. An explicit `per_repo` (or the Settings toggle) wins. See [advisory.md](advisory.md#one-report-or-one-per-repo). |
 | `HIVE_ADVISORY_ISSUE_AGING_AFTER` | No | `45m` | Age (Go duration) after which a hive's advisory digest is bucketed `aging` in hub fleet-row freshness reporting (`pkg/hub/advisory_issue_activity.go`). Must be set **below** `HIVE_ADVISORY_ISSUE_STALE_AFTER`: if stale ≤ aging, **both** thresholds silently revert to their defaults. |
 | `HIVE_ADVISORY_ISSUE_STALE_AFTER` | No | `1h30m` | Age (Go duration) after which the same advisory-digest freshness struct is bucketed `stale` and drives the advisory-stale verdict. Same pairing rule as above: a value ≤ the aging threshold makes both revert to defaults. |
 | `HIVE_HUB_PUBLIC_URL` | No | none (chain continues) | First variable in the hub public-origin chain used to build notification deep links and to match the hub domain suffix. Precedence: `HIVE_HUB_PUBLIC_URL` → `HIVE_PUBLIC_URL` → `HIVE_HUB_BASE_URL` → `HIVE_DASHBOARD_URL` → `HIVE_HUB_URL`, then the compiled-in canonical public origin (links) or the default cluster domain (suffix match). |
 | `HIVE_PUBLIC_URL` | No | none (chain continues) | Second variable in the hub public-origin chain — see `HIVE_HUB_PUBLIC_URL` for the full precedence order. |
 | `HIVE_HUB_BASE_URL` | No | none (chain continues) | Third variable in the hub public-origin chain — see `HIVE_HUB_PUBLIC_URL` for the full precedence order. |
+
+### Secrets at rest (keystore)
+
+The spoke seals every secret value it stores on the data volume — the
+`/data/secrets/*` key files, the Copilot device-flow token and the
+`github.token` value in `hive.yaml.runtime` — through a keystore provider
+([#18214](https://github.com/hivecommons/hive/issues/18214); see
+[security-model.md](security-model.md#5-network-and-credentials)). Key
+material is resolved in the order listed; the first non-empty source is the
+current generation and every other non-empty one is accepted for decryption
+only, so moving from the heartbeat default to an explicit key, or a hub
+rotation, never strands a sealed file.
+
+| Variable | Required | Default | Purpose |
+|---|---:|---|---|
+| `HIVE_KEYSTORE_PROVIDER` | No | `env` | Which provider seals secrets: `env` (AES-256-GCM under a key derived from the variables below), `openbao` (OpenBao Transit, [#18216](https://github.com/hivecommons/hive/issues/18216)), or `none` (explicit plaintext). A name the binary does not know, or a provider that cannot be built, refuses boot rather than falling back to plaintext. |
+| `HIVE_SECRETS_KEY_FILE` | No | none | Path to a file holding the key material for the `env` provider (at least 16 bytes). Wins over every other source. Mount it from a Kubernetes Secret or a Docker secret, never from the data volume. |
+| `HIVE_SECRETS_KEY` | No | none | Key material for the `env` provider, inline. Used when no key file is set. |
+| `HIVE_SECRETS_KEY_PREVIOUS` | No | none | Retired key material, decrypt-only. Set it beside the new key for one boot after a rotation; files sealed under the old generation are re-sealed under the new one as they are read, and the boot sweep covers the ones nothing reads. |
+| `HIVE_HEARTBEAT_KEY_PREVIOUS` | No | none | The previous hub-provisioned heartbeat key, decrypt-only, for a spoke whose default key material changed with a hub master-key rotation. |
+| `HIVE_OPENBAO_ADDR` | With `openbao` | none | OpenBao (or Vault-API compatible) server URL for the `openbao` provider, e.g. `https://openbao.openbao.svc:8200`. See [integrations/openbao.md](integrations/openbao.md). |
+| `HIVE_OPENBAO_TOKEN` | One of token, token file or role | none | Client token for the `openbao` provider. Prefer the file or Kubernetes auth. |
+| `HIVE_OPENBAO_TOKEN_FILE` | One of token, token file or role | none | File holding the client token (a mounted Secret). |
+| `HIVE_OPENBAO_K8S_ROLE` | One of token, token file or role | none | Kubernetes auth role: the pod's projected ServiceAccount JWT is exchanged for a client token at `/v1/auth/<mount>/login`, renewed ahead of its lease and re-obtained when a renewal is refused. |
+| `HIVE_OPENBAO_K8S_MOUNT` | No | `kubernetes` | Kubernetes auth mount. |
+| `HIVE_OPENBAO_K8S_JWT_FILE` | No | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Where the ServiceAccount JWT is read from. |
+| `HIVE_OPENBAO_TRANSIT_MOUNT` | No | `transit` | Transit engine mount. |
+| `HIVE_OPENBAO_KEY` | No | `hive-<hive id>` | Transit key name; created as `aes256-gcm96` when missing and the token may create it. |
+| `HIVE_OPENBAO_NAMESPACE` | No | none | Sent as `X-Vault-Namespace` on every request. |
+| `HIVE_OPENBAO_CA_FILE` | No | system roots | PEM bundle that verifies the server certificate. |
+| `HIVE_OPENBAO_TIMEOUT` | No | `10s` | Per-request timeout (Go duration). |
+
+With `env` selected (the default) and none of these set, the hub-provisioned
+`HIVE_HEARTBEAT_KEY` is the key material, derived through HKDF with a
+dedicated info string so the signing key itself never encrypts anything. A
+self-hosted hive with no heartbeat key and no `HIVE_SECRETS_KEY` keeps storing
+secrets in plaintext and logs one `WARN` at boot: there is nowhere outside the
+data volume to put a generated key, and a key stored next to the data would
+protect nothing.
 
 ### Spoke-side derived keys
 
@@ -390,7 +681,7 @@ only when neither is configured.
 
 | Variable | Required | Default | Purpose |
 |---|---:|---|---|
-| `HIVE_HEARTBEAT_KEY` | No | derived from `HIVE_HUB_SECRET` | Spoke heartbeat signing sub-key. |
+| `HIVE_HEARTBEAT_KEY` | No | derived from `HIVE_HUB_SECRET` | Spoke heartbeat signing sub-key. For a self-service (`byo-`) hive this is the only key the spoke holds: the hub mints it at registration, shows it once, and stores only a hash. There is no derivation fallback for a `byo-` ID; rotate it from the dashboard if it is lost (see [hub-deployment.md](hub-deployment.md#self-service-registration)). |
 | `HIVE_SESSION_KEY` | No | derived from `HIVE_HUB_SECRET` | Spoke session-cookie signing sub-key. |
 | `HIVE_INVITE_KEY` | No | derived from `HIVE_HUB_SECRET` | Per-hive contributor-invite signing key. Symmetric: the spoke both mints and verifies invite tokens with it. |
 | `HIVE_TERMINAL_KEY` | No | self-derived per-hive from `HIVE_HUB_SECRET` + `HIVE_ID` | Per-hive terminal-assertion signing key. It never falls back to a fleet-uniform key. |
@@ -439,8 +730,14 @@ With two or more providers configured, `/login` renders a provider picker; with 
 | `HIVE_COMMONS_STRATEGY` | No | `ranked` | Multi-hive routing strategy for The Commons. `ranked` keeps strict rank order and falls through only when a hive has no work; `spread` does rank-weighted rotation with periodic mixing; `neediest` scores subscribed hubs by `actionable_items` plus idle contributor capacity from `/api/contribute/status`. Read between tasks only. |
 | `HIVE_COMMONS_SPREAD_MIX_EVERY` | No | `7` | In `spread`, choose randomly from the weighted rank cycle every N completed/failed tasks. `0` disables random mixing. |
 | `HIVE_COMMONS_NEEDIEST_REFRESH_MS` | No | `60000` | In `neediest`, milliseconds between `/api/contribute/status` refreshes per subscribed hub. `0` disables the interval. |
+| `HIVE_MAX_PARALLEL_FIXES` | No | `1` (clamped to 0–16) | Maximum fix-pr sessions beside the interactive pane; `0` disables parallel fixes and forces preempt mode. The launcher environment takes precedence over `~/.config/hive/contributor.env`; restart the relay after changing it. |
+| `HIVE_FIX_PR_TIMEOUT_MS` | No | `7200000` (2h) | Milliseconds before a headless fix-pr child is killed and the task reported failed. Same precedence and file as `HIVE_MAX_PARALLEL_FIXES`. |
 | `AGENT_BACKEND` | No | `claude` | Contributor/agent CLI backend selector. |
 | `AGENT_MODEL` | No | backend default, or `GOOSE_MODEL` for Goose fallback | Contributor/agent model override. |
+| `HIVE_MLX_PYTHON` | For optional MLX when `python3` is not its native environment | `python3` | Native Apple Silicon Python 3.10+ virtualenv executable containing MLX/MLX-LM; metadata-only preflight never initializes the GPU. [MLX setup](contributor-relay.md#apple-mlx-local-inference). |
+| `HIVE_MLX_ENDPOINT` | No | `http://127.0.0.1:8080/v1` | Optional MLX setup/serve endpoint. Only literal loopback HTTP `/v1` URLs; no credentials, redirects or public hosts. Setup persists it in Pi's `mlx` provider. Docker Desktop host networking connects the relay container to the Mac. |
+| `HIVE_MLX_CONTEXT_WINDOW` | No | `8192` | Pi model context metadata at explicit MLX setup; positive integer. Not a host-RAM limit. |
+| `HIVE_MLX_MAX_TOKENS` | No | `2048` | Pi output metadata at explicit MLX setup; positive integer smaller than context. Not a host-RAM limit. |
 | `CONTRIBUTOR_MODE` | No | `interactive` | Contributor relay mode: `interactive` uses tmux; `headless` uses one-shot CLI execution for supported backends. |
 | `HIVE_SESSION` | No | backend name (`AGENT_BACKEND`) | Optional session label for running multiple relays concurrently under one GitHub account. The hub keys task leases, assignment cooldowns, failure streaks, and ownership fences on `ContributorID#session`, so distinctly labeled relays hold independent task slots; auth, trust tier, model admission, and rate-limit accounting stay per-account. Sanitized to `[A-Za-z0-9._-]`, max 32 bytes. Set to the empty string to opt out (bare per-account identity, the historical single-session behavior). See `src/docs/contributor-relay.md`, "Running multiple backends under one account". |
 | `HIVE_AGENT_ROLE` | No | empty string | Optional contributor role claim sent during relay authentication (for example `scanner`, `quality`, or `outreach`) so the hub can apply role-aware policy. Whitespace is trimmed. |
@@ -471,6 +768,7 @@ With two or more providers configured, `/login` renders a provider picker; with 
 | `HIVE_LIVE_CLI_SHELL_WAIT_TIMEOUT_MS` | No | `5000` | Timeout, in milliseconds, for waiting until the tmux pane returns to a shell before respawning it during live-CLI recovery. |
 | `HIVE_LIVE_CLI_SHELL_WAIT_POLL_MS` | No | `250` | Poll interval, in milliseconds, while waiting for the tmux pane to return to a shell. |
 | `HIVE_LIVE_CLI_RESPAWN_SETTLE_MS` | No | `500` | Delay, in milliseconds, after `tmux respawn-pane -k` before the relay rechecks shell readiness. |
+| `HIVE_RELAY_SHUTDOWN_FLUSH_MS` | No | `5000` (5 s) | Longest the relay waits, on SIGTERM or Ctrl-C, for a finished task's `task_complete` or `task_failed` frame to be written before it exits. It applies only when such a frame is still being written; otherwise the relay exits at once. Keep it below the container runtime's stop timeout (10 s by default for docker and podman), which SIGKILLs the relay. |
 | `HIVE_CLAUDE_PROJECTS_DIR` | No | `$HOME/.claude/projects` | Claude transcript directory used for best-effort model auto-detection. The relay reads only tail bytes needed to find the latest model field. |
 | `HIVE_COPILOT_SESSIONS_DIR` | No | `$HOME/.copilot/session-state` | Copilot session-state directory used for best-effort model auto-detection. The relay reads only tail bytes needed to find the latest model field. |
 | `HIVE_BOB_DIR` | No | `$HOME/.bob` | Bob CLI home directory used for best-effort model auto-detection from local transcript state. |
@@ -514,7 +812,7 @@ With two or more providers configured, `/login` renders a provider picker; with 
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `HIVE_QUESTION_AUTOCLOSE` | No | unset (config `governor.question_autoclose.enabled`, default `false`) | Turns question auto-close on or off, overriding the config value when set to a boolean (`true`/`false`/`1`/`0`). See [labels-and-control-signals.md](labels-and-control-signals.md#question-auto-close) ([#9584](https://github.com/hivecommons/hive/issues/9584)). |
+| `HIVE_QUESTION_AUTOCLOSE` | No | unset (config `governor.question_autoclose.enabled`, default `false`) | Turns question auto-close on or off, overriding the config value when set to a boolean (`true`/`false`/`1`/`0`). See [labels-and-control-signals.md](labels-and-control-signals/glossary-and-operations.md#question-auto-close) ([#9584](https://github.com/hivecommons/hive/issues/9584)). |
 | `HIVE_QUESTION_AUTOCLOSE_HOURS` | No | `4` (config `governor.question_autoclose.hours`) | Hours an answered question stays open for the author to react 👎 before Hive closes it as completed. Non-positive or non-numeric values are ignored. |
 
 ## Credly badge integration (proposed — not implemented)

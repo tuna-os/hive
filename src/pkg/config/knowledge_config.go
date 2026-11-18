@@ -44,6 +44,21 @@ type KnowledgeConfig struct {
 	// kick primer and through agent-identified TOC/entry reads. A missing
 	// entry or an empty field is unrestricted.
 	AgentScopes map[string]KnowledgeAgentScope `yaml:"agent_scopes,omitempty"`
+	// Advisor turns on the mid-task knowledge advisor (hivecommons/hive#17052):
+	// when a running agent's pane first shows a source directory or `gh`
+	// command family its kick did not know about, matching entries are typed
+	// into the live session as one-line hints. Off by default while hive's
+	// own hive dogfoods it.
+	Advisor bool `yaml:"advisor,omitempty"`
+	// AdvisorMaxPerKick caps advisor deliveries per kick; zero takes
+	// DefaultKnowledgeAdvisorMaxPerKick.
+	AdvisorMaxPerKick int `yaml:"advisor_max_per_kick,omitempty"`
+	// AdvisorExcludeAgents lists agents (by name or family base name) the
+	// advisor never types at, e.g. lanes whose work is reading, not editing.
+	AdvisorExcludeAgents []string `yaml:"advisor_exclude_agents,omitempty"`
+	// AdvisorLLM configures the optional model-ranked advisor pass
+	// (hivecommons/hive#17054). Ignored unless Advisor is true.
+	AdvisorLLM AdvisorLLMConfig `yaml:"advisor_llm,omitempty"`
 }
 
 // PublicKnowledgeConfig is the dashboard-persisted owner override for the
@@ -116,8 +131,9 @@ const (
 	DefaultCuratorSchedule              = "daily"
 	DefaultCuratorAutoPromoteThreshold  = 0.9
 	DefaultKnowledgePrimerMaxFacts      = 25
-	DefaultKnowledgePrimerMaxBytes      = 4096
+	DefaultKnowledgePrimerMaxBytes      = 8192
 	DefaultKnowledgePrimerMergeStrategy = "precedence"
+	DefaultKnowledgeAdvisorMaxPerKick   = 3
 )
 
 // KnowledgeSchedules are the schedule values the bead synthesizer, curator
@@ -300,7 +316,7 @@ type KnowledgePrimer struct {
 	MergeStrategy string   `yaml:"merge_strategy"`
 	// MaxBytes caps the rendered knowledge primer per kick; facts past it are
 	// dropped whole and a marker says so. Zero takes the knowledge package
-	// default (4096).
+	// default (8192).
 	MaxBytes int `yaml:"max_bytes"`
 }
 
@@ -353,6 +369,23 @@ func ValidateKnowledgeAgentScopes(scopes map[string]KnowledgeAgentScope) error {
 // KnowledgeAgentScope returns the knowledge scope bound to agent. A replica
 // without its own entry inherits its base agent's scope. ok is false when the
 // agent is unrestricted.
+// KnowledgeAdvisorEnabledFor reports whether the mid-task knowledge advisor
+// may type at agent: knowledge and the advisor are on, and neither the agent
+// nor its family base name is in knowledge.advisor_exclude_agents.
+func (c *Config) KnowledgeAdvisorEnabledFor(agent string) bool {
+	if c == nil || !c.Knowledge.Enabled || !c.Knowledge.Advisor || agent == "" {
+		return false
+	}
+	base := c.BaseAgentName(agent)
+	for _, name := range c.Knowledge.AdvisorExcludeAgents {
+		name = strings.TrimSpace(name)
+		if name != "" && (name == agent || name == base) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Config) KnowledgeAgentScope(agent string) (KnowledgeAgentScope, bool) {
 	if c == nil || len(c.Knowledge.AgentScopes) == 0 || agent == "" {
 		return KnowledgeAgentScope{}, false

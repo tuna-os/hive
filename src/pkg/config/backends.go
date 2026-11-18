@@ -48,6 +48,30 @@ func LaunchCmdExecutable(cmd string) string {
 	return filepath.Base(fields[i])
 }
 
+// ReconcileLaunchCmdForBackend returns the launch_cmd an agent should keep
+// once its backend is set to backend, and whether that means dropping the
+// one it had. backend is the operator-owned field; launch_cmd is derived from
+// it (the dashboard fills the default per backend when it is empty), so when
+// the two disagree — judged by the same ValidateLaunchCmdBackend gate the
+// loader applies — launch_cmd is the stale half and is cleared. A launch_cmd
+// that already agrees with the new backend, or has no opinion (an unknown
+// wrapper script), is kept untouched.
+//
+// Every path that changes an agent's backend must call this before
+// persisting. The dashboard "switch backend" control did not, and persisted a
+// `backend: codex` next to a `launch_cmd: /usr/bin/bob …`; the running
+// process kept its in-memory state so nothing failed until the next restart,
+// when the loader rejected the config and the hive crash-looped for 18 hours.
+func (g GovernorConfig) ReconcileLaunchCmdForBackend(backend, launchCmd string) (string, bool) {
+	if strings.TrimSpace(launchCmd) == "" {
+		return launchCmd, false
+	}
+	if g.ValidateLaunchCmdBackend(backend, launchCmd) == nil {
+		return launchCmd, false
+	}
+	return "", true
+}
+
 func (g GovernorConfig) ValidateLaunchCmdBackend(backend, launchCmd string) error {
 	declared := LaunchCmdDeclaredBackend(launchCmd)
 	if declared == "" || backend == "" {

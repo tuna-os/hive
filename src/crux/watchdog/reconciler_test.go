@@ -308,6 +308,9 @@ func fastSettings() Settings {
 	s.Mode = ModeHeal
 	s.ProbeInterval = 0 // every Tick sweeps; interval gating has its own test
 	s.RestartTimeout = 50 * time.Millisecond
+	// One sighting pages: the auth tests here assert the paging branch itself;
+	// the multi-poll streak guard has its own test (TestAuthLoginStreak).
+	s.LoginStreak = 1
 	return s
 }
 
@@ -1780,4 +1783,67 @@ func TestProducingWindowWidensToCadencePeriod(t *testing.T) {
 			t.Fatalf("Producing = %+v, want False/NoRecentProduction", p)
 		}
 	})
+}
+
+// blockingObserveFleet wraps fakeFleet so the first Observe wedges until
+// release is closed, like a hung tmux server behind an unbounded probe.
+type blockingObserveFleet struct {
+	*fakeFleet
+	entered  chan struct{}
+	release  chan struct{}
+	observed chan string
+}
+
+func (b *blockingObserveFleet) AgentNames() []string { return []string{"a1", "a2"} }
+
+func (b *blockingObserveFleet) Observe(name string) (Observation, error) {
+	b.observed <- name
+	if name == "a1" {
+		close(b.entered)
+		<-b.release
+	}
+	return b.fakeFleet.Observe(name)
+}
+
+// TestTickHonoursCancelledContextBetweenAgents pins #16097: once ctx is done
+// (shutdown), Tick must stop instead of probing the remaining agents.
+func TestTickHonoursCancelledContextBetweenAgents(t *testing.T) {
+	inner := newFakeFleet("a1", "a2")
+	fleet := &blockingObserveFleet{
+		fakeFleet: inner,
+		entered:   make(chan struct{}),
+		release:   make(chan struct{}),
+		observed:  make(chan string, 2),
+	}
+	r := New(fastSettings(), fleet, newFakeAlerter(), testLogger(), WithClock(newFakeClock().Now))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		r.Tick(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-fleet.entered:
+	case <-time.After(waitBudget):
+		t.Fatal("Tick never observed the first agent")
+	}
+	cancel()
+	close(fleet.release)
+
+	select {
+	case <-done:
+	case <-time.After(waitBudget):
+		t.Fatal("Tick did not return after ctx was cancelled")
+	}
+	close(fleet.observed)
+	var got []string
+	for n := range fleet.observed {
+		got = append(got, n)
+	}
+	if len(got) != 1 || got[0] != "a1" {
+		t.Fatalf("observed %v after cancellation, want only [a1]", got)
+	}
 }

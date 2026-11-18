@@ -1,7 +1,8 @@
 package scheduler
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/hivecommons/hive/pkg/config"
-	"github.com/hivecommons/hive/pkg/knowledge"
 )
 
 // --- agentsRepoRoot ---
@@ -145,7 +145,7 @@ func TestAgentsRepoRoot_ThreadedRootReachesTheKick(t *testing.T) {
 	cfg.Project.CheckoutsDir = checkouts
 	s := New(cfg, slog.Default())
 
-	got := s.primeAgentsMd(s.agentsRepoRoot(cfg.Project.PrimaryRepo))
+	got := s.primeAgentsMd(cfg.Project.PrimaryRepo, s.agentsRepoRoot(cfg.Project.PrimaryRepo))
 	if !strings.Contains(got, body) {
 		t.Fatalf("AGENTS.md body did not reach the injection; got %q", got)
 	}
@@ -155,15 +155,15 @@ func TestAgentsRepoRoot_ThreadedRootReachesTheKick(t *testing.T) {
 
 func TestPrimeAgentsMd_EmptyRootIsNoOp(t *testing.T) {
 	s := New(&config.Config{}, slog.Default())
-	if got := s.primeAgentsMd(""); got != "" {
-		t.Errorf("primeAgentsMd(\"\") = %q, want empty", got)
+	if got := s.primeAgentsMd("", ""); got != "" {
+		t.Errorf("primeAgentsMd(\"\", \"\") = %q, want empty", got)
 	}
 }
 
 func TestPrimeAgentsMd_MissingFileYieldsEmpty(t *testing.T) {
 	s := New(&config.Config{}, slog.Default())
 	root := t.TempDir() // no AGENTS.md inside
-	if got := s.primeAgentsMd(root); got != "" {
+	if got := s.primeAgentsMd("", root); got != "" {
 		t.Errorf("primeAgentsMd(root without AGENTS.md) = %q, want empty", got)
 	}
 }
@@ -176,7 +176,7 @@ func TestPrimeAgentsMd_InjectsBody(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := s.primeAgentsMd(root)
+	got := s.primeAgentsMd("", root)
 	if got == "" {
 		t.Fatal("primeAgentsMd returned empty for a root with AGENTS.md")
 	}
@@ -194,138 +194,124 @@ func TestPrimeAgentsMd_EmptyAgentsMdYieldsEmpty(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("   \n\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.primeAgentsMd(root); got != "" {
+	if got := s.primeAgentsMd("", root); got != "" {
 		t.Errorf("primeAgentsMd(blank AGENTS.md) = %q, want empty", got)
 	}
 }
 
-// --- inceptionVars ---
+// --- remoteAgentsRepoRoot (GitHub fallback, #17090) ---
 
-// writeInceptionState persists a crafted state file where NewInceptionEngine
-// loads it from, so tests can exercise states not reachable via Start alone.
-func writeInceptionState(t *testing.T, dataDir string, state knowledge.InceptionState) {
+type fakeAgentsMdFetcher struct {
+	body  string
+	err   error
+	calls int
+	last  [4]string
+}
+
+func (f *fakeAgentsMdFetcher) GetFileContentRef(_ context.Context, owner, repo, path, ref string) (string, error) {
+	f.calls++
+	f.last = [4]string{owner, repo, path, ref}
+	return f.body, f.err
+}
+
+func useTempRemoteAgentsMdDir(t *testing.T) {
 	t.Helper()
-	dir := filepath.Join(dataDir, "inception")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := json.Marshal(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), raw, 0o644); err != nil {
-		t.Fatal(err)
+	old := remoteAgentsMdDir
+	remoteAgentsMdDir = t.TempDir()
+	t.Cleanup(func() { remoteAgentsMdDir = old })
+}
+
+// With no local root and no fetcher wired the behaviour is unchanged: nothing.
+func TestAgentsRepoRoot_NoFetcherStaysEmpty(t *testing.T) {
+	useTempRemoteAgentsMdDir(t)
+	cfg := &config.Config{}
+	cfg.Project.Org = "hivecommons"
+	s := New(cfg, slog.Default())
+	if got := s.agentsRepoRoot("hive"); got != "" {
+		t.Errorf("agentsRepoRoot() = %q, want empty with no fetcher", got)
 	}
 }
 
-func TestInceptionVars_NoEngine(t *testing.T) {
-	s := New(&config.Config{}, slog.Default())
-	idea, phase, mode, answers, slug, repoURL := s.inceptionVars()
-	if idea != "" || phase != "" || mode != "" || answers != "" || slug != "" || repoURL != "" {
-		t.Errorf("inceptionVars() with no engine = (%q,%q,%q,%q,%q,%q), want all empty",
-			idea, phase, mode, answers, slug, repoURL)
+// A hosted spoke with no checkout gets the primary repo's AGENTS.md from the
+// forge's default branch, materialised so the existing priming path injects it,
+// and one fetch serves every kick inside the TTL.
+func TestAgentsRepoRoot_FetchesFromGitHubWhenNoLocalRoot(t *testing.T) {
+	useTempRemoteAgentsMdDir(t)
+	const body = "Always add a changelog.d fragment."
+	f := &fakeAgentsMdFetcher{body: body + "\n"}
+
+	cfg := &config.Config{}
+	cfg.Project.Org = "hivecommons"
+	cfg.Project.PrimaryRepo = "hive"
+	s := New(cfg, slog.Default())
+	s.SetAgentsMdFetcher(f)
+
+	root := s.agentsRepoRoot("hive")
+	if want := filepath.Join(remoteAgentsMdDir, "hivecommons", "hive"); root != want {
+		t.Fatalf("agentsRepoRoot() = %q, want %q", root, want)
+	}
+	if f.last != [4]string{"hivecommons", "hive", "AGENTS.md", ""} {
+		t.Errorf("fetched %v, want owner/repo AGENTS.md at the default branch", f.last)
+	}
+	if got := s.primeAgentsMd("", root); !strings.Contains(got, body) {
+		t.Fatalf("fetched AGENTS.md did not reach the injection; got %q", got)
+	}
+
+	for i := 0; i < 3; i++ {
+		if again := s.agentsRepoRoot("hivecommons/hive"); again != root {
+			t.Fatalf("agentsRepoRoot() = %q on repeat, want cached %q", again, root)
+		}
+	}
+	if f.calls != 1 {
+		t.Errorf("fetch calls = %d, want 1 (served from cache inside the TTL)", f.calls)
 	}
 }
 
-func TestInceptionVars_EngineWithoutState(t *testing.T) {
-	s := New(&config.Config{}, slog.Default())
-	s.SetInception(knowledge.NewInceptionEngine(t.TempDir(), nil, nil))
+// A repo without AGENTS.md (404) yields no root and is not re-asked inside
+// the TTL; a later failure keeps serving the last-known-good copy.
+func TestAgentsRepoRoot_RemoteMissAndLastKnownGood(t *testing.T) {
+	useTempRemoteAgentsMdDir(t)
+	f := &fakeAgentsMdFetcher{err: errors.New("404 Not Found")}
+	cfg := &config.Config{}
+	cfg.Project.Org = "hivecommons"
+	s := New(cfg, slog.Default())
+	s.SetAgentsMdFetcher(f)
 
-	idea, phase, mode, answers, slug, repoURL := s.inceptionVars()
-	if idea != "" || phase != "" || mode != "" || answers != "" || slug != "" || repoURL != "" {
-		t.Errorf("inceptionVars() with stateless engine = (%q,%q,%q,%q,%q,%q), want all empty",
-			idea, phase, mode, answers, slug, repoURL)
+	if got := s.agentsRepoRoot("hive"); got != "" {
+		t.Fatalf("agentsRepoRoot() = %q, want empty on 404", got)
+	}
+	s.agentsRepoRoot("hive")
+	if f.calls != 1 {
+		t.Errorf("fetch calls = %d, want 1 (negative result cached)", f.calls)
+	}
+
+	// Expire the cache, succeed once, then fail: the good copy must survive.
+	s.remoteAgents = nil
+	f.err, f.body = nil, "rule\n"
+	root := s.agentsRepoRoot("hive")
+	if root == "" {
+		t.Fatal("agentsRepoRoot() empty after a successful fetch")
+	}
+	s.remoteAgents["hivecommons/hive"] = remoteAgentsMd{root: root, fetched: time.Now().Add(-2 * remoteAgentsMdTTL)}
+	f.err = errors.New("502 Bad Gateway")
+	if got := s.agentsRepoRoot("hive"); got != root {
+		t.Errorf("agentsRepoRoot() = %q after refresh failure, want last-known-good %q", got, root)
 	}
 }
 
-func TestInceptionVars_GreenfieldState(t *testing.T) {
-	dataDir := t.TempDir()
-	writeInceptionState(t, dataDir, knowledge.InceptionState{
-		Phase:    knowledge.PhaseCapture,
-		Mode:     knowledge.InceptionGreenfield,
-		IdeaText: "a CLI that summarizes build logs",
-		IdeaSlug: "idea-cli-build-logs",
-		Questions: []knowledge.Question{
-			{ID: "q1", Text: "Which language?", Category: "language"},
-		},
-		Answers:   map[string]string{"q1": "Go"},
-		FactSlugs: []string{"idea-cli-build-logs"},
-		StartedAt: time.Now(),
-	})
-
-	s := New(&config.Config{}, slog.Default())
-	s.SetInception(knowledge.NewInceptionEngine(dataDir, nil, nil))
-
-	idea, phase, mode, answers, slug, repoURL := s.inceptionVars()
-	if idea != "a CLI that summarizes build logs" {
-		t.Errorf("idea = %q, want the greenfield idea text", idea)
+// A configured local root still wins over the forge: no fetch happens.
+func TestAgentsRepoRoot_LocalRootBeatsFetch(t *testing.T) {
+	useTempRemoteAgentsMdDir(t)
+	f := &fakeAgentsMdFetcher{body: "x"}
+	cfg := &config.Config{}
+	cfg.Project.Org = "hivecommons"
+	cfg.Project.CheckoutsDir = "/data/checkouts"
+	s := New(cfg, slog.Default())
+	s.SetAgentsMdFetcher(f)
+	if got, want := s.agentsRepoRoot("hive"), filepath.Join("/data/checkouts", "hive"); got != want {
+		t.Errorf("agentsRepoRoot() = %q, want %q", got, want)
 	}
-	if phase != string(knowledge.PhaseCapture) {
-		t.Errorf("phase = %q, want %q", phase, knowledge.PhaseCapture)
-	}
-	if mode != string(knowledge.InceptionGreenfield) {
-		t.Errorf("mode = %q, want %q", mode, knowledge.InceptionGreenfield)
-	}
-	if slug != "idea-cli-build-logs" {
-		t.Errorf("slug = %q, want idea-cli-build-logs", slug)
-	}
-	if repoURL != "" {
-		t.Errorf("repoURL = %q, want empty for greenfield", repoURL)
-	}
-	if !strings.Contains(answers, "Which language?") || !strings.Contains(answers, "Go") {
-		t.Errorf("answers = %q, want rendered question and answer", answers)
-	}
-}
-
-func TestInceptionVars_BrownfieldIdeaFallsBackToRepoURL(t *testing.T) {
-	dataDir := t.TempDir()
-	writeInceptionState(t, dataDir, knowledge.InceptionState{
-		Phase:     knowledge.PhaseCapture,
-		Mode:      knowledge.InceptionBrownfield,
-		IdeaText:  "", // crafted: force the RepoURL fallback branch
-		IdeaSlug:  "idea-brownfield-repo",
-		RepoURL:   "https://github.com/example/legacy",
-		Answers:   map[string]string{},
-		FactSlugs: []string{},
-		StartedAt: time.Now(),
-	})
-
-	s := New(&config.Config{}, slog.Default())
-	s.SetInception(knowledge.NewInceptionEngine(dataDir, nil, nil))
-
-	idea, _, mode, answers, _, repoURL := s.inceptionVars()
-	if mode != string(knowledge.InceptionBrownfield) {
-		t.Errorf("mode = %q, want %q", mode, knowledge.InceptionBrownfield)
-	}
-	if repoURL != "https://github.com/example/legacy" {
-		t.Errorf("repoURL = %q, want the brownfield repo URL", repoURL)
-	}
-	if idea != repoURL {
-		t.Errorf("idea = %q, want fallback to repoURL %q when IdeaText is empty", idea, repoURL)
-	}
-	if answers != "" {
-		t.Errorf("answers = %q, want empty with no recorded answers", answers)
-	}
-}
-
-func TestInceptionVars_GreenfieldEmptyIdeaDoesNotFallBack(t *testing.T) {
-	dataDir := t.TempDir()
-	writeInceptionState(t, dataDir, knowledge.InceptionState{
-		Phase:     knowledge.PhaseCapture,
-		Mode:      knowledge.InceptionGreenfield,
-		IdeaText:  "",
-		IdeaSlug:  "idea-empty",
-		RepoURL:   "https://github.com/example/should-not-leak",
-		Answers:   map[string]string{},
-		FactSlugs: []string{},
-		StartedAt: time.Now(),
-	})
-
-	s := New(&config.Config{}, slog.Default())
-	s.SetInception(knowledge.NewInceptionEngine(dataDir, nil, nil))
-
-	idea, _, _, _, _, _ := s.inceptionVars()
-	if idea != "" {
-		t.Errorf("idea = %q, want empty: RepoURL fallback is brownfield-only", idea)
+	if f.calls != 0 {
+		t.Errorf("fetch calls = %d, want 0 when a local root exists", f.calls)
 	}
 }

@@ -28,11 +28,12 @@ const src = [
   pick(/const STAGE_TRACKER_ISSUE_DECISION_COLUMN = \d+;/, 'STAGE_TRACKER_ISSUE_DECISION_COLUMN'),
   pick(/const STAGE_TRACKER_TRIAGE_NEEDED = \d+;/, 'STAGE_TRACKER_TRIAGE_NEEDED'),
   pick(/const STAGE_TRACKER_POSSIBLY_EXISTS = \d+;/, 'STAGE_TRACKER_POSSIBLY_EXISTS'),
+  pick(/const STAGE_TRACKER_OPEN_FOR_DISCUSSION = \d+;/, 'STAGE_TRACKER_OPEN_FOR_DISCUSSION'),
   pick(/const STAGE_TRACKER_PRE_MERGE_SOAK = \d+;/, 'STAGE_TRACKER_PRE_MERGE_SOAK'),
   pick(/const STAGE_TRACKER_TERMINAL = \d+;/, 'STAGE_TRACKER_TERMINAL'),
   pick(/const STAGE_TRACKER_ADOPTED_BY_HIVE = \d+;/, 'STAGE_TRACKER_ADOPTED_BY_HIVE'),
   pick(/function stageTrackerAdoptedWord\(item\) \{[\s\S]*?\n    \}\n/, 'stageTrackerAdoptedWord'),
-  pick(/function stageTrackerAnchor\(stage, stages, kind\) \{[\s\S]*?\n    \}\n/, 'stageTrackerAnchor'),
+  pick(/function stageTrackerAnchor\(stage, stages, kind, item, presentation\) \{[\s\S]*?\n    \}\n/, 'stageTrackerAnchor'),
 ].join('\n');
 const lifted = new Function(src + '; return { anchor: stageTrackerAnchor, adoptedWord: stageTrackerAdoptedWord, ADOPTED: STAGE_TRACKER_ADOPTED_BY_HIVE };')();
 
@@ -47,16 +48,19 @@ const STAGES = [
 
 const COLUMN = { OPEN: 0, ACTIONABLE: 10, CLAIMED: 20, PR: 30, REVIEW: 50, MERGE_GATE: 80, DONE: 110 };
 
-test('074 adopted-by-hive renders in the CI/Review column, not the merge gate', () => {
+test('074 retains its native CI/Review aggregate while adopted repair displays in PR progress', () => {
   assert.strictEqual(lifted.ADOPTED, 74);
   assert.strictEqual(lifted.anchor(74, STAGES, 'pr'), COLUMN.REVIEW);
+  const item = { head: 'head', display_column: 30, code_activity: { head: 'head', state: 'adopted' } };
+  assert.strictEqual(lifted.anchor(74, STAGES, 'pr', item), COLUMN.PR);
+  assert.strictEqual(lifted.anchor(74, STAGES, 'pr', item, false), COLUMN.REVIEW, 'native sort/count mapping stays unchanged');
 });
 
 test('every PR stage lands in its owner-rule column', () => {
   const want = {
     30: COLUMN.PR, 40: COLUMN.PR,                 // in progress / covered
-    50: COLUMN.REVIEW, 70: COLUMN.REVIEW, 71: COLUMN.REVIEW, 72: COLUMN.REVIEW, 74: COLUMN.REVIEW,
-    60: COLUMN.MERGE_GATE, 80: COLUMN.MERGE_GATE, 85: COLUMN.MERGE_GATE, 90: COLUMN.MERGE_GATE, 95: COLUMN.MERGE_GATE, 100: COLUMN.MERGE_GATE,
+    50: COLUMN.REVIEW, 60: COLUMN.REVIEW, 70: COLUMN.REVIEW, 71: COLUMN.REVIEW, 72: COLUMN.REVIEW, 74: COLUMN.REVIEW, // 060 reviewed waits on CI/soak, not the gate (#15185)
+    80: COLUMN.MERGE_GATE, 85: COLUMN.MERGE_GATE, 90: COLUMN.MERGE_GATE, 95: COLUMN.MERGE_GATE, 100: COLUMN.MERGE_GATE,
     110: COLUMN.DONE, 120: COLUMN.DONE,           // merged / closed (superseded, wontfix)
   };
   for (const [stage, col] of Object.entries(want)) {

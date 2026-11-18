@@ -57,7 +57,9 @@ var auditSensitiveActions = map[string]bool{
 	"claude_auth_complete":                    true,
 	"claude_auth_logout":                      true,
 	"claude_auth_start":                       true,
+	"claude_credential_rebridged":             true,
 	"claude_token_missing":                    true,
+	"config_admin_mcp_writes":                 true,
 	"config_agent_cadences":                   true,
 	"config_agent_channels":                   true,
 	"config_agent_connections":                true,
@@ -70,10 +72,13 @@ var auditSensitiveActions = map[string]bool{
 	"config_agent_stats":                      true,
 	"config_agent_tools":                      true,
 	"config_auto_merge":                       true,
+	"config_code_scanning":                    true,
 	"config_compliance":                       true,
 	"config_convergence":                      true,
+	"config_decisions_delegate":               true,
 	"config_escalation":                       true,
 	"config_github":                           true,
+	"config_governor":                         true,
 	"config_governor_advisory":                true,
 	"config_governor_attribution":             true,
 	"config_governor_backup_key":              true,
@@ -104,6 +109,8 @@ var auditSensitiveActions = map[string]bool{
 	"config_governor_trajectory":              true,
 	"config_governor_watchdog":                true,
 	"config_governor_work_source":             true,
+	"config_reference_repos":                  true,
+	"config_remote_write_identity":            true,
 	"config_review":                           true,
 	"config_write_surface":                    true,
 	"contributor-tier-changed":                true,
@@ -125,8 +132,16 @@ var auditSensitiveActions = map[string]bool{
 	"relay_task_revoked":                      true,
 	"relay_token_minted":                      true,
 	"run_stage_reset":                         true,
+	"session_autostart":                       true,
+	"session_closed":                          true,
+	"session_created":                         true,
+	"session_input":                           true,
+	"session_renamed":                         true,
+	"session_started":                         true,
+	"session_upload":                          true,
 	"signed_commit_reauthored":                true,
 	"tool_approval":                           true,
+	"user_session_login_adopted":              true,
 }
 
 type auditSummary struct {
@@ -280,7 +295,7 @@ func (a *AuditLog) logRecordAt(timestamp, user, action, detail, agent, repo stri
 	if len(a.ring) >= auditRingCap {
 		a.ring = a.ring[1:]
 	}
-	if prThroughputActions[entry.Action] && !a.notePRThroughput(entry) && prThroughputTerminalAction(entry.Action) {
+	if prThroughputActions[entry.Action] && !a.notePRThroughput(entry) && prThroughputDedupedAction(entry.Action) {
 		a.mu.Unlock()
 		return
 	}

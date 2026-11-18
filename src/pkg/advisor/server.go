@@ -49,7 +49,21 @@ type Runtime struct {
 	TimeoutS             int
 	DailyBudgetTokens    int
 	MaxConsecutiveBlocks int
+	// ReasoningEffort is the advisor model role's reasoning_effort, sent
+	// with each review and recorded; empty sends none.
+	ReasoningEffort string
+	// Route is the path a review takes (RouteHTTP or RouteClaudeCLI), as the
+	// composition root resolved the agent's advisor backend; empty is
+	// RouteHTTP. RouteUnready means no path can run the review, and
+	// UnreadyReason says why.
+	Route         string
+	UnreadyReason string
 }
+
+// RouteUnready marks a Runtime whose advisor backend has no path that can
+// run a review (no endpoint, or Claude not signed in): every review is
+// recorded as skipped, unreachable, and the reason is logged.
+const RouteUnready = "none"
 
 // Request is what the hook posts for one finished turn.
 type Request struct {
@@ -99,6 +113,11 @@ type Server struct {
 	// Usage may be nil (no budget accounting).
 	Usage  UsageRecorder
 	Logger *slog.Logger
+
+	// CLI runs a review turn through the Claude CLI on the hive's own Claude
+	// login, for agents whose advisor backend resolves to RouteClaudeCLI.
+	// Nil leaves that route unavailable: such reviews are skipped.
+	CLI CLITurn
 
 	// newEvaluator is a test seam; nil uses NewEvaluator.
 	newEvaluator func(Config) (*Evaluator, error)
@@ -193,10 +212,15 @@ func (s *Server) handleAdvise(w http.ResponseWriter, r *http.Request) {
 // answers with a non-blocking response: the lane FAILS OPEN.
 func (s *Server) review(ctx context.Context, agent string, rt Runtime, req Request) Response {
 	base := Record{
-		Agent:  agent,
-		Turn:   strings.TrimSpace(req.Turn),
-		Model:  rt.Model,
-		Heeded: HeededUndetermined,
+		Agent:           agent,
+		Turn:            strings.TrimSpace(req.Turn),
+		Model:           rt.Model,
+		ReasoningEffort: rt.ReasoningEffort,
+		Route:           rt.Route,
+		Heeded:          HeededUndetermined,
+	}
+	if base.Route == "" {
+		base.Route = RouteHTTP
 	}
 
 	// Guard invariant: ioscan on the inbound text, before any model sees it.
@@ -216,16 +240,26 @@ func (s *Server) review(ctx context.Context, agent string, rt Runtime, req Reque
 		return s.skip(agent, base, SkipBudgetExhausted)
 	}
 
+	if rt.Route == RouteUnready {
+		if s.Logger != nil {
+			s.Logger.Warn("advisor not ready", "agent", agent, "reason", rt.UnreadyReason)
+		}
+		return s.skip(agent, base, SkipUnreachable)
+	}
+
 	newEval := s.newEvaluator
 	if newEval == nil {
 		newEval = NewEvaluator
 	}
 	eval, err := newEval(Config{
-		Endpoint:     rt.Endpoint,
-		APIKey:       rt.APIKey,
-		Model:        rt.Model,
-		Instructions: rt.Instructions,
-		TimeoutS:     rt.TimeoutS,
+		Endpoint:        rt.Endpoint,
+		APIKey:          rt.APIKey,
+		Model:           rt.Model,
+		Instructions:    rt.Instructions,
+		TimeoutS:        rt.TimeoutS,
+		ReasoningEffort: rt.ReasoningEffort,
+		Route:           rt.Route,
+		CLI:             s.CLI,
 	})
 	if err != nil {
 		if s.Logger != nil {
@@ -238,7 +272,11 @@ func (s *Server) review(ctx context.Context, agent string, rt Runtime, req Reque
 	base.InputTokens = usage.InputTokens
 	base.OutputTokens = usage.OutputTokens
 	base.UsageEstimated = usage.Estimated
-	base.CostUSD, _ = tokens.EstimateCostUSD(rt.Model, int64(usage.InputTokens), int64(usage.OutputTokens), 0, 0)
+	if base.Route != RouteClaudeCLI {
+		// A turn on the hive's Claude subscription has no per-token price;
+		// its estimated tokens still count against the daily budget.
+		base.CostUSD, _ = tokens.EstimateCostUSD(rt.Model, int64(usage.InputTokens), int64(usage.OutputTokens), 0, 0)
+	}
 	s.recordSpend(agent, rt.Model, usage)
 	if err != nil {
 		reason := SkipUnreachable

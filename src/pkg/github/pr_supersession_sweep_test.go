@@ -42,6 +42,20 @@ type supersessionPRFixture struct {
 	UpdateBranchStatus int
 	// LabelEvents feed the needs-human attribution read (actor per label).
 	LabelEvents []supersessionLabelEventFixture
+	// CrossRefs are the timeline's cross-referenced events from other PRs
+	// (the declared-supersession read, hivecommons/hive#15208).
+	CrossRefs []supersessionCrossRefFixture
+	// CreatedAt, when set, is the open PR's created_at in the listing. The
+	// GraphQL closer always merged at 2026-10-10T11:40:00Z.
+	CreatedAt time.Time
+}
+
+type supersessionCrossRefFixture struct {
+	Number int
+	Body   string
+	Merged bool
+	// Repo overrides the source repository ("" = same repo).
+	Repo string
 }
 
 type supersessionLabelEventFixture struct {
@@ -67,6 +81,7 @@ type supersessionThreadFixture struct {
 type supersessionIssueFixture struct {
 	Number          int
 	State           string
+	StateReason     string
 	GraphQLCloserPR int
 	ClosingCommit   string
 }
@@ -170,6 +185,9 @@ func supersessionSweepServer(t *testing.T, org, repo string, prs []supersessionP
 				"html_url": fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, pr.Number),
 				"head":     map[string]any{"sha": headSHA, "ref": "topic/supersession"},
 				"base":     map[string]any{"sha": baseSHA, "ref": baseRef},
+			}
+			if !pr.CreatedAt.IsZero() {
+				entry["created_at"] = pr.CreatedAt.Format(time.RFC3339)
 			}
 			if len(pr.Labels) > 0 {
 				labels := []map[string]any{}
@@ -286,7 +304,7 @@ func supersessionSweepServer(t *testing.T, org, repo string, prs []supersessionP
 		switch {
 		case len(parts) == 1 && r.Method == "GET":
 			issue := issueByNumber[n]
-			_ = json.NewEncoder(w).Encode(map[string]any{"number": n, "state": issue.State})
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": n, "state": issue.State, "state_reason": issue.StateReason})
 		case len(parts) == 1 && r.Method == "PATCH":
 			obs.mu.Lock()
 			obs.closed = append(obs.closed, n)
@@ -345,6 +363,20 @@ func supersessionSweepServer(t *testing.T, org, repo string, prs []supersessionP
 			}
 			for i, ev := range prByNumber[n].LabelEvents {
 				wire = append(wire, map[string]any{"id": i + 1, "event": ev.Event, "label": map[string]any{"name": ev.Label}, "actor": map[string]any{"login": ev.Actor}, "created_at": now})
+			}
+			for _, ref := range prByNumber[n].CrossRefs {
+				srcRepo := ref.Repo
+				if srcRepo == "" {
+					srcRepo = org + "/" + repo
+				}
+				links := map[string]any{"url": fmt.Sprintf("https://api.github.com/repos/%s/pulls/%d", srcRepo, ref.Number)}
+				if ref.Merged {
+					links["merged_at"] = "2026-10-10T11:40:00Z"
+				}
+				wire = append(wire, map[string]any{"event": "cross-referenced", "created_at": now, "source": map[string]any{"type": "issue", "issue": map[string]any{
+					"number": ref.Number, "body": ref.Body, "html_url": fmt.Sprintf("https://github.com/%s/pull/%d", srcRepo, ref.Number),
+					"repository_url": "https://api.github.com/repos/" + srcRepo, "pull_request": links,
+				}}})
 			}
 			_ = json.NewEncoder(w).Encode(wire)
 		default:
@@ -603,6 +635,42 @@ func TestSweepSupersededOpenPRs_OpenClosingClaimKeepsPRLive(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// hotshot#364: a changelog follow-up whose only reference (`Refs #358`) is
+// already stamped resolved must not be closed because its prose cites closed
+// sibling numbers (`fix in that section (#333`) or the passive `closed by #359`.
+func TestSweepSupersededOpenPRs_CitationProseDoesNotSupersede(t *testing.T) {
+	org, repo := "hivecommons", "hive"
+	title := "📖 docs(changelog): record the Windows directory-creation error redaction (#359)"
+	body := "#359 Refs #358 (closed by #359; this PR adds `CHANGELOG.md`) by redacting the folder in the Windows \"cannot create screenshot directory\" error, " +
+		"but the Unreleased section never recorded it, while every sibling Windows redaction fix in that section (#333, #335, the save-failure message) has a bullet. " +
+		"Without this line the fix drops out of the v0.3.0 release notes.\n\n" +
+		"Refs #358 (already closed by #359; this only adds the release-notes line it omitted).\n\n" +
+		"Checks run: none needed — Markdown-only change.\n<!-- hive:supersession-resolved issue=358 closer=359 -->"
+	server, obs := supersessionSweepServer(t, org, repo,
+		[]supersessionPRFixture{
+			{Number: 20, Title: title, Body: body, Author: "hive-app[bot]", Files: []string{"CHANGELOG.md"}},
+			{Number: 359, Title: "landed", Body: "Fixes #358", Author: "hive-app[bot]", Merged: true, Files: []string{"pkg/a.go"}},
+			{Number: 334, Title: "landed", Body: "Fixes #333\nFixes #335", Author: "hive-app[bot]", Merged: true, Files: []string{"pkg/b.go"}},
+		},
+		[]supersessionIssueFixture{
+			{Number: 358, State: "closed", GraphQLCloserPR: 359},
+			{Number: 333, State: "closed", GraphQLCloserPR: 334},
+			{Number: 335, State: "closed", GraphQLCloserPR: 334},
+		},
+	)
+	defer server.Close()
+
+	c := newTestClient(t, server, org, []string{repo})
+	c.SetAppBotLogin("hive-app[bot]")
+	res, err := c.SweepSupersededOpenPRs(context.Background(), SupersessionSweepOptions{ACMMLevelForRepo: func(string) int { return acmmLevelAutonomous }})
+	if err != nil {
+		t.Fatalf("SweepSupersededOpenPRs: %v", err)
+	}
+	if len(res.Commented) != 0 || len(res.Closed) != 0 || len(obs.comments[20]) != 0 || len(obs.closed) != 0 {
+		t.Fatalf("citation prose must not supersede: result=%+v comments=%v closed=%v", res, obs.comments[20], obs.closed)
 	}
 }
 

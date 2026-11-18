@@ -61,6 +61,10 @@ type ReporterTrustClankerConfig interface {
 // and a refused issue is outside the pipeline until a required label lands.
 const issueFilterReason = "Project issue filter"
 
+// IssueFilterReason is issueFilterReason for readers of the work detail
+// (the dashboard's your-turn decision).
+const IssueFilterReason = issueFilterReason
+
 // IssueFilterNoticeConfig is the optional user-facing side of Admits: the
 // labels that would admit an issue the filter refuses, named in a reply.
 // config.IssueFilterConfig implements it.
@@ -77,16 +81,12 @@ type HardSuppressClassifier interface {
 	HardSuppressIssueBucket(labels []string) string
 }
 
-// AgentProposalGate is the optional admission-side half of #5117: a filter
-// that implements it is asked whether an UNACKNOWLEDGED, hive-filed issue
-// with this title and these labels is a direction proposal that must wait for
-// a human. config.IssueFilterConfig implements it; the zero value holds
-// nothing.
+// AgentProposalGate identifies direction proposals that need human acknowledgement
+// before an agent can work on them.
 type AgentProposalGate interface {
-	HoldsAgentProposal(title string, labels []string) bool
+	IsAgentProposal(labels []string, title string) bool
 }
 
-// agentProposalFilterReason is the work-detail reason for a held proposal.
 const agentProposalFilterReason = "Agent proposal awaiting " + HumanAckLabel
 
 // NeedsDecisionLabeler is the optional configurable name of the label that

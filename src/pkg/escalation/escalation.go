@@ -199,6 +199,20 @@ type Entry struct {
 	// RunWaitEscalatedGen records the run generation whose human wait timeout
 	// already paged a human. It makes run-wait escalation once-per-generation.
 	RunWaitEscalatedGen uint64 `json:"run_wait_escalated_gen,omitempty"`
+
+	// TransientTriagedSHA is the red head on which every failing check run
+	// carries a `hive-ci-transient` triage marker (Observation.
+	// TransientTriaged), as of the last ObserveRed pass; "" otherwise.
+	// TransientRerunSHA is the head whose failed jobs the hive already
+	// re-ran because of such a triage. Together they make the re-run once
+	// per head and hold fix kicks while it is owed (transient_rerun.go).
+	TransientTriagedSHA string `json:"transient_triaged_sha,omitempty"`
+	TransientRerunSHA   string `json:"transient_rerun_sha,omitempty"`
+	// TransientRerunSkipped is why the re-run spent on TransientRerunSHA
+	// re-ran nothing (a write-back gate reason, "rerun-forbidden",
+	// "no-failed-runs"); "" when the failed jobs were re-run. It is only
+	// read together with TransientRerunSHA.
+	TransientRerunSkipped string `json:"transient_rerun_skipped,omitempty"`
 }
 
 // Store is the on-PVC attempt ledger. All methods are safe for concurrent use.
@@ -303,6 +317,12 @@ type Observation struct {
 	// SharedCIIncident is the open [shared-ci] incident the PR is deferred
 	// to, 0 when none; named in the hold comment.
 	SharedCIIncident int
+	// TransientTriaged reports that every failing check run on this head
+	// carries an agent's `hive-ci-transient` marker for this head and run
+	// (github.PullRequest.TransientCITriaged): the failure was diagnosed as
+	// infrastructure, not this change. The fix loop re-runs the failed jobs
+	// once instead of kicking a fixer (transient_rerun.go).
+	TransientTriaged bool
 }
 
 // MarkSharedFailures classifies each red observation's failing checks as
@@ -599,6 +619,9 @@ func (s *Store) Sweep(obs []Observation, threshold int) map[string]Result {
 			e.RedSHAs = nil
 			e.ReEngagements = 0
 			e.LastReEngagedAt = time.Time{}
+			// A person returned the PR to the lane: a fresh transient
+			// triage on the same head earns one more re-run.
+			e.TransientRerunSHA = ""
 			e.UpdatedAt = s.now()
 		}
 
@@ -683,6 +706,7 @@ func (s *Store) Sweep(obs []Observation, threshold int) map[string]Result {
 			e.RedSHAs = nil
 			e.RedTrees = nil
 			e.ReEngagements = 0
+			e.TransientRerunSHA = ""
 			// Remember WHAT the reviewer left on the branch and WHEN, so a
 			// later re-escalation can hand the human the reviewer's context
 			// instead of a bare label (#5617 item 3). Keyed on the SHA so a
@@ -1088,6 +1112,7 @@ func (s *Store) ObserveRed(obs []Observation) {
 				e.FirstRedAt = time.Time{}
 				e.ReEngagements = 0
 				e.LastReEngagedAt = time.Time{}
+				e.TransientTriagedSHA = ""
 			}
 			continue
 		}
@@ -1113,6 +1138,10 @@ func (s *Store) ObserveRed(obs []Observation) {
 		if o.Excerpt != "" {
 			e.LastExcerpt = o.Excerpt
 		}
+		e.TransientTriagedSHA = ""
+		if o.TransientTriaged {
+			e.TransientTriagedSHA = o.HeadSHA
+		}
 		e.UpdatedAt = now
 	}
 	s.saveLocked()
@@ -1135,6 +1164,38 @@ func (s *Store) StaleRed(repo string, number int, headSHA string) bool {
 		return false
 	}
 	return s.now().Sub(e.FirstRedAt) >= RedPRStaleAfter
+}
+
+// ClaimReleaseAfter is how long a red head may sit unchanged before the
+// claim-release valve lets the covered issue go even though no re-engagement
+// was ever delivered (an owner the fix loop could not reach). It is the
+// whole re-engagement window — MaxReEngagements spaced by ReEngageCooldown —
+// so an issue is never offered for a second PR while the first is still
+// inside the hive's own repair budget.
+const ClaimReleaseAfter = time.Duration(MaxReEngagements) * ReEngageCooldown
+
+// AbandonedRed reports whether the hive has stopped repairing the PR's
+// CURRENT red head SHA: the head is StaleRed AND the fix loop has given up
+// on it — the PR was escalated to a human, the re-engagement budget for
+// this head is spent, or the head has been red for ClaimReleaseAfter with
+// nobody reachable to re-engage. It is the predicate the claim-release
+// valve (FilterClaimedIssues, "Fix #3") must use instead of StaleRed: a
+// red head that is merely stale is still being re-engaged by the reaper
+// and the merge watcher, and releasing its issue then stages the issue
+// 010-actionable while the covering PR reads 070-fixing — one piece of
+// work with two owners (hivecommons/hive#16522).
+func (s *Store) AbandonedRed(repo string, number int, headSHA string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.entries[Key(repo, number)]
+	if e == nil || e.CurRedSHA == "" || headSHA == "" || e.CurRedSHA != headSHA || e.FirstRedAt.IsZero() {
+		return false
+	}
+	redFor := s.now().Sub(e.FirstRedAt)
+	if redFor < RedPRStaleAfter {
+		return false
+	}
+	return e.Escalated || e.ReEngagements >= MaxReEngagements || redFor >= ClaimReleaseAfter
 }
 
 // TryReEngage atomically decides whether the re-engagement paths (#2/#4) may

@@ -177,6 +177,47 @@ fi
 rm -rf "$REQ_DIR"
 mkdir -p "$REQ_DIR"
 
+# A cross-repo parent (hivecommons/hive#18680): owner/repo#N and an issue URL
+# both produce parent + parent_repo; a same-repo owner/repo#N omits parent_repo.
+run_script "xparentbot" --repo "hiveorg/companion" --title "Cross child" --body "body" \
+  --parent "hiveorg/widgets#100"
+REQ_FILE="$(find_req xparentbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('parent', 0), d.get('parent_repo', ''))" "$REQ_FILE")"
+  check "--parent owner/repo#N produces parent and parent_repo" "100 hiveorg/widgets" "$GOT"
+else
+  echo "  FAIL: request file not created for cross-repo --parent test"
+  FAIL=$((FAIL + 1))
+fi
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+run_script "urlparentbot" --repo "hiveorg/companion" --title "URL child" --body "body" \
+  --parent "https://github.com/hiveorg/widgets/issues/101"
+REQ_FILE="$(find_req urlparentbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('parent', 0), d.get('parent_repo', ''))" "$REQ_FILE")"
+  check "--parent issue URL produces parent and parent_repo" "101 hiveorg/widgets" "$GOT"
+else
+  echo "  FAIL: request file not created for URL --parent test"
+  FAIL=$((FAIL + 1))
+fi
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+run_script "sameparentbot" --repo "hiveorg/widgets" --title "Same child" --body "body" \
+  --parent "hiveorg/widgets#102"
+REQ_FILE="$(find_req sameparentbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('parent', 0), 'parent_repo' in d)" "$REQ_FILE")"
+  check "--parent naming the same repo omits parent_repo" "102 False" "$GOT"
+else
+  echo "  FAIL: request file not created for same-repo --parent test"
+  FAIL=$((FAIL + 1))
+fi
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
 # Omitting --parent must not add the field at all (optional, not zero-valued).
 run_script "noparentbot" --repo "hiveorg/widgets" --title "No parent" --body "body"
 
@@ -215,6 +256,71 @@ BAD_RC=$?
 set -e
 check "--blocked-by refuses a non-numeric blocker (exit 2)" "2" "$BAD_RC"
 check "--blocked-by refusal writes no request" "" "$(find_req badblockedbot)"
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+# On a comment --blocked-by links the existing issue: a park that only defers
+# to another issue's decision (Danathar/tududi#512 → #511) waits on it.
+run_script "blockedcommentbot" comment --repo "hiveorg/widgets" 512 --body "Answer on #511; the same choice applies here." \
+  --needs-decision --blocked-by "#511" >/dev/null
+REQ_FILE="$(find_req blockedcommentbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_BLOCKED="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('kind'), d.get('number'), d.get('needs_decision'), d.get('blocked_by'))" "$REQ_FILE")"
+  check "comment --blocked-by carries blocked_by on the comment request" "comment 512 True [511]" "$GOT_BLOCKED"
+else
+  echo "  FAIL: request file not created for comment --blocked-by test"
+  FAIL=$((FAIL + 1))
+fi
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+set +e
+run_script "badblockedcommentbot" comment --repo "hiveorg/widgets" 512 --body "x" --blocked-by "eleven" >/dev/null 2>&1
+BAD_RC=$?
+set -e
+check "comment --blocked-by refuses a non-numeric blocker (exit 2)" "2" "$BAD_RC"
+check "comment --blocked-by refusal writes no request" "" "$(find_req badblockedcommentbot)"
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+# --blocked-on-pr takes a same-repo number or owner/repo#n (a PR in another
+# repository): the request carries the number and, for the second, its repo.
+run_script "blockedonprbot" comment --repo "hiveorg/widgets" 7 --body "Lands after the upstream change." \
+  --blocked-on-pr "hiveorg/gadgets#42" >/dev/null
+REQ_FILE="$(find_req blockedonprbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_BLOCKED="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('blocked_on_pr'), d.get('blocked_on_pr_repo'))" "$REQ_FILE")"
+  check "comment --blocked-on-pr owner/repo#n carries the number and the repo" "42 hiveorg/gadgets" "$GOT_BLOCKED"
+else
+  echo "  FAIL: request file not created for --blocked-on-pr owner/repo#n test"
+  FAIL=$((FAIL + 1))
+fi
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+run_script "blockedonprsamebot" comment --repo "hiveorg/widgets" 7 --body "Lands after #41." --blocked-on-pr 41 >/dev/null
+REQ_FILE="$(find_req blockedonprsamebot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_BLOCKED="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('blocked_on_pr'), d.get('blocked_on_pr_repo'))" "$REQ_FILE")"
+  check "comment --blocked-on-pr <n> stays same-repo (no blocked_on_pr_repo)" "41 None" "$GOT_BLOCKED"
+else
+  echo "  FAIL: request file not created for --blocked-on-pr <n> test"
+  FAIL=$((FAIL + 1))
+fi
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
+set +e
+run_script "badblockedonprbot" comment --repo "hiveorg/widgets" 7 --body "x" --blocked-on-pr "hiveorg/gadgets#" >/dev/null 2>&1
+BAD_RC=$?
+set -e
+check "comment --blocked-on-pr refuses a malformed owner/repo#n (exit 2)" "2" "$BAD_RC"
+check "comment --blocked-on-pr refusal writes no request" "" "$(find_req badblockedonprbot)"
 
 rm -rf "$REQ_DIR"
 mkdir -p "$REQ_DIR"
@@ -331,6 +437,38 @@ check "--needs-decision refusal writes no request" "" "$(find_req needsdecisionc
 rm -rf "$REQ_DIR"
 mkdir -p "$REQ_DIR"
 
+# --withdraw-decision on a comment takes back the caller's own park
+# (Danathar/openaudible-autoupdate#177).
+run_script "withdrawbot" comment --repo "hiveorg/widgets" 177 --body "No decision is needed: PR #176 closes this." --withdraw-decision >/dev/null
+REQ_FILE="$(find_req withdrawbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT_WD="$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(r['kind'], r['number'], r.get('withdraw_decision'), r.get('needs_decision'))" "$REQ_FILE")"
+  check "comment --withdraw-decision sets withdraw_decision" "comment 177 True None" "$GOT_WD"
+else
+  echo "  FAIL: request file not created for comment --withdraw-decision test"
+  FAIL=$((FAIL + 1))
+fi
+run_script "plaincommentbot" comment --repo "hiveorg/widgets" 177 --body "note" >/dev/null
+REQ_FILE="$(find_req plaincommentbot)"
+check "a plain comment omits withdraw_decision" "None" "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('withdraw_decision'))" "$REQ_FILE")"
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+for bad in "withdrawissue:--repo hiveorg/widgets --title T --body B --withdraw-decision" \
+           "withdrawboth:comment --repo hiveorg/widgets 5 --body B --withdraw-decision --needs-decision"; do
+  name="${bad%%:*}"
+  read -r -a args <<<"${bad#*:}"
+  set +e
+  run_script "$name" "${args[@]}" >/dev/null 2>&1
+  BAD_RC=$?
+  set -e
+  check "--withdraw-decision misuse ($name) is refused (exit 2)" "2" "$BAD_RC"
+  check "--withdraw-decision misuse ($name) writes no request" "" "$(find_req "$name")"
+done
+
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
 # Typed release steps record metadata, never a release write (#12483).
 RELEASE_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 run_script "releasestepbot" comment --repo hiveorg/widgets 5 --body "Cut the release." --needs-decision \
@@ -368,6 +506,30 @@ for bad_case in no-park no-kind no-tag no-target mutable-target marker-injection
   check_exit "invalid release metadata: $bad_case" 2 run_script "invalidreleasebot" "${args[@]}"
 done
 check "invalid release metadata writes no request" "" "$(find_req invalidreleasebot)"
+# --not-agent-work <verdict> carries the verdict on a comment; a bad verdict or a non-comment is refused (#18675).
+run_script "nawbot" comment --repo "hiveorg/widgets" 5 --body "not startable" --not-agent-work needs-environment >/dev/null
+REQ_FILE="$(find_req nawbot)"
+if [ -n "$REQ_FILE" ]; then
+  GOT="$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(r.get('kind'), r.get('not_agent_work'))" "$REQ_FILE")"
+  check "--not-agent-work sets not_agent_work on the comment request" "comment needs-environment" "$GOT"
+else
+  echo "  FAIL: request file not created for --not-agent-work test"
+  FAIL=$((FAIL + 1))
+fi
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+set +e
+run_script "nawbadbot" comment --repo "hiveorg/widgets" 5 --body "x" --not-agent-work maybe >/dev/null 2>&1
+BAD_RC=$?
+run_script "nawissuebot" --repo "hiveorg/widgets" --title "t" --body "b" --not-agent-work needs-human >/dev/null 2>&1
+BAD_ISSUE_RC=$?
+set -e
+check "--not-agent-work with an unknown verdict is refused (exit 2)" "2" "$BAD_RC"
+check "--not-agent-work on a create is refused (exit 2)" "2" "$BAD_ISSUE_RC"
+check "--not-agent-work refusals write no request" "" "$(find_req nawbadbot)$(find_req nawissuebot)"
+rm -rf "$REQ_DIR"
+mkdir -p "$REQ_DIR"
+
 # --no-consolidate <reason> carries the reason; an empty reason or a non-create is refused.
 run_script "noconsolbot" --repo "hiveorg/widgets" --title "Unrelated" --body "b" --no-consolidate "different work"
 REQ_FILE="$(find_req noconsolbot)"
@@ -657,6 +819,52 @@ check "repo inside HIVE_REPOS (case-insensitive) is written" "1" "$(find "$REQ_D
 # A placeholder-looking name that the hive has literally configured is real.
 env HIVE_AGENT=cfgbot HIVE_REPOS="org/repo" bash "$MODIFIED_SCRIPT" --repo org/repo --title t --body b >/dev/null 2>&1 || true
 check "configured placeholder-looking repo is accepted" "1" "$(find "$REQ_DIR" -name 'cfgbot-*.json' | wc -l | tr -d ' ')"
+
+# --- sandbox spool (hivecommons/hive#18573) ---
+# Runs the UNMODIFIED script: the spool redirect is the script's own behavior.
+echo ""
+echo "--- sandbox spool via HIVE_SANDBOX_REQUEST_DIR ---"
+ISSUE_SPOOL="$TMPDIR_ROOT/workspace/.hive/review-requests"
+ISSUE_KEY="0123456789abcdef0123456789abcdef"
+env HIVE_AGENT="spoolbot" HIVE_SANDBOX_REQUEST_DIR="$ISSUE_SPOOL" HIVE_SANDBOX_SPOOL_KEY="$ISSUE_KEY" \
+  bash "$SCRIPT" --repo hiveorg/widgets --title "dependency X breaks us" --body "detail" >/dev/null 2>&1 || true
+ISSUE_FILES=("$ISSUE_SPOOL"/spoolbot-*.json)
+if [ -f "${ISSUE_FILES[0]}" ]; then
+  check "spooled envelope kind is issue" "issue" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["kind"])' "${ISSUE_FILES[0]}")"
+  # The relay recomputes HMAC-SHA256(key, "issue\n" + request): the kind is bound.
+  check "envelope MAC binds the issue kind" "ok" "$(python3 -c '
+import hashlib, hmac, json, sys
+env = json.load(open(sys.argv[1]))
+want = hmac.new(sys.argv[2].encode(), ("issue\n" + env["request"]).encode(), hashlib.sha256).hexdigest()
+print("ok" if hmac.compare_digest(env["mac"], want) else "bad")' "${ISSUE_FILES[0]}" "$ISSUE_KEY")"
+  check "spooled request carries the title" "dependency X breaks us" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["request"])["title"])' "${ISSUE_FILES[0]}")"
+  if grep -q "$ISSUE_KEY" "${ISSUE_FILES[0]}"; then
+    echo "  FAIL: the spool key itself was written into the spool"; FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: the spool key is not in the spool file"; PASS=$((PASS + 1))
+  fi
+else
+  echo "  FAIL: issue request not written to HIVE_SANDBOX_REQUEST_DIR"; FAIL=$((FAIL + 4))
+fi
+
+echo ""
+echo "--- sandbox spool via the older HIVE_REVIEW_* names ---"
+OLD_SPOOL="$TMPDIR_ROOT/old/.hive/review-requests"
+env HIVE_AGENT="oldbot" HIVE_REVIEW_REQUEST_DIR="$OLD_SPOOL" HIVE_REVIEW_SPOOL_KEY="$ISSUE_KEY" \
+  bash "$SCRIPT" comment --repo hiveorg/widgets 41 --body "note" >/dev/null 2>&1 || true
+OLD_FILES=("$OLD_SPOOL"/oldbot-*.json)
+if [ -f "${OLD_FILES[0]}" ]; then
+  check "older env names spool a signed comment" "issue comment" "$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e["kind"], json.loads(e["request"])["kind"])' "${OLD_FILES[0]}")"
+else
+  echo "  FAIL: comment not written to HIVE_REVIEW_REQUEST_DIR"; FAIL=$((FAIL + 1))
+fi
+
+echo ""
+echo "--- a spool dir without a key is not a spool ---"
+NOKEY_SPOOL="$TMPDIR_ROOT/nokey/.hive/review-requests"
+env HIVE_AGENT="nokeybot" HIVE_SANDBOX_REQUEST_DIR="$NOKEY_SPOOL" bash "$MODIFIED_SCRIPT" --repo hiveorg/widgets --title t --body b >/dev/null 2>&1 || true
+check "no key: nothing written to the spool dir" "0" "$(find "$TMPDIR_ROOT/nokey" -name 'nokeybot-*.json' 2>/dev/null | wc -l | tr -d ' ')"
+check "no key: the pod-local request is plain JSON" "issue" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("kind",""))' "$(find "$REQ_DIR" -name 'nokeybot-*.json' | head -1)")"
 
 echo ""
 echo "=== $PASS passed, $FAIL failed ==="

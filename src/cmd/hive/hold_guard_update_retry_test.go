@@ -7,7 +7,10 @@ package main
 // projectbluefin/ghostscript-printer-app#152, projectbluefin/ps-printer-app#136).
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -350,4 +353,126 @@ func TestEnforceHoldGuardSettledUpdateIsNotDriftAtLift(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A stop whose ledger entry was dropped and re-snapshotted (hold lifted, then
+// returned) is announced at INFO once per head, base and reason, and its
+// person-facing note posted once per head and reason, not every pass.
+func TestStopHeldPRUpdateWarnsAndNotesOncePerHeadAndBase(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	store := newTestHoldGuardStore(t)
+	writer := &fakeIssueWriter{}
+	pr := github.PullRequest{Repo: "widgets", Number: 9016, HeadSHA: "once-h1", BaseSHA: "once-b1", MergeableState: "dirty", FromFork: true}
+	for i := 0; i < 3; i++ {
+		store.Clear("acme/widgets", pr.Number)
+		store.Snapshot("acme/widgets", pr.Number, pr.HeadSHA, nil)
+		stopHeldPRUpdate(context.Background(), writer, store, "acme/widgets", pr, holdguard.UpdateStopForkNotEditable, nil, logger)
+	}
+	if n := strings.Count(buf.String(), "stopped keeping held PR mergeable"); n != 1 {
+		t.Fatalf("warned %d times, want 1:\n%s", n, buf.String())
+	}
+	if len(writer.comments) != 1 {
+		t.Fatalf("posted %d notes, want 1: %q", len(writer.comments), writer.comments)
+	}
+	// A moved base warns again but the note stays per head and reason.
+	pr.BaseSHA = "once-b2"
+	store.Clear("acme/widgets", pr.Number)
+	store.Snapshot("acme/widgets", pr.Number, pr.HeadSHA, nil)
+	stopHeldPRUpdate(context.Background(), writer, store, "acme/widgets", pr, holdguard.UpdateStopForkNotEditable, nil, logger)
+	if n := strings.Count(buf.String(), "stopped keeping held PR mergeable"); n != 2 {
+		t.Fatalf("a moved base must warn again; got %d warnings", n)
+	}
+	if len(writer.comments) != 1 {
+		t.Fatalf("a moved base must not re-post the note; got %d", len(writer.comments))
+	}
+	// A moved head is a new stop: warn and note again.
+	pr.HeadSHA = "once-h2"
+	store.Clear("acme/widgets", pr.Number)
+	store.Snapshot("acme/widgets", pr.Number, pr.HeadSHA, nil)
+	stopHeldPRUpdate(context.Background(), writer, store, "acme/widgets", pr, holdguard.UpdateStopForkNotEditable, nil, logger)
+	if n := strings.Count(buf.String(), "stopped keeping held PR mergeable"); n != 3 {
+		t.Fatalf("a moved head must warn again; got %d warnings", n)
+	}
+	if len(writer.comments) != 2 {
+		t.Fatalf("a moved head must earn a new note; got %d", len(writer.comments))
+	}
+}
+
+// Process memory is scoped to the ledger it shadows: a fresh test store
+// (newTestHoldGuardStore) forgets earlier stops, so the same repo#number and
+// head earns its own WARN and note in each test instead of inheriting an
+// earlier test's dedupe.
+func TestStopHeldPRUpdateFreshStoreForgetsAnnouncedStops(t *testing.T) {
+	pr := github.PullRequest{Repo: "widgets", Number: 9017, HeadSHA: "fresh-h1", BaseSHA: "fresh-b1", MergeableState: "dirty", FromFork: true}
+	for i := 0; i < 2; i++ {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		store := newTestHoldGuardStore(t)
+		writer := &fakeIssueWriter{}
+		store.Snapshot("acme/widgets", pr.Number, pr.HeadSHA, nil)
+		stopHeldPRUpdate(context.Background(), writer, store, "acme/widgets", pr, holdguard.UpdateStopForkNotEditable, nil, logger)
+		if n := strings.Count(buf.String(), "stopped keeping held PR mergeable"); n != 1 {
+			t.Fatalf("store %d: warned %d times, want 1:\n%s", i, n, buf.String())
+		}
+		if len(writer.comments) != 1 {
+			t.Fatalf("store %d: posted %d notes, want 1", i, len(writer.comments))
+		}
+	}
+}
+
+// Process memory holds one entry per held PR however often its base moves,
+// while a moved base still re-warns and a repeated tuple does not
+// (hivecommons/hive#16106).
+func TestStopHeldPRUpdateMemoryBoundedPerPR(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	store := newTestHoldGuardStore(t)
+	writer := &fakeIssueWriter{}
+	pr := github.PullRequest{Repo: "widgets", Number: 9018, HeadSHA: "bound-h1", MergeableState: "dirty", FromFork: true}
+	store.Snapshot("acme/widgets", pr.Number, pr.HeadSHA, nil)
+	const bases = 5
+	for i := 0; i < bases; i++ {
+		pr.BaseSHA = fmt.Sprintf("bound-b%d", i)
+		for j := 0; j < 2; j++ {
+			stopHeldPRUpdate(context.Background(), writer, store, "acme/widgets", pr, holdguard.UpdateStopForkNotEditable, nil, logger)
+		}
+	}
+	if n := strings.Count(buf.String(), "stopped keeping held PR mergeable"); n != bases {
+		t.Fatalf("warned %d times, want %d (once per base, not per repeat)", n, bases)
+	}
+	entries := 0
+	heldPRUpdateStopAnnounced.Range(func(key, _ any) bool {
+		k, _ := key.(string)
+		if k == heldPRUpdateStopKey("acme/widgets", pr) {
+			entries++
+		} else if strings.HasPrefix(k, "acme/widgets#9018") {
+			t.Errorf("unexpected extra memory key %q for the PR", k)
+		}
+		return true
+	})
+	if entries != 1 {
+		t.Fatalf("process memory holds %d entries for one PR, want 1", entries)
+	}
+}
+
+// The stop is an expected steady state already noted on the PR, so its first
+// announcement is INFO: at WARN, several held PRs stopping in one pass collapse
+// into one line repeated and trip unclassified_error_repeated (#17520).
+func TestStopHeldPRUpdateAnnouncesAtInfoNotWarn(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	store := newTestHoldGuardStore(t)
+	pr := github.PullRequest{Repo: "docs", Number: 9020, HeadSHA: "lvl-h1", BaseSHA: "lvl-b1", MergeableState: "dirty", FromFork: true}
+	store.Snapshot("acme/docs", pr.Number, pr.HeadSHA, nil)
+	stopHeldPRUpdate(context.Background(), &fakeIssueWriter{}, store, "acme/docs", pr, holdguard.UpdateStopForkNotEditable, nil, logger)
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "stopped keeping held PR mergeable") {
+			if !strings.Contains(line, "level=INFO") {
+				t.Fatalf("stop announcement must be INFO, got: %s", line)
+			}
+			return
+		}
+	}
+	t.Fatalf("no stop announcement logged:\n%s", buf.String())
 }

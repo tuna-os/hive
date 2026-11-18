@@ -83,15 +83,14 @@ func TestPlukPipePaneCmdQuotesEveryOperand(t *testing.T) {
 	}
 }
 
-// TestPlukSessionLogPathMatchesItsConsumers pins the path against the two
-// readers, which hardcode it independently: inception_watcher.go builds
-// "<plukLogDir>/hive-brainstorm.jsonl" and hive-panes.sh globs
-// "$LOG_DIR"/hive-*.jsonl. If this drifts, both go quiet without erroring.
+// TestPlukSessionLogPathMatchesItsConsumers pins the path against its
+// reader, which hardcodes it independently: hive-panes.sh globs
+// "$LOG_DIR"/hive-*.jsonl. If this drifts, it goes quiet without erroring.
 func TestPlukSessionLogPathMatchesItsConsumers(t *testing.T) {
 	got := plukSessionLogPath(productionPlukRunDir, "hive-brainstorm")
 	const want = "/var/run/pluk/logs/hive-brainstorm.jsonl"
 	if got != want {
-		t.Fatalf("log path = %q, want %q — the inception watcher tails the literal %q",
+		t.Fatalf("log path = %q, want %q — hive-panes.sh globs the literal %q",
 			got, want, want)
 	}
 
@@ -236,5 +235,17 @@ func TestPlukHasPatterns(t *testing.T) {
 	}
 	if !plukHasPatterns("/nonexistent/pluk", "omp") {
 		t.Fatal("omp not detected despite shipped pattern file")
+	}
+}
+
+func TestWarnNoPlukPatternsOnce(t *testing.T) {
+	const backend = "test-only-backend-warn-once"
+	plukNoPatternsWarned.Delete(backend)
+	defer plukNoPatternsWarned.Delete(backend)
+	if !warnNoPlukPatternsOnce(backend) {
+		t.Fatal("first call must warn")
+	}
+	if warnNoPlukPatternsOnce(backend) {
+		t.Fatal("repeat call must not warn again")
 	}
 }

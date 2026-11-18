@@ -6,7 +6,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	itemblocker "github.com/hivecommons/hive/pkg/blocker"
 )
 
 // DefaultWebhookHealthWindow is the "healthy" window used until the governor
@@ -28,9 +31,29 @@ type WebhookHealth struct {
 	// deliveries and refreshes caused.
 	TargetedRefreshes1h    int `json:"targeted_refreshes_1h"`
 	TrackerInvalidations1h int `json:"tracker_invalidations_1h"`
+	// CI deliveries (check_run, check_suite, status, workflow_run,
+	// workflow_job) for managed repositories (hivecommons/hive#16521):
+	// when the last one arrived, how many in the window, how many check
+	// observations they applied to a head's set without a GitHub call, and
+	// how many coalesced check-run re-reads they caused. A nil
+	// LastCIEventAt with webhooks otherwise healthy means the App or the
+	// relay does not deliver check events.
+	LastCIEventAt     *time.Time `json:"last_ci_event_at"`
+	CIEvents1h        int        `json:"ci_events_1h"`
+	CIEventsApplied1h int        `json:"ci_events_applied_1h"`
+	CIRefetches1h     int        `json:"ci_refetches_1h"`
+	// Rejected1h counts deliveries the receiver turned away in the last hour
+	// (no secret configured, signature mismatch, undecodable payload) and
+	// LastRejectedAt is the newest one; mode_reason_code says which kind.
+	Rejected1h     int        `json:"rejected_1h"`
+	LastRejectedAt *time.Time `json:"last_rejected_at"`
 	// WebhookModeStatus is the reconcile cadence the health drives:
 	// `mode` webhook|polling and `since` (hivecommons/hive#13381).
 	WebhookModeStatus
+	// Verification is how this spoke authenticates deliveries:
+	// "github-signed", "relay (hub-signed)" or "none" (WebhookVerification,
+	// hivecommons/hive#17911).
+	Verification string `json:"verification,omitempty"`
 }
 
 // WebhookEventResult reports what one delivered GitHub webhook did.
@@ -39,11 +62,14 @@ type WebhookEventResult struct {
 	Repo        string `json:"repo"`
 	KnownRepo   bool   `json:"known_repo"`
 	Invalidated []int  `json:"invalidated"`
-	// DirtyIssues lists the issues an `issues` labeled/unlabeled event marked
-	// for the next un-park sweep (hivecommons/hive#11313).
+	// DirtyIssues lists issues opened or relabeled by an `issues` event.
+	// They wake evaluation and feed the next un-park sweep (#11313).
 	DirtyIssues []int `json:"dirty_issues,omitempty"`
 	// ReopenedIssue is the issue an `issues` reopened event named, if any.
 	ReopenedIssue int `json:"reopened_issue,omitempty"`
+	// BlockerKind is the structured blocker an issue_comment delivery
+	// recorded on the issue, if any (hivecommons/hive#15099).
+	BlockerKind string `json:"blocker_kind,omitempty"`
 	// TouchedIssues lists the non-PR issues an `issues` or `issue_comment`
 	// event named, whatever the action: the stage tracker re-reads them.
 	TouchedIssues []int `json:"touched_issues,omitempty"`
@@ -69,6 +95,14 @@ type WebhookEventResult struct {
 	// so a stage tracker whose confirming GET is refused or lost cannot keep
 	// showing a closed item as open (hivecommons/hive#14159, #14064).
 	Item *WebhookItemHint `json:"item,omitempty"`
+	// CIFailure is set when a check_run, check_suite or status delivery
+	// reported a failed check (failure / timed_out / error) on a head SHA,
+	// with the open PRs that head resolved to.
+	CIFailure *WebhookCIFailure `json:"ci_failure,omitempty"`
+	// CIEvidence reports what a check_run / check_suite / status /
+	// workflow_run / workflow_job delivery did to the head's check set
+	// (hivecommons/hive#16521).
+	CIEvidence *WebhookCIEvidence `json:"ci_evidence,omitempty"`
 }
 
 // WebhookItemHint is the state a webhook payload reports for the item it
@@ -102,13 +136,52 @@ type webhookTracker struct {
 	invalidations []time.Time
 	refreshes     []time.Time
 	trackerDrops  []time.Time
+	ciEvents      []time.Time
+	ciApplied     []time.Time
+	ciRefetches   []time.Time
+	lastCIEvent   time.Time
 	wasHealthy    bool
 	// lastActivity is the newest GitHub `updated_at` a poll listed and
 	// lastFailure the newest delivery that failed verification; both feed
 	// the cadence mode machine (webhook_mode.go).
 	lastActivity time.Time
 	lastFailure  time.Time
-	mode         webhookModeMachine
+	// lastFailureReason is the WebhookReason* code of lastFailure and
+	// rejected the per-minute count of rejected deliveries (rejected_1h).
+	lastFailureReason string
+	rejected          webhookMinuteCounter
+	mode              webhookModeMachine
+}
+
+// webhookMinuteCounter counts events over the last hour in sixty one-minute
+// buckets: fixed size, so recording a delivery never allocates however many
+// arrive.
+type webhookMinuteCounter struct {
+	minute [60]int64
+	count  [60]uint32
+}
+
+func (c *webhookMinuteCounter) add(now time.Time) {
+	m := now.Unix() / 60
+	i := int(m % 60)
+	if c.minute[i] != m {
+		c.minute[i] = m
+		c.count[i] = 0
+	}
+	c.count[i]++
+}
+
+// total is the count over the hour ending at now (the current minute and the
+// 59 before it).
+func (c *webhookMinuteCounter) total(now time.Time) int {
+	m := now.Unix() / 60
+	n := 0
+	for i := range c.minute {
+		if c.count[i] > 0 && c.minute[i] > m-60 && c.minute[i] <= m {
+			n += int(c.count[i])
+		}
+	}
+	return n
 }
 
 func newWebhookTracker() *webhookTracker {
@@ -122,7 +195,15 @@ func newWebhookTracker() *webhookTracker {
 	}
 }
 
-var sharedWebhookTracker = newWebhookTracker()
+// webhookTrackerPtr is atomic because tests swap the tracker while goroutines
+// from earlier tests (a refresher flush) may still be reading it.
+var webhookTrackerPtr = func() *atomic.Pointer[webhookTracker] {
+	p := &atomic.Pointer[webhookTracker]{}
+	p.Store(newWebhookTracker())
+	return p
+}()
+
+func sharedWebhookTracker() *webhookTracker { return webhookTrackerPtr.Load() }
 
 // SetWebhookHealthWindow sets how recent the last webhook event must be for
 // webhooks to count as healthy. The governor publishes 2 × eval_interval_s.
@@ -130,7 +211,7 @@ func SetWebhookHealthWindow(d time.Duration) {
 	if d <= 0 {
 		d = DefaultWebhookHealthWindow
 	}
-	t := sharedWebhookTracker
+	t := sharedWebhookTracker()
 	t.mu.Lock()
 	t.window = d
 	t.mu.Unlock()
@@ -138,7 +219,7 @@ func SetWebhookHealthWindow(d time.Duration) {
 
 // WebhookHealthSnapshot returns the current webhook health block.
 func WebhookHealthSnapshot() WebhookHealth {
-	return sharedWebhookTracker.snapshot()
+	return sharedWebhookTracker().snapshot()
 }
 
 // ObserveWebhookHealth reports whether webhooks are healthy and whether this
@@ -146,7 +227,7 @@ func WebhookHealthSnapshot() WebhookHealth {
 // (stale → healthy, healthy → stale), so callers can log exactly once per
 // transition.
 func ObserveWebhookHealth() (healthy, becameHealthy, becameStale bool) {
-	return sharedWebhookTracker.observe()
+	return sharedWebhookTracker().observe()
 }
 
 // RecordWebhookEventForTest records a delivery for repo as if a verified
@@ -154,7 +235,7 @@ func ObserveWebhookHealth() (healthy, becameHealthy, becameStale bool) {
 // without a GitHub client.
 func RecordWebhookEventForTest(repo string) {
 	key := canonicalPRDetailRepo(repo)
-	sharedWebhookTracker.recordEvent([]string{key})
+	sharedWebhookTracker().recordEvent([]string{key})
 }
 
 func (t *webhookTracker) recordEvent(aliases []string) {
@@ -184,16 +265,28 @@ func (t *webhookTracker) recordInvalidations(n int) {
 // RecordWebhookTargetedRefreshes counts n single-item GitHub reads made on
 // behalf of webhook deliveries (/api/status webhooks.targeted_refreshes_1h).
 func RecordWebhookTargetedRefreshes(n int) {
-	t := sharedWebhookTracker
+	t := sharedWebhookTracker()
 	t.recordStamped(&t.refreshes, n)
 }
 
 // RecordWebhookTrackerInvalidations counts n stage-tracker cache drops caused
 // by webhook deliveries (/api/status webhooks.tracker_invalidations_1h).
 func RecordWebhookTrackerInvalidations(n int) {
-	t := sharedWebhookTracker
+	t := sharedWebhookTracker()
 	t.recordStamped(&t.trackerDrops, n)
 }
+
+func (t *webhookTracker) recordCIEvent() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	t.lastCIEvent = now
+	t.ciEvents = append(pruneWebhookTimes(t.ciEvents, now), now)
+}
+
+func (t *webhookTracker) recordCIApplied(n int) { t.recordStamped(&t.ciApplied, n) }
+
+func (t *webhookTracker) recordCIRefetches(n int) { t.recordStamped(&t.ciRefetches, n) }
 
 func (t *webhookTracker) recordStamped(dst *[]time.Time, n int) {
 	if n <= 0 {
@@ -259,7 +352,7 @@ func (t *webhookTracker) takeDirtyIssues() int {
 // a non-zero answer to run early instead of waiting out its interval; polling
 // stays the fallback when webhooks are not delivered.
 func TakeDirtyIssueCount() int {
-	return sharedWebhookTracker.takeDirtyIssues()
+	return sharedWebhookTracker().takeDirtyIssues()
 }
 
 // clearDirtyBefore clears a dirty mark set before since. A mark set after the
@@ -346,13 +439,26 @@ func (t *webhookTracker) snapshot() WebhookHealth {
 	t.invalidations = pruneWebhookTimes(t.invalidations, now)
 	t.refreshes = pruneWebhookTimes(t.refreshes, now)
 	t.trackerDrops = pruneWebhookTimes(t.trackerDrops, now)
+	t.ciEvents = pruneWebhookTimes(t.ciEvents, now)
+	t.ciApplied = pruneWebhookTimes(t.ciApplied, now)
+	t.ciRefetches = pruneWebhookTimes(t.ciRefetches, now)
 	healthy, latest := t.healthyLocked(now)
 	out := WebhookHealth{Healthy: healthy, Events1h: len(t.events), Invalidations1h: len(t.invalidations),
 		TargetedRefreshes1h: len(t.refreshes), TrackerInvalidations1h: len(t.trackerDrops),
-		WebhookModeStatus: t.mode.status(t.window, now)}
+		CIEvents1h: len(t.ciEvents), CIEventsApplied1h: len(t.ciApplied), CIRefetches1h: len(t.ciRefetches),
+		Rejected1h: t.rejected.total(now), WebhookModeStatus: t.mode.status(t.window, now), Verification: WebhookVerification()}
+	t.annotateModeLocked(&out.WebhookModeStatus, now)
+	if !t.lastFailure.IsZero() {
+		at := t.lastFailure.UTC()
+		out.LastRejectedAt = &at
+	}
 	if !latest.IsZero() {
 		at := latest.UTC()
 		out.LastEventAt = &at
+	}
+	if !t.lastCIEvent.IsZero() {
+		at := t.lastCIEvent.UTC()
+		out.LastCIEventAt = &at
 	}
 	return out
 }
@@ -379,13 +485,13 @@ func pruneWebhookTimes(in []time.Time, now time.Time) []time.Time {
 }
 
 func resetWebhookTrackerForTest(now func() time.Time) func() {
-	old := sharedWebhookTracker
+	old := sharedWebhookTracker()
 	t := newWebhookTracker()
 	if now != nil {
 		t.now = now
 	}
-	sharedWebhookTracker = t
-	return func() { sharedWebhookTracker = old }
+	webhookTrackerPtr.Store(t)
+	return func() { webhookTrackerPtr.Store(old) }
 }
 
 // ResetWebhookTrackerForTest swaps in a fresh process-wide webhook tracker and
@@ -405,6 +511,39 @@ func ResetWebhookTrackerForTestWithClock(now func() time.Time) func() {
 
 type webhookPRRef struct {
 	Number int `json:"number"`
+}
+
+// webhookCheckRunPayload is the `check_run` object of a check_run delivery.
+type webhookCheckRunPayload struct {
+	ID           int64          `json:"id"`
+	NodeID       string         `json:"node_id"`
+	HeadSHA      string         `json:"head_sha"`
+	Name         string         `json:"name"`
+	Status       string         `json:"status"`
+	Conclusion   string         `json:"conclusion"`
+	DetailsURL   string         `json:"details_url"`
+	HTMLURL      string         `json:"html_url"`
+	StartedAt    *time.Time     `json:"started_at"`
+	CompletedAt  *time.Time     `json:"completed_at"`
+	PullRequests []webhookPRRef `json:"pull_requests"`
+	App          *struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+	} `json:"app"`
+}
+
+// webhookWorkflowJobPayload is the `workflow_job` object: one GitHub Actions
+// job, which is its check run as the Actions App reports it.
+type webhookWorkflowJobPayload struct {
+	ID          int64      `json:"id"`
+	NodeID      string     `json:"node_id"`
+	HeadSHA     string     `json:"head_sha"`
+	Name        string     `json:"name"`
+	Status      string     `json:"status"`
+	Conclusion  string     `json:"conclusion"`
+	HTMLURL     string     `json:"html_url"`
+	StartedAt   *time.Time `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at"`
 }
 
 type webhookEventPayload struct {
@@ -438,16 +577,40 @@ type webhookEventPayload struct {
 		UpdatedAt   *time.Time       `json:"updated_at"`
 		PullRequest *json.RawMessage `json:"pull_request"`
 	} `json:"issue"`
+	Comment *struct {
+		Body      string     `json:"body"`
+		CreatedAt *time.Time `json:"created_at"`
+		User      *struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	} `json:"comment"`
 	CheckSuite *struct {
 		HeadSHA      string         `json:"head_sha"`
+		Conclusion   string         `json:"conclusion"`
+		URL          string         `json:"url"`
 		PullRequests []webhookPRRef `json:"pull_requests"`
+		App          struct {
+			Name string `json:"name"`
+		} `json:"app"`
 	} `json:"check_suite"`
-	CheckRun *struct {
+	CheckRun    *webhookCheckRunPayload `json:"check_run"`
+	WorkflowRun *struct {
 		HeadSHA      string         `json:"head_sha"`
 		PullRequests []webhookPRRef `json:"pull_requests"`
-	} `json:"check_run"`
-	SHA      string `json:"sha"`
-	Branches []struct {
+	} `json:"workflow_run"`
+	// WorkflowJob is one GitHub Actions job: its check run, as the Actions
+	// App reports it, without the check_run envelope.
+	WorkflowJob *webhookWorkflowJobPayload `json:"workflow_job"`
+	ID          int64                      `json:"id"`
+	NodeID      string                     `json:"node_id"`
+	SHA         string                     `json:"sha"`
+	State       string                     `json:"state"`
+	Context     string                     `json:"context"`
+	TargetURL   string                     `json:"target_url"`
+	Description string                     `json:"description"`
+	CreatedAt   *time.Time                 `json:"created_at"`
+	UpdatedAt   *time.Time                 `json:"updated_at"`
+	Branches    []struct {
 		Name string `json:"name"`
 	} `json:"branches"`
 	Ref string `json:"ref"`
@@ -476,28 +639,48 @@ func (c *Client) HandleWebhookEvent(event string, payload []byte) (WebhookEventR
 	res.KnownRepo = true
 	res.ConfiguredRepo = configured
 	aliases := webhookRepoAliases(configured, p.Repository.FullName)
-	sharedWebhookTracker.recordEvent(aliases)
+	sharedWebhookTracker().recordEvent(aliases)
 
+	res.Item = webhookItemHint(event, p)
 	if n, ok := webhookTouchedIssue(event, p); ok {
 		res.TouchedIssues = []int{n}
+		if res.Item.Closed() {
+			// Closed issues no longer contribute to blocked_items. Comments
+			// delivered after closure must not recreate their blocker.
+			l := itemblocker.Shared()
+			l.Clear(configured, n)
+			// Comment webhooks use the configured name; sweep reports use
+			// owner/repo. Clear both when configuration uses a short name.
+			owner, repo := c.splitRepo(configured)
+			if full := owner + "/" + repo; full != configured {
+				l.Clear(full, n)
+			}
+		} else if body, at, ok := webhookIssueCommentBody(event, p); ok {
+			// A needs-human report that names a capability the App lacks
+			// becomes a structured blocker the moment it lands, so the
+			// tracker and "Let hive decide" read it before the next
+			// enumeration (hivecommons/hive#15099).
+			if e, changed := itemblocker.Shared().Observe(configured, n, body, at); changed && e.Blocks() {
+				res.BlockerKind = string(e.Blocker.Kind)
+			}
+		}
 	}
-	res.Item = webhookItemHint(event, p)
 	if reviewRequestWakeEvent(event, p) {
 		c.reviewWake.wake()
 		res.WokeReviewWatcher = true
 	}
 
-	if n, ok := webhookIssueLabelTarget(event, p); ok {
-		sharedWebhookTracker.markIssueDirty(aliases, n)
+	if n, ok := webhookIssueDirtyTarget(event, p); ok {
+		sharedWebhookTracker().markIssueDirty(aliases, n)
 		res.DirtyIssues = []int{n}
 	}
 	if n, ok := webhookIssueReopenedTarget(event, p); ok {
 		res.ReopenedIssue = n
 		if hook := issueReopenedHook(); hook != nil {
-			hook(configured, n, sharedWebhookTracker.now())
+			hook(configured, n, sharedWebhookTracker().now())
 		}
 	}
-	if d, ok := c.webhookPRClaimDelivery(event, configured, p, sharedWebhookTracker.now()); ok {
+	if d, ok := c.webhookPRClaimDelivery(event, configured, p, sharedWebhookTracker().now()); ok {
 		// The PR's claims take effect now, not on the next reconcile pass
 		// (hivecommons/hive#14814); the live open-PR index for the repo is
 		// stale the same instant, so the next guard call lists again.
@@ -514,12 +697,24 @@ func (c *Client) HandleWebhookEvent(event string, payload []byte) (WebhookEventR
 		c.RecordReviewEvidenceRevert(merged)
 	}
 	res.HeadSHA = webhookHeadSHA(event, p)
+	if res.HeadSHA != "" {
+		sharedCIReportingCache.invalidate(p.Repository.FullName, res.HeadSHA)
+	}
 	numbers := webhookInvalidationTargets(event, p, aliases)
+	if IsWebhookCIEvent(event) && res.HeadSHA != "" {
+		numbers = sharedCIEvidence().resolvePRs(p.Repository.FullName, res.HeadSHA, numbers)
+	}
+	// Capture the failed-check identity and the PRs it resolved to BEFORE
+	// invalidation drops their cache entries: the receiver reacts to a red
+	// check on the event rather than on the next sweep.
+	res.CIFailure = c.webhookCIFailureResult(event, p, aliases, numbers)
+	CIFailureSignals().forgetResolvedWebhook(event, p)
 	for _, n := range numbers {
 		c.invalidateWebhookPR(aliases, n)
 	}
-	sharedWebhookTracker.recordInvalidations(len(numbers))
+	sharedWebhookTracker().recordInvalidations(len(numbers))
 	res.Invalidated = numbers
+	res.CIEvidence = c.applyWebhookCIEvidence(event, p, configured, numbers)
 	return res, nil
 }
 
@@ -545,18 +740,37 @@ func webhookRepoAliases(configured, fullName string) []string {
 	return []string{a, b}
 }
 
-// webhookIssueLabelTarget returns the issue number of an `issues` event whose
-// action changed a label on a non-PR issue. Everything else is not an un-park
-// trigger.
-func webhookIssueLabelTarget(event string, p webhookEventPayload) (int, bool) {
+// webhookIssueDirtyTarget returns an opened or relabeled non-PR issue.
+// Opened issues must wake evaluation too: a tracker refresh alone does not
+// run the CEL rules against the newly patched actionable snapshot.
+func webhookIssueDirtyTarget(event string, p webhookEventPayload) (int, bool) {
 	if event != "issues" || p.Issue == nil || p.Issue.PullRequest != nil || p.Issue.Number <= 0 {
 		return 0, false
 	}
 	switch p.Action {
-	case "labeled", "unlabeled":
+	case "opened", "labeled", "unlabeled":
 		return p.Issue.Number, true
 	}
 	return 0, false
+}
+
+// webhookIssuePullRequestMerged reads the merge instant the `issue` object
+// of an `issues` / `issue_comment` delivery carries for a pull request
+// (`issue.pull_request.merged_at`). A bot's comment on a PR that just
+// merged used to produce a closed-but-not-merged snapshot — the tracker
+// then listed the merged PR in recently_closed and the SPA said "closed",
+// forfeiting the merge celebration (hivecommons/hive#16658).
+func webhookIssuePullRequestMerged(raw *json.RawMessage) bool {
+	if raw == nil || len(*raw) == 0 {
+		return false
+	}
+	var pr struct {
+		MergedAt *time.Time `json:"merged_at"`
+	}
+	if err := json.Unmarshal(*raw, &pr); err != nil {
+		return false
+	}
+	return pr.MergedAt != nil && !pr.MergedAt.IsZero()
 }
 
 // webhookItemHint is the payload's state for the issue or pull request an
@@ -578,7 +792,8 @@ func webhookItemHint(event string, p webhookEventPayload) *WebhookItemHint {
 		if p.Issue == nil || p.Issue.Number <= 0 {
 			return nil
 		}
-		h := &WebhookItemHint{Number: p.Issue.Number, IsPR: p.Issue.PullRequest != nil, State: p.Issue.State}
+		h := &WebhookItemHint{Number: p.Issue.Number, IsPR: p.Issue.PullRequest != nil, State: p.Issue.State,
+			Merged: webhookIssuePullRequestMerged(p.Issue.PullRequest)}
 		if p.Issue.UpdatedAt != nil {
 			h.UpdatedAt = *p.Issue.UpdatedAt
 		}
@@ -597,6 +812,19 @@ func webhookTouchedIssue(event string, p webhookEventPayload) (int, bool) {
 		return 0, false
 	}
 	return p.Issue.Number, true
+}
+
+// webhookIssueCommentBody returns the body and time of a created or edited
+// issue_comment delivery on a non-PR issue.
+func webhookIssueCommentBody(event string, p webhookEventPayload) (string, time.Time, bool) {
+	if event != "issue_comment" || p.Comment == nil || (p.Action != "created" && p.Action != "edited") {
+		return "", time.Time{}, false
+	}
+	at := sharedWebhookTracker().now()
+	if p.Comment.CreatedAt != nil && !p.Comment.CreatedAt.IsZero() {
+		at = *p.Comment.CreatedAt
+	}
+	return p.Comment.Body, at, true
 }
 
 // webhookIssueReopenedTarget returns the issue number of an `issues` event
@@ -647,6 +875,14 @@ func webhookHeadSHA(event string, p webhookEventPayload) string {
 		}
 	case "status":
 		return strings.TrimSpace(p.SHA)
+	case "workflow_run":
+		if p.WorkflowRun != nil {
+			return strings.TrimSpace(p.WorkflowRun.HeadSHA)
+		}
+	case "workflow_job":
+		if p.WorkflowJob != nil {
+			return strings.TrimSpace(p.WorkflowJob.HeadSHA)
+		}
 	}
 	return ""
 }
@@ -699,6 +935,15 @@ func webhookInvalidationTargets(event string, p webhookEventPayload, aliases []s
 		}
 	case "status":
 		bySHA(p.SHA)
+	case "workflow_run":
+		if p.WorkflowRun != nil {
+			addRefs(p.WorkflowRun.PullRequests)
+			bySHA(p.WorkflowRun.HeadSHA)
+		}
+	case "workflow_job":
+		if p.WorkflowJob != nil {
+			bySHA(p.WorkflowJob.HeadSHA)
+		}
 	case "push":
 		if ref, ok := strings.CutPrefix(p.Ref, "refs/heads/"); ok && ref != "" {
 			addMatching(func(_, headRef, baseRef string) bool { return headRef == ref || baseRef == ref })
@@ -718,5 +963,43 @@ func (c *Client) invalidateWebhookPR(aliases []string, number int) {
 		sharedPRDetailCache.invalidate(repo, number)
 		c.invalidateGraphQLPRBatchPR(repo, number)
 	}
-	sharedWebhookTracker.markDirty(aliases, number)
+	sharedWebhookTracker().markDirty(aliases, number)
+}
+
+// webhookCIFailureResult pairs a failed-check delivery with the PRs it
+// resolved to, read from the detail cache before the delivery invalidates
+// them. A PR the cache does not hold is reported by number only.
+func (c *Client) webhookCIFailureResult(event string, p webhookEventPayload, aliases []string, numbers []int) *WebhookCIFailure {
+	f := webhookCIFailure(event, p)
+	if f == nil || f.HeadSHA == "" {
+		return nil
+	}
+	for _, n := range numbers {
+		ref := CIFailurePR{Number: n}
+		for _, repo := range aliases {
+			pr, headSHA, ok := sharedPRDetailCache.peek(repo, n)
+			if !ok {
+				continue
+			}
+			if pr.GetState() != "" && pr.GetState() != "open" {
+				ref.Number = 0
+				break
+			}
+			if headSHA != "" && !strings.EqualFold(headSHA, f.HeadSHA) {
+				// The cache knows a newer head: this failure is stale.
+				ref.Number = 0
+				break
+			}
+			ref.Author = pr.GetUser().GetLogin()
+			ref.Title = pr.GetTitle()
+			ref.URL = pr.GetHTMLURL()
+			ref.BaseRef = pr.GetBase().GetRef()
+			ref.HiveAuthored = c.IsHiveAuthorLogin(ref.Author)
+			break
+		}
+		if ref.Number > 0 {
+			f.PRs = append(f.PRs, ref)
+		}
+	}
+	return f
 }

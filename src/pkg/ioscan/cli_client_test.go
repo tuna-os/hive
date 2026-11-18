@@ -81,6 +81,12 @@ func TestSupportsToolless(t *testing.T) {
 			t.Errorf("NewCLIChatClient(%q) accepted a backend that cannot run tool-less", backend)
 		}
 	}
+	// Only omp runs in an isolated profile with no default model of its own.
+	for backend, want := range map[string]bool{"claude": false, "copilot": false, "omp": true, " omp ": true, "codex": false, "": false} {
+		if got := RequiresModel(backend); got != want {
+			t.Errorf("RequiresModel(%q) = %v, want %v", backend, got, want)
+		}
+	}
 }
 
 func TestCLIChatClientGoodReply(t *testing.T) {
@@ -236,7 +242,7 @@ func TestCLIChatClientOmpLaunchIsToolless(t *testing.T) {
 
 	argv := strings.Split(strings.TrimSuffix(readRec(t, rec, "argv"), "\n"), "\n")
 	joined := strings.Join(argv, "\x00") + "\x00"
-	for _, want := range []string{"-p", "--no-tools", "--no-lsp", "--no-extensions", "--no-skills", "--no-rules", "--no-session"} {
+	for _, want := range []string{"-p", "--no-tools", "--no-lsp", "--no-extensions", "--no-skills", "--no-rules", "--no-session", "--no-title", "--no-context-files"} {
 		if !strings.Contains(joined, "\x00"+want+"\x00") {
 			t.Errorf("omp launch argv %q lacks %s", argv, want)
 		}
@@ -393,4 +399,35 @@ func TestExtractSingleJSONObject(t *testing.T) {
 			t.Errorf("extract(%q) = %q, want error", s, got)
 		}
 	}
+}
+
+// An empty or whitespace model must omit --model from argv entirely; a bare
+// `--model` would make the CLI consume the next argument as its value.
+func TestCLIChatClientArgvOmitsEmptyModel(t *testing.T) {
+	for _, model := range []string{"", "  "} {
+		c, err := NewCLIChatClient("claude", model, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		argv := c.argv("classify this")
+		for i, arg := range argv {
+			if arg == "--model" {
+				t.Fatalf("model %q: argv %v carries --model at %d", model, argv, i)
+			}
+		}
+	}
+	c, err := NewCLIChatClient("claude", " haiku ", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := c.argv("classify this")
+	for i, arg := range argv {
+		if arg == "--model" {
+			if i+1 >= len(argv) || argv[i+1] != "haiku" {
+				t.Fatalf("argv %v: --model must be followed by the trimmed model", argv)
+			}
+			return
+		}
+	}
+	t.Fatalf("argv %v: configured model missing", argv)
 }

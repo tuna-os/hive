@@ -10,6 +10,7 @@ package github
 import (
 	"strings"
 
+	itemblocker "github.com/hivecommons/hive/pkg/blocker"
 	"github.com/hivecommons/hive/pkg/claims"
 	"github.com/hivecommons/hive/pkg/stageengine"
 	"github.com/hivecommons/hive/pkg/stagelabels"
@@ -28,6 +29,7 @@ func issueFactsFrom(in IssueStageInput, prStage func(repo string, number int) st
 	f := stageengine.Facts{
 		Ref:    stageengine.Ref{Owner: owner, Repo: repo, Number: in.Number, Kind: stagelabels.IssueItem},
 		Labels: append([]string(nil), in.Labels...),
+		Title:  in.Title,
 		Open:   true,
 		Author: stageengine.AuthorFacts{Kind: in.AuthorKind},
 		Issue: &stageengine.IssueFacts{
@@ -77,10 +79,11 @@ func issueBucketFrom(bucket string) stageengine.IssueBucket {
 
 // resolveIssueLabelFacts fills the label-family verdicts the engine's
 // deriver reads (IssueFacts.HoldLabel, BlockedReason, UmbrellaLabel,
-// TriageAwaiting, LikelyDone and the ParkFacts) from the labels and bucket
-// in carries, using the hive's configured label vocabulary (hold labels,
-// never-claim labels, hard-suppress park labels, the reporter-trust
-// awaiting label). It is the one place that vocabulary meets the engine.
+// DiscussionLabel, TriageAwaiting, LikelyDone and the ParkFacts) from the
+// labels and bucket in carries, using the hive's configured label
+// vocabulary (hold labels, never-claim labels, hard-suppress park labels,
+// the reporter-trust awaiting label). It is the one place that vocabulary
+// meets the engine.
 func resolveIssueLabelFacts(in IssueStageInput, f *stageengine.Facts) {
 	f.Park.Holds = stagelabels.Holds(in.Labels)
 	f.Park.NeedsHuman = f.Park.NeedsHuman || issueHeldByNeedsHuman(in)
@@ -99,7 +102,16 @@ func resolveIssueLabelFacts(in IssueStageInput, f *stageengine.Facts) {
 	is.LikelyDone = issueHasLabel(in.Labels, LikelyDoneLabel)
 	is.HoldLabel = issueHoldLabel(in)
 	is.NeedsHumanLabel = issueNeedsHumanLabel
-	is.UmbrellaLabel = issueUmbrellaLabel(in.Labels)
+	is.Blocker, is.BlockerShort = "", ""
+	if b, ok := issueBlockerLookup(in.Repo, in.Number); ok {
+		is.Blocker, is.BlockerShort = string(b.Kind), b.Kind.Short()
+	}
+	is.ApprovedDirectionLabel = ""
+	if issueHasLabel(in.Labels, HumanAckLabel) {
+		is.ApprovedDirectionLabel = HumanAckLabel
+	}
+	is.UmbrellaLabel = issueUmbrellaLabel(in.Labels, in.SpekUmbrella)
+	is.DiscussionLabel = issueDiscussionSignal(in.Labels, in.Title)
 	is.BlockedReason = ""
 	if hasBlockedLabel(in.Labels) {
 		is.BlockedReason = blockedStageReason(in)
@@ -114,12 +126,19 @@ func resolveIssueLabelFacts(in IssueStageInput, f *stageengine.Facts) {
 	}
 }
 
+// issueBlockerLookup reads the structured blocker recorded on an issue
+// (pkg/blocker's shared ledger: an agent's `<!-- hive:blocker -->` marker
+// or the prose it inferred from). Tests swap it.
+var issueBlockerLookup = func(repo string, number int) (itemblocker.Blocker, bool) {
+	return itemblocker.Shared().Blocking(repo, number)
+}
+
 // issueInputFrom rebuilds the label/bucket view of an out-of-cycle Facts
 // (a FactSink submission enriched with a fresh read) so the same label
 // resolution applies to it as to an enumerated issue. An un-park fact is
 // resolved without the park labels it lifts (unparkDerivationLabels).
 func issueInputFrom(f stageengine.Facts) IssueStageInput {
-	in := IssueStageInput{Repo: f.Ref.FullRepo(), Number: f.Ref.Number, Labels: unparkDerivationLabels(f), AuthorKind: f.Author.Kind}
+	in := IssueStageInput{Repo: f.Ref.FullRepo(), Number: f.Ref.Number, Labels: unparkDerivationLabels(f), Title: f.Title, AuthorKind: f.Author.Kind}
 	if f.Issue != nil {
 		if f.Issue.Bucket != stageengine.BucketActionable {
 			in.Bucket = string(f.Issue.Bucket)

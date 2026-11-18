@@ -249,6 +249,9 @@ func (c *Client) CreatePR(ctx context.Context, repo, head, base, title, body str
 	if head == "" {
 		return CreatePRResult{}, fmt.Errorf("CreatePR: head branch is required")
 	}
+	if reason := invalidHeadReason(head); reason != "" {
+		return CreatePRResult{}, &errInvalidHead{head: head, reason: reason}
+	}
 	if base = strings.TrimSpace(base); base == "" {
 		resolved, err := c.DefaultBranch(ctx, owner, repo)
 		if err != nil {
@@ -469,6 +472,18 @@ func (c *Client) MergePRVia(ctx context.Context, repo string, number int, mergeM
 	}
 
 	opts := &gh.PullRequestOptions{MergeMethod: mergeMethod}
+	if fetched == nil {
+		var err error
+		fetched, _, err = c.client.PullRequests.Get(WithRESTCaller(ctx, "hive:merge_destination"), owner, repo, number)
+		if err != nil {
+			return MergePRResult{}, err
+		}
+	}
+	ctx, releaseDestination, err := AcquireDestinationMerge(ctx, DestinationMergeDirectory(), owner+"/"+repo, fetched.GetBase().GetRef())
+	if err != nil {
+		return MergePRResult{}, err
+	}
+	defer releaseDestination()
 	if expectSHA = strings.TrimSpace(expectSHA); expectSHA != "" {
 		opts.SHA = expectSHA
 	}
@@ -486,6 +501,17 @@ func (c *Client) MergePRVia(ctx context.Context, repo string, number int, mergeM
 		commitMessage = credit.CommitMessage
 		c.NoteMergeCredit(owner+"/"+repo, number, credit)
 	}
+	// A squash carries the branch's Signed-off-by trailers into the landing
+	// commit, or, in a repo that requires DCO, does not happen
+	// (hivecommons/hive#18203).
+	squashHead := expectSHA
+	if squashHead == "" {
+		squashHead = fetched.GetHead().GetSHA()
+	}
+	commitMessage, err = c.MergeCreditor().SquashSignoff(ctx, owner, repo, number, fetched.GetBase().GetRef(), squashHead, mergeMethod, commitMessage)
+	if err != nil {
+		return MergePRResult{}, fmt.Errorf("merging PR %s/%s#%d (%s): %w", owner, repo, number, mergeMethod, err)
+	}
 	var res *gh.PullRequestMergeResult
 	boundary := c.mutationBoundary()
 	claim := effects.Claim{
@@ -495,6 +521,9 @@ func (c *Client) MergePRVia(ctx context.Context, repo string, number int, mergeM
 		Inputs: map[string]string{"method": mergeMethod, "expect_sha": expectSHA},
 	}
 	merge := func(ctx context.Context) (effects.Result, error) {
+		if err := VerifyDestinationMerge(ctx, c.client, owner, repo, number, expectSHA); err != nil {
+			return effects.Result{}, effects.NotApplied(err)
+		}
 		var apiErr error
 		res, _, apiErr = c.client.PullRequests.Merge(ctx, owner, repo, number, commitMessage, opts)
 		if apiErr != nil {
@@ -505,11 +534,15 @@ func (c *Client) MergePRVia(ctx context.Context, repo string, number int, mergeM
 		}
 		return effects.Result{Provenance: res.GetSHA()}, nil
 	}
+	// The tracker's "Merging" state (hivecommons/hive#15245) spans exactly
+	// the merge call, whichever caller issued it.
+	BeginMergeAttemptOnHead(owner+"/"+repo, number, auditPath, expectSHA)
 	out, err := effects.Execute(ctx, boundary, claim, merge)
 	if errors.Is(err, effects.ErrNeedsReconciliation) {
 		out, err = c.reconcileMerge(ctx, boundary, claim, owner, repo, number, merge, err)
 	}
 	if err != nil {
+		EndMergeAttempt(owner+"/"+repo, number, false, err)
 		return MergePRResult{}, fmt.Errorf("merging PR %s/%s#%d (%s): %w", owner, repo, number, mergeMethod, err)
 	}
 	sha, merged := res.GetSHA(), res.GetMerged()
@@ -518,6 +551,11 @@ func (c *Client) MergePRVia(ctx context.Context, repo string, number int, mergeM
 		// the journaled merge SHA as provenance; surface it as the typed
 		// result rather than an empty, unmerged-looking success.
 		sha, merged = out.Provenance, out.Provenance != ""
+	}
+	if merged {
+		EndMergeAttempt(owner+"/"+repo, number, true, nil)
+	} else {
+		EndMergeAttempt(owner+"/"+repo, number, false, fmt.Errorf("GitHub did not merge the pull request: %s", strings.TrimSpace(res.GetMessage())))
 	}
 	if merged {
 		c.forgeWriteThrough(owner+"/"+repo, number, forgestate.Mutation{Op: forgestate.OpMerge, Kind: forgestate.KindPR})
@@ -612,6 +650,17 @@ func (c *Client) UpdateBranchExpectedHead(ctx context.Context, repo string, numb
 	return c.updateBranch(ctx, repo, number, expectedHeadSHA, observedBaseSHA)
 }
 
+// ErrBaseRefreshAwaitingAdmission marks an update-branch call deferred by
+// policy: the repo's base refresh is owned by the automerge preparation front.
+var ErrBaseRefreshAwaitingAdmission = errors.New("base-refresh:awaiting-admission")
+
+// IsBaseRefreshAwaitingAdmission reports whether err is that deliberate
+// deferral rather than a failed update.
+func IsBaseRefreshAwaitingAdmission(err error) bool {
+	return err != nil && (errors.Is(err, ErrBaseRefreshAwaitingAdmission) ||
+		strings.Contains(err.Error(), ErrBaseRefreshAwaitingAdmission.Error()))
+}
+
 // IsUpdateBranchStaleHead reports whether err is GitHub refusing an
 // UpdateBranchExpectedHead call because the PR head is no longer the expected
 // SHA: a 422 naming the expected head. Callers treat it as "the head moved
@@ -643,6 +692,9 @@ func (c *Client) updateBranch(ctx context.Context, repo string, number int, expe
 		owner, repo = parts[0], parts[1]
 	}
 	var inputs map[string]string
+	if c.baseRefreshScheduled(owner + "/" + repo) {
+		return fmt.Errorf("%w: %s/%s#%d is refreshed only by the automerge preparation front", ErrBaseRefreshAwaitingAdmission, owner, repo, number)
+	}
 	if expectedHeadSHA != "" || observedBaseSHA != "" {
 		inputs = map[string]string{"expected_head_sha": expectedHeadSHA, "observed_base_sha": observedBaseSHA}
 	}

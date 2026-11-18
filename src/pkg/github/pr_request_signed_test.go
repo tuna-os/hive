@@ -43,6 +43,8 @@ type signedMock struct {
 	comments  []map[string]any
 	posted    []string // bodies of POSTed issue comments
 
+	refCreateStatus int // when set, POST git/refs answers this status with an error body
+
 	calls    []string // "METHOD path"
 	graphql  map[string]any
 	refPatch map[string]any
@@ -141,6 +143,11 @@ func (m *signedMock) server() *httptest.Server {
 		case r.Method == "DELETE" && strings.Contains(p, "/git/refs/"):
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == "POST" && strings.HasSuffix(p, "/git/refs"):
+			if m.refCreateStatus != 0 {
+				w.WriteHeader(m.refCreateStatus)
+				_, _ = io.WriteString(w, `{"message":"Reference update failed"}`)
+				return
+			}
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if body["sha"] != m.mergeBase {
@@ -526,6 +533,27 @@ func TestSignedCommitMessage(t *testing.T) {
 	headline, body = signedCommitMessage(nil)
 	if headline == "" || body != "" {
 		t.Errorf("no commits must still yield a headline, got %q / %q", headline, body)
+	}
+}
+
+// A signed re-author whose agent commits carried no trailer still publishes
+// a signed-off commit (hivecommons/hive#16619); one that already has a
+// trailer, or an unknown App login, is left as folded.
+func TestEnsureSignedOffBy(t *testing.T) {
+	t.Setenv(signedTrailerDomainEnv, "")
+	want := "Signed-off-by: acme-hive[bot] <acme-hive@hive.kubestellar.io>"
+	if got := ensureSignedOffBy("body one\n\nsecond", "acme-hive[bot]"); got != "body one\n\nsecond\n\n"+want {
+		t.Errorf("unsigned body: got %q", got)
+	}
+	if got := ensureSignedOffBy("", "acme-hive[bot]"); got != want {
+		t.Errorf("empty body: got %q", got)
+	}
+	signed := "body\n\nSigned-off-by: a <a@x>"
+	if got := ensureSignedOffBy(signed, "acme-hive[bot]"); got != signed {
+		t.Errorf("signed body must not gain a second trailer: got %q", got)
+	}
+	if got := ensureSignedOffBy("body", ""); got != "body" {
+		t.Errorf("unknown App login must not invent a trailer: got %q", got)
 	}
 }
 

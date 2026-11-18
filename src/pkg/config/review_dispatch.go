@@ -183,8 +183,8 @@ func trimmedNonEmpty(in []string) []string {
 
 const (
 	// DefaultReviewDeltaTrivialLines is review.delta_trivial_lines unset: a
-	// re-review delta under this many changed lines, touching only files the
-	// previous verdict found nothing in, re-stamps that verdict without a
+	// re-review delta under this many changed lines, touching only files a
+	// previous approve found nothing in, re-stamps that approve without a
 	// model call.
 	DefaultReviewDeltaTrivialLines = 20
 	// DefaultReviewDeltaMaxAge is review.delta_max_age unset: a
@@ -234,6 +234,30 @@ func (r ReviewConfig) ValidateDeltaMaxAge() error {
 	}
 	if _, err := time.ParseDuration(raw); err != nil {
 		return fmt.Errorf("review: delta_max_age %q is not a duration (e.g. 72h); unset means the default %s", r.DeltaMaxAge, DefaultReviewDeltaMaxAge)
+	}
+	return nil
+}
+
+// EffectiveFixerFallbackAfterUndeliverable is zero while fallback routing is
+// disabled, so setting a threshold alone cannot change existing behavior.
+func (r ReviewConfig) EffectiveFixerFallbackAfterUndeliverable() int {
+	if len(r.EffectiveFixerFallbackAgents()) == 0 {
+		return 0
+	}
+	if r.FixerFallbackAfterUndeliverable > 0 {
+		return r.FixerFallbackAfterUndeliverable
+	}
+	return 3
+}
+
+// EffectiveFixerFallbackAgents returns the ordered, non-empty agent names.
+func (r ReviewConfig) EffectiveFixerFallbackAgents() []string {
+	return trimmedNonEmpty(r.FixerFallbackAgents)
+}
+
+func (r ReviewConfig) ValidateFixerFallback() error {
+	if r.FixerFallbackAfterUndeliverable < 0 {
+		return fmt.Errorf("review: fixer_fallback_after_undeliverable must be >= 0")
 	}
 	return nil
 }

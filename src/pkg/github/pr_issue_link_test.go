@@ -205,6 +205,27 @@ func TestEnsureClosingIssueLinkMutationErrorIsNotCached(t *testing.T) {
 	}
 }
 
+// TestEnsureClosingIssueLinkManualReferenceLimitIsTerminal covers
+// hivecommons/hive#18666: GitHub's manual reference limit is permanent, so it
+// is recorded as a skip, not an error, and the pair is not retried.
+func TestEnsureClosingIssueLinkManualReferenceLimitIsTerminal(t *testing.T) {
+	f := &closingLinkFixture{defaultBranch: "v5", base: "v5", prState: "OPEN", issueState: "OPEN"}
+	f.mutationErr = "Pull request exceeds manual reference limit"
+	c := newClosingLinkClient(t, f)
+	for i := 0; i < 3; i++ {
+		res, err := c.EnsureClosingIssueLink(context.Background(), "hivecommons/hive", 1, 7)
+		if err != nil {
+			t.Fatalf("call %d: err = %v, want nil", i, err)
+		}
+		if res.Linked || res.Skipped == "" {
+			t.Fatalf("call %d: res = %+v, want skipped", i, res)
+		}
+	}
+	if f.mutations.Load() != 1 || f.lookups.Load() != 1 {
+		t.Fatalf("lookups=%d mutations=%d, want 1/1 (terminal error must not retry)", f.lookups.Load(), f.mutations.Load())
+	}
+}
+
 // TestCreatePR_LinksClosingIssuesOnNonDefaultBase covers the relay hook: a PR
 // opened against v6 with `Fixes #7` gets addCloseIssueReferences sent.
 func TestCreatePR_LinksClosingIssuesOnNonDefaultBase(t *testing.T) {
@@ -339,6 +360,7 @@ func TestRewriteRefsIssueLinkToClosingPreservesWatcherDowngrade(t *testing.T) {
 		want bool
 	}{
 		{"bare-reference", "Refs #7", true},
+		{"recorded-decision", "Refs #7\n" + prDecisionHeadMarkerLine("head", prDecisionChangesRequested), false},
 		{"watcher-downgrade", "Refs #7" + downgradeNote("unfinished-delegated-work"), false},
 		{"watcher-downgrade-multiple-refs", "Refs #7" + downgradeNote("unfinished-delegated-work") + "\nRefs #8", false},
 	} {
@@ -355,13 +377,16 @@ func TestRewriteRefsIssueLinkToClosingPreservesWatcherDowngrade(t *testing.T) {
 }
 
 type issueStagePRLinkFixture struct {
-	body          string
-	base          string
-	defaultBranch string
-	author        string
-	state         string
-	patches       atomic.Int32
-	patchedBody   string
+	lastEditedAt   string
+	decisionBody   string
+	decisionAuthor string
+	body           string
+	base           string
+	defaultBranch  string
+	author         string
+	state          string
+	patches        atomic.Int32
+	patchedBody    string
 }
 
 func (f *issueStagePRLinkFixture) handler(t *testing.T) http.HandlerFunc {
@@ -387,11 +412,13 @@ func (f *issueStagePRLinkFixture) handler(t *testing.T) http.HandlerFunc {
 			"repository": map[string]any{
 				"defaultBranchRef": map[string]any{"name": f.defaultBranch},
 				"pullRequest": map[string]any{
-					"state":       f.state,
-					"baseRefName": f.base,
-					"body":        f.body,
-					"url":         "https://github.com/hivecommons/hive/pull/1",
-					"author":      map[string]any{"login": f.author},
+					"state":        f.state,
+					"baseRefName":  f.base,
+					"body":         f.body,
+					"lastEditedAt": f.lastEditedAt,
+					"comments":     map[string]any{"nodes": []map[string]any{{"body": f.decisionBody, "author": map[string]string{"login": f.decisionAuthor}}}},
+					"url":          "https://github.com/hivecommons/hive/pull/1",
+					"author":       map[string]any{"login": f.author},
 				},
 			},
 		}})
@@ -533,6 +560,26 @@ func TestClosingContradictions(t *testing.T) {
 				if got[i] != tc.want[i] {
 					t.Fatalf("ClosingContradictions = %v, want %v", got, tc.want)
 				}
+			}
+		})
+	}
+}
+
+func TestEnsureIssueStagePRLinkPreservesOwnerReference(t *testing.T) {
+	for _, tc := range []struct {
+		name, edited, actor string
+		wantEdit            bool
+	}{
+		{name: "recorded decision", actor: "hive[bot]"},
+		{name: "body edited after opening", edited: "2026-10-28T01:15:00Z"},
+		{name: "untrusted pasted decision marker", actor: "outsider", wantEdit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &issueStagePRLinkFixture{body: "Refs #7 — further expectations remain open on the issue.", base: "v5", defaultBranch: "v5", author: "hive[bot]", lastEditedAt: tc.edited, decisionAuthor: tc.actor, decisionBody: prDecisionHeadMarkerLine("head", prDecisionChangesRequested)}
+			c := newIssueStagePRLinkClient(t, f)
+			got, err := c.EnsureIssueStagePRLink(context.Background(), "hivecommons/hive", 7, &IssueClaimContext{PRNumber: 1, Reference: true})
+			if err != nil || got.EditedBody != tc.wantEdit || (f.patches.Load() > 0) != tc.wantEdit {
+				t.Fatalf("result=%+v err=%v patches=%d", got, err, f.patches.Load())
 			}
 		})
 	}

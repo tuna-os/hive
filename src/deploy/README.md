@@ -19,6 +19,8 @@ Use it indirectly through the dashboard terminal link. If a terminal pane says i
 - `entrypoint.sh` — container startup, config layering, proxy/agent setup, and long-lived process supervision.
 - `k8s/` — the Kustomize base (`kustomization.yaml`) with namespace, deployment, service, PVC, Secret, ConfigMap and RBAC manifests, plus the custom error backend (`error-pages.yaml`), the hub backup CronJob (`backup-cronjob.yaml`) and the node-prep DaemonSet (`node-prep/`), which are applied separately. The OpenShift Route lives in `kustomize/overlays/openshift/`.
 - `inference/` — sample in-cluster OpenAI-compatible inference deployment and RBAC.
+- `openshell.md` — cluster-side notes for the opt-in `sandbox.runtime: openshell` (ADR-0026): prerequisites, the upstream Helm install, the gateway settings and PVC labels hive's runtime depends on, and how to verify. No manifests are vendored.
+- `substrate.md` — cluster-side notes for the opt-in `sandbox.runtime: substrate` (ADR-0026 phase 2): the Agent Substrate operator install, WorkerPool and SandboxConfig, the pod-certificate feature gates, the router client bundle hive needs, and how to verify. No manifests are vendored.
 - `docker-compose.architect.yaml`, `hive-quickstart.yaml`, `hive-level*.yaml`, `architect-only.yaml`, `hive.yaml` — example deployment/configuration manifests.
 - `blue-green-deploy.sh`, `bootstrap-lxc.sh`, `create-lxc.sh` — operational scripts for **Docker Compose** deployments (LXC bootstrap and a blue-green Compose upgrade). Not "non-Kubernetes" generally: none of the three shells out to `podman` or reads `HIVE_DEPLOY_RUNTIME`, so none of them applies to the Quadlet stack in `quadlet/` below. See [Deployment helper scripts](../docs/deployment-scripts.md) for each script's scope and where a Podman operator should go instead.
 - `quadlet/` — Podman Quadlet units for the standalone deployment (ADR-0017). `hive.container` and `hive-data.volume` start the Hive service under `systemd`, rootful or rootless; `hive.network` and `hive-gateway.container` put the authenticating gateway in front of it with the same published-port split as the Compose stack — 3001 published, 7681 never. See [the operator guide](../docs/podman-standalone-quadlet.md). Docker Compose remains the default runtime and is unaffected.
@@ -28,7 +30,9 @@ Use it indirectly through the dashboard terminal link. If a terminal pane says i
 
 ## Other directories
 
+- `kustomize/components/`: opt-in Kustomize components such as `monitoring` (Prometheus Operator `ServiceMonitor` for `/metrics` plus a `PrometheusRule` with `HiveMetricsDown`, `HiveCostBurnHigh` and `HiveStageTransitionAnomalies` alerts; the scrape token lives in its own `hive-metrics-token` Secret). See [its README](kustomize/components/monitoring/README.md).
 - `kustomize/overlays/`: the `standalone` (self-hosted, hub-less), `openshift`, `openshift-netadmin` and `backup-exec-restriction` overlays on top of `k8s/` and `inference/`. See the [standalone overlay README](kustomize/overlays/standalone/README.md).
+- `stream/`: the headless Twitch streamer that puts the dashboard's Activity Monitor on a 24/7 stream (Xvfb + Chromium + ffmpeg image, Kustomize base and the `hive-hosted` overlay). See [its README](stream/README.md) and [Streaming the Activity Monitor](../docs/streaming-the-activity-monitor.md).
 - `ci-runners/`: manifests for the self-hosted GitHub Actions runners that serve this repository. See [its README](ci-runners/README.md).
 - `legacy-redirect/`: the hub legacy-host redirect that keeps the request path and query (#6430). See [its README](legacy-redirect/README.md).
 - `dibs-domain-cutover/`: staged manifests for moving dibs to `dibs.hivecommons.dev` (#5925). See [its README](dibs-domain-cutover/README.md).

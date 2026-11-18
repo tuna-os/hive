@@ -18,6 +18,19 @@ import (
 	"github.com/hivecommons/hive/crux/inferencehealth"
 )
 
+// logTranslateFailure logs a translateAnthropicToOpenAI refusal. A missing
+// model is an operator configuration condition the agent's LastError already
+// names with its remedy, so it logs at WARN under its own message instead of
+// the ERROR the fleet report counts as an inference_upstream_error
+// (hivecommons/hive#16170).
+func (p *GitHubProxy) logTranslateFailure(agentName string, err error) {
+	if errors.Is(err, errNoInferenceModel) {
+		p.logger.Warn("inference model not configured; request refused", "agent", agentName, "error", err)
+		return
+	}
+	p.logger.Error("inference translate request failed", "agent", agentName, "error", err)
+}
+
 // inferenceAPIKeyPrefix is what the manager prepends to the agent's name to
 // form the ANTHROPIC_API_KEY it hands each inference-routed agent
 // (agent/manager_env.go). The suffix is the agent's NAME, not a secret.
@@ -36,8 +49,22 @@ const inferenceAPIKeyPrefix = "sk-hive-"
 //   - a UID mapped to an agent is authoritative; a header naming someone else
 //     is logged and overridden;
 //   - the root control plane keeps the header name — the hive is the party
-//     that issues these keys; the proxy UID cannot assert a name because its
-//     upstream sockets can relay agent-controlled requests;
+//     that issues these keys;
+//   - the proxy UID keeps the header name only while the private-forward
+//     guard is in place. On v5 pods the hive drops to `dev`, which IS the
+//     proxy UID, and every agent without its own UID runs as it, so refusing
+//     that UID outright refused the hive's own agents (#18061). The reason it
+//     was refused (#14448) is that the proxy's plain-forward and uninspected
+//     tunnel legs can relay an agent-controlled request to this loopback
+//     port from the proxy's own socket; those legs dial only globally
+//     routable addresses unless HIVE_PROXY_ALLOW_PRIVATE_FORWARD lifts the
+//     guard, so with the guard lifted the proxy UID is still refused. Even
+//     with the guard in place the proxy UID is a SHARED identity: every
+//     UID-less agent runs as it, so one such agent could claim another
+//     agent's key. A caller at that UID may therefore only assert a name
+//     that has no per-agent UID: an agent that owns a UID always arrives
+//     from that UID, so a proxy-UID socket claiming it is refused, and
+//     HIVE_PROXY_ADVISORY_OK does not lift that refusal (#18115);
 //   - an unmapped UID, or no UID map at all, accepts the header only under
 //     HIVE_PROXY_ADVISORY_OK, the same operator escape hatch the GitHub path
 //     honours for deployments without per-agent UID separation.
@@ -46,7 +73,7 @@ const inferenceAPIKeyPrefix = "sk-hive-"
 // request must be refused.
 func (p *GitHubProxy) translatorAgentName(r *http.Request) (string, bool) {
 	claimed := strings.TrimPrefix(r.Header.Get("x-api-key"), inferenceAPIKeyPrefix)
-	if p.uidMap == nil {
+	if p.loadedUIDMap() == nil {
 		if p.proxyAdvisoryOK {
 			return claimed, true
 		}
@@ -54,18 +81,20 @@ func (p *GitHubProxy) translatorAgentName(r *http.Request) (string, bool) {
 	}
 	uid, err := uidForRemoteAddr(r.RemoteAddr)
 	if err == nil {
-		if name := p.uidMap.LookupByUID(uid); name != "" {
+		if name := p.lookupAgentByUID(uid); name != "" {
 			if claimed != "" && claimed != name {
 				p.logger.Warn("inference identity: x-api-key names another agent; using the socket owner",
 					"agent", name, "claimed", claimed, "uid", uid)
 			}
 			return name, true
 		}
-		if uid == 0 && p.uidMap.IsInternalUID(uid) {
+		if p.internalTranslatorUID(uid) && !p.sharedUIDClaimsIsolatedAgent(uid, claimed) {
 			return claimed, true
 		}
 	}
-	if p.proxyAdvisoryOK {
+	// Advisory-ok accepts self-asserted identity where the socket proves
+	// nothing; it does not override a socket that proves the claim false.
+	if p.proxyAdvisoryOK && !(err == nil && p.sharedUIDClaimsIsolatedAgent(uid, claimed)) {
 		return claimed, true
 	}
 	return "", false
@@ -186,8 +215,10 @@ func (p *GitHubProxy) recordInferenceError(route *InferenceRoute, agentName stri
 	if isInferenceAuthStatus(status) && p.inferenceAuth != nil {
 		msg := inferenceAuthErrorMessage(route.Backend, status, truncateBytes(body, 200))
 		p.inferenceAuth.recordFailure(msg, time.Now())
+		keySource, keyChanged := inferenceKeyLogFields(route)
 		p.logger.Warn("inference backend auth failure",
-			"agent", agentName, "backend", route.Backend, "endpoint", route.Endpoint, "status", status)
+			"agent", agentName, "backend", route.Backend, "endpoint", route.Endpoint, "status", status,
+			"key_source", keySource, "key_changed_since_start", keyChanged)
 	}
 
 	// PROVIDER SPEND REBUFF (#4294). Checked before the 403/entitlement branch
@@ -383,7 +414,8 @@ func (p *GitHubProxy) inferenceTranslatorHandler() http.Handler {
 		agentName, ok := p.translatorAgentName(r)
 		if !ok {
 			p.logger.Warn("inference request from unidentified caller refused",
-				"remote", r.RemoteAddr, "method", r.Method, "path", r.URL.Path)
+				p.translatorRefusalAttrs(r)...)
+			setTranslatorOutcome(r.Context(), outcomeUnidentifiedCaller)
 			http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"caller could not be identified"}}`, http.StatusUnauthorized)
 			return
 		}
@@ -398,11 +430,12 @@ func (p *GitHubProxy) inferenceTranslatorHandler() http.Handler {
 
 		route := p.inference.Get(agentName)
 		if route == nil {
-			p.logger.Warn("inference no route", "agent", agentName)
+			p.logger.Warn("inference no route", "agent", agentName, "reason", p.inference.MissReason(agentName))
+			setTranslatorOutcome(r.Context(), outcomeNoRoute)
 			http.Error(w, `{"type":"error","error":{"type":"api_error","message":"no inference route for agent"}}`, http.StatusBadGateway)
 			return
 		}
-		route = p.routeWithEntitledModel(route, agentName)
+		route = p.routeWithEntitledModel(routeWithCurrentKey(route), agentName)
 
 		body, err := io.ReadAll(r.Body)
 		if r.Body != nil {
@@ -438,7 +471,7 @@ func (p *GitHubProxy) inferenceTranslatorHandler() http.Handler {
 
 		openaiBody, err := translateAnthropicToOpenAI(body, route.Model, route.MaxContextLen, resolveInferencePreamble(route, agentName))
 		if err != nil {
-			p.logger.Error("inference translate request failed", "agent", agentName, "error", err)
+			p.logTranslateFailure(agentName, err)
 			p.recordAgentInferenceError(agentName, "translation error: "+err.Error(), 0)
 			http.Error(w, fmt.Sprintf(`{"type":"error","error":{"type":"api_error","message":"translation error: %s"}}`, jsonEscape(err.Error())), http.StatusBadGateway)
 			return
@@ -468,6 +501,9 @@ func (p *GitHubProxy) inferenceTranslatorHandler() http.Handler {
 			return
 		}
 		resp, err := client.Do(upstreamReq)
+		if err == nil {
+			resp, route = p.retryInferenceOnAuthFailure(r.Context(), client, route, agentName, upstreamURL, openaiBody, resp)
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) && errors.Is(r.Context().Err(), context.Canceled) {
 				p.logger.Debug("inference request canceled", "agent", agentName)
@@ -528,13 +564,11 @@ func (p *GitHubProxy) inferenceTranslatorHandler() http.Handler {
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			in, out, err := translateOpenAISSEToAnthropic(resp.Body, w, route.Model)
+			usage, err := translateOpenAISSEToAnthropicUsage(resp.Body, w, route.Model)
 			if err != nil {
 				p.logger.Error("inference SSE translation failed", "agent", agentName, "error", err)
 			}
-			if in > 0 || out > 0 {
-				p.recordUsage(agentName, route.Model, in, out)
-			}
+			p.recordGatewayUsage(agentName, route.Model, usage)
 			return
 		}
 
@@ -550,9 +584,7 @@ func (p *GitHubProxy) inferenceTranslatorHandler() http.Handler {
 			"preview", truncateBytes(respBody, 500),
 		)
 
-		if in, out := extractOpenAIUsage(respBody); in > 0 || out > 0 {
-			p.recordUsage(agentName, route.Model, in, out)
-		}
+		p.recordGatewayUsage(agentName, route.Model, extractOpenAIUsageDetailed(respBody))
 
 		translated, err := translateOpenAIResponseToAnthropic(respBody, route.Model)
 		if err != nil {
@@ -572,7 +604,7 @@ func (p *GitHubProxy) inferenceTranslatorHandler() http.Handler {
 		_, _ = w.Write(translated)
 	})
 
-	return mux
+	return instrumentTranslator(mux)
 }
 
 // StartInferenceTranslator runs the Anthropic-compatible inference translator
@@ -634,7 +666,7 @@ func (p *GitHubProxy) handleAnthropicReroute(conn net.Conn, r *http.Request, hos
 // handleInferenceRequest translates a single Anthropic API request and
 // forwards it to the inference backend.
 func (p *GitHubProxy) handleInferenceRequest(conn net.Conn, req *http.Request, agentName string, route *InferenceRoute) {
-	route = p.routeWithEntitledModel(route, agentName)
+	route = p.routeWithEntitledModel(routeWithCurrentKey(route), agentName)
 	_ = conn.SetReadDeadline(time.Now().Add(httpReadTimeout))
 	body, err := io.ReadAll(req.Body)
 	_ = conn.SetReadDeadline(time.Time{})
@@ -659,7 +691,7 @@ func (p *GitHubProxy) handleInferenceRequest(conn net.Conn, req *http.Request, a
 
 	openaiBody, err := translateAnthropicToOpenAI(body, route.Model, route.MaxContextLen, resolveInferencePreamble(route, agentName))
 	if err != nil {
-		p.logger.Error("inference translate request failed", "agent", agentName, "error", err)
+		p.logTranslateFailure(agentName, err)
 		p.recordAgentInferenceError(agentName, "translation error: "+err.Error(), 0)
 		p.writeHTTPError(conn, http.StatusBadGateway, "translation error: "+err.Error())
 		return
@@ -683,11 +715,10 @@ func (p *GitHubProxy) handleInferenceRequest(conn net.Conn, req *http.Request, a
 		return
 	}
 	resp, err := client.Do(upstreamReq)
+	if err == nil {
+		resp, route = p.retryInferenceOnAuthFailure(req.Context(), client, route, agentName, upstreamURL, openaiBody, resp)
+	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) && errors.Is(req.Context().Err(), context.Canceled) {
-			p.logger.Debug("inference request canceled", "agent", agentName)
-			return
-		}
 		p.logger.Error("inference upstream failed", "agent", agentName, "url", upstreamURL, "error", err)
 		if p.gatewayHealth != nil {
 			p.gatewayHealth.RecordEndpointError(route.Backend, route.Endpoint, err, time.Now())
@@ -734,13 +765,11 @@ func (p *GitHubProxy) handleInferenceRequest(conn net.Conn, req *http.Request, a
 		if _, err := conn.Write([]byte(hdr)); err != nil {
 			return
 		}
-		in, out, err := translateOpenAISSEToAnthropic(resp.Body, conn, route.Model)
+		usage, err := translateOpenAISSEToAnthropicUsage(resp.Body, conn, route.Model)
 		if err != nil {
 			p.logger.Error("inference SSE translation failed", "agent", agentName, "error", err)
 		}
-		if in > 0 || out > 0 {
-			p.recordUsage(agentName, route.Model, in, out)
-		}
+		p.recordGatewayUsage(agentName, route.Model, usage)
 		return
 	}
 
@@ -750,9 +779,7 @@ func (p *GitHubProxy) handleInferenceRequest(conn net.Conn, req *http.Request, a
 		return
 	}
 
-	if in, out := extractOpenAIUsage(respBody); in > 0 || out > 0 {
-		p.recordUsage(agentName, route.Model, in, out)
-	}
+	p.recordGatewayUsage(agentName, route.Model, extractOpenAIUsageDetailed(respBody))
 
 	translated, err := translateOpenAIResponseToAnthropic(respBody, route.Model)
 	if err != nil {

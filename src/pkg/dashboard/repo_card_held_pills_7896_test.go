@@ -271,6 +271,7 @@ func TestRepoHoldToggleOptimisticRollback(t *testing.T) {
 		jsFunc(t, html, "repoParts") + "\n" +
 		jsFunc(t, html, "updateRepoBreakdownForHold") + "\n" +
 		jsFunc(t, html, "moveRepoItemHold") + "\n" +
+		repoHoldShiftGuardJS(t, html) + "\n" +
 		jsFunc(t, html, "toggleRepoItemHold") + "\n" +
 		holdToggleRollbackAssertions
 	path := filepath.Join(t.TempDir(), "hold-toggle.js")
@@ -305,6 +306,7 @@ func TestRepoHoldToggleSuccessRaisesStatusFloor(t *testing.T) {
 		jsFunc(t, html, "repoParts") + "\n" +
 		jsFunc(t, html, "updateRepoBreakdownForHold") + "\n" +
 		jsFunc(t, html, "moveRepoItemHold") + "\n" +
+		repoHoldShiftGuardJS(t, html) + "\n" +
 		jsFunc(t, html, "toggleRepoItemHold") + "\n" +
 		holdToggleSuccessAssertions
 	path := filepath.Join(t.TempDir(), "hold-toggle-success.js")
@@ -374,6 +376,17 @@ const renovate = { labels: ['hold', 'needs-human', 'dependencies'] };
 check('renovate says on hold', heldReason(renovate).startsWith('On hold'));
 check('renovate names needs-human', heldReason(renovate).includes('needs-human: automated fix attempts exhausted'));
 check('renovate does not claim the level gate', !heldReason(renovate).includes('ACMM level gate'));
+
+// projectbluefin/homebrew-tap#60: held by its sentinel alert alone. No hold
+// label to remove, and no generic hold to call the ACMM gate.
+const sentinelOnly = { labels: ['sentinel-alert'], hive_attributed: true };
+check('sentinel-only names no hold label', !heldReason(sentinelOnly).includes('hold label'));
+check('sentinel-only says what holds it', heldReason(sentinelOnly).includes('until what holds it is cleared'));
+check('sentinel-only does not claim the level gate', !heldReason(sentinelOnly).includes('ACMM level gate'));
+// projectbluefin/utah-packages#878: a holdguard hold is not the level gate.
+const holdguard = { labels: ['hold'], hive_attributed: true, hold_sources: ['holdguard'] };
+check('holdguard does not claim the level gate', !heldReason(holdguard).includes('ACMM level gate'));
+check('a recorded level gate keeps the sentence', heldReason({ labels: ['hold'], hive_attributed: true, hold_sources: ['level_gate'] }).includes('ACMM level gate'));
 
 const reporterHeld = { labels: ['hold', 'needs-human'], hive_attributed: true, reporter_trust_reason: 'reporter-trust hold — issue #42 filed by @outsider' };
 check('reporter hold names the request reporter', heldReason(reporterHeld).includes(reporterHeld.reporter_trust_reason));

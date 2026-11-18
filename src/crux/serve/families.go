@@ -148,13 +148,7 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if !s.readOptionalJSON(w, r, &req) {
 		return
 	}
-	var err error
-	if req.Bootstrap != "" {
-		err = s.Runtime.RestartWithBootstrap(s.LaunchContext, name, req.Bootstrap)
-	} else {
-		err = s.Runtime.Restart(s.LaunchContext, name)
-	}
-	if err != nil {
+	if err := s.restartFor(name, req); err != nil {
 		s.writeRuntimeError(w, name, "restart", err)
 		return
 	}
@@ -988,9 +982,7 @@ func (s *Server) installHostObservers() func() {
 	if !ok {
 		return func() {}
 	}
-	host.SetKickOutcomeObserver(func(agent string, o crux.KickOutcome) {
-		s.publishData(api.EventKickOutcome, agent, api.KickOutcome{Kind: o.Kind, Reason: o.Reason, At: o.At, KickAt: o.KickAt})
-	})
+	host.SetKickOutcomeObserver(s.recordKickOutcome)
 	host.SetPauseTransitionObserver(func(ev crux.PauseTransitionEvent) {
 		s.publishData(api.EventPauseTransition, ev.Agent, api.PauseTransition{
 			Paused: ev.Paused, Trigger: ev.Trigger, Reason: ev.Reason, By: ev.By, At: ev.At,
@@ -1027,46 +1019,6 @@ func (t auditTee) Record(actor, action, agentName string, fields map[string]any)
 	t.s.publishData(api.EventAudit, agentName, api.Audit{Actor: actor, Action: action, Fields: fields})
 	if t.s.AuditSink != nil {
 		t.s.AuditSink.Record(actor, action, agentName, fields)
-	}
-}
-
-type conditionTee struct{ s *Server }
-
-// Conditions is the server's own condition reporter: every report reaches
-// the event stream (EventCondition) and ConditionReporter when set. It is
-// how a condition about the serving process itself, rather than one the
-// runtime raises, gets onto the same path (hivecap.Watch uses it for
-// hive_callback_unavailable).
-func (s *Server) Conditions() crux.ConditionReporter { return conditionTee{s} }
-
-// StreamConditions reports only to the event stream, never to
-// ConditionReporter. It is for a condition that must not travel over the
-// forwarding path because it describes that path being down
-// (hivecap.Watch's hive_callback_unavailable, when ConditionReporter is the
-// hive callback itself).
-func (s *Server) StreamConditions() crux.ConditionReporter { return streamConditions{s} }
-
-type streamConditions struct{ s *Server }
-
-func (t streamConditions) Observe(class, key, message, diagnostics string) {
-	t.s.publishData(api.EventCondition, "", api.ConditionEvent{Action: api.ConditionObserve, Class: class, Key: key, Message: message, Diagnostics: diagnostics})
-}
-
-func (t streamConditions) Clear(class, key string) {
-	t.s.publishData(api.EventCondition, "", api.ConditionEvent{Action: api.ConditionClear, Class: class, Key: key})
-}
-
-func (t conditionTee) Observe(class, key, message, diagnostics string) {
-	t.s.publishData(api.EventCondition, "", api.ConditionEvent{Action: api.ConditionObserve, Class: class, Key: key, Message: message, Diagnostics: diagnostics})
-	if t.s.ConditionReporter != nil {
-		t.s.ConditionReporter.Observe(class, key, message, diagnostics)
-	}
-}
-
-func (t conditionTee) Clear(class, key string) {
-	t.s.publishData(api.EventCondition, "", api.ConditionEvent{Action: api.ConditionClear, Class: class, Key: key})
-	if t.s.ConditionReporter != nil {
-		t.s.ConditionReporter.Clear(class, key)
 	}
 }
 
