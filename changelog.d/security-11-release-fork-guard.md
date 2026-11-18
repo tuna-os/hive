@@ -1,0 +1,1 @@
+- The `decide` job in `tagged-release.yml` now starts from `workflow_run` only for a push build in this repository ([#11](https://github.com/tuna-os/hive/issues/11)). Before, a pull request from a fork with a head branch named `v4` could start the job. The job then ran scripts from the fork commit with a token that can write contents, packages and actions.
