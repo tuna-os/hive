@@ -48,6 +48,14 @@ For each red check:
      a fix, plus `hold` when `hold` is true. It also comments on the culprit
      with a link.
 
+     With `hold` true the revert is opened as a **draft** and marked ready
+     only after the labels are on it. The label can only be added once the
+     pull request exists, and a draft cannot be merged, so the revert is never
+     open and mergeable without `hold`. If the labels cannot be added, the
+     revert stays a draft, the culprit gets no comment, and the audit log
+     records `failed` with the revert's number. Add the labels by hand, then
+     mark it ready, or close it.
+
 Both the confirming rerun and the held revert proposal consult the shared
 writeback gate under `ci_rerun`, using the culprit PR's author, labels and
 creation time. Operator-paused or writeback-off repositories stay untouched.
@@ -72,3 +80,8 @@ A case ends when the check goes green on the tip.
   its job re-run again, which only delays a revert.
 - GitHub authors the revert commit, so it has no `Signed-off-by` trailer.
   Repositories that require DCO need a person to sign off or merge it.
+- `hold: true` needs draft pull requests. Where the repository's plan has
+  none, GitHub refuses the revert and the case ends as `failed`.
+- A draft left without labels does not carry `hive/revert`, so the
+  open-revert check does not see it. After a restart the sheriff can open a
+  second draft for the same culprit.

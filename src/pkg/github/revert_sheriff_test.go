@@ -23,10 +23,15 @@ type sheriffServer struct {
 	mu         sync.Mutex
 	culpritRun map[string]any
 	reruns     []string
-	graphql    []map[string]any
-	labels     [][]string
-	comments   []string
-	prFiles    []string
+	// graphql holds the revertPullRequest mutations; ready holds the
+	// markPullRequestReadyForReview ones.
+	graphql  []map[string]any
+	ready    []map[string]any
+	labels   [][]string
+	comments []string
+	prFiles  []string
+	// failLabels makes GitHub refuse the label write on the revert PR.
+	failLabels bool
 }
 
 func (s *sheriffServer) handler(t *testing.T) http.Handler {
@@ -103,17 +108,32 @@ func (s *sheriffServer) handler(t *testing.T) http.Handler {
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if query, _ := req["query"].(string); strings.Contains(query, "markPullRequestReadyForReview") {
+			s.mu.Lock()
+			s.ready = append(s.ready, req)
+			s.mu.Unlock()
+			_, _ = w.Write([]byte(`{"data":{"markPullRequestReadyForReview":{"pullRequest":{"number":77}}}}`))
+			return
+		}
 		s.mu.Lock()
 		s.graphql = append(s.graphql, req)
 		s.mu.Unlock()
-		_, _ = w.Write([]byte(`{"data":{"revertPullRequest":{"revertPullRequest":{"number":77,"url":"https://github.test/acme/widget/pull/77"}}}}`))
+		_, _ = w.Write([]byte(`{"data":{"revertPullRequest":{"revertPullRequest":{"id":"PR_77","number":77,"url":"https://github.test/acme/widget/pull/77"}}}}`))
 	})
 	mux.HandleFunc("/repos/acme/widget/issues/77/labels", func(w http.ResponseWriter, r *http.Request) {
 		var labels []string
 		_ = json.NewDecoder(r.Body).Decode(&labels)
 		s.mu.Lock()
-		s.labels = append(s.labels, labels)
+		refuse := s.failLabels
+		if !refuse {
+			s.labels = append(s.labels, labels)
+		}
 		s.mu.Unlock()
+		if refuse {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"message":"Validation Failed"}`))
+			return
+		}
 		_, _ = w.Write([]byte("[]"))
 	})
 	mux.HandleFunc("/repos/acme/widget/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -149,11 +169,16 @@ func sheriffSetup(t *testing.T, files ...string) (*Client, *sheriffServer, func(
 
 func sheriffSweep(t *testing.T, c *Client, mode string, now time.Time) []RevertSheriffEvent {
 	t.Helper()
+	return sheriffSweepHold(t, c, mode, true, now)
+}
+
+func sheriffSweepHold(t *testing.T, c *Client, mode string, hold bool, now time.Time) []RevertSheriffEvent {
+	t.Helper()
 	var events []RevertSheriffEvent
 	_, err := c.SweepRevertSheriff(context.Background(), RevertSheriffOptions{
 		Watches:        func(repo string) bool { return repo == "acme/widget" },
 		Mode:           mode,
-		Hold:           true,
+		Hold:           hold,
 		MaxPerDay:      2,
 		Lookback:       10,
 		ConfirmTimeout: 3 * time.Hour,
@@ -209,8 +234,14 @@ func TestRevertSheriffRevertsAConfirmedBreak(t *testing.T) {
 	if vars["pr"] != "PR_42" || !strings.Contains(vars["body"].(string), "<!-- hive:revert-sheriff repo=acme/widget pr=42 sha=c2 -->") {
 		t.Fatalf("revert mutation vars = %v", vars)
 	}
+	if vars["draft"] != true {
+		t.Fatalf("a held revert must be opened as a draft, vars = %v", vars)
+	}
 	if len(s.labels) != 1 || strings.Join(s.labels[0], ",") != "hive/revert,fixes-main,hold" {
 		t.Fatalf("labels = %v, want hive/revert,fixes-main,hold", s.labels)
+	}
+	if len(s.ready) != 1 || s.ready[0]["variables"].(map[string]any)["pr"] != "PR_77" {
+		t.Fatalf("ready-for-review calls = %v, want one for PR_77 once hold is on", s.ready)
 	}
 	if len(s.comments) != 1 || !strings.Contains(s.comments[0], "#77") {
 		t.Fatalf("culprit comment = %v", s.comments)
@@ -231,6 +262,62 @@ func TestRevertSheriffLeavesAFlakeAlone(t *testing.T) {
 	onlyAction(t, sheriffSweep(t, c, config.RevertSheriffPropose, t0.Add(10*time.Minute)), "flaky")
 	if len(s.graphql) != 0 {
 		t.Fatal("reverted a flake")
+	}
+}
+
+// A held revert whose labels cannot be added must not become mergeable: it
+// stays a draft, is never marked ready, and the audit says it failed and
+// names the pull request left open.
+func TestRevertSheriffKeepsAnUnlabelledHeldRevertADraft(t *testing.T) {
+	c, s, done := sheriffSetup(t)
+	defer done()
+	s.mu.Lock()
+	s.failLabels = true
+	s.mu.Unlock()
+	t0 := time.Date(2026, 10, 30, 11, 10, 0, 0, time.UTC)
+	onlyAction(t, sheriffSweep(t, c, config.RevertSheriffPropose, t0), "rerun")
+	s.setCulpritRun(23, "failure", t0.Add(time.Minute).Format(time.RFC3339))
+
+	ev := onlyAction(t, sheriffSweep(t, c, config.RevertSheriffPropose, t0.Add(10*time.Minute)), "failed")
+	if ev.RevertPR != 77 || !strings.Contains(ev.Reason, "draft") || !strings.Contains(ev.Reason, "hold") {
+		t.Fatalf("failed event = %+v, want revert #77 reported as a draft without hold", ev)
+	}
+	if len(s.graphql) != 1 || s.graphql[0]["variables"].(map[string]any)["draft"] != true {
+		t.Fatalf("revert mutations = %v, want one draft revert", s.graphql)
+	}
+	if len(s.ready) != 0 {
+		t.Fatalf("an unlabelled held revert was marked ready: %v", s.ready)
+	}
+	if len(s.labels) != 0 || len(s.comments) != 0 {
+		t.Fatalf("labels = %v, comments = %v, want none", s.labels, s.comments)
+	}
+	if got := c.revertSheriffLedger().RevertsSince("acme/widget", t0.Add(11*time.Minute)); got != 1 {
+		t.Fatalf("reverts counted toward the daily cap = %d, want 1 (a draft was opened)", got)
+	}
+
+	// The case is closed: no second draft while main stays red.
+	if events := sheriffSweep(t, c, config.RevertSheriffPropose, t0.Add(20*time.Minute)); len(events) != 0 || len(s.graphql) != 1 {
+		t.Fatalf("acted twice: events %+v, revert mutations %d", events, len(s.graphql))
+	}
+}
+
+// With hold off nothing depends on a label, so the revert is opened ready
+// for review as before.
+func TestRevertSheriffWithoutHoldOpensAReadyRevert(t *testing.T) {
+	c, s, done := sheriffSetup(t)
+	defer done()
+	t0 := time.Date(2026, 10, 30, 11, 10, 0, 0, time.UTC)
+	onlyAction(t, sheriffSweepHold(t, c, config.RevertSheriffPropose, false, t0), "rerun")
+	s.setCulpritRun(23, "failure", t0.Add(time.Minute).Format(time.RFC3339))
+	onlyAction(t, sheriffSweepHold(t, c, config.RevertSheriffPropose, false, t0.Add(10*time.Minute)), "reverted")
+	if len(s.graphql) != 1 || s.graphql[0]["variables"].(map[string]any)["draft"] != false {
+		t.Fatalf("revert mutations = %v, want one non-draft revert", s.graphql)
+	}
+	if len(s.ready) != 0 {
+		t.Fatalf("ready-for-review called for a revert that was never a draft: %v", s.ready)
+	}
+	if len(s.labels) != 1 || strings.Join(s.labels[0], ",") != "hive/revert,fixes-main" {
+		t.Fatalf("labels = %v, want hive/revert,fixes-main", s.labels)
 	}
 }
 
