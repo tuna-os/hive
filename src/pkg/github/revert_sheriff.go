@@ -335,8 +335,14 @@ func (c *Client) revertSheriffAct(ctx context.Context, ledger *revertsheriff.Led
 	}
 	number, url, err := c.openRevertPR(ctx, owner, name, pr, cs, branch, runURL, opts.Hold)
 	if err != nil {
+		// A non-zero number is a revert left open as a draft (see
+		// openRevertPR): it counts toward the cap and the audit names it.
+		if number != 0 {
+			ledger.RecordRevert(cs.Repo, now)
+		}
 		cs.Finish(false, "revert failed: "+err.Error(), now)
 		ev.Action, ev.Reason = "failed", err.Error()
+		ev.RevertPR, ev.RevertURL = number, url
 		audit(ev)
 		return
 	}
@@ -363,14 +369,26 @@ func (c *Client) openSheriffRevert(ctx context.Context, owner, name, repo string
 	return 0, nil
 }
 
-const revertPullRequestMutation = `mutation($pr:ID!, $title:String!, $body:String!) {
-  revertPullRequest(input:{pullRequestId:$pr, title:$title, body:$body}) {
-    revertPullRequest { number url }
+const revertPullRequestMutation = `mutation($pr:ID!, $title:String!, $body:String!, $draft:Boolean!) {
+  revertPullRequest(input:{pullRequestId:$pr, title:$title, body:$body, draft:$draft}) {
+    revertPullRequest { id number url }
+  }
+}`
+
+const revertReadyForReviewMutation = `mutation($pr:ID!) {
+  markPullRequestReadyForReview(input:{pullRequestId:$pr}) {
+    pullRequest { number }
   }
 }`
 
 // openRevertPR asks GitHub to revert pr (the same operation as the Revert
 // button), labels the revert and points the culprit at it.
+//
+// A held revert must never be mergeable without its `hold` label, and the
+// label can only be added after the pull request exists. So a held revert is
+// opened as a draft, which neither GitHub nor the merge sweep will merge, and
+// is marked ready only once the labels are on it. When the labels cannot be
+// added it stays a draft and the error is returned together with its number.
 func (c *Client) openRevertPR(ctx context.Context, owner, name string, pr *gh.PullRequest, cs *revertsheriff.Case, branch, runURL string, hold bool) (int, string, error) {
 	if pr.GetNodeID() == "" {
 		return 0, "", fmt.Errorf("culprit #%d has no node id", pr.GetNumber())
@@ -385,23 +403,25 @@ func (c *Client) openRevertPR(ctx context.Context, owner, name string, pr *gh.Pu
 	}
 	b.WriteString("\n\nOpened by the Hive revert sheriff. Merge it to restore the branch, or close it if a fix is landing first.")
 	if hold {
-		b.WriteString(" It carries `hold`, so it waits for a person to release it.")
+		b.WriteString(" It is opened as a draft and marked ready once it carries `hold`, so it waits for a person to release it. If it is still a draft, check that `hold` is on it before marking it ready.")
 	}
 	b.WriteString("\n\n" + revertsheriff.Marker(cs.Repo, pr.GetNumber(), cs.Finding.Culprit) + "\n")
 
 	var out struct {
 		RevertPullRequest struct {
 			RevertPullRequest struct {
+				ID     string `json:"id"`
 				Number int    `json:"number"`
 				URL    string `json:"url"`
 			} `json:"revertPullRequest"`
 		} `json:"revertPullRequest"`
 	}
-	vars := map[string]any{"pr": pr.GetNodeID(), "title": title, "body": b.String()}
+	vars := map[string]any{"pr": pr.GetNodeID(), "title": title, "body": b.String(), "draft": hold}
 	if err := c.graphQL(ctx, revertPullRequestMutation, vars, &out); err != nil {
 		return 0, "", fmt.Errorf("revertPullRequest #%d: %w", pr.GetNumber(), err)
 	}
-	number, url := out.RevertPullRequest.RevertPullRequest.Number, out.RevertPullRequest.RevertPullRequest.URL
+	revert := out.RevertPullRequest.RevertPullRequest
+	number, url := revert.Number, revert.URL
 	if number == 0 {
 		return 0, "", fmt.Errorf("revertPullRequest #%d returned no PR", pr.GetNumber())
 	}
@@ -414,7 +434,16 @@ func (c *Client) openRevertPR(ctx context.Context, owner, name string, pr *gh.Pu
 		labels = append(labels, "hold")
 	}
 	if err := c.AddLabels(ctx, repo, number, labels); err != nil { // writeback:gated by revertSheriffAct (ci_rerun)
+		if hold {
+			return number, url, fmt.Errorf("revert #%d is open as a draft without `hold`: its labels could not be added, so it was not marked ready: %w", number, err)
+		}
 		c.logger.Warn("revert sheriff: labels not added", "repo", repo, "pr", number, "error", err)
+	} else if hold {
+		// The draft now carries `hold`, so it is safe to take out of draft.
+		// A failure here leaves a held draft, which a person can mark ready.
+		if err := c.graphQL(ctx, revertReadyForReviewMutation, map[string]any{"pr": revert.ID}, nil); err != nil {
+			c.logger.Warn("revert sheriff: held revert not marked ready, it stays a draft", "repo", repo, "pr", number, "error", err)
+		}
 	}
 	note := fmt.Sprintf("The Hive revert sheriff opened #%d to revert this PR: the required check `%s` failed on `%s` at its merge commit and again on re-run.", number, cs.Check, branch)
 	if runURL != "" {
