@@ -61,6 +61,15 @@ func forceFastPaneShell(t *testing.T) {
 // so the goroutine is drained before the test's env restores run.
 func quiesceThenMarkReady(t *testing.T, m *Manager, name string) (wait func()) {
 	t.Helper()
+	// The helper below spends a full poll interval plus margin (4s) before it
+	// renders the marker, and waitForCLIReadyForAgent's clock is already
+	// running by then. TestMain shrinks cliReadyTimeout to 5s, which leaves
+	// under a second for tmux to paint on a loaded runner: both users of this
+	// helper failed at exactly the timeout on CI. Widen it for these tests
+	// only; nothing else in them depends on it expiring.
+	prevReadyTimeout := cliReadyTimeout
+	cliReadyTimeout = 30 * time.Second
+	t.Cleanup(func() { cliReadyTimeout = prevReadyTimeout })
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
