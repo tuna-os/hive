@@ -18,7 +18,7 @@ squash, which re-creates duplicated history.
 
 ## Layout
 
-- `src/` — the Go module (`github.com/hivecommons/hive`, Go 1.25.6). Everything
+- `src/` — the Go module (`github.com/hivecommons/hive`, Go 1.26.11). Everything
   buildable lives here: `cmd/hive`, `pkg/`, `internal/`, `test/`.
 - `src/pkg/dashboard/` — dashboard API and the single-file UI
   `static/index.html`. ACMM evaluation: `acmm_criteria.go`, `api_acmm_eval.go`.
