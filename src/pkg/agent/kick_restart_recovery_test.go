@@ -13,6 +13,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -99,14 +101,58 @@ func quiesceThenMarkReady(t *testing.T, m *Manager, name string) (wait func()) {
 			// One poll interval (3s) with margin, so the poller has observed
 			// ctx.Done before anything below makes the pane interesting.
 			time.Sleep(4 * time.Second)
-			_ = testTmuxCommand("send-keys", "-t", session, "-l", ": goose is ready").Run()
-			_ = testTmuxCommand("send-keys", "-t", session, "Enter").Run()
+			renderReadyMarker(t, session, stop)
 			return
 		}
 	}()
 	return func() {
 		close(stop)
 		wg.Wait()
+	}
+}
+
+// renderReadyMarker types ": goose is ready" into the pane and CONFIRMS it
+// landed, retrying until it does, stop closes, or a deadline passes.
+//
+// The previous single fire-and-forget send (`_ = ...Run()`) made a lost
+// keystroke indistinguishable from a slow runner: widening cliReadyTimeout
+// from 5s to 30s did not help, because on CI both users of this helper kept
+// failing at exactly timeout+cleanup (10s before, 35s after) — the marker
+// never reached the pane at all, and with the error discarded nothing said
+// why. Verifying via capture-pane and resending makes the helper converge
+// whenever the pane is reachable; when it is not, the tmux error output and
+// the pane/session state are logged so the next failure is diagnosable
+// instead of a bare "CLI not ready".
+func renderReadyMarker(t *testing.T, session string, stop <-chan struct{}) {
+	t.Helper()
+	const marker = "goose is ready"
+	giveUp := time.Now().Add(25 * time.Second)
+	var lastErr string
+	for {
+		for _, args := range [][]string{
+			{"send-keys", "-t", session, "-l", ": " + marker},
+			{"send-keys", "-t", session, "Enter"},
+		} {
+			if out, err := testTmuxCommand(args...).CombinedOutput(); err != nil {
+				lastErr = fmt.Sprintf("tmux %v: %v: %s", args, err, strings.TrimSpace(string(out)))
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+		pane, _ := testTmuxCommand("capture-pane", "-t", session, "-p").Output()
+		if strings.Contains(string(pane), marker) {
+			return
+		}
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if time.Now().After(giveUp) {
+			sessions, _ := testTmuxCommand("list-sessions", "-F", "#{session_name}").CombinedOutput()
+			t.Logf("ready marker never appeared in pane %q; last tmux error: %q; sessions: %q; pane: %q",
+				session, lastErr, strings.TrimSpace(string(sessions)), string(pane))
+			return
+		}
 	}
 }
 
