@@ -142,13 +142,19 @@ redirects, never reads the pane tail (`liveSummary`),
 redacts everything it writes (report, summary, issues are all public), and
 scrubs the configured session value from every output.
 
-Operators with cluster access can get the same view without a secret:
+Operators with shell access to the host can get the same view without a
+secret. Since 2026-10-25, School and Reef are Docker Compose services, with
+the container names `hives-<svc>-1` (see [`FORK.md`](../../FORK.md#where-the-fleet-runs)):
 
 ```sh
-kubectl -n hive exec deploy/hive -- curl -sS -H "X-Hive-Internal: $TOKEN" \
+docker exec hives-school-1 curl -sS -H "X-Hive-Internal: $TOKEN" \
   http://127.0.0.1:3002/api/status > school-status.json
 go run . -only school -status-file school=school-status.json   # from tools/hive-health
 ```
+
+For a target that runs on Kubernetes, send the same request with
+`kubectl -n <namespace> exec deploy/hive --`. The `namespace` field in
+`targets.json` gives the namespace.
 
 A status file carries no model catalog, so the model checks are skipped on
 that path.
