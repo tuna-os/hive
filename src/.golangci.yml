@@ -54,8 +54,18 @@ linters:
     # is now written \u200b: identical bytes, visible in source, so ST1018 is
     # satisfied without weakening the injection test.
     - staticcheck
+    # RATCHET: funlen enabled with every current offender allowlisted below
+    # (#182, #188). It blocks a NEW function over 150 lines; it does not ask
+    # anyone to split the existing ones. Delete a function's entry in the PR
+    # that brings it under the cap.
+    - funlen
 
   settings:
+    funlen:
+      # A line cap only: the #182 ruling chose a length lint with a generous
+      # threshold. A statement cap would be a second threshold nobody chose.
+      lines: 150
+      statements: -1
     staticcheck:
       # The SA* family is the bug detector -- misused stdlib, impossible
       # conditions, ignored results. That is what this gate is for, and the
@@ -74,6 +84,61 @@ linters:
 
   exclusions:
     generated: lax
+    rules:
+      # funlen baseline (#188): the functions over 150 lines when the gate was
+      # enabled, one entry each, with the length funlen reported then. This
+      # list only shrinks: remove an entry when its function is split, and
+      # never add one to land a new long function.
+      - { linters: [funlen], path: '^cmd/hive/main\.go$', text: "^Function 'main' is too long" } # 2775
+      - { linters: [funlen], path: '^cmd/hive/main\.go$', text: "^Function 'persistState' is too long" } # 181
+      - { linters: [funlen], path: '^cmd/hive/main\.go$', text: "^Function 'runEvalCycle' is too long" } # 580
+      - { linters: [funlen], path: '^pkg/agent/manager\.go$', text: "^Function 'launchInTmux' is too long" } # 238
+      - { linters: [funlen], path: '^pkg/agent/manager\.go$', text: "^Function 'pollTmuxOutputForAgent' is too long" } # 209
+      - { linters: [funlen], path: '^pkg/config/config\.go$', text: "^Function 'applyDefaults' is too long" } # 246
+      - { linters: [funlen], path: '^pkg/dashboard/api\.go$', text: "^Function 'RegisterAPI' is too long" } # 272
+      - { linters: [funlen], path: '^pkg/dashboard/api\.go$', text: "^Function 'handleAgentConfigGeneral' is too long" } # 303
+      - { linters: [funlen], path: '^pkg/dashboard/api_agents\.go$', text: "^Function 'handleAgentImport' is too long" } # 175
+      - { linters: [funlen], path: '^pkg/dashboard/api_contribute\.go$', text: "^Function 'handleAPIDocs' is too long" } # 177
+      - { linters: [funlen], path: '^pkg/dashboard/api_contribute\.go$', text: "^Function 'handleContributeLanding' is too long" } # 5583
+      - { linters: [funlen], path: '^pkg/dashboard/api_packs\.go$', text: "^Function 'applyPack' is too long" } # 240
+      - { linters: [funlen], path: '^pkg/dashboard/contribute_ws\.go$', text: "^Function 'HandleWS' is too long" } # 694
+      - { linters: [funlen], path: '^pkg/dashboard/contribute_ws\.go$', text: "^Function 'selectTask' is too long" } # 359
+      - { linters: [funlen], path: '^pkg/dashboard/gateways\.go$', text: "^Function 'handleGovernorGatewaysUpsert' is too long" } # 191
+      - { linters: [funlen], path: '^pkg/dashboard/server\.go$', text: "^Function 'authenticate' is too long" } # 164
+      - { linters: [funlen], path: '^pkg/dashboard/server\.go$', text: "^Function 'handleHealthDeep' is too long" } # 230
+      - { linters: [funlen], path: '^pkg/dashboard/server\.go$', text: "^Function 'healthSummaryFor' is too long" } # 215
+      - { linters: [funlen], path: '^pkg/dashboard/status_builder\.go$', text: "^Function 'buildAgents' is too long" } # 204
+      - { linters: [funlen], path: '^pkg/dashboard/validation_test\.go$', text: "^Function 'TestValidateAgentGeneralInput' is too long" } # 178
+      - { linters: [funlen], path: '^pkg/github/app_discovery_test\.go$', text: "^Function 'TestDiscoverInstallationID' is too long" } # 153
+      - { linters: [funlen], path: '^pkg/hub/alerts\.go$', text: "^Function 'evaluateAlerts' is too long" } # 176
+      - { linters: [funlen], path: '^pkg/hub/cluster_app_key_test\.go$', text: "^Function 'TestDecideAppKeySync' is too long" } # 284
+      - { linters: [funlen], path: '^pkg/hub/cluster_metrics\.go$', text: "^Function 'collectClusterHealthUncached' is too long" } # 282
+      - { linters: [funlen], path: '^pkg/hub/drift\.go$', text: "^Function 'computeDrift' is too long" } # 174
+      - { linters: [funlen], path: '^pkg/hub/drift_test\.go$', text: "^Function 'TestComputeDriftSignals' is too long" } # 262
+      - { linters: [funlen], path: '^pkg/hub/forge\.go$', text: "^Function 'handleSwitchForge' is too long" } # 179
+      - { linters: [funlen], path: '^pkg/hub/github_host_backfill_test\.go$', text: "^Function 'TestReconcileGitHubHostFromSpoke' is too long" } # 170
+      - { linters: [funlen], path: '^pkg/hub/health_verdict\.go$', text: "^Function 'hiveHealthBase' is too long" } # 174
+      - { linters: [funlen], path: '^pkg/hub/health_verdict_reasons_test\.go$', text: "^Function 'TestHiveHealthForReasons' is too long" } # 204
+      - { linters: [funlen], path: '^pkg/hub/health_verdict_test\.go$', text: "^Function 'TestHiveHealthFor_ACMMBands' is too long" } # 342
+      - { linters: [funlen], path: '^pkg/hub/orphaned_pod_reaper_test\.go$', text: "^Function 'TestPodIsOrphanedTerminating' is too long" } # 172
+      - { linters: [funlen], path: '^pkg/hub/perhive_env_reconcile\.go$', text: "^Function 'reconcilePerHiveEnv' is too long" } # 157
+      - { linters: [funlen], path: '^pkg/hub/remediation_test\.go$', text: "^Function 'TestRemediationPerSignature' is too long" } # 291
+      - { linters: [funlen], path: '^pkg/hub/saas\.go$', text: "^Function 'buildClusterHealth' is too long" } # 172
+      - { linters: [funlen], path: '^pkg/hub/saas\.go$', text: "^Function 'buildSingleClusterHealth' is too long" } # 280
+      - { linters: [funlen], path: '^pkg/hub/saas\.go$', text: "^Function 'handleAssignHive' is too long" } # 221
+      - { linters: [funlen], path: '^pkg/hub/saas\.go$', text: "^Function 'handleCreateHive' is too long" } # 211
+      - { linters: [funlen], path: '^pkg/hub/saas\.go$', text: "^Function 'handleMyHives' is too long" } # 377
+      - { linters: [funlen], path: '^pkg/hub/saas\.go$', text: "^Function 'triggerAutoUpgrades' is too long" } # 252
+      - { linters: [funlen], path: '^pkg/hub/saas_provision\.go$', text: "^Function 'provisionHive' is too long" } # 195
+      - { linters: [funlen], path: '^pkg/hub/server\.go$', text: "^Function 'handleHeartbeat' is too long" } # 732
+      - { linters: [funlen], path: '^pkg/hub/stale_upgrade_test\.go$', text: "^Function 'TestEvaluateOrphanedUpgrade' is too long" } # 187
+      - { linters: [funlen], path: '^pkg/hub/timeline_test\.go$', text: "^Function 'TestDetectTransitions' is too long" } # 237
+      - { linters: [funlen], path: '^pkg/hub/upgrade_schedule_test\.go$', text: "^Function 'TestShouldAutoUpgradeNow' is too long" } # 165
+      - { linters: [funlen], path: '^pkg/hub/usage_test\.go$', text: "^Function 'TestBuildUsageBuckets' is too long" } # 166
+      - { linters: [funlen], path: '^pkg/knowledge/inception\.go$', text: "^Function 'ProduceScaffold' is too long" } # 206
+      - { linters: [funlen], path: '^pkg/proxy/github_proxy\.go$', text: "^Function 'inferenceTranslatorHandler' is too long" } # 170
+      - { linters: [funlen], path: '^pkg/tui/app\.go$', text: "^Function 'Update' is too long" } # 204
+      - { linters: [funlen], path: '^pkg/watchdog/classify_test\.go$', text: "^Function 'TestClassifyStateMachine' is too long" } # 155
 
 issues:
   # Report every occurrence. The defaults (50 per linter, 3 per identical
