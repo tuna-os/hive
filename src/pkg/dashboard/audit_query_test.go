@@ -105,3 +105,21 @@ func TestAuditDetailValue(t *testing.T) {
 		t.Fatal("auditDetailValue")
 	}
 }
+
+func TestAuditEntryKindGovernorAndLoginError(t *testing.T) {
+	cases := []struct {
+		name string
+		e    AuditEntry
+		want string
+	}{
+		{"governor approval", AuditEntry{User: "system", Action: "agent_pr_reviewed", Agent: "governor"}, AuditKindScheduler},
+		{"dashboard creation", AuditEntry{User: "system", Action: "agent_issue_created", Agent: "dashboard"}, AuditKindOperator},
+		{"agent review", AuditEntry{User: "system", Action: "agent_pr_reviewed", Agent: "reviewer"}, AuditKindAgentResult},
+		{"failed login", AuditEntry{User: "unknown", Action: "login_error"}, AuditKindOperator},
+	}
+	for _, c := range cases {
+		if got := auditEntryKind(c.e); got != c.want {
+			t.Errorf("%s: kind=%q want %q", c.name, got, c.want)
+		}
+	}
+}

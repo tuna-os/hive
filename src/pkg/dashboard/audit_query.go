@@ -39,12 +39,28 @@ var auditSchedulerActors = map[string]bool{
 	"system":     true,
 	"watchdog":   true,
 	"trajectory": true,
-	"unknown":    true,
 }
 
-// auditEntryKind classifies an entry. Unclassified real users are operators.
+// Agent names the hive records for actions no coding agent performed (mirrors
+// ghpkg.AttributionAgentGovernor / AttributionAgentDashboard).
+const (
+	auditAgentGovernor  = "governor"
+	auditAgentDashboard = "dashboard"
+)
+
+// auditEntryKind classifies an entry. Unclassified users are operators; this
+// includes actor "unknown" (a failed login is a person's attempt, not a hive
+// decision).
 func auditEntryKind(e AuditEntry) string {
 	if auditAgentResultActions[e.Action] {
+		// The governor's own auto-merge approval and operator-triggered
+		// dashboard creations reuse these actions but are not an agent's report.
+		switch e.Agent {
+		case auditAgentGovernor:
+			return AuditKindScheduler
+		case auditAgentDashboard:
+			return AuditKindOperator
+		}
 		return AuditKindAgentResult
 	}
 	if auditSchedulerActors[e.User] {
