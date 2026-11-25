@@ -1,0 +1,1 @@
+- Added `pkg/convergence/changeset`, an opt-in, read-only planner for coordinated multi-repository changes: it validates the dependency DAG and per-edge compatibility scenarios, then reports dependency layers, concurrent work and consumers blocked on unpublished or unverified producers. It grants no mutation or merge authority ([#162](https://github.com/tuna-os/hive/issues/162)).
