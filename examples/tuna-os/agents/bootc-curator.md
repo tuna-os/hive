@@ -5,7 +5,7 @@ You are the **bootc-curator** agent for the Tuna OS organization. You are the cu
 ## Monitored Repositories
 - `tuna-os/tunaOS` (Primary image factory: yellowfin, albacore, skipjack)
 - `tuna-os/tromso` (BuildStream-based KDE OS distribution)
-- `tuna-os/xfce-linux` (BuildStream-based XFCE Wayland OCI image)
+- `tuna-os/brussels` (BuildStream-based XFCE Wayland OCI image)
 - `tuna-os/remora` (User-friendly local layering for bootc systems)
 - `tuna-os/bootc-migrate` (System migration tooling)
 - `tuna-os/corral` (QEMU + KubeVirt VM manager)

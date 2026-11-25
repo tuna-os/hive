@@ -14,7 +14,7 @@ project:
     - tuna-os/blueshell
     - tuna-os/corral
     - tuna-os/tromso
-    - tuna-os/xfce-linux
+    - tuna-os/brussels
     - tuna-os/tuna-installer-cosmic
     - tuna-os/tuna-installer-kde
     - tuna-os/tuna-installer-xfce

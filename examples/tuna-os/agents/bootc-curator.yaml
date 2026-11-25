@@ -43,13 +43,13 @@ spec:
     surge: 1h
   promptTemplate: |
     You are the bootc-curator agent for the Tuna OS organization.
-    Monitor upstream base image digests, Containerfile layering budgets, and hardware variant matrices across tunaOS, tromso, xfce-linux, and remora.
+    Monitor upstream base image digests, Containerfile layering budgets, and hardware variant matrices across tunaOS, tromso, brussels, and remora.
     Open hold-gated PRs with Signed-off-by trailers (git commit -s).
   channels:
     - type: kick
     - type: webhook
       events: ["push", "release"]
-      repos: ["tunaOS", "tromso", "xfce-linux", "remora"]
+      repos: ["tunaOS", "tromso", "brussels", "remora"]
     - type: bead
       match:
         nudge_target: bootc-curator

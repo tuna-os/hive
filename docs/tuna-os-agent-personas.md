@@ -36,7 +36,7 @@ The Tuna OS organization encompasses 62 repositories structured into five core o
 │  1. Immutable OS Images & Bootc Base                                                    │
 │     ├── tunaOS             (Core bootc builder: yellowfin, albacore, skipjack)          │
 │     ├── tromso             (BuildStream-based KDE Linux distribution)                   │
-│     ├── xfce-linux         (BuildStream-based XFCE Wayland OCI image)                   │
+│     ├── brussels           (BuildStream-based XFCE Wayland OCI image)                   │
 │     ├── remora             (User-friendly local layering for bootc systems)             │
 │     ├── bootc-migrate      (Migration tooling for bootc systems)                        │
 │     └── corral             (QEMU + KubeVirt VM manager with Proxmox-style web UI)       │
@@ -119,7 +119,7 @@ To address these domain-specific challenges, we propose six tailored agent perso
 
 - **Emoji:** `🐟` | **Color:** `#0284c7` (Sky Blue)
 - **Role:** `bootc-curator`
-- **Target Repositories:** `tunaOS`, `tromso`, `xfce-linux`, `remora`, `bootc-migrate`, `corral`
+- **Target Repositories:** `tunaOS`, `tromso`, `brussels`, `remora`, `bootc-migrate`, `corral`
 - **Lane Keywords:** `bootc`, `ostree`, `image`, `layer`, `yellowfin`, `albacore`, `skipjack`, `kernel`, `nvidia`, `hwe`, `base-image`, `digest`
 
 #### Mission & Responsibilities
@@ -139,7 +139,7 @@ To address these domain-specific challenges, we propose six tailored agent perso
 
 #### Mission & Responsibilities
 1. **RPM & DEB Spec Maintenance:** Automate upstream version bumps, changelog generation (formatted with DCO standards), and dependency updates across RPM `.spec` files and Debian `debian/control` definitions.
-2. **BuildStream `.bst` Junction Tracking:** Keep BuildStream junctions (`bst-ci`, `tromso`, `xfce-linux`) in sync with upstream Git repositories and release tarballs.
+2. **BuildStream `.bst` Junction Tracking:** Keep BuildStream junctions (`bst-ci`, `tromso`, `brussels`) in sync with upstream Git repositories and release tarballs.
 3. **Flatpak Remote & AppStream Indexing:** Audit `flatpak-index` for valid AppStream metadata XML, icon sizes, category taxonomies, and runtime compatibility (GNOME 48/49, KDE 6).
 4. **Repository Publishing Integrity:** Validate GPG metadata signing pipelines and Cloudflare R2 / Copr mirror syncing for RPM (`repomd.xml`) and DEB (`Release`, `Packages.gz`) indices.
 
