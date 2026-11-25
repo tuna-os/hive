@@ -54,6 +54,10 @@ type AuditEntry struct {
 	// identity key. Stamped at SERVE time only (handleAuditLog) — the ring and
 	// the on-disk log keep the raw key, so history survives name changes.
 	UserName string `json:"user_name,omitempty"`
+	// Kind classifies who decided (operator, scheduler) or reported
+	// (agent_result) the event. Derived at SERVE time by auditEntryKind, never
+	// stored, so history stays valid if the classification is refined.
+	Kind string `json:"kind,omitempty"`
 }
 
 type AuditLog struct {
@@ -312,15 +316,23 @@ func (s *Server) handleAuditLog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "insufficient access", http.StatusForbidden)
 		return
 	}
-	entries := s.audit.Recent(auditMaxEntries)
-	// Cosmetic: attach display names for opaque OIDC actor keys. Recent()
+	q := parseAuditQuery(r)
+	res := s.audit.Query(q)
+	entries := res.Entries
+	// Cosmetic: attach display names for opaque OIDC actor keys. Query
 	// returns copies, so the ring itself is never mutated.
 	for i := range entries {
 		if dn := s.authorizedDisplayName(entries[i].User); dn != "" && dn != entries[i].User {
 			entries[i].UserName = dn
 		}
 	}
-	jsonResponse(w, map[string]any{"entries": entries})
+	jsonResponse(w, map[string]any{
+		"entries":   entries,
+		"count":     len(entries),
+		"matched":   res.Matched,
+		"truncated": res.Truncated,
+		"window":    res.Window,
+	})
 }
 
 // requestUser resolves the acting user behind an authenticated dashboard

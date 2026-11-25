@@ -1,0 +1,1 @@
+- `GET /api/audit` now accepts `agent`, `repo`, `number`, `actor`, `kind`, `action`, `since` and `limit` filters, labels each entry `operator`, `scheduler` or `agent_result`, and reports `matched`, `truncated` and the ring `window` so a bounded view is never mistaken for complete history ([#161](https://github.com/tuna-os/hive/issues/161)).
