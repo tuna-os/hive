@@ -304,7 +304,7 @@ func TestDiagnoseStuckLoginSignedInSaysCauseIsElsewhere(t *testing.T) {
 	// Both files are good, so the message must NOT blame the session state —
 	// a false #4596 diagnosis would send the next investigator down the wrong
 	// path, which is the exact cost this change is trying to remove.
-	if strings.Contains(got, "4596") {
+	if strings.Contains(got, "hive#4596") {
 		t.Errorf("healthy session state must not be blamed on #4596:\n%s", got)
 	}
 	if !strings.Contains(got, "not on-disk state") {
@@ -338,7 +338,7 @@ func TestDiagnoseStuckLoginNonClaudeBackendStaysGeneric(t *testing.T) {
 	got := m.diagnoseStuckLogin(agent)
 	// Copilot does not split auth across two files, so a claude-shaped
 	// diagnosis would be fabricated.
-	if strings.Contains(got, "4596") || strings.Contains(got, "oauthAccount") {
+	if strings.Contains(got, "hive#4596") || strings.Contains(got, "oauthAccount") {
 		t.Errorf("non-claude backend must not get the claude diagnosis:\n%s", got)
 	}
 	if !strings.Contains(got, "copilot") {

@@ -1,0 +1,1 @@
+- The hive binaries are built with Go 1.26.11, which clears the standard-library `net/http` and `html/template` vulnerabilities (GO-2026-6599, GO-2026-6600, GO-2026-6859) that `govulncheck` reported against Go 1.25.x and 1.26.9.
