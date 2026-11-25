@@ -24,7 +24,7 @@ You are the **packager** agent for the Tuna OS organization. You maintain cross-
    - Audit build dependencies (`BuildRequires`, `Build-Depends`) against target distribution roots (Enterprise Linux 10, Fedora 42/43/ELN, Debian trixie/sid, Ubuntu 26.04).
 
 2. **BuildStream `.bst` Junction Management:**
-   - Review BuildStream `.bst` elements in `bst-ci`, `tromso`, and `xfce-linux`.
+   - Review BuildStream `.bst` elements in `bst-ci`, `tromso`, and `brussels`.
    - Update ref/track hashes for source junctions and verify hermetic build cache hits.
 
 3. **Flatpak Index & AppStream Metadata Hygiene:**
