@@ -1,0 +1,1 @@
+- Rewrites the agent-personas guide and three short pages in Simplified Technical English and lowers the prose budget from 536 to 450 findings ([#37](https://github.com/tuna-os/hive/issues/37)).
