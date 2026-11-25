@@ -39,6 +39,19 @@ fi
 
 api() { gh api "$@"; }
 
+# Send a comment body on stdin as JSON. A PR that touches thousands of paths
+# makes the body larger than the kernel's per-argument limit (128 KiB), so
+# `-f body=...` fails with "Argument list too long". The body is also capped
+# below GitHub's 65536-character comment limit.
+MAX_COMMENT_CHARS=60000
+send_body() { # method url body
+  local method=$1 url=$2 text=$3
+  if ((${#text} > MAX_COMMENT_CHARS)); then
+    text="${text:0:MAX_COMMENT_CHARS}"$'\n\n'"_Report truncated: too many shared paths to list._"
+  fi
+  printf '%s' "$text" | jq -Rs '{body: .}' | api -X "$method" "$url" --input - >/dev/null
+}
+
 ensure_base() {
   local base=$1
   git fetch --no-tags origin "+refs/heads/${base}:refs/remotes/origin/${base}" >/dev/null
@@ -262,14 +275,14 @@ upsert_comment_and_label() {
     --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n1)
   if [[ "$has_any" != '1' ]]; then
     if [[ -n "$comment_id" ]]; then
-      api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" -f body="$(resolved_body "$base")" >/dev/null
+      send_body PATCH "repos/${REPO}/issues/comments/${comment_id}" "$(resolved_body "$base")"
     else
       printf 'PR #%s: no overlap findings and no earlier comment; not posting\n' "$pr"
     fi
   elif [[ -n "$comment_id" ]]; then
-    api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" -f body="$body" >/dev/null
+    send_body PATCH "repos/${REPO}/issues/comments/${comment_id}" "$body"
   else
-    api -X POST "repos/${REPO}/issues/${pr}/comments" -f body="$body" >/dev/null
+    send_body POST "repos/${REPO}/issues/${pr}/comments" "$body"
   fi
 
   if [[ "$has_conflicts" == '1' ]]; then

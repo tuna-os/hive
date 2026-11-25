@@ -103,6 +103,7 @@ cat >"$BIN/gh" <<'GH'
 [[ "$1" == api ]] || exit 2
 shift
 case "$*" in
+  -X*--input\ -) printf '%s body=%s\n' "$*" "$(jq -r .body)" >>"$GH_WRITE_LOG"; exit 0 ;;
   -X*) printf '%s\n' "$*" >>"$GH_WRITE_LOG"; exit 0 ;;
   *'/pulls?base=v6'*)
     for n in 8 7 6 5 4 3 2 1; do printf '%s\tPR %s\t%s\t2026-01-01T00:00:00Z\n' "$n" "$n" "$REPO_SLUG"; done ;;
@@ -134,8 +135,8 @@ run_pr() { # pr -> sets OUT and WRITES
 
 LABEL_ADD="-X POST repos/${REPO_SLUG}/issues/%s/labels -f labels[]=conflicts-with-open-pr"
 LABEL_DEL="-X DELETE repos/${REPO_SLUG}/issues/%s/labels/conflicts-with-open-pr"
-COMMENT_POST="-X POST repos/${REPO_SLUG}/issues/%s/comments -f body="
-COMMENT_PATCH="-X PATCH repos/${REPO_SLUG}/issues/comments/%s -f body="
+COMMENT_POST="-X POST repos/${REPO_SLUG}/issues/%s/comments --input - body="
+COMMENT_PATCH="-X PATCH repos/${REPO_SLUG}/issues/comments/%s --input - body="
 
 echo 'PR 2: real sibling conflict with PR 3, stale PR 1 is not blamed'
 run_pr 2
