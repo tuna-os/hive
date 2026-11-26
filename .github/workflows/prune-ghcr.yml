@@ -27,6 +27,7 @@ permissions:
 jobs:
   prune:
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'kubestellar'
     steps:
       - name: Prune untagged hive images
         # v3.1.0+ AUTOMATICALLY protects per-architecture child manifests that
@@ -60,6 +61,7 @@ jobs:
   # long-lived branches themselves.
   prune-orphan-branch-tags:
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'kubestellar'
     steps:
       - name: Delete orphaned <branch>-latest tags
         env:
@@ -127,6 +129,7 @@ jobs:
   # never deleted by this job.
   prune-old-sha-tags:
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'kubestellar'
     steps:
       - name: Delete old pure short-SHA image tags
         env:
